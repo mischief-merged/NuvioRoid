@@ -25,6 +25,10 @@ import nuvio.composeapp.generated.resources.downloads_announce_waiting_network
 import nuvio.composeapp.generated.resources.downloads_announce_waiting_connection
 import nuvio.composeapp.generated.resources.downloads_announce_waiting_hotspot
 import nuvio.composeapp.generated.resources.downloads_announce_waiting_low_data
+import nuvio.composeapp.generated.resources.downloads_announce_waiting_slow
+import nuvio.composeapp.generated.resources.downloads_announce_waiting_blocked
+import nuvio.composeapp.generated.resources.downloads_status_waiting_slow
+import nuvio.composeapp.generated.resources.downloads_status_waiting_blocked
 import nuvio.composeapp.generated.resources.downloads_status_waiting_connection
 import nuvio.composeapp.generated.resources.downloads_status_waiting_hotspot
 import nuvio.composeapp.generated.resources.downloads_status_waiting_low_data
@@ -105,6 +109,12 @@ internal enum class DownloadPhase(
     /** Waiting because the network uses Low Data Mode. It goes on by itself when that ends. */
     WaitingOnLowDataMode(Res.string.downloads_status_waiting_low_data, showsSize = true, Res.string.downloads_announce_waiting_low_data),
 
+    /** Waiting because the network has been very slow. Automatic downloads only. */
+    WaitingOnSlowNetwork(Res.string.downloads_status_waiting_slow, showsSize = true, Res.string.downloads_announce_waiting_slow),
+
+    /** Waiting because the network seems to block downloads. */
+    WaitingOnBlockedNetwork(Res.string.downloads_status_waiting_blocked, showsSize = true, Res.string.downloads_announce_waiting_blocked),
+
     /** Waiting for a better connection, at a moment when the reason is not known (it is just ending). */
     WaitingForConnection(Res.string.downloads_status_waiting_connection, showsSize = true, Res.string.downloads_announce_waiting_connection),
 }
@@ -113,6 +123,8 @@ internal enum class DownloadPhase(
 internal fun waitingPhaseFor(reason: LimitedConnectionReason?): DownloadPhase = when (reason) {
     LimitedConnectionReason.Hotspot -> DownloadPhase.WaitingOnHotspot
     LimitedConnectionReason.LowDataMode -> DownloadPhase.WaitingOnLowDataMode
+    LimitedConnectionReason.SlowConnection -> DownloadPhase.WaitingOnSlowNetwork
+    LimitedConnectionReason.NetworkBlocksDownloads -> DownloadPhase.WaitingOnBlockedNetwork
     null -> DownloadPhase.WaitingForConnection
 }
 

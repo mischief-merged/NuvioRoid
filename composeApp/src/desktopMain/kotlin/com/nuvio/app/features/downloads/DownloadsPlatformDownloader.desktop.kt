@@ -201,11 +201,14 @@ internal actual object DownloadsPlatformDownloader {
                         onFailure(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
                         return@launch
                     }
+                    // A network that blocks downloads fails them like this; enough of it makes downloads wait.
+                    transferFailureKind(error)?.let { kind -> reportTransferFailure(request.sourceUrl, kind) }
                     if (!retries.awaitNextAttempt(madeProgress = tempFile.partialLength() > bytesBeforeAttempt)) {
                         onFailure(error.message?.takeIf { it.isNotBlank() && it != "closed" } ?: "Connection lost")
                         return@launch
                     }
                 } catch (error: Throwable) {
+                    transferFailureKind(error)?.let { kind -> reportTransferFailure(request.sourceUrl, kind) }
                     onFailure(error.message ?: "Download failed")
                     return@launch
                 }
@@ -330,6 +333,13 @@ internal actual object DownloadsPlatformDownloader {
             error("Download failed with HTTP $statusCode")
         }
 
+        // A web page where a video was asked for: a sign-in page of the network, usually. Nothing of it is
+        // written and the partial file is left as it is; the transfer is tried again like a dropped connection.
+        if (isWebPage(response.headers().firstValue("Content-Type").orElse(null))) {
+            response.body().close()
+            throw PageInsteadOfFile()
+        }
+
         val isPartialResume = attemptedRangeRequest && statusCode == 206 && resumeFromBytes > 0L
         val appendToTemp = isPartialResume
         val startingBytes = if (appendToTemp) resumeFromBytes else 0L
@@ -345,6 +355,7 @@ internal actual object DownloadsPlatformDownloader {
             contentLength = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull(),
         )
         var downloadedBytes = startingBytes
+        val traffic = DownloadTraffic.app
         val reporter = ThrottledProgress(progressIntervalMs, System::nanoTime) { bytes -> onProgress(bytes, totalBytes) }
         // Checked before anything of the body is written, for every download: a file announced as
         // larger than the room on the disk fails with a plain message instead of a system error.
@@ -400,6 +411,8 @@ internal actual object DownloadsPlatformDownloader {
                         }
                     }
                 }
+                // Counted as a running transfer only while the body is read; the finally below ends it.
+                val trafficToken = traffic.begin(endpointOf(request.sourceUrl))
                 try {
                     openPartial(tempFile.toPath(), appendToTemp).also { if (!appendToTemp) partial.created(tempFile.toPath()) }.use { output ->
                         val buffer = ByteArray(ReadBufferBytes)
@@ -410,6 +423,7 @@ internal actual object DownloadsPlatformDownloader {
                             if (read <= 0) break
                             lastReadAtNanos.set(System.nanoTime())
                             output.write(buffer, 0, read)
+                            traffic.add(read)
                             digest?.update(buffer, 0, read)
                             downloadedBytes += read.toLong()
                             reporter.offer(downloadedBytes)
@@ -433,6 +447,7 @@ internal actual object DownloadsPlatformDownloader {
                     currentCoroutineContext().ensureActive()
                     throw if (stalled.get()) IOException("Connection stalled") else error
                 } finally {
+                    traffic.end(trafficToken)
                     stallWatch.cancel()
                     closer.cancel()
                     // The last value is always reported, whether the transfer ended, failed or was stopped.
@@ -752,7 +767,6 @@ internal fun freeDownloadName(folder: java.nio.file.Path, name: String): String 
     throw IOException("No free name for $name")
 }
 
-
 /** The rejected file goes to the Trash only while its recorded identity still matches. */
 internal fun trashPublishedFile(path: java.nio.file.Path, key: String, moveToTrash: (java.nio.file.Path) -> Boolean): Boolean =
     runCatching {
@@ -760,3 +774,36 @@ internal fun trashPublishedFile(path: java.nio.file.Path, key: String, moveToTra
         if (Files.isSymbolicLink(path) || DownloadMover.identityOf(path) != key) return@runCatching false
         moveToTrash(path) && !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
     }.getOrDefault(false)
+
+/** A web page arrived where a video was asked for. Its body is not written. */
+internal class PageInsteadOfFile : IOException("The network sent a web page instead of the video")
+
+/** Whether a response of [contentType] is a web page rather than a file. */
+internal fun isWebPage(contentType: String?): Boolean {
+    val type = contentType?.substringBefore(';')?.trim()?.lowercase() ?: return false
+    return type == "text/html" || type == "application/xhtml+xml"
+}
+
+/** How [error] failed, in the ways a network that blocks downloads makes transfers fail; null for others. */
+internal fun transferFailureKind(error: Throwable): TransferFailureKind? {
+    val message = error.message.orEmpty()
+    return when {
+        error is PageInsteadOfFile -> TransferFailureKind.PageInsteadOfFile
+        error is javax.net.ssl.SSLException -> TransferFailureKind.SecureConnection
+        Regex("HTTP (403|451|5\\d\\d)").containsMatchIn(message) -> TransferFailureKind.Refused
+        error is IOException && (message.contains("reset", ignoreCase = true) || message.contains("closed", ignoreCase = true)) -> TransferFailureKind.Reset
+        else -> null
+    }
+}
+
+private fun reportTransferFailure(url: String, kind: TransferFailureKind) {
+    val host = runCatching { URI(url).host }.getOrNull() ?: return
+    DesktopPoliteDownloads.onTransferFailure(host, kind)
+}
+
+/** The host and port a transfer talks to, for the round trip probe. */
+internal fun endpointOf(url: String): TransferEndpoint {
+    val uri = runCatching { URI(url) }.getOrNull()
+    val port = uri?.port?.takeIf { it > 0 } ?: if (uri?.scheme.equals("http", ignoreCase = true)) 80 else 443
+    return TransferEndpoint(uri?.host.orEmpty(), port)
+}

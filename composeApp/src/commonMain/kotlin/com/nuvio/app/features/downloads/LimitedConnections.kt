@@ -16,7 +16,17 @@ internal sealed interface LimitedConnectionReason {
 
     /** The user turned on Low Data Mode for this network. */
     data object LowDataMode : LimitedConnectionReason
+
+    /** What downloads get has stayed very low. Only automatic downloads wait for this one. */
+    data object SlowConnection : LimitedConnectionReason
+
+    /** The network answers downloads with a sign-in page, breaks secure connections, or refuses them from every host. */
+    data object NetworkBlocksDownloads : LimitedConnectionReason
 }
+
+/** Whether a download the user started waits for [reason] too, or only automatic ones do. */
+internal val LimitedConnectionReason.holdsUserDownloads: Boolean
+    get() = this != LimitedConnectionReason.SlowConnection
 
 /** What the system says about the path traffic takes now. */
 internal sealed interface NetworkPathReport {
@@ -80,18 +90,30 @@ internal fun limitedReasonOf(report: NetworkPathReport): LimitedConnectionReason
 }
 
 internal data class ConnectionHoldState(
-    /** Why the connection is limited now, or null when it is not or nothing is known. Whatever the setting. */
-    val reason: LimitedConnectionReason? = null,
+    /** Why the network path is limited now (hotspot, Low Data Mode), or null. Whatever the setting. */
+    val pathReason: LimitedConnectionReason? = null,
+    /** What downloads found the network to be (slow, blocking downloads), or null. */
+    val quality: LimitedConnectionReason? = null,
     /** Whether the setting to pause downloads on limited connections is on. */
     val enabled: Boolean = true,
     /** The user chose "Download anyway" on this network, in this run of the app. */
     val overridden: Boolean = false,
 ) {
-    /** Downloads wait now: the connection is limited, the setting is on and the user did not override it. */
-    val holding: Boolean get() = reason != null && enabled && !overridden
+    /** Why the connection is limited now, whatever the setting: the path first, then what downloads found. */
+    val reason: LimitedConnectionReason? get() = pathReason ?: quality
 
-    /** Why downloads wait now, or null when they do not. */
-    val holdReason: LimitedConnectionReason? get() = reason.takeIf { holding }
+    /** Why a download waits now, or null when it does not. [automatic]: queued by an automatic-download rule. */
+    fun holdReasonFor(automatic: Boolean): LimitedConnectionReason? {
+        if (overridden) return null
+        pathReason?.takeIf { enabled }?.let { return it }
+        return quality?.takeIf { automatic || it.holdsUserDownloads }
+    }
+
+    /** Some download waits now. */
+    val holding: Boolean get() = holdReason != null
+
+    /** Why some download waits now (automatic ones wait for every reason), or null when none does. */
+    val holdReason: LimitedConnectionReason? get() = holdReasonFor(automatic = true)
 }
 
 /**
@@ -107,6 +129,7 @@ internal class ConnectionHold(
 ) {
     private val lock = SynchronizedObject()
     private var report: NetworkPathReport = NetworkPathReport.Unknown
+    private var quality: LimitedConnectionReason? = null
     private var enabled: Boolean? = null
 
     // The network the user said "Download anyway" for, null when there is no such choice.
@@ -120,8 +143,17 @@ internal class ConnectionHold(
         synchronized(lock) { _state.value = computeLocked() }
     }
 
-    /** Why downloads wait now, or null. Reads the published state only, so it never waits for a lock. */
+    /** Why some download waits now, or null. Reads the published state only, so it never waits for a lock. */
     val holdReason: LimitedConnectionReason? get() = _state.value.holdReason
+
+    /** Why a download waits now, or null. Reads the published state only. */
+    fun holdReasonFor(automatic: Boolean): LimitedConnectionReason? = _state.value.holdReasonFor(automatic)
+
+    /** What downloads found the network to be: slow, blocking downloads, or neither (null). */
+    fun reportQuality(reason: LimitedConnectionReason?) = change {
+        quality = reason
+        if (reason == null && limitedReasonOf(report) == null) overrideKey = null
+    }
 
     fun listen(listener: () -> Unit) {
         synchronized(lock) { this.listener = listener }
@@ -134,10 +166,12 @@ internal class ConnectionHold(
         val chosen = overrideKey
         overrideKey = when {
             chosen == null -> null
-            key == null || !sameNetwork(key, chosen) || limitedReasonOf(report) == null -> null
+            key == null && chosen != UnknownNetworkKey -> null
+            key != null && !sameNetwork(key, chosen) -> null
+            limitedReasonOf(report) == null && quality == null -> null
             // The same network, maybe now with a router's hardware address that was not known before: kept, so a
             // network with the same addresses but another router is told apart from then on.
-            else -> key
+            else -> key ?: chosen
         }
     }
 
@@ -148,19 +182,20 @@ internal class ConnectionHold(
 
     /** Lets downloads run on this network until it changes or the app quits. Nothing when nothing is held. */
     fun downloadAnyway() = change {
-        val known = report as? NetworkPathReport.Known
-        if (known != null && limitedReasonOf(known) != null) overrideKey = known.networkKey
+        if (limitedReasonOf(report) == null && quality == null) return@change
+        overrideKey = (report as? NetworkPathReport.Known)?.networkKey ?: UnknownNetworkKey
     }
 
     private fun enabledLocked(): Boolean =
         enabled ?: (runCatching { loadEnabled() }.getOrNull() ?: true).also { enabled = it }
 
     private fun computeLocked(): ConnectionHoldState {
-        val known = report as? NetworkPathReport.Known
+        val key = (report as? NetworkPathReport.Known)?.networkKey ?: UnknownNetworkKey
         return ConnectionHoldState(
-            reason = limitedReasonOf(report),
+            pathReason = limitedReasonOf(report),
+            quality = quality,
             enabled = enabledLocked(),
-            overridden = known != null && overrideKey?.let { sameNetwork(it, known.networkKey) } == true,
+            overridden = overrideKey?.let { it == key || (key != UnknownNetworkKey && it != UnknownNetworkKey && sameNetwork(it, key)) } == true,
         )
     }
 
@@ -175,6 +210,9 @@ internal class ConnectionHold(
     }
 }
 
+/** The network key of a "Download anyway" given while the path is not known (no detector). */
+private const val UnknownNetworkKey = "?"
+
 /** The app's hold, with the setting saved where the platform keeps settings. */
 internal object LimitedConnections {
     val hold: ConnectionHold = ConnectionHold(
@@ -187,4 +225,37 @@ internal object LimitedConnections {
 internal expect object LimitedConnectionStorage {
     fun loadPauseOnLimited(): Boolean?
     fun savePauseOnLimited(value: Boolean)
+
+    /** The setting "Let other apps go first". Null: never set (on). */
+    fun loadPolite(): Boolean?
+    fun savePolite(value: Boolean)
+}
+
+/** The setting "Let other apps go first" and what the downloads screen shows about it. */
+internal object PoliteDownloadsHost {
+    private val lock = SynchronizedObject()
+    private var loaded = false
+    private val _enabled = MutableStateFlow(true)
+    val enabled: StateFlow<Boolean>
+        get() {
+            synchronized(lock) {
+                if (!loaded) {
+                    loaded = true
+                    _enabled.value = runCatching { LimitedConnectionStorage.loadPolite() }.getOrNull() ?: true
+                }
+            }
+            return _enabled.asStateFlow()
+        }
+
+    fun setEnabled(value: Boolean) {
+        synchronized(lock) {
+            loaded = true
+            _enabled.value = value
+        }
+        runCatching { LimitedConnectionStorage.savePolite(value) }
+    }
+
+    /** Set by the platform that runs [PoliteDownloads]. */
+    val stateFlow = MutableStateFlow(PoliteState())
+    val state: StateFlow<PoliteState> get() = stateFlow.asStateFlow()
 }

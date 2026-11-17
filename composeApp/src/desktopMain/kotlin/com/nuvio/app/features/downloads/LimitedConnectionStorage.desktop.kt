@@ -11,4 +11,10 @@ internal actual object LimitedConnectionStorage {
     actual fun savePauseOnLimited(value: Boolean) {
         store.putString("pause_on_limited", value.toString())
     }
+
+    actual fun loadPolite(): Boolean? = store.getString("let_others_first")?.toBooleanStrictOrNull()
+
+    actual fun savePolite(value: Boolean) {
+        store.putString("let_others_first", value.toString())
+    }
 }
