@@ -174,7 +174,7 @@ class BlockedNetworkJudgeTest {
 
     @Test
     fun one_host_failing_is_that_source_not_the_network() {
-        judge.onFailure(0L, "a.example", TransferFailureKind.Refused)
+        judge.onFailure(0L, "a.example", TransferFailureKind.PageInsteadOfFile)
         judge.onFailure(1_000L, "a.example", TransferFailureKind.Reset)
         assertFalse(judge.onCheck(2_000L, NetworkCheck.Open))
     }
@@ -182,7 +182,7 @@ class BlockedNetworkJudgeTest {
     @Test
     fun every_host_failing_while_other_requests_work_is_a_blocking_network() {
         judge.onFailure(0L, "a.example", TransferFailureKind.Reset)
-        judge.onFailure(1_000L, "b.example", TransferFailureKind.Refused)
+        judge.onFailure(1_000L, "b.example", TransferFailureKind.PageInsteadOfFile)
         assertTrue(judge.onCheck(2_000L, NetworkCheck.Open))
     }
 
@@ -222,8 +222,7 @@ class BlockedNetworkJudgeTest {
     fun the_failures_a_download_shows_are_told_apart() {
         assertEquals(TransferFailureKind.PageInsteadOfFile, transferFailureKind(PageInsteadOfFile()))
         assertEquals(TransferFailureKind.SecureConnection, transferFailureKind(javax.net.ssl.SSLHandshakeException("PKIX path building failed")))
-        assertEquals(TransferFailureKind.Refused, transferFailureKind(IllegalStateException("Download failed with HTTP 451")))
-        assertEquals(TransferFailureKind.Refused, transferFailureKind(IOException("Download failed with HTTP 503")))
+        assertNull(transferFailureKind(IllegalStateException("Download failed with HTTP 451")))
         assertEquals(TransferFailureKind.Reset, transferFailureKind(IOException("Connection reset")))
         assertNull(transferFailureKind(IllegalStateException("Download failed with HTTP 404")))
         assertTrue(isWebPage("text/html; charset=utf-8"))
@@ -305,7 +304,7 @@ class PoliteDownloadsRunnerTest {
     @Test
     fun failures_from_every_host_report_a_blocked_network_after_one_look() {
         polite.onTransferFailure("a.example", TransferFailureKind.Reset)
-        polite.onTransferFailure("b.example", TransferFailureKind.Refused)
+        polite.onTransferFailure("b.example", TransferFailureKind.PageInsteadOfFile)
         repeat(30) { tick() }
         assertEquals(LimitedConnectionReason.NetworkBlocksDownloads, qualities.last())
         assertEquals(1, networkChecks, "the network was looked at more than once in a minute")

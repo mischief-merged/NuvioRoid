@@ -152,7 +152,6 @@ internal class ConnectionHold(
     /** What downloads found the network to be: slow, blocking downloads, or neither (null). */
     fun reportQuality(reason: LimitedConnectionReason?) = change {
         quality = reason
-        if (reason == null && limitedReasonOf(report) == null) overrideKey = null
     }
 
     fun listen(listener: () -> Unit) {
@@ -168,7 +167,6 @@ internal class ConnectionHold(
             chosen == null -> null
             key == null && chosen != UnknownNetworkKey -> null
             key != null && !sameNetwork(key, chosen) -> null
-            limitedReasonOf(report) == null && quality == null -> null
             // The same network, maybe now with a router's hardware address that was not known before: kept, so a
             // network with the same addresses but another router is told apart from then on.
             else -> key ?: chosen
@@ -180,7 +178,10 @@ internal class ConnectionHold(
         runCatching { saveEnabled(value) }
     }
 
-    /** Lets downloads run on this network until it changes or the app quits. Nothing when nothing is held. */
+    /**
+     * Lets downloads run on this network until it changes or the app quits, for every reason, also one that
+     * ends and comes back on the same network. Nothing when nothing is held.
+     */
     fun downloadAnyway() = change {
         if (limitedReasonOf(report) == null && quality == null) return@change
         overrideKey = (report as? NetworkPathReport.Known)?.networkKey ?: UnknownNetworkKey

@@ -333,10 +333,13 @@ internal actual object DownloadsPlatformDownloader {
             error("Download failed with HTTP $statusCode")
         }
 
-        // A web page where a video was asked for: a sign-in page of the network, usually. Nothing of it is
-        // written and the partial file is left as it is; the transfer is tried again like a dropped connection.
-        if (isWebPage(response.headers().firstValue("Content-Type").orElse(null))) {
-            response.body().close()
+        // A web page where a video was asked for: a sign-in page of the network, usually. Its label is read, and
+        // its first bytes, since a portal may send it unlabelled or labelled as a file. Nothing of it is written
+        // and the partial file is left as it is; the transfer is tried again like a dropped connection.
+        // The first bytes are read and pushed back, so the reads that follow come straight from the connection as before.
+        val body = java.io.PushbackInputStream(response.body(), SniffBytes)
+        if (isWebPage(response.headers().firstValue("Content-Type").orElse(null)) || startsLikeWebPage(peekHead(body))) {
+            body.close()
             throw PageInsteadOfFile()
         }
 
@@ -385,7 +388,7 @@ internal actual object DownloadsPlatformDownloader {
         }
         val digest = expectedDigest?.let { runCatching { MessageDigest.getInstance(it.algorithm) }.getOrNull() }
 
-        response.body().use { input ->
+        body.use { input ->
             coroutineScope {
                 // A connection that goes silent never ends the read by itself. Closing the body
                 // ends it, and the transfer is then tried again like any other dropped connection.
@@ -784,13 +787,15 @@ internal fun isWebPage(contentType: String?): Boolean {
     return type == "text/html" || type == "application/xhtml+xml"
 }
 
-/** How [error] failed, in the ways a network that blocks downloads makes transfers fail; null for others. */
+/**
+ * How [error] failed, in the ways a network that blocks downloads makes transfers fail; null for others. A
+ * refusal or a server error (403, 410, 5xx) is the source's, an expired or removed link: never counted.
+ */
 internal fun transferFailureKind(error: Throwable): TransferFailureKind? {
     val message = error.message.orEmpty()
     return when {
         error is PageInsteadOfFile -> TransferFailureKind.PageInsteadOfFile
         error is javax.net.ssl.SSLException -> TransferFailureKind.SecureConnection
-        Regex("HTTP (403|451|5\\d\\d)").containsMatchIn(message) -> TransferFailureKind.Refused
         error is IOException && (message.contains("reset", ignoreCase = true) || message.contains("closed", ignoreCase = true)) -> TransferFailureKind.Reset
         else -> null
     }
@@ -806,4 +811,45 @@ internal fun endpointOf(url: String): TransferEndpoint {
     val uri = runCatching { URI(url) }.getOrNull()
     val port = uri?.port?.takeIf { it > 0 } ?: if (uri?.scheme.equals("http", ignoreCase = true)) 80 else 443
     return TransferEndpoint(uri?.host.orEmpty(), port)
+}
+
+/** How many first bytes of a body are looked at for a web page, at most... */
+internal const val SniffBytes = 512
+
+/** ...and waited for, at least (or the end of a shorter body): enough to see past a byte order mark and white space. */
+internal const val SniffMinBytes = 64
+
+/** The first bytes of [body], which stay to be read. Gives up (closing the body) when nothing comes in time. */
+private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = coroutineScope {
+    val guard = launch {
+        delay(DownloadsPlatformDownloader.stallTimeoutMs)
+        runCatching { body.close() }
+    }
+    try {
+        runInterruptible(Dispatchers.IO) {
+            val head = ByteArray(SniffBytes)
+            var filled = 0
+            while (filled < SniffMinBytes) {
+                val read = body.read(head, filled, SniffBytes - filled)
+                if (read <= 0) break
+                filled += read
+            }
+            if (filled > 0) body.unread(head, 0, filled)
+            head.copyOf(filled)
+        }
+    } finally {
+        guard.cancel()
+    }
+}
+
+/**
+ * Whether a body starts like a web page: after a byte order mark and white space, "<!doctype html", "<html",
+ * "<head", "<body" or "<?xml". No video container starts with "<".
+ */
+internal fun startsLikeWebPage(head: ByteArray): Boolean {
+    var start = 0
+    if (head.size >= 3 && head[0] == 0xEF.toByte() && head[1] == 0xBB.toByte() && head[2] == 0xBF.toByte()) start = 3
+    while (start < head.size && head[start].toInt().toChar().isWhitespace()) start++
+    val text = head.copyOfRange(start, minOf(head.size, start + 16)).decodeToString().lowercase()
+    return listOf("<!doctype html", "<html", "<head", "<body", "<?xml").any { text.startsWith(it) }
 }

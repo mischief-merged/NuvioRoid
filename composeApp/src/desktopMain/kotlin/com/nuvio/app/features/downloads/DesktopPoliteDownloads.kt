@@ -93,7 +93,9 @@ internal object DesktopPoliteDownloads {
                 HttpResponse.BodyHandlers.ofString(),
             )
         }.getOrNull() ?: return@runInterruptible NetworkCheck.Unreachable
-        if (page.statusCode() != 200 || !page.body().contains("Success")) return@runInterruptible NetworkCheck.SignInPage
+        val redirectHost = page.headers().firstValue("Location").orElse(null)?.let { runCatching { URI(it).host }.getOrNull() }
+        val found = networkCheckOf(page.statusCode(), page.body(), redirectHost)
+        if (found != NetworkCheck.Open) return@runInterruptible found
         val secure = runCatching {
             client.send(
                 HttpRequest.newBuilder(URI("https://www.apple.com/library/test/success.html")).timeout(Duration.ofSeconds(5))

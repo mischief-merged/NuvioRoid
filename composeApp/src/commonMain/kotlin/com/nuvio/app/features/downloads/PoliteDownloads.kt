@@ -60,29 +60,25 @@ internal const val YieldMinBytesPerSecond = 64_000L
 /** A round trip probe that gets no answer within this counts as this long a round trip: a full queue. */
 internal const val ProbeTimeoutMs = 1_500L
 
-/**
- * Works out the download rate that leaves the link to other traffic. Times in milliseconds on any
- * monotonic clock. Pure: it looks at nothing but its arguments.
- */
-internal class YieldController {
-    // The lowest round trip of each minute, oldest first: (minute, round trip).
-    private val minuteMinimums = ArrayDeque<Pair<Long, Long>>()
-    private val recent = ArrayDeque<Long>()
-    private var lastCutAtMs: Long? = null
-    private var calmSinceMs: Long? = null
+/** A host's round trips are judged only once this many were measured: before that it has no baseline of its own. */
+internal const val WarmupSamples = 5
 
-    /** The rate downloads are held to, in bytes a second. Null: not held. */
-    var capBytesPerSecond: Long? = null
-        private set
+/** After this many probes in a row that got no answer at all, the limit eases off: there is no evidence of a queue. */
+internal const val FailedProbesBeforeEasing = 3
+
+/** What is known about the round trips to one host. */
+private class HostRoundTrips {
+    // The lowest round trip of each minute, oldest first: (minute, round trip).
+    val minuteMinimums = ArrayDeque<Pair<Long, Long>>()
+    val recent = ArrayDeque<Long>()
+    var samples = 0
+    var lastSeenMs = 0L
 
     val baselineMs: Long? get() = minuteMinimums.minOfOrNull { it.second }
 
-    /**
-     * One look: [rttMs] is the round trip just measured (null when the probe could not be made), and
-     * [throughputBytesPerSecond] what downloads got since the last look. Returns the rate to hold to.
-     */
-    fun onSample(nowMs: Long, rttMs: Long?, throughputBytesPerSecond: Long): Long? {
-        if (rttMs == null || rttMs < 0L) return capBytesPerSecond
+    fun add(nowMs: Long, rttMs: Long) {
+        lastSeenMs = nowMs
+        samples++
         val minute = nowMs / 60_000L
         val last = minuteMinimums.lastOrNull()
         if (last != null && last.first == minute) {
@@ -90,16 +86,54 @@ internal class YieldController {
         } else {
             minuteMinimums.addLast(minute to rttMs)
         }
-        while (minuteMinimums.size > BaselineMinutes || (minuteMinimums.firstOrNull()?.first ?: minute) <= minute - BaselineMinutes) {
-            minuteMinimums.removeFirst()
-        }
+        while (minuteMinimums.isNotEmpty() && minuteMinimums.first().first <= minute - BaselineMinutes) minuteMinimums.removeFirst()
         recent.addLast(rttMs)
         while (recent.size > RecentSamples) recent.removeFirst()
-        // Too few samples to tell a queue from noise.
-        if (recent.size < RecentSamples) return capBytesPerSecond
+    }
+}
 
-        val baseline = baselineMs ?: return capBytesPerSecond
-        val queueMs = recent.min() - baseline
+/**
+ * Works out the download rate that leaves the link to other traffic. Times in milliseconds on any
+ * monotonic clock. Pure: it looks at nothing but its arguments.
+ *
+ * Each host is judged against its own baseline (a far host has a long round trip that is no queue), and
+ * only after [WarmupSamples] of its own. The limit is one for all downloads: they share the link.
+ */
+internal class YieldController {
+    private val hosts = mutableMapOf<String, HostRoundTrips>()
+    private var lastCutAtMs: Long? = null
+    private var calmSinceMs: Long? = null
+    private var failedProbes = 0
+
+    /** The rate downloads are held to, in bytes a second. Null: not held. */
+    var capBytesPerSecond: Long? = null
+        private set
+
+    /** The baseline of [host], or of the only host measured when none is named. */
+    fun baselineMs(host: String? = null): Long? =
+        (if (host != null) hosts[host] else hosts.values.singleOrNull())?.baselineMs
+
+    val baselineMs: Long? get() = baselineMs(null)
+
+    /**
+     * One look: [rttMs] is the round trip to [host] just measured (null when the probe got no answer at all),
+     * and [throughputBytesPerSecond] what downloads got since the last look. Returns the rate to hold to.
+     */
+    fun onSample(nowMs: Long, rttMs: Long?, throughputBytesPerSecond: Long, host: String = ""): Long? {
+        if (rttMs == null || rttMs < 0L) {
+            // Probes that fail say nothing about a queue: after a few, the limit eases off as on a calm link.
+            if (++failedProbes >= FailedProbesBeforeEasing) ease(nowMs, throughputBytesPerSecond)
+            return capBytesPerSecond
+        }
+        failedProbes = 0
+        hosts.entries.removeAll { (name, trips) -> name != host && nowMs - trips.lastSeenMs > BaselineMinutes * 60_000L }
+        val trips = hosts.getOrPut(host) { HostRoundTrips() }
+        trips.add(nowMs, rttMs)
+        // Too few samples of this host to tell a queue from its normal round trip.
+        if (trips.samples < WarmupSamples || trips.recent.size < RecentSamples) return capBytesPerSecond
+
+        val baseline = trips.baselineMs ?: return capBytesPerSecond
+        val queueMs = trips.recent.min() - baseline
         val target = queueTargetMs(baseline)
         val cap = capBytesPerSecond
         when {
@@ -111,27 +145,31 @@ internal class YieldController {
                 lastCutAtMs = nowMs
                 calmSinceMs = null
             }
-            queueMs * 2 <= target -> {
-                val calmSince = calmSinceMs ?: nowMs.also { calmSinceMs = it }
-                val cooled = lastCutAtMs?.let { nowMs - it >= YieldCooldownMs } ?: true
-                if (cap != null && cooled) {
-                    val grown = (cap * YieldGrowFactor).toLong() + 1L
-                    val unbound = throughputBytesPerSecond > 0L && grown >= throughputBytesPerSecond * YieldReleaseHeadroom
-                    capBytesPerSecond = if (unbound && nowMs - calmSince >= YieldReleaseCalmMs) null else grown
-                }
-            }
+            queueMs * 2 <= target -> ease(nowMs, throughputBytesPerSecond)
             // Between: hold the rate where it is.
             else -> calmSinceMs = null
         }
         return capBytesPerSecond
     }
 
-    /** No transfer runs: the limit goes (the next transfer starts free), the baseline is kept. */
+    /** A calm look: the rate grows after the cooldown, and the limit goes once it no longer binds and stayed calm. */
+    private fun ease(nowMs: Long, throughputBytesPerSecond: Long) {
+        val cap = capBytesPerSecond ?: return
+        val calmSince = calmSinceMs ?: nowMs.also { calmSinceMs = it }
+        val cooled = lastCutAtMs?.let { nowMs - it >= YieldCooldownMs } ?: true
+        if (!cooled) return
+        val grown = (cap * YieldGrowFactor).toLong() + 1L
+        val unbound = throughputBytesPerSecond > 0L && grown >= throughputBytesPerSecond * YieldReleaseHeadroom
+        capBytesPerSecond = if (unbound && nowMs - calmSince >= YieldReleaseCalmMs) null else grown
+    }
+
+    /** No transfer runs: the limit goes (the next transfer starts free), the baselines are kept. */
     fun idle() {
         capBytesPerSecond = null
-        recent.clear()
+        hosts.values.forEach { it.recent.clear() }
         lastCutAtMs = null
         calmSinceMs = null
+        failedProbes = 0
     }
 }
 
@@ -161,9 +199,17 @@ internal class SlowNetworkJudge {
 
     /**
      * One look. [transfersActive]: some download is transferring. [userCapBytesPerSecond]: the user's
-     * own limit; one below the floor is the user's choice and never makes a network slow.
+     * own limit; one below the floor is the user's choice and never makes a network slow. [limitedByYield]:
+     * this app was holding downloads back to leave the link to others, so what they got is not what the
+     * network can give, and the look is not judged: yielding never makes a network slow by itself.
      */
-    fun onSample(nowMs: Long, throughputBytesPerSecond: Long, transfersActive: Boolean, userCapBytesPerSecond: Long?): Boolean {
+    fun onSample(
+        nowMs: Long,
+        throughputBytesPerSecond: Long,
+        transfersActive: Boolean,
+        userCapBytesPerSecond: Long?,
+        limitedByYield: Boolean = false,
+    ): Boolean {
         val held = heldAtMs
         if (held != null) {
             if (nowMs - held >= SlowRecheckMs) {
@@ -187,6 +233,10 @@ internal class SlowNetworkJudge {
         }
         val activeSince = activeSinceMs ?: nowMs.also { activeSinceMs = it }
         if (nowMs - activeSince < SlowGraceMs) return false
+        if (limitedByYield) {
+            slowSinceMs = null
+            return false
+        }
         if (throughputBytesPerSecond >= SlowFloorBytesPerSecond) {
             slowSinceMs = null
             return false
@@ -214,9 +264,6 @@ internal enum class TransferFailureKind {
 
     /** The connection was reset or closed before the file. */
     Reset,
-
-    /** The answer refused the download (403, 451) or was a server error (5xx). */
-    Refused,
 }
 
 /** What a look at a known page outside the download hosts found. */
@@ -232,9 +279,42 @@ internal enum class NetworkCheck {
 
     /** It could not be reached at all: the internet is down, which is not a blocked network. */
     Unreachable,
+
+    /** It answered with something else (an error of its own, a redirect within Apple): nothing can be told. */
+    Unknown,
 }
 
-/** Failures from this many hosts in [BlockedWindowMs], with no bytes from any, while requests work, is a network that blocks downloads. */
+/**
+ * What the look at Apple's connectivity page found, from its answer. Only the expected "Success" page is
+ * [NetworkCheck.Open]; a 200 with another page, or a redirect to another host, is a sign-in page; any other
+ * answer (429, 5xx, a redirect within Apple) tells nothing.
+ */
+internal fun networkCheckOf(status: Int, body: String?, redirectHost: String?): NetworkCheck = when {
+    status == 200 && body.orEmpty().contains("<TITLE>Success</TITLE>", ignoreCase = true) -> NetworkCheck.Open
+    status == 200 -> NetworkCheck.SignInPage
+    status in 300..399 && redirectHost != null && !redirectHost.lowercase().let { it == "apple.com" || it.endsWith(".apple.com") } ->
+        NetworkCheck.SignInPage
+    else -> NetworkCheck.Unknown
+}
+
+/** Second-level labels under which a country code makes the registrable domain three labels long ("files.co.uk"). */
+private val SECOND_LEVEL_SUFFIXES = setOf("co", "com", "net", "org", "ac", "gov", "edu", "ne", "or", "go")
+
+/**
+ * The domain a host belongs to, so that two hosts of one provider count as one: "edge-1.cdn.provider.com"
+ * is "provider.com", "files.other.co.uk" is "other.co.uk". An approximation of the public suffix list that
+ * errs towards counting hosts as one provider. An address is itself.
+ */
+internal fun registrableDomain(host: String): String {
+    val name = host.trim().trimEnd('.').lowercase()
+    if (name.isEmpty() || name.contains(':') || name.all { it.isDigit() || it == '.' }) return name
+    val labels = name.split('.')
+    if (labels.size <= 2) return name
+    val take = if (labels.last().length == 2 && labels[labels.size - 2] in SECOND_LEVEL_SUFFIXES) 3 else 2
+    return labels.takeLast(take).joinToString(".")
+}
+
+/** Failures from this many providers (registrable domains) in [BlockedWindowMs], with no bytes from any, while requests work, is a network that blocks downloads. */
 internal const val BlockedMinHosts = 2
 internal const val BlockedWindowMs = 3 * 60_000L
 
@@ -259,7 +339,7 @@ internal class BlockedNetworkJudge {
     }
 
     fun onFailure(nowMs: Long, host: String, kind: TransferFailureKind) {
-        failures += Triple(nowMs, host.lowercase(), kind)
+        failures += Triple(nowMs, registrableDomain(host), kind)
         failures.removeAll { nowMs - it.first > BlockedWindowMs }
     }
 
@@ -278,11 +358,15 @@ internal class BlockedNetworkJudge {
         val noBytes = lastBytesAtMs?.let { nowMs - it > BlockedWindowMs } ?: true
         val wasBlocked = blocked
         val nowBlocked = when (check) {
-            NetworkCheck.SignInPage -> true
-            NetworkCheck.SecureConnectionBroken -> recent.any { it.third == TransferFailureKind.SecureConnection } || wasBlocked
+            // Downloads that still receive bytes are not blocked, whatever the page says.
+            NetworkCheck.SignInPage -> noBytes
+            NetworkCheck.SecureConnectionBroken -> noBytes && (recent.any { it.third == TransferFailureKind.SecureConnection } || wasBlocked)
             NetworkCheck.Unreachable -> false
+            NetworkCheck.Unknown -> wasBlocked
             NetworkCheck.Open -> !wasBlocked && noBytes && recent.map { it.second }.distinct().size >= BlockedMinHosts
         }
+        // Failures while the internet was down say nothing about a block once it is back.
+        if (check == NetworkCheck.Unreachable) failures.clear()
         blockedAtMs = if (nowBlocked) (blockedAtMs ?: nowMs) else null
         // A block that ended, or a trial after one: failures from before say nothing about what comes now.
         if (wasBlocked && !nowBlocked) failures.clear()
@@ -395,8 +479,15 @@ internal class PoliteDownloads(
                 probes++
                 runCatching { probeRoundTrip(endpoint) }.getOrNull()
             }
-            setYieldCap(controller.onSample(now, rtt, throughput))
-            slowJudge.onSample(now, throughput, transfersActive = true, userCapBytesPerSecond = userCapBytesPerSecond())
+            val limitedAtLook = controller.capBytesPerSecond != null
+            setYieldCap(controller.onSample(now, rtt, throughput, host = "${endpoint.host}:${endpoint.port}"))
+            // What downloads got while this app limited them says nothing about the network: not judged.
+            slowJudge.onSample(
+                now, throughput,
+                transfersActive = true,
+                userCapBytesPerSecond = userCapBytesPerSecond(),
+                limitedByYield = limitedAtLook || controller.capBytesPerSecond != null,
+            )
         }
         _state.value = PoliteState(yielding = controller.capBytesPerSecond != null)
 
