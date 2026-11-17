@@ -1,6 +1,9 @@
 #import <Cocoa/Cocoa.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hidsystem/ev_keymap.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <Network/Network.h>
 #include <arpa/inet.h>
@@ -22,6 +25,7 @@
 #include <mpv/render_gl.h>
 
 #include <atomic>
+#include <algorithm>
 #include <memory>
 #include <chrono>
 #include <clocale>
@@ -4336,4 +4340,85 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_nuvio_app_features_downloads_MacNetworkPathNative_stopMonitor(JNIEnv *env, jobject) {
     std::lock_guard<std::mutex> guard(gPathMonitorMutex);
     NuvioStopPathMonitorLocked(env);
+}
+
+// Power-source notifications arrive on the main run loop; transfer updates come from worker threads.
+static std::mutex gDownloadPowerMutex;
+static IOPMAssertionID gDownloadSleepAssertion = kIOPMNullAssertionID;
+static CFRunLoopSourceRef gDownloadPowerSource = nullptr;
+static bool gDownloadsWantSleepPrevention = false;
+static NSString *gDownloadSleepReason = nil;
+
+// -2: external power, -1: unreadable, 0...100: battery percentage.
+static int NuvioDownloadPowerState() {
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (!info) return -1;
+    CFArrayRef sources = IOPSCopyPowerSourcesList(info);
+    int result = -1;
+    if (sources) {
+        for (CFIndex index = 0; index < CFArrayGetCount(sources); ++index) {
+            CFDictionaryRef description = IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(sources, index));
+            if (!description) continue;
+            NSDictionary *source = (__bridge NSDictionary *)description;
+            if (![source[@kIOPSTypeKey] isEqual:@kIOPSInternalBatteryType]) continue;
+            if ([source[@kIOPSPowerSourceStateKey] isEqual:@kIOPSACPowerValue]) {
+                result = -2;
+                break;
+            }
+            NSNumber *current = source[@kIOPSCurrentCapacityKey];
+            NSNumber *maximum = source[@kIOPSMaxCapacityKey];
+            if ([source[@kIOPSPowerSourceStateKey] isEqual:@kIOPSBatteryPowerValue] && current && maximum.doubleValue > 0) {
+                result = (int)std::floor(100.0 * current.doubleValue / maximum.doubleValue);
+                result = std::max(0, std::min(100, result));
+                break;
+            }
+        }
+        CFRelease(sources);
+    }
+    CFRelease(info);
+    return result;
+}
+
+static void NuvioRefreshDownloadSleepAssertionLocked() {
+    const int power = NuvioDownloadPowerState();
+    const bool hold = gDownloadsWantSleepPrevention && !(power >= 0 && power < 20);
+    if (hold && gDownloadSleepAssertion == kIOPMNullAssertionID) {
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
+                                   kIOPMAssertionLevelOn, (__bridge CFStringRef)gDownloadSleepReason,
+                                   &gDownloadSleepAssertion);
+    } else if (!hold && gDownloadSleepAssertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(gDownloadSleepAssertion);
+        gDownloadSleepAssertion = kIOPMNullAssertionID;
+    }
+}
+
+static void NuvioDownloadPowerChanged(void *) {
+    std::lock_guard<std::mutex> guard(gDownloadPowerMutex);
+    NuvioRefreshDownloadSleepAssertionLocked();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_nuvio_app_features_downloads_MacDownloadPowerNative_powerState(JNIEnv *, jobject) {
+    return NuvioDownloadPowerState();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_downloads_MacDownloadPowerNative_setSleepPrevention(JNIEnv *env, jobject, jboolean requested, jstring reason) {
+    @autoreleasepool {
+        const std::string text = jstringToString(env, reason);
+        NSString *label = [NSString stringWithUTF8String:text.c_str()];
+        std::lock_guard<std::mutex> guard(gDownloadPowerMutex);
+        gDownloadsWantSleepPrevention = requested;
+        gDownloadSleepReason = label;
+        if (requested && !gDownloadPowerSource) {
+            gDownloadPowerSource = IOPSNotificationCreateRunLoopSource(NuvioDownloadPowerChanged, nullptr);
+            if (gDownloadPowerSource) CFRunLoopAddSource(CFRunLoopGetMain(), gDownloadPowerSource, kCFRunLoopCommonModes);
+        }
+        NuvioRefreshDownloadSleepAssertionLocked();
+        if (!requested && gDownloadPowerSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), gDownloadPowerSource, kCFRunLoopCommonModes);
+            CFRelease(gDownloadPowerSource);
+            gDownloadPowerSource = nullptr;
+        }
+    }
 }

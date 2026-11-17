@@ -75,8 +75,8 @@ internal actual object DownloadsPlatformDownloader {
     internal const val StartSubtitlesTimeoutMs = 60_000L
 
     /**
-     * A file is found only where its record says. Nothing is adopted by name or size: a finished record
-     * without an address shows "File not found", and only the user can point it at a file ("Locate the file…").
+     * Finished records are found only at their recorded address. An interrupted transfer checks its
+     * recorded destination in start() before receiving bytes, in case publishing already finished.
      */
     actual fun restoreItem(item: DownloadItem): DownloadItem = item
 
@@ -110,6 +110,24 @@ internal actual object DownloadsPlatformDownloader {
             var request = request
             var destination = File(downloadsDir, request.destinationFileName)
             var tempFile = File(downloadsDir, "${request.destinationFileName}.part")
+            // A previous process may have stopped after publishing but before verification saved Completed.
+            // Check only the recorded address (or the recorded location and name for older records).
+            val recovered = publishedDownloadToVerify(request.item, destination, tempFile)
+            if (recovered != null) {
+                if (!request.mayPublish()) {
+                    onPaused()
+                    return@launch
+                }
+                val uri = recovered.toURI().toString()
+                // Recovery never grants permission to remove an existing finished file, even if checks fail.
+                publishedKeys.remove(uri)
+                if (!request.onPublished(uri, recovered.length(), null)) {
+                    onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
+                    return@launch
+                }
+                onSuccess(uri, request.item.totalBytes ?: recovered.length())
+                return@launch
+            }
             // The partial file is resumed, cut back or removed only when it is this download's own, proven by the
             // identity recorded when it was created. A file of that name that is not: left alone, and this download
             // takes a name that is free.
@@ -231,6 +249,7 @@ internal actual object DownloadsPlatformDownloader {
             } finally {
                 // Only now, with the file closed, can anything else write or move it.
                 WriterTokens.release(request.item.id)
+                request.onFinished()
             }
         }
 
@@ -535,6 +554,22 @@ private fun openDirectoryWithPlatformCommand(directory: File): Boolean {
         else -> listOf("xdg-open", directory.absolutePath)
     }
     return runCatching { ProcessBuilder(command).start() }.isSuccess
+}
+
+/** A final file at the recorded address, with no partial name left, still needs the usual video checks. */
+internal fun publishedDownloadToVerify(item: DownloadItem, destination: File, partial: File): File? {
+    if (item.status != DownloadStatus.Downloading) return null
+    val file = if (item.localFileUri != null) item.localFileUri.toLocalFileOrNull() ?: return null else destination
+    val nofollow = java.nio.file.LinkOption.NOFOLLOW_LINKS
+    return runCatching {
+        if (!Files.notExists(partial.toPath(), nofollow) ||
+            !Files.notExists(File(file.parentFile, "${file.name}.part").toPath(), nofollow) ||
+            !Files.isRegularFile(file.toPath(), nofollow)
+        ) return null
+        val size = Files.size(file.toPath())
+        val announced = item.totalBytes?.takeIf { it > 0 }
+        if (size <= 0 || size < item.downloadedBytes || announced != null && size != announced) null else file
+    }.getOrNull()
 }
 
 private class DesktopDownloadsTaskHandle(

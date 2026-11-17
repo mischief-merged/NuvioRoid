@@ -113,6 +113,7 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         LimitedConnectionSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
         PoliteDownloadsSetting(isTablet)
+        KeepDownloadingSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
         DownloadFolderSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)

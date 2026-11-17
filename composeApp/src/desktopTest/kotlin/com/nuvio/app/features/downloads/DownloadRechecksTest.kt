@@ -48,6 +48,24 @@ class DownloadRechecksTest {
     private val many = (1..20).map { item("m$it") }
 
     @Test
+    fun activity_is_visible_during_a_pass_and_cleared_on_completion_or_cancellation() = runBlocking {
+        val checks = checks(listOf(item("one")))
+        assertFalse(checks.isRunning.value)
+        outcome = {
+            assertTrue(checks.isRunning.value)
+            RecheckOutcome.LooksRight
+        }
+        checks.pass(force = true)
+        assertFalse(checks.isRunning.value)
+        outcome = {
+            assertTrue(checks.isRunning.value)
+            throw kotlinx.coroutines.CancellationException()
+        }
+        kotlin.test.assertFailsWith<kotlinx.coroutines.CancellationException> { checks.pass(force = true) }
+        assertFalse(checks.isRunning.value)
+    }
+
+    @Test
     fun a_pass_takes_only_a_few_downloads_and_two_at_a_time_with_a_pause_between_groups() = runBlocking {
         val summary = checks(many).pass()
 
