@@ -26,6 +26,7 @@ internal interface DownloadsHooks {
     fun pauseAndWait(downloadId: String): Boolean
     fun resume(downloadId: String)
     fun resumeHeld()
+    fun refreshOfflineIndex() = Unit
 
     /** The profile whose list [items] is. A move belongs to the one that started it. */
     fun profileId(): Int = 0
@@ -93,6 +94,7 @@ internal object RepositoryDownloadsHooks : DownloadsHooks {
     override fun pauseAndWait(downloadId: String): Boolean = DownloadsRepository.pauseAndWait(downloadId)
     override fun resume(downloadId: String) = DownloadsRepository.resumeDownload(downloadId)
     override fun resumeHeld() = DownloadsRepository.resumeHeldByFolder()
+    override fun refreshOfflineIndex() = DownloadsRepository.refreshOfflineIndex()
     override fun profileId(): Int = ProfileRepository.activeProfileId
 
     override fun <T> withListLock(block: () -> T): T = DownloadsStorage.withListLock(block)
@@ -168,6 +170,8 @@ internal class DesktopDownloadFolders(
     private val recoveryDone = CountDownLatch(1)
     private var seenSignature = false
     private var lastSignature: List<Pair<String, DownloadStatus>> = emptyList()
+    private val snapshotLock = Any()
+    private var lastLocationSnapshot: Map<String, Pair<FolderAvailability, String>>? = null
     private var monitor: Thread? = null
     @Volatile private var stopped = false
 
@@ -357,6 +361,7 @@ internal class DesktopDownloadFolders(
             hooks.resumeHeld()
             onReturned()
         }
+        noteLocationSnapshot(infos.associate { it.id to (it.availability to it.path) })
     }
 
     /**
@@ -380,7 +385,8 @@ internal class DesktopDownloadFolders(
         locations.all().filter { it.id != DownloadLocations.AppId }.forEach { location ->
             if (locations.availability(location) != FolderAvailability.Available) locations.rediscover(location)
         }
-        val states = locations.all().associate { it.id to locations.availability(it) }
+        val allLocations = locations.all()
+        val states = allLocations.associate { it.id to locations.availability(it) }
         val current = _state.value
         if (current.locations.isNotEmpty()) {
             _state.value = current.copy(
@@ -396,6 +402,18 @@ internal class DesktopDownloadFolders(
         if (noteAvailability(states)) {
             hooks.resumeHeld()
             onReturned()
+        }
+        noteLocationSnapshot(allLocations.associate { it.id to (states.getValue(it.id) to it.path.toString()) })
+    }
+
+    private fun noteLocationSnapshot(snapshot: Map<String, Pair<FolderAvailability, String>>) {
+        val snapshotChanged = synchronized(snapshotLock) {
+            val changed = lastLocationSnapshot != snapshot
+            lastLocationSnapshot = snapshot
+            changed
+        }
+        if (snapshotChanged) {
+            hooks.refreshOfflineIndex()
         }
     }
 
@@ -774,7 +792,10 @@ internal class DesktopDownloadFolders(
         return reveal(location.path)
     }
 
-    override fun onLocationReturned() = onReturned()
+    override fun onLocationReturned() {
+        hooks.refreshOfflineIndex()
+        onReturned()
+    }
 
     companion object {
         private const val CheckIntervalMs = 3_000L

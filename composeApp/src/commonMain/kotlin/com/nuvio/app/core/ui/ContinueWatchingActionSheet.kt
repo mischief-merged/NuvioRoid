@@ -47,6 +47,7 @@ import org.jetbrains.compose.resources.stringResource
 fun NuvioContinueWatchingActionSheet(
     item: ContinueWatchingItem?,
     showManualPlayOption: Boolean,
+    manualPlayLabel: String = stringResource(Res.string.play_manually),
     showDetailsOption: Boolean = true,
     onDismiss: () -> Unit,
     onOpenDetails: () -> Unit,
@@ -110,7 +111,7 @@ fun NuvioContinueWatchingActionSheet(
             if (showManualPlayOption && onPlayManually != null) {
                 NuvioBottomSheetActionRow(
                     icon = Icons.Default.PlayArrow,
-                    title = stringResource(Res.string.play_manually),
+                    title = manualPlayLabel,
                     onClick = { dismissAfter(onPlayManually) },
                 )
             }

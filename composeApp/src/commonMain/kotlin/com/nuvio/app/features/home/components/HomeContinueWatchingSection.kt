@@ -38,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -46,6 +47,7 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.DisintegratingContainer
 import com.nuvio.app.core.ui.DisintegrationRequest
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
@@ -66,6 +68,9 @@ import com.nuvio.app.core.ui.desktopPosterHoverScale
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
 import com.nuvio.app.features.cloud.CloudLibraryContentType
 import com.nuvio.app.features.cloud.cloudLibraryDisplayArtworkUrl
+import com.nuvio.app.features.downloads.AvailableOfflineBadge
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.tracking.WatchProgressSource
 import com.nuvio.app.features.watchprogress.ContinueWatchingItem
 import com.nuvio.app.features.watchprogress.ContinueWatchingSectionStyle
@@ -342,6 +347,8 @@ private fun HomeContinueWatchingSectionContent(
     disintegrationRequest: DisintegrationRequest<String>?,
 ) {
     key(dataSourceKey) {
+        val offlineIndex = rememberOfflineDownloadIndex()
+        val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
         val disintegration = remember {
             ScopedDisintegrationTracker<WatchProgressSource, String, ContinueWatchingItem>(
                 itemKey = ::continueWatchingItemKey,
@@ -363,6 +370,13 @@ private fun HomeContinueWatchingSectionContent(
             val item = entry.item
             val onClick = if (entry.exiting) null else onItemClick?.let { { it(item) } }
             val onLongClick = if (entry.exiting) null else onItemLongPress?.let { { it(item) } }
+            val isAvailableOffline = !item.isCloudLibraryItem() && offlineIndex.hasFor(
+                parentMetaId = item.parentMetaId,
+                seasonNumber = item.seasonNumber,
+                episodeNumber = item.episodeNumber,
+                videoId = item.videoId,
+            )
+            val isUnavailableOffline = networkStatus.isNoInternet && !isAvailableOffline
             DisintegratingContainer(
                 disintegrating = entry.exiting,
                 onDisintegrated = { disintegration.onDisintegrated(entry.key) },
@@ -372,6 +386,8 @@ private fun HomeContinueWatchingSectionContent(
                         item = item,
                         useEpisodeThumbnails = useEpisodeThumbnails,
                         blurNextUp = blurNextUp,
+                        isAvailableOffline = isAvailableOffline,
+                        isUnavailableOffline = isUnavailableOffline,
                         onClick = onClick,
                         onLongClick = onLongClick,
                     )
@@ -380,6 +396,8 @@ private fun HomeContinueWatchingSectionContent(
                         layout = layout,
                         useEpisodeThumbnails = useEpisodeThumbnails,
                         blurNextUp = blurNextUp,
+                        isAvailableOffline = isAvailableOffline,
+                        isUnavailableOffline = isUnavailableOffline,
                         onClick = onClick,
                         onLongClick = onLongClick,
                     )
@@ -388,6 +406,8 @@ private fun HomeContinueWatchingSectionContent(
                         layout = layout,
                         useEpisodeThumbnails = useEpisodeThumbnails,
                         blurNextUp = blurNextUp,
+                        isAvailableOffline = isAvailableOffline,
+                        isUnavailableOffline = isUnavailableOffline,
                         onClick = onClick,
                         onLongClick = onLongClick,
                     )
@@ -676,6 +696,8 @@ private fun ContinueWatchingCard(
     item: ContinueWatchingItem,
     useEpisodeThumbnails: Boolean,
     blurNextUp: Boolean,
+    isAvailableOffline: Boolean = false,
+    isUnavailableOffline: Boolean = false,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
 ) {
@@ -722,6 +744,7 @@ private fun ContinueWatchingCard(
                 zoomImageUrl = imageUrl,
                 zoomCornerRadius = cardMetrics.cornerRadius,
             )
+            .graphicsLayer { alpha = if (isUnavailableOffline) 0.48f else 1f }
             .width(cardMetrics.width)
             .aspectRatio(PosterLandscapeAspectRatio)
             .clip(RoundedCornerShape(cardMetrics.cornerRadius))
@@ -767,7 +790,18 @@ private fun ContinueWatchingCard(
                 desktopAnimation = rememberAnimatedArtworkAnimation(),
             )
         }
-        if (item.shufflePlayback) ShuffleBadge(Modifier.align(Alignment.TopStart).padding(8.dp))
+        if (item.shufflePlayback || isAvailableOffline) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (item.shufflePlayback) ShuffleBadge()
+                if (isAvailableOffline) AvailableOfflineBadge(compact = true)
+            }
+        }
         Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
@@ -896,6 +930,8 @@ private fun ContinueWatchingWideCard(
     layout: ContinueWatchingLayout,
     useEpisodeThumbnails: Boolean,
     blurNextUp: Boolean,
+    isAvailableOffline: Boolean = false,
+    isUnavailableOffline: Boolean = false,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
 ) {
@@ -904,6 +940,7 @@ private fun ContinueWatchingWideCard(
         modifier = Modifier
             .nuvioFocusBorder(RoundedCornerShape(cornerRadius))
             .posterCardClickable(onClick = onClick, onLongClick = onLongClick)
+            .graphicsLayer { alpha = if (isUnavailableOffline) 0.48f else 1f }
             .width(layout.wideCardWidth)
             .height(layout.wideCardHeight)
             .clip(RoundedCornerShape(cornerRadius))
@@ -924,6 +961,7 @@ private fun ContinueWatchingWideCard(
             imageUrl = artworkUrl,
             width = layout.widePosterStripWidth,
             blurred = shouldBlurArtwork,
+            isAvailableOffline = isAvailableOffline,
             fallbackUrl = item.fallbackUrlForArtwork(artworkUrl),
             contentScale = if (item.isCloudLibraryItem()) ContentScale.Fit else ContentScale.Crop,
             modifier = Modifier.fillMaxHeight(),
@@ -1026,6 +1064,8 @@ private fun ContinueWatchingPosterCard(
     layout: ContinueWatchingLayout,
     useEpisodeThumbnails: Boolean,
     blurNextUp: Boolean,
+    isAvailableOffline: Boolean = false,
+    isUnavailableOffline: Boolean = false,
     onClick: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
 ) {
@@ -1034,6 +1074,7 @@ private fun ContinueWatchingPosterCard(
     Column(
         modifier = Modifier
             .desktopPosterHoverScale()
+            .graphicsLayer { alpha = if (isUnavailableOffline) 0.48f else 1f }
             .width(layout.posterCardWidth),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -1077,7 +1118,18 @@ private fun ContinueWatchingPosterCard(
                     desktopAnimation = rememberAnimatedArtworkAnimation(),
                 )
             }
-            if (item.shufflePlayback) ShuffleBadge(Modifier.align(Alignment.TopStart).padding(8.dp))
+            if (item.shufflePlayback || isAvailableOffline) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (item.shufflePlayback) ShuffleBadge()
+                if (isAvailableOffline) AvailableOfflineBadge(compact = true)
+            }
+        }
             if (item.progressFraction <= 0f && item.seasonNumber != null && item.episodeNumber != null) {
                 Box(
                     modifier = Modifier
@@ -1166,6 +1218,7 @@ private fun ArtworkPanel(
     imageUrl: String?,
     width: Dp,
     blurred: Boolean = false,
+    isAvailableOffline: Boolean = false,
     fallbackUrl: String? = null,
     contentScale: ContentScale = ContentScale.Crop,
     modifier: Modifier = Modifier,
@@ -1190,6 +1243,7 @@ private fun ArtworkPanel(
                 desktopAnimation = rememberAnimatedArtworkAnimation(),
             )
         }
+        PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
     }
 }
 

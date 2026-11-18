@@ -16,16 +16,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.format.formatReleaseDateForDisplay
+import com.nuvio.app.core.network.NetworkStatusRepository
 import coil3.compose.AsyncImage
 import com.nuvio.app.core.ui.NuvioAsyncImage
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
@@ -35,6 +39,8 @@ import com.nuvio.app.core.ui.desktopPosterHoverScale
 import com.nuvio.app.core.ui.nuvioCardDepth
 import com.nuvio.app.core.ui.posterCardClickable
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
 import com.nuvio.app.features.watching.application.WatchingState
@@ -120,11 +126,16 @@ private fun PosterGridTile(
         onLongClick = onLongClick,
         modifier = modifier,
     ) {
+        val offlineIndex = rememberOfflineDownloadIndex()
+        val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+        val isAvailableOffline = offlineIndex.hasMeta(item.id)
+        val isUnavailableOffline = networkStatus.isNoInternet && !isAvailableOffline
         Column(
             modifier = Modifier
                 .desktopPosterHoverScale()
                 .fillMaxWidth()
-                .then(it),
+                .then(it)
+                .graphicsLayer { alpha = if (isUnavailableOffline) 0.52f else 1f },
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Box(
@@ -177,6 +188,7 @@ private fun PosterGridTile(
                         )
                     }
                 }
+                PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
                 NuvioPosterWatchedOverlay(isWatched = isWatched)
             }
             if (!hideLabels) {

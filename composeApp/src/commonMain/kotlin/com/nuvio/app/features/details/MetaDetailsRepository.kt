@@ -7,6 +7,7 @@ import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.addons.fetchAddonResponseText
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.features.addons.supportsResource
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
@@ -56,6 +57,7 @@ object MetaDetailsRepository {
     val uiState: StateFlow<MetaDetailsUiState> = _uiState.asStateFlow()
     private var activeRequestKey: String? = null
     private val cachedMetaByRequestKey = BoundedCache<String, CachedMetaEntry>()
+    internal var loadMetaForTest: (suspend (type: String, id: String) -> MetaDetails?)? = null
 
     internal fun putCachedMetaForTest(meta: MetaDetails) {
         val requestKey = "${meta.type}:${meta.id}"
@@ -80,7 +82,7 @@ object MetaDetailsRepository {
         }
     }
 
-    fun load(type: String, id: String) {
+    fun load(type: String, id: String, forceNetwork: Boolean = false) {
         log.d { "load() called — type=$type id=$id" }
         val requestKey = "$type:$id"
         ServerItemRef.parse(id)?.let { ref ->
@@ -150,6 +152,33 @@ object MetaDetailsRepository {
         _uiState.value = MetaDetailsUiState(isLoading = true)
 
         scope.launch {
+            if (!forceNetwork && NetworkStatusRepository.uiState.value.isNoInternet) {
+                log.d { "Skipping network meta load while offline — type=$type id=$id" }
+                _uiState.value = MetaDetailsUiState(
+                    errorMessage = getString(Res.string.details_load_failed_all_addons),
+                )
+                activeRequestKey = null
+                return@launch
+            }
+            loadMetaForTest?.let { testLoader ->
+                val testMeta = runCatching { testLoader(type, id) }.getOrNull()
+                if (testMeta != null) {
+                    publishLoadedMeta(
+                        requestKey = requestKey,
+                        meta = testMeta,
+                        fallbackItemId = id,
+                        fallbackItemType = type,
+                        mdbListSettings = mdbListSettings,
+                        metaScreenSettingsFingerprint = metaScreenSettingsFingerprint,
+                    )
+                } else {
+                    _uiState.value = MetaDetailsUiState(
+                        errorMessage = getString(Res.string.details_load_failed_all_addons),
+                    )
+                    activeRequestKey = null
+                }
+                return@launch
+            }
             val metaLookupId = resolveMetaLookupId(itemId = id, itemType = type)
             val manifests = findReadyMetaManifests(type = type, id = metaLookupId)
 

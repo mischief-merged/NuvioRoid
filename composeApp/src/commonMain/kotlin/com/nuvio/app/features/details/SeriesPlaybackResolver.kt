@@ -140,6 +140,32 @@ internal data class SeriesPrimaryAction(
     val resumePositionMs: Long?,
 )
 
+internal fun MetaDetails.resolveSequentialPrimaryAction(
+    fromSavedDetails: Boolean,
+    entries: List<WatchProgressEntry>,
+    watchedItems: List<WatchedItem>,
+    todayIsoDate: String,
+    preferFurthestEpisode: Boolean = true,
+    showUnairedNextUp: Boolean = false,
+    watchedKeys: Set<String> = emptySet(),
+    allowRewatch: Boolean = true,
+): SeriesPrimaryAction? {
+    val catalogMeta = if (fromSavedDetails) {
+        copy(videos = videos.map { if (it.available) it else it.copy(available = true) })
+    } else {
+        this
+    }
+    return catalogMeta.seriesPrimaryAction(
+        entries = entries,
+        watchedItems = watchedItems,
+        todayIsoDate = todayIsoDate,
+        preferFurthestEpisode = preferFurthestEpisode,
+        showUnairedNextUp = showUnairedNextUp,
+        watchedKeys = watchedKeys,
+        allowRewatch = allowRewatch,
+    )
+}
+
 internal fun MetaDetails.seriesPrimaryAction(
     entries: List<WatchProgressEntry>,
     watchedItems: List<WatchedItem>,
