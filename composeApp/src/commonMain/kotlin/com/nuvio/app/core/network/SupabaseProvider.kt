@@ -24,12 +24,20 @@ import kotlin.time.Duration.Companion.seconds
 object SupabaseProvider {
     private val clientLock = SynchronizedObject()
     private var cachedClient: SupabaseClient? = null
+    private var cachedEngine: io.ktor.client.engine.HttpClientEngine? = null
     private val rateLimitCoordinator = BackendRateLimitCoordinator()
 
     @OptIn(SupabaseInternal::class)
     val client: SupabaseClient
         get() = synchronized(clientLock) {
-            cachedClient ?: createClient().also { cachedClient = it }
+            cachedClient ?: try {
+                cachedEngine = createBackendHttpEngine()
+                createClient().also { cachedClient = it }
+            } catch (error: Throwable) {
+                cachedEngine?.close()
+                cachedEngine = null
+                throw error
+            }
         }
 
     @OptIn(SupabaseInternal::class)
@@ -41,6 +49,7 @@ object SupabaseProvider {
             supabaseUrl = configuration.backendUrl,
             supabaseKey = configuration.publishableKey,
         ) {
+            httpEngine = cachedEngine
             httpConfig {
                 install(BackendRateLimitPlugin) {
                     coordinator = rateLimitCoordinator
@@ -127,11 +136,12 @@ object SupabaseProvider {
 
     suspend fun reset() {
         val previous = synchronized(clientLock) {
-            cachedClient.also {
+            (cachedClient to cachedEngine).also {
                 cachedClient = null
+                cachedEngine = null
                 rateLimitCoordinator.clear()
             }
         }
-        previous?.close()
+        try { previous.first?.close() } finally { previous.second?.close() }
     }
 }

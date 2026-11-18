@@ -29,6 +29,9 @@ expect suspend fun httpGetTextWithHeaders(
     headers: Map<String, String>,
 ): String
 
+/** Subtitle font attachments have a separate, bounded budget from metadata. */
+expect suspend fun httpGetSubtitleText(url: String, headers: Map<String, String>): String
+
 expect suspend fun httpPostJsonWithHeaders(
     url: String,
     body: String,

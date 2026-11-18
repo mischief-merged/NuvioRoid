@@ -336,3 +336,6 @@ actual suspend fun httpRequestRaw(
             cancelHandle?.dispose()
         }
     }
+
+actual suspend fun httpGetSubtitleText(url: String, headers: Map<String, String>): String =
+    httpGetTextWithHeaders(url, headers)

@@ -21,7 +21,7 @@ import kotlin.test.assertTrue
  * The real fetch path (the platform HTTP client) against a loopback server: bytes must arrive
  * exactly, through a redirect, for formats whose bytes are not valid text. Nothing leaves the machine.
  */
-class ArtworkFetchTest {
+class ArtworkFetchTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private lateinit var server: HttpServer
     private lateinit var folder: File
     private var now = 1_700_000_000_000L

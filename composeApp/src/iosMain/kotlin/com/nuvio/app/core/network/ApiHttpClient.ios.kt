@@ -13,3 +13,5 @@ internal actual fun createApiHttpClient(): HttpClient = HttpClient(Darwin) {
         socketTimeoutMillis = 30_000
     }
 }
+
+internal actual fun createBackendHttpEngine(): io.ktor.client.engine.HttpClientEngine? = null

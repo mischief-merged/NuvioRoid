@@ -683,6 +683,7 @@ val buildMacosPlayerBridge = tasks.register<Exec>("buildMacosPlayerBridge") {
     notCompatibleWithConfigurationCache("Builds a host-local player bridge against the bundled macOS libmpv runtime.")
     enabled = isMacHost
     inputs.file(macosPlayerBridgeSource)
+    inputs.file("src/desktopMain/native/macos/network_trust.h")
     inputs.file(bundledMacosLibmpvDylib)
     inputs.dir(macosLibmpvHeaders)
     outputs.file(macosPlayerBridgeOutput)
@@ -1201,7 +1202,7 @@ kotlin {
                     implementation(project(":composeMediaPlayer"))
                 }
                 implementation(libs.kotlinx.coroutines.swing)
-                implementation(libs.ktor.client.cio)
+                implementation(libs.ktor.client.okhttp)
                 implementation("com.squareup.okhttp3:okhttp:4.12.0")
                 implementation(libs.quickjs.kt)
                 implementation(libs.ksoup)

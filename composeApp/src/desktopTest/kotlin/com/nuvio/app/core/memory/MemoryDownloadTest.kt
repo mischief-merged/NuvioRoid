@@ -1,5 +1,6 @@
 package com.nuvio.app.core.memory
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.downloads.*
 import com.sun.net.httpserver.HttpServer
@@ -14,7 +15,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class MemoryDownloadTest {
+class MemoryDownloadTest : TrustedLocalServerTest() {
     @Test fun publishedFileIdentityLivesOnlyUntilTheSuccessCallbackReturns() {
         val bytes = ByteArray(1024) { 7 }
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)

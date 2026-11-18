@@ -14,7 +14,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /** Findings of the review of the polite downloads, each as the sequence that showed it. */
-class PoliteDownloadsReviewTest {
+class PoliteDownloadsReviewTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private var now = 0L
     private val rtts = mutableMapOf<String, Long?>()
     private val traffic = DownloadTraffic()

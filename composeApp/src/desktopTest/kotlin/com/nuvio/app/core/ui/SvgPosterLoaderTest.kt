@@ -19,7 +19,7 @@ import org.jetbrains.skia.EncodedImageFormat
 import org.jetbrains.skia.Image
 import org.jetbrains.skia.ImageInfo
 
-class SvgPosterLoaderTest {
+class SvgPosterLoaderTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun posterWithExternalImageRendersThroughImageLoader() = runBlocking {
         val bitmap = Bitmap().apply { allocPixels(ImageInfo.makeN32Premul(20, 20)) }

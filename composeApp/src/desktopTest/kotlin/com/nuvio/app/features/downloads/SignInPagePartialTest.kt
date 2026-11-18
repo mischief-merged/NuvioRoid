@@ -10,7 +10,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertTrue
 
 /** A network sign-in page that arrives where the rest of a video was asked for never replaces the partial file. */
-class SignInPagePartialTest {
+class SignInPagePartialTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val freeBefore = DownloadsPlatformDownloader.freeBytesProvider
     private val files = mutableListOf<File>()
 

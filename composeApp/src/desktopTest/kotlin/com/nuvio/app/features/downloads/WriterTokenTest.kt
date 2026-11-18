@@ -15,7 +15,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** Exactly one writer per download, and no adoption of files by name. */
-class WriterTokenTest {
+class WriterTokenTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val servers = mutableListOf<HttpServer>()
     private val files = mutableListOf<File>()
     private val freeBefore = DownloadsPlatformDownloader.freeBytesProvider

@@ -15,7 +15,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopAutoDownloadAddressTest {
+class DesktopAutoDownloadAddressTest : com.nuvio.app.core.network.UntrustedLocalServerTest() {
     private fun address(vararg bytes: Int): InetAddress = InetAddress.getByAddress(ByteArray(bytes.size) { bytes[it].toByte() })
 
     private fun address6(first: Int, second: Int, last: Int = 1): InetAddress =
@@ -50,7 +50,7 @@ class DesktopAutoDownloadAddressTest {
     }
 
     @Test
-    fun an_automatic_transfer_to_this_computer_fails_without_a_request_and_a_manual_one_runs() {
+    fun automatic_and_manual_transfers_both_require_explicit_home_server_trust() {
         val requests = AtomicInteger(0)
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server.createContext("/video.mkv") { exchange ->
@@ -97,10 +97,19 @@ class DesktopAutoDownloadAddressTest {
             assertEquals(0, requests.get())
 
             val (manualSuccess, manualFailure) = transfer(ruleKey = null)
-            assertNull(manualFailure)
-            assertNotNull(manualSuccess)
-            assertEquals(1, requests.get())
+            assertNotNull(manualFailure)
+            assertNull(manualSuccess)
+            assertEquals(0, requests.get())
+            com.nuvio.app.core.network.TrustedHomeServers.add("127.0.0.1")
+            assertTrue("http://127.0.0.1/video".hasPublicDownloadHost())
+            for (rule in listOf(null, "series|tt1")) {
+                val (success, failure) = transfer(rule)
+                assertNull(failure)
+                assertNotNull(success)
+            }
+            assertEquals(2, requests.get())
         } finally {
+            com.nuvio.app.core.network.TrustedHomeServers.remove("127.0.0.1")
             server.stop(0)
             fileNames.forEach {
                 File(downloadsDir, it).delete()

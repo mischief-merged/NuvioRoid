@@ -21,7 +21,7 @@ import javax.imageio.ImageIO
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-class CollectionCardRemoteImageTest {
+class CollectionCardRemoteImageTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @get:Rule
     val compose = createComposeRule()
 
