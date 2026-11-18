@@ -39,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -104,6 +105,7 @@ fun PersonDetailScreen(
     modifier: Modifier = Modifier,
 ) {
     var uiState by remember(personId) { mutableStateOf<PersonDetailUiState>(PersonDetailUiState.Loading) }
+    var loadAttempt by remember(personId) { mutableIntStateOf(0) }
     val watchedUiState by remember {
         WatchedRepository.ensureLoaded()
         WatchedRepository.uiState
@@ -111,20 +113,25 @@ fun PersonDetailScreen(
     val fullyWatchedSeriesKeys by WatchedRepository.fullyWatchedSeriesKeys.collectAsStateWithLifecycle()
     val resolvedAvatarTransitionKey = avatarTransitionKey ?: castAvatarSharedTransitionKey(personId)
 
-    LaunchedEffect(personId) {
+    LaunchedEffect(detailLoadKey(personId.toString(), loadAttempt)) {
         uiState = PersonDetailUiState.Loading
-        val detail = TmdbMetadataService.fetchPersonDetail(
-            personId = personId,
-            preferCrewCredits = preferCrew,
-        )
-        uiState = if (detail != null) {
-            val pattern = com.nuvio.app.core.poster.CustomPosterUrlRepository.let { repo ->
-                repo.ensureLoaded()
-                repo.patternForScreen(com.nuvio.app.core.poster.CustomPosterScreen.DETAILS)
+        val failureMessage = getString(Res.string.person_load_failed, personName)
+        when (
+            val outcome = loadOrFail(loadAttempt, failureMessage) {
+                TmdbMetadataService.fetchPersonDetail(
+                    personId = personId,
+                    preferCrewCredits = preferCrew,
+                )
             }
-            PersonDetailUiState.Success(detail.withCustomPosterUrls(pattern))
-        } else {
-            PersonDetailUiState.Error(getString(Res.string.person_load_failed, personName))
+        ) {
+            is DetailLoadOutcome.Ready -> {
+                val pattern = com.nuvio.app.core.poster.CustomPosterUrlRepository.let { repo ->
+                    repo.ensureLoaded()
+                    repo.patternForScreen(com.nuvio.app.core.poster.CustomPosterScreen.DETAILS)
+                }
+                uiState = PersonDetailUiState.Success(outcome.value.withCustomPosterUrls(pattern))
+            }
+            is DetailLoadOutcome.Failed -> uiState = PersonDetailUiState.Error(outcome.message)
         }
     }
 
@@ -144,10 +151,7 @@ fun PersonDetailScreen(
             )
             is PersonDetailUiState.Error -> PersonDetailError(
                 message = state.message,
-                onRetry = {
-                    uiState = PersonDetailUiState.Loading
-                    // Retry will be triggered by the LaunchedEffect above if we reset
-                },
+                onRetry = { loadAttempt = nextDetailAttempt(loadAttempt) },
             )
             is PersonDetailUiState.Success -> PersonDetailContent(
                 person = state.personDetail,

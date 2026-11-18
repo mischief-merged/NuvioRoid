@@ -8,9 +8,10 @@ data class CatalogUiState(
     val nextSkip: Int? = null,
     val consecutiveDuplicatePages: Int = 0,
     val errorMessage: String? = null,
+    val loadMoreFailed: Boolean = false,
 ) {
     val canLoadMore: Boolean
-        get() = nextSkip != null
+        get() = nextSkip != null && !loadMoreFailed
 }
 
 data class CatalogScrollPosition(

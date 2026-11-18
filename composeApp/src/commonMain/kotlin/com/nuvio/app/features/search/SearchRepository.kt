@@ -12,6 +12,7 @@ import com.nuvio.app.features.addons.hasPendingEnabledManifests
 import com.nuvio.app.features.servers.ServerCatalog
 import com.nuvio.app.features.servers.ServerMediaKind
 import com.nuvio.app.features.servers.serverMessage
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.features.servers.ServerRepository
 import com.nuvio.app.features.catalog.CATALOG_PAGE_SIZE
 import com.nuvio.app.features.catalog.CatalogPage
@@ -205,8 +206,13 @@ object SearchRepository {
 
             val completedResults = results.filterNotNull()
             val sections = results.orderedSections()
-            val firstFailure = completedResults.firstNotNullOfOrNull { result -> result.error?.let { it.serverMessage() ?: it.message } }
+            val rawFailure = completedResults.firstNotNullOfOrNull { result -> result.error?.let { it.serverMessage() ?: it.message } }
             val allFailed = completedResults.isNotEmpty() && completedResults.all { it.error != null }
+            val firstFailure = if (allFailed) {
+                userFacingFailure(rawFailure, getString(Res.string.compose_search_empty_failed_message))
+            } else {
+                null
+            }
 
             _uiState.value = SearchUiState(
                 isLoading = sections.isEmpty() && hasPendingAddonManifests,
@@ -625,7 +631,10 @@ object SearchRepository {
                         isLoading = false,
                         nextSkip = null,
                         emptyStateReason = DiscoverEmptyStateReason.RequestFailed,
-                        errorMessage = error.message ?: getString(Res.string.discover_empty_load_failed_message),
+                        errorMessage = userFacingFailure(
+                            error.message,
+                            getString(Res.string.discover_empty_load_failed_message),
+                        ),
                     )
                 },
             )

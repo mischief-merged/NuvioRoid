@@ -18,11 +18,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.network.NetworkCondition
+import com.nuvio.app.core.ui.userFacingErrorText
 import com.nuvio.app.core.ui.NuvioDropdownChip
 import com.nuvio.app.core.ui.NuvioDropdownOption
 import com.nuvio.app.core.ui.NuvioNetworkOfflineCard
+import com.nuvio.app.features.home.EmptyScreenAction
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.home.failedEmptyActions
+import com.nuvio.app.features.home.performEmptyAction
+import com.nuvio.app.features.home.setupEmptyActions
+import com.nuvio.app.features.home.visibleEmptyActions
 import com.nuvio.app.features.home.components.PosterGridRow
 import com.nuvio.app.features.home.components.PosterGridSkeletonRow
 import com.nuvio.app.features.home.components.HomeEmptyStateCard
@@ -38,6 +45,9 @@ internal fun LazyListScope.discoverContent(
     onCatalogSelected: (String) -> Unit,
     onGenreSelected: (String?) -> Unit,
     onRetry: (() -> Unit)? = null,
+    onAddSource: () -> Unit = {},
+    onConnectServer: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
     watchedKeys: Set<String> = emptySet(),
     fullyWatchedSeriesKeys: Set<String> = emptySet(),
     onPosterClick: ((MetaPreview) -> Unit)? = null,
@@ -90,6 +100,9 @@ internal fun LazyListScope.discoverContent(
                     errorMessage = state.errorMessage,
                     networkCondition = networkCondition,
                     onRetry = onRetry,
+                    onAddSource = onAddSource,
+                    onConnectServer = onConnectServer,
+                    onOpenDownloads = onOpenDownloads,
                     modifier = Modifier.padding(horizontal = 16.dp),
                 )
             }
@@ -198,16 +211,45 @@ private fun DiscoverEmptyStateCard(
     errorMessage: String?,
     networkCondition: NetworkCondition,
     onRetry: (() -> Unit)? = null,
+    onAddSource: () -> Unit = {},
+    onConnectServer: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    if (
-        reason == DiscoverEmptyStateReason.RequestFailed &&
-        (networkCondition == NetworkCondition.NoInternet || networkCondition == NetworkCondition.ServersUnreachable)
-    ) {
+    val offline = networkCondition == NetworkCondition.NoInternet ||
+        networkCondition == NetworkCondition.ServersUnreachable
+    val needsSetup = reason == DiscoverEmptyStateReason.NoActiveAddons ||
+        reason == DiscoverEmptyStateReason.NoDiscoverCatalogs
+    val failed = reason == DiscoverEmptyStateReason.RequestFailed
+    val actions = visibleEmptyActions(
+        when {
+            failed -> failedEmptyActions(offline)
+            needsSetup -> setupEmptyActions(offline)
+            else -> emptyList()
+        },
+        AppFeaturePolicy.downloadsEnabled,
+    )
+    val dispatch = { action: EmptyScreenAction ->
+        performEmptyAction(
+            action = action,
+            onAddSource = onAddSource,
+            onConnectServer = onConnectServer,
+            onOpenDownloads = onOpenDownloads,
+            onRetry = { onRetry?.invoke() },
+        )
+    }
+    if (failed && offline) {
+        val showDownloads = actions.contains(EmptyScreenAction.OpenDownloads)
         NuvioNetworkOfflineCard(
             condition = networkCondition,
             modifier = modifier,
             onRetry = onRetry,
+            secondaryActionLabel = if (showDownloads) {
+                stringResource(Res.string.home_empty_open_downloads)
+            } else {
+                null
+            },
+            onSecondaryAction = if (showDownloads) onOpenDownloads else null,
         )
         return
     }
@@ -228,7 +270,10 @@ private fun DiscoverEmptyStateCard(
 
         DiscoverEmptyStateReason.RequestFailed -> {
             title = stringResource(Res.string.discover_empty_load_failed_title)
-            message = errorMessage ?: stringResource(Res.string.discover_empty_load_failed_message)
+            message = userFacingErrorText(
+                errorMessage,
+                stringResource(Res.string.discover_empty_load_failed_message),
+            )
         }
 
         DiscoverEmptyStateReason.NoResults, null -> {
@@ -241,12 +286,8 @@ private fun DiscoverEmptyStateCard(
         modifier = modifier,
         title = title,
         message = message,
-        actionLabel = if (reason == DiscoverEmptyStateReason.RequestFailed) {
-            stringResource(Res.string.action_retry)
-        } else {
-            null
-        },
-        onActionClick = if (reason == DiscoverEmptyStateReason.RequestFailed) onRetry else null,
+        actions = actions,
+        onEmptyAction = dispatch,
     )
 }
 

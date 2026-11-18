@@ -2,6 +2,7 @@ package com.nuvio.app.features.addons
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.sync.putSyncOriginClientId
 import com.nuvio.app.features.profiles.ProfileRepository
 import io.github.jan.supabase.postgrest.postgrest
@@ -198,7 +199,9 @@ object AddonRepository {
         val manifestUrl = try {
             normalizeManifestUrl(rawUrl)
         } catch (error: IllegalArgumentException) {
-            return AddAddonResult.Error(error.message ?: getString(Res.string.addon_invalid_url))
+            return AddAddonResult.Error(
+                userFacingFailure(error.message, getString(Res.string.addon_invalid_url)),
+            )
         }
 
         if (_uiState.value.addons.any { it.manifestUrl == manifestUrl }) {
@@ -214,7 +217,9 @@ object AddonRepository {
                 )
             }
         } catch (error: Throwable) {
-            return AddAddonResult.Error(error.message ?: getString(Res.string.addon_load_manifest_failed))
+            return AddAddonResult.Error(
+                userFacingFailure(error.message, getString(Res.string.addon_load_manifest_failed)),
+            )
         }
 
         if (manifest.isTrackingAddon) {
@@ -332,6 +337,12 @@ object AddonRepository {
                         payload = payload,
                     )
                 }
+                val failureMessage = result.exceptionOrNull()?.let { error ->
+                    userFacingFailure(
+                        error.message,
+                        getString(Res.string.addon_load_manifest_failed),
+                    )
+                }
 
                 _uiState.update { current ->
                     current.copy(
@@ -347,10 +358,10 @@ object AddonRepository {
                                             errorMessage = null,
                                         )
                                     },
-                                    onFailure = { error ->
+                                    onFailure = {
                                         addon.copy(
                                             isRefreshing = false,
-                                            errorMessage = error.message ?: getString(Res.string.addon_load_manifest_failed),
+                                            errorMessage = failureMessage,
                                         )
                                     },
                                 )

@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import com.nuvio.app.core.network.NetworkCondition
@@ -18,6 +19,8 @@ fun NuvioNetworkOfflineCard(
     condition: NetworkCondition,
     modifier: Modifier = Modifier,
     onRetry: (() -> Unit)? = null,
+    secondaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null,
 ) {
     val tokens = MaterialTheme.nuvio
     NuvioSurfaceCard(modifier = modifier) {
@@ -38,6 +41,11 @@ fun NuvioNetworkOfflineCard(
                 text = stringResource(Res.string.action_retry),
                 onClick = onRetry,
             )
+        }
+        if (secondaryActionLabel != null && onSecondaryAction != null) {
+            TextButton(onClick = onSecondaryAction) {
+                Text(text = secondaryActionLabel)
+            }
         }
     }
 }

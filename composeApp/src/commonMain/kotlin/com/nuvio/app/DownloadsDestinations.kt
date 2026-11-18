@@ -17,6 +17,7 @@ internal fun DownloadsDestination(
     useNativeNavigation: Boolean,
     onOpenDownload: (DownloadItem) -> Unit,
     onChooseAnotherSource: ((DownloadItem) -> Unit)? = null,
+    onBrowse: (() -> Unit)? = null,
 ) {
     val onBack = rememberGuardedPopBackStack(navController, route)
     DownloadsScreen(
@@ -24,6 +25,7 @@ internal fun DownloadsDestination(
         onOpenDownload = onOpenDownload,
         onOpenDetails = navController::openDownloadDetails,
         onChooseAnotherSource = onChooseAnotherSource,
+        onBrowse = onBrowse,
         onOpenShowDetails = { type, id, title -> navController.navigate(DetailRoute(type = type, id = id, title = title)) },
         episodeLinks = if (isDesktop) downloadEpisodeLinks(navController) else null,
         onNavigateToShow = if (useNativeNavigation) {

@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import com.nuvio.app.core.ui.NuvioBackButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -65,6 +66,7 @@ import com.nuvio.app.core.ui.nuvioCardDepth
 import com.nuvio.app.core.ui.posterCardClickable
 import com.nuvio.app.core.ui.posterGridColumnCountForViewport
 import com.nuvio.app.core.ui.NuvioLoadingIndicator
+import com.nuvio.app.core.ui.userFacingErrorText
 import com.nuvio.app.core.ui.SkeletonPoster
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.posterCardClickable
@@ -285,7 +287,11 @@ fun CatalogScreen(
                             )
                         }
                     }
-                    if (uiState.isLoading) {
+                    if (catalogShowsLoadMoreRetry(uiState)) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            CatalogLoadMoreRetry(onRetry = { CatalogRepository.loadMore() })
+                        }
+                    } else if (uiState.isLoading) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             CatalogLoadingFooter()
                         }
@@ -513,10 +519,28 @@ private fun CatalogEmptyState(
         title = stringResource(
             if (loadFailed) Res.string.catalog_load_failed_title else Res.string.catalog_empty_title,
         ),
-        message = errorMessage ?: stringResource(Res.string.catalog_empty_message),
+        message = if (loadFailed) {
+            userFacingErrorText(errorMessage, stringResource(Res.string.catalog_load_failed))
+        } else {
+            stringResource(Res.string.catalog_empty_message)
+        },
         actionLabel = if (loadFailed) stringResource(Res.string.action_retry) else null,
         onActionClick = if (loadFailed) onRetry else null,
     )
+}
+
+@Composable
+private fun CatalogLoadMoreRetry(onRetry: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        TextButton(onClick = onRetry) {
+            Text(text = stringResource(Res.string.catalog_load_more_retry))
+        }
+    }
 }
 
 @Composable
