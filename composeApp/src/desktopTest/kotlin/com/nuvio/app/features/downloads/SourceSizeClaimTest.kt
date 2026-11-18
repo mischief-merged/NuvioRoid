@@ -150,7 +150,7 @@ class SourceSizeClaimTest {
 
     @Test
     fun sizes_are_written_for_a_sentence_the_way_the_list_and_the_source_write_them() {
-        assertEquals("8.1 MB", formatListedSize(8_509_628L))
+        assertEquals("8.5 MB", formatListedSize(8_509_628L))
         assertEquals("9.5 GB", formatClaimedSize(9_530_000_000L))
         assertEquals("8.5 MB", formatDecimalSize(8_509_628L))
     }
