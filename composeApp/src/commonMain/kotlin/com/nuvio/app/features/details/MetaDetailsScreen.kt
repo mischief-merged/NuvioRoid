@@ -783,7 +783,8 @@ fun MetaDetailsScreen(
                     meta.moreLikeThis.isNotEmpty()
                 }
                 // A trailer is streamed, so none is offered while the app is offline.
-                val trailersAvailableOffline = !networkStatusUiState.isOfflineLike
+                val connection by com.nuvio.app.features.downloads.LimitedConnections.hold.state.collectAsStateWithLifecycle()
+                val trailersAvailableOffline = !networkStatusUiState.isOfflineLike && connection.travel.previewsAllowed
                 val hasTrailersSection = remember(meta, trailersAvailableOffline) {
                     trailersOffered(meta.trailers.size, offline = !trailersAvailableOffline)
                 }
@@ -835,10 +836,18 @@ fun MetaDetailsScreen(
                     heroTrailerFinished = true
                     onBack()
                 }
-                val resolveTrailer: (MetaTrailer) -> Unit = remember(meta.id, trailerPlaybackMode, uriHandler) {
+                LaunchedEffect(connection.travel.previewsAllowed) {
+                    if (!connection.travel.previewsAllowed) {
+                        trailerRequestToken++
+                        selectedTrailer = null
+                        trailerPlaybackSource = null
+                        trailerLoading = false
+                    }
+                }
+                val resolveTrailer: (MetaTrailer) -> Unit = remember(meta.id, trailerPlaybackMode, uriHandler, connection.travel.previewsAllowed) {
                     { trailer ->
                         val youtubeUrl = trailer.youtubePlaybackUrl()
-                        when (trailerPlaybackMode) {
+                        if (connection.travel.previewsAllowed) when (trailerPlaybackMode) {
                             TrailerPlaybackMode.EXTERNAL -> runCatching { uriHandler.openUri(youtubeUrl) }
                             TrailerPlaybackMode.IN_APP -> {
                                 selectedTrailer = trailer

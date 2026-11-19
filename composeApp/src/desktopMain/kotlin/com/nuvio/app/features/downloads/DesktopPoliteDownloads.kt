@@ -30,6 +30,11 @@ internal object DesktopPoliteDownloads {
     @Volatile
     private var running: PoliteDownloads? = null
 
+    suspend fun recheckAfterWake() {
+        addresses.clear()
+        running?.recheckAfterWake()
+    }
+
     fun onTransferFailure(host: String, kind: TransferFailureKind) {
         running?.onTransferFailure(host, kind)
     }
@@ -41,8 +46,11 @@ internal object DesktopPoliteDownloads {
             probeRoundTrip = ::connectRoundTripMs,
             checkNetwork = ::checkNetwork,
             traffic = DownloadTraffic.app,
-            enabled = { PoliteDownloadsHost.enabled.value },
-            userCapBytesPerSecond = { DownloadBandwidth.userCapBytesPerSecond.value },
+            enabled = { LimitedConnections.hold.state.value.travel.yieldingEnabled(PoliteDownloadsHost.enabled.value) },
+            userCapBytesPerSecond = {
+                effectiveDownloadCap(DownloadBandwidth.userCapBytesPerSecond.value,
+                    LimitedConnections.hold.state.value.travel.downloadCapBytesPerSecond, null)
+            },
             setYieldCap = DownloadBandwidth::setYieldCap,
             reportQuality = { reason ->
                 log.i { "Network for downloads: ${reason ?: "fine"}" }
@@ -52,7 +60,7 @@ internal object DesktopPoliteDownloads {
         running = polite
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             while (true) {
-                runCatching { polite.tick() }.onFailure { log.w(it) { "a polite downloads tick failed" } }
+                runCatching { if (!LimitedConnections.hold.state.value.checkingNetwork) polite.tick() }.onFailure { log.w(it) { "a polite downloads tick failed" } }
                 PoliteDownloadsHost.stateFlow.value = polite.state.value
                 delay(PoliteTickMs)
             }

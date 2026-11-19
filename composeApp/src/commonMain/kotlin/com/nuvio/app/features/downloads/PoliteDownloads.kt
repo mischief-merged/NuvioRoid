@@ -5,6 +5,8 @@ import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /*
  * Downloads that never make the rest of the Mac's internet worse.
@@ -226,7 +228,7 @@ internal class SlowNetworkJudge {
             }
             return slow
         }
-        if (!transfersActive || (userCapBytesPerSecond != null && userCapBytesPerSecond < SlowFloorBytesPerSecond)) {
+        if (!transfersActive || (userCapBytesPerSecond != null && userCapBytesPerSecond <= SlowFloorBytesPerSecond)) {
             activeSinceMs = null
             slowSinceMs = null
             return false
@@ -244,6 +246,13 @@ internal class SlowNetworkJudge {
         val since = slowSinceMs ?: nowMs.also { slowSinceMs = it }
         if (nowMs - since >= SlowSustainMs) heldAtMs = nowMs
         return slow
+    }
+
+    fun afterWake(nowMs: Long) {
+        if (heldAtMs != null) heldAtMs = nowMs
+        activeSinceMs = null
+        slowSinceMs = null
+        fastSinceMs = null
     }
 
     fun reset() {
@@ -351,6 +360,17 @@ internal class BlockedNetworkJudge {
         return blocked || failures.any { nowMs - it.first <= BlockedWindowMs }
     }
 
+    fun afterWake(nowMs: Long, check: NetworkCheck) {
+        failures.clear()
+        lastBytesAtMs = null
+        lastCheckAtMs = nowMs
+        blockedAtMs = when (check) {
+            NetworkCheck.SignInPage, NetworkCheck.SecureConnectionBroken -> nowMs
+            NetworkCheck.Unknown -> blockedAtMs
+            else -> null
+        }
+    }
+
     /** What the look at the network found. Returns whether the network blocks downloads now. */
     fun onCheck(nowMs: Long, check: NetworkCheck): Boolean {
         lastCheckAtMs = nowMs
@@ -434,7 +454,7 @@ internal class PoliteDownloads(
     private val reportQuality: (LimitedConnectionReason?) -> Unit,
 ) {
     private val lock = SynchronizedObject()
-    private val controller = YieldController()
+    private var controller = YieldController()
     private val slowJudge = SlowNetworkJudge()
     private val blockedJudge = BlockedNetworkJudge()
     private var lastTickAtMs: Long? = null
@@ -453,7 +473,28 @@ internal class PoliteDownloads(
         blockedJudge.onFailure(clock(), host, kind)
     }
 
-    suspend fun tick() {
+    private val tickLock = Mutex()
+
+    /** Refreshes blocking rules before a path report can release the sleep hold. */
+    suspend fun recheckAfterWake() = tickLock.withLock {
+        val check = runCatching { checkNetwork() }.getOrDefault(NetworkCheck.Unreachable)
+        synchronized(lock) { blockedJudge.afterWake(clock(), check) }
+        controller = YieldController()
+        slowJudge.afterWake(clock())
+        lastTickAtMs = null
+        lastProbeAtMs = null
+        traffic.takeBytes()
+        setYieldCap(null)
+        // A previous slow result stays in force until its normal timed trial finds spare bandwidth.
+        reported = when {
+            check == NetworkCheck.SignInPage || check == NetworkCheck.SecureConnectionBroken || blockedJudge.blocked -> LimitedConnectionReason.NetworkBlocksDownloads
+            slowJudge.slow -> LimitedConnectionReason.SlowConnection
+            else -> null
+        }
+        reportQuality(reported)
+    }
+
+    suspend fun tick() = tickLock.withLock {
         val now = clock()
         val elapsed = lastTickAtMs?.let { now - it }?.takeIf { it > 0L }
         lastTickAtMs = now

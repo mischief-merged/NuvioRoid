@@ -72,6 +72,26 @@ class DesktopDownloadSpeedCapTest : com.nuvio.app.core.network.TrustedLocalServe
         assertNull(DownloadBandwidth.limiter.bytesPerSecond)
     }
 
+    @Test
+    fun travel_and_yield_caps_both_apply_to_the_real_shared_limiter() = keepingTheStoredLimit {
+        try {
+            DownloadBandwidth.setUserCap(null)
+            DownloadBandwidth.setTravelCap(500_000L)
+            assertEquals(500_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.applyStoredLimit()
+            assertEquals(500_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setYieldCap(100_000L)
+            assertEquals(100_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setUserCap(50_000L)
+            assertEquals(50_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setTravelCap(null)
+            assertEquals(50_000L, DownloadBandwidth.limiter.bytesPerSecond)
+        } finally {
+            DownloadBandwidth.setTravelCap(null)
+            DownloadBandwidth.setYieldCap(null)
+        }
+    }
+
     private inline fun keepingTheStoredLimit(block: () -> Unit) {
         val stored = DownloadSpeedStorage.loadBytesPerSecond()
         try {

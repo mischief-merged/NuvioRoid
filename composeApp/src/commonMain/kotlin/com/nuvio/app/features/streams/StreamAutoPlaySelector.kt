@@ -1,6 +1,8 @@
 package com.nuvio.app.features.streams
 
 import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.features.downloads.BatchQuality
+import com.nuvio.app.features.downloads.LimitedConnections
 import com.nuvio.app.features.downloads.SeasonDownloadDefaults
 import com.nuvio.app.features.downloads.rankStreamsByPreferences
 
@@ -93,6 +95,7 @@ object StreamAutoPlaySelector {
         runtimeMinutes: Int? = null,
         /** Used only by [StreamAutoPlayMode.PREFERRED]: the title, episode or year, so other content ranks last. Unknown: nothing is judged. */
         wanted: WantedContent? = null,
+        travelMode: Boolean = LimitedConnections.hold.state.value.travel.enabled,
     ): StreamAutoPlayEvaluation {
         if (streams.isEmpty()) return StreamAutoPlayEvaluation()
 
@@ -125,6 +128,12 @@ object StreamAutoPlaySelector {
         // A cached copy in the binge group goes before one the debrid service does not have yet.
         val preferredReadyStream = bingeGroupCandidates
             .filter { stream -> stream.isAutoPlayable(debridEnabled, activeResolverProviderId) }
+            .let { ready ->
+                if (travelMode) rankStreamsByPreferences(
+                    ready, BatchQuality.BestAvailable,
+                    runtimeMinutes = runtimeMinutes, wanted = wanted, travelMode = true,
+                ) else ready
+            }
             .cachedFirst { it.saysNotCached }
             .firstOrNull()
         if (bingeGroupOnly) {
@@ -196,18 +205,19 @@ object StreamAutoPlaySelector {
         val readyMatchingStreams = matchingStreams
             .filter { it.isAutoPlayable(debridEnabled, activeResolverProviderId) }
             .let { ready ->
-                if (mode != StreamAutoPlayMode.PREFERRED) {
+                if (mode != StreamAutoPlayMode.PREFERRED && !travelMode) {
                     ready
                 } else {
                     // The same ranking the season downloader uses. A source it drops does not fit the
                     // saved choices, so it is never played here; with none left the list is shown.
                     rankStreamsByPreferences(
                         streams = ready,
-                        quality = preferences.quality,
-                        maxBitrateMbps = preferences.maxBitrateMbps,
-                        audioLanguage = preferences.audioLanguage,
+                        quality = if (mode == StreamAutoPlayMode.PREFERRED) preferences.quality else BatchQuality.BestAvailable,
+                        maxBitrateMbps = preferences.maxBitrateMbps.takeIf { mode == StreamAutoPlayMode.PREFERRED },
+                        audioLanguage = preferences.audioLanguage.takeIf { mode == StreamAutoPlayMode.PREFERRED },
                         runtimeMinutes = runtimeMinutes,
                         wanted = wanted,
+                        travelMode = travelMode,
                     )
                 }
             }
