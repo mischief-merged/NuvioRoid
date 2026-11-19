@@ -184,6 +184,8 @@ data class DownloadsUiState(
     val storeProblem: DownloadsStoreProblem? = null,
     /** Transfers whose bodies are finished but whose files are still being checked. Never persisted. */
     val checkingIds: Set<String> = emptySet(),
+    /** Files in download folders that could not be matched confidently during a scan. */
+    val unrecognisedFiles: List<UnrecognisedFile> = emptyList(),
 ) {
     /** What is not downloaded: running, paused, failed, and finished files that are not the video. */
     val activeItems: List<DownloadItem>

@@ -62,6 +62,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.compose.resources.StringResource
+import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
@@ -226,6 +227,8 @@ internal fun DownloadsScreenContent(
     // A file the user picked for a download without one, waiting for the user to confirm it.
     var locatePick by remember { mutableStateOf<Pair<DownloadItem, String>?>(null) }
     val locateScope = rememberCoroutineScope()
+    var scanningDisk by remember { mutableStateOf(false) }
+    val canScanDisk = folders.supported || DownloadsRepository.canScanDisk()
     // Looking at the volumes can take a while on a drive that is failing, so never on this thread.
     DisposableEffect(folders) {
         if (folders.supported) folders.setUsageWatched(true)
@@ -364,6 +367,36 @@ internal fun DownloadsScreenContent(
                 },
                 actions = {
                     val headerColor = MaterialTheme.nuvio.colors.textPrimary
+                    if (selectedShowId == null && canScanDisk) {
+                        TextButton(
+                            enabled = !scanningDisk,
+                            onClick = {
+                                scanningDisk = true
+                                checkScope.launch {
+                                    try {
+                                        val controllerScanner = if (folders.supported) folders::scanDownloadsOnDisk else null
+                                        val summary = withContext(Dispatchers.IO) {
+                                            DownloadsRepository.findDownloadsOnDisk(controllerScanner)
+                                        }
+                                        if (folders.supported) {
+                                            withContext(Dispatchers.IO) { folders.refresh() }
+                                        }
+                                        NuvioToastController.show(scanSummaryToast(summary))
+                                    } finally {
+                                        scanningDisk = false
+                                    }
+                                }
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(
+                                    if (scanningDisk) Res.string.downloads_find_on_disk_scanning else Res.string.downloads_find_on_disk,
+                                ),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
                     if (extras != null && uiState.completedItems.isNotEmpty()) {
                         TextButton(
                             onClick = {
@@ -905,8 +938,32 @@ private fun LazyListScope.downloadsRootContent(
         }
     }
 
+    if (uiState.unrecognisedFiles.isNotEmpty()) {
+        item(key = "unrecognised-header") {
+            SectionTitle(stringResource(Res.string.downloads_section_unrecognised))
+        }
+        item(key = "unrecognised-note") {
+            Text(
+                text = stringResource(Res.string.downloads_unrecognised_note),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        items(
+            items = uiState.unrecognisedFiles,
+            key = { "unrecognised:${it.localFileUri}" },
+        ) { file ->
+            val locationInfo = clock.extras?.folderState?.location(file.locationId)
+            val showLocation = clock.extras?.folderState?.hasSeveralLocations == true ||
+                (locationInfo != null && !locationInfo.isAppFolder) ||
+                (!file.locationId.isNullOrBlank() && file.locationId != "app")
+            UnrecognisedFileRow(file = file, showLocation = showLocation)
+        }
+    }
+
     // A list that could not be read is not an empty one: the banner says so instead.
-    if (uiState.items.isEmpty() && uiState.storeProblem == null) {
+    if (uiState.items.isEmpty() && uiState.unrecognisedFiles.isEmpty() && uiState.storeProblem == null) {
         item {
             EmptyDownloads(showSeasonHint = showSeasonHint, onBrowse = onBrowse)
         }
@@ -1378,7 +1435,7 @@ private fun DownloadRow(
                 }
             }
 
-            if (episodeLinks != null && item.isEpisode) {
+            if (episodeLinks != null && item.isEpisode && !item.parentMetaId.startsWith("recovered:")) {
                 EpisodeLinkButtons(item = item, links = episodeLinks)
             }
 
@@ -1907,4 +1964,82 @@ private fun resultText(status: DownloadRowStatus, saved: DownloadCompanionsNote?
         null -> Unit
     }
     return message
+}
+
+@Composable
+private fun UnrecognisedFileRow(
+    file: UnrecognisedFile,
+    showLocation: Boolean,
+) {
+    val sizeText = formatBytes(file.sizeBytes)
+    val subtitle = if (showLocation && !file.locationName.isNullOrBlank()) {
+        stringResource(Res.string.downloads_unrecognised_size_location, sizeText, file.locationName)
+    } else {
+        sizeText
+    }
+    val reasonText = unrecognisedReasonText(file.reason)
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .semantics(mergeDescendants = true) {},
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = file.fileName,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = reasonText,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun unrecognisedReasonText(reason: UnrecognisedFileReason): String = stringResource(
+    when (reason) {
+        UnrecognisedFileReason.NoCompanionFolder -> Res.string.downloads_unrecognised_reason_no_companion
+        UnrecognisedFileReason.ForeignCompanionFolder -> Res.string.downloads_unrecognised_reason_foreign_companion
+        UnrecognisedFileReason.EpisodeMismatch -> Res.string.downloads_unrecognised_reason_episode_mismatch
+        UnrecognisedFileReason.AmbiguousName -> Res.string.downloads_unrecognised_reason_ambiguous_name
+        UnrecognisedFileReason.UnreadableCompanion -> Res.string.downloads_unrecognised_reason_unreadable_companion
+        UnrecognisedFileReason.NotAVideoFile -> Res.string.downloads_unrecognised_reason_not_video
+    },
+)
+
+private suspend fun scanSummaryToast(summary: DiskScanSummary): String = when {
+    summary.skippedBusy -> getString(Res.string.downloads_find_on_disk_busy)
+    summary.addedCount > 0 && summary.unrecognisedCount > 0 -> getString(
+        Res.string.downloads_find_on_disk_found_partial,
+        summary.addedCount,
+        summary.unrecognisedCount,
+    )
+    summary.addedCount > 0 -> getPluralString(Res.plurals.downloads_find_on_disk_found, summary.addedCount, summary.addedCount)
+    summary.unrecognisedCount > 0 -> getPluralString(
+        Res.plurals.downloads_find_on_disk_none_with_unrecognised,
+        summary.unrecognisedCount,
+        summary.unrecognisedCount,
+    )
+    else -> getString(Res.string.downloads_find_on_disk_none)
 }

@@ -23,7 +23,9 @@ class MergedOfflineInvariantsTest {
     private inner class HeldBackend : DownloadsBackend by LocationsBackend(world) {
         val inner = LocationsBackend(world)
         override fun loadPayload() = inner.payload
+        override fun loadPayload(profileId: Int) = loadPayload()
         override fun savePayload(payload: String) { inner.payload = payload }
+        override fun savePayload(profileId: Int, payload: String) = savePayload(payload)
         override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
         override fun trashFile(localFileUri: String): Boolean = inner.trashFile(localFileUri)
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? =

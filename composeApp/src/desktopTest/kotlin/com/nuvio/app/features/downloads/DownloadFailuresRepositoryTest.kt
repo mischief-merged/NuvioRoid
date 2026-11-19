@@ -231,6 +231,9 @@ class DownloadFailuresRepositoryTest {
             override fun saveUnreadablePayload(payload: String, atEpochMs: Long) {
                 unreadable += payload
             }
+
+            override fun saveUnreadablePayload(profileId: Int, payload: String, atEpochMs: Long) =
+                saveUnreadablePayload(payload, atEpochMs)
         }
         DownloadsRepository.backend = store
         fun stored(id: String, extra: String) =
