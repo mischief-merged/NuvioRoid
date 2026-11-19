@@ -29,3 +29,34 @@ internal expect object PlayerTrackPreferenceStorage {
     fun loadAudioDelayMs(audioOutputKey: String): Int?
     fun saveAudioDelayMs(audioOutputKey: String, delayMs: Int)
 }
+
+/**
+ * Resolves the persistence key for per-show subtitle delay adjustments, preferring [parentMetaId]
+ * so episodes of the same show share the offset and falling back to [videoId] for standalone items.
+ */
+internal fun subtitleDelayStorageKey(
+    parentMetaId: String,
+    videoId: String,
+): String = parentMetaId.trim().takeIf { it.isNotEmpty() } ?: videoId.trim()
+
+internal fun loadShowSubtitleDelayMs(
+    parentMetaId: String,
+    videoId: String,
+): Int? {
+    val showKey = subtitleDelayStorageKey(parentMetaId, videoId)
+    if (showKey.isEmpty()) return null
+    return PlayerTrackPreferenceStorage.loadSubtitleDelayMs(showKey)
+        ?: videoId.trim().takeIf { it.isNotEmpty() && it != showKey }
+            ?.let(PlayerTrackPreferenceStorage::loadSubtitleDelayMs)
+}
+
+internal fun saveShowSubtitleDelayMs(
+    parentMetaId: String,
+    videoId: String,
+    delayMs: Int,
+) {
+    val showKey = subtitleDelayStorageKey(parentMetaId, videoId)
+    if (showKey.isNotEmpty()) {
+        PlayerTrackPreferenceStorage.saveSubtitleDelayMs(showKey, delayMs)
+    }
+}

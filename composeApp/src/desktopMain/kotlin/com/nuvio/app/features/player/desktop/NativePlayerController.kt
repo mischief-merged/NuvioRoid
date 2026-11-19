@@ -29,17 +29,28 @@ import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MAX_MS
 import com.nuvio.app.features.player.findPreferredAudioTrackIndex
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MIN_MS
+import com.nuvio.app.features.player.StartupSubtitleSelection
 import com.nuvio.app.features.player.SubtitleColorSwatches
 import com.nuvio.app.features.player.SubtitleFontResolver
+import com.nuvio.app.features.player.SubtitleLocalFilePlatform
 import com.nuvio.app.features.player.SubtitleOutlineColorSwatches
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.inferForcedSubtitleTrack
+import com.nuvio.app.features.player.isLocalSubtitleUri
 import com.nuvio.app.features.player.toStorageHexString
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import com.nuvio.app.features.streams.StreamSubtitle
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -47,6 +58,7 @@ import java.awt.Component
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 import kotlin.math.roundToInt
@@ -87,6 +99,49 @@ internal typealias NativePlayerCreate = (
     NativePlayerEventSink,
 ) -> Long
 
+internal interface NativeSubtitleBridgeOps {
+    fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    )
+    fun addSubtitleTrack(
+        handle: Long,
+        url: String,
+        title: String,
+        language: String,
+        select: Boolean,
+    )
+    fun clearExternalSubtitles(handle: Long)
+    fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int)
+    fun selectSubtitleTrack(handle: Long, trackId: Int)
+    fun subtitleTracksJson(handle: Long): String
+}
+
+/** The subtitle calls the controller makes, sent through the same backend as every other native call. */
+internal class BackendSubtitleBridgeOps(private val backend: NativePlayerBackend) : NativeSubtitleBridgeOps {
+    override fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    ) = backend.configureStartupSubtitles(handle, urls, titles, languages, selectedIndex, disableAutoSelect)
+
+    override fun addSubtitleTrack(handle: Long, url: String, title: String, language: String, select: Boolean) =
+        backend.addSubtitleTrack(handle, url, title, language, select)
+
+    override fun clearExternalSubtitles(handle: Long) = backend.clearExternalSubtitles(handle)
+    override fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int) =
+        backend.clearExternalSubtitlesAndSelect(handle, trackId)
+    override fun selectSubtitleTrack(handle: Long, trackId: Int) = backend.selectSubtitleTrack(handle, trackId)
+    override fun subtitleTracksJson(handle: Long): String = backend.subtitleTracksJson(handle)
+}
+
 internal class NativePlayerController(
     private val host: NativePlayerHost,
     backend: NativePlayerBackend = RealNativePlayerBackend,
@@ -121,11 +176,19 @@ internal class NativePlayerController(
     },
     private val lifecycleCoordinator: NativePlayerLifecycleCoordinator? = null,
     remoteCommandsEnabledByDefault: Boolean = true,
+    private val resolvePlayableLocalSubtitle: suspend (
+        url: String,
+        headers: Map<String, String>,
+        languageHint: String?,
+    ) -> String? = SubtitleStartupCoordinator::resolvePlayableLocalSubtitle,
+    private val resolveLocalFilePath: (String) -> String? = SubtitleLocalFilePlatform::resolveLocalFilePath,
+    subtitleBridgeOps: NativeSubtitleBridgeOps? = null,
 ) : PlayerEngineController {
     private val usesInjectedCreateStub = nativeCreate != null && backend === RealNativePlayerBackend
     private val backend: NativePlayerBackend =
         (if (usesInjectedCreateStub) NoOpNativePlayerBackend else backend)
             .withTestCommandOverrides(nativeSeekBy, nativeUpdateControls)
+    private val subtitleOps: NativeSubtitleBridgeOps = subtitleBridgeOps ?: BackendSubtitleBridgeOps(this.backend)
     private val nativeCreateOverride: NativePlayerCreate? = nativeCreate
     private val nativeDispose: (Long) -> Unit = nativeDispose ?: this.backend::dispose
     private val nativeSeekTo: (Long, Long) -> Unit = nativeSeekTo ?: this.backend::seekTo
@@ -200,6 +263,17 @@ internal class NativePlayerController(
     private var onEvent: (String, Double) -> Boolean = { _, _ -> false }
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
+    private var onExternalSubtitleLoadFailed: ((String) -> Unit)? = null
+    private val subtitleScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val subtitleRequestGeneration = AtomicLong(0L)
+    @Volatile
+    private var activeSubtitleJob: Job? = null
+    @Volatile
+    private var startupConfiguredForSource: String? = null
+    @Volatile
+    private var startupLoadedLocalPaths: Set<String> = emptySet()
+    @Volatile
+    private var startupSelectedLocalPath: String? = null
     private fun eventSink(pending: PendingSource, token: Any) = NativePlayerEventSink { type, value ->
         if (type == "stateSynchronized") {
             val current = synchronized(lifecycleLock) {
@@ -228,6 +302,8 @@ internal class NativePlayerController(
         decoderPriority: Int,
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean = false,
+        externalSubtitles: List<StreamSubtitle> = emptyList(),
+        startupSubtitleSelection: StartupSubtitleSelection? = null,
         onError: (String?) -> Unit,
     ) {
         val headerLines = try { sourceHeaders.toHeaderLines() } catch (error: IllegalArgumentException) {
@@ -242,8 +318,14 @@ internal class NativePlayerController(
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
             nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled,
+            externalSubtitles = externalSubtitles,
+            startupSubtitleSelection = startupSubtitleSelection,
             onError = onError,
         )
+        startupConfiguredForSource = null
+        startupLoadedLocalPaths = emptySet()
+        startupSelectedLocalPath = null
+        cancelInFlightSubtitleLoad()
         var terminalFailure: String? = null
         val accepted = synchronized(lifecycleLock) {
             when {
@@ -481,6 +563,7 @@ internal class NativePlayerController(
                             .onFailure { error -> recordTerminalDisposeFailure(error, "superseded create", created) }
                         return@onSuccess
                     }
+                    configureStartupSubtitlesSafe(created, pending)
                     SwingUtilities.invokeLater {
                         val shouldConfigure = synchronized(lifecycleLock) {
                             when {
@@ -519,6 +602,7 @@ internal class NativePlayerController(
                             handlePlayerEvent("certificateFailure", 0.0, eventToken)
                         }
                         _manualRefreshTick.update { it + 1L }
+                        triggerFallbackRemoteStartupSubtitleIfNeeded(pending)
                     }
                 }.onFailure { error ->
                     log.w(error) { "attach failed source=${pending.sourceUrl.toPlaybackLogKey()}" }
@@ -1287,11 +1371,13 @@ internal class NativePlayerController(
         fallbackHideTimer = null
         cancelPendingAttachment()
         surfaceHostOverride = null
+        cancelInFlightSubtitleLoad()
         host.onCursorActivity = null
         onAction = { false }
         onEvent = { _, _ -> false }
         onScrubChange = { false }
         onScrubFinished = { false }
+        onExternalSubtitleLoadFailed = null
     }
 
     private fun awaitInFlightCreates() {
@@ -1443,6 +1529,8 @@ internal class NativePlayerController(
             decoderPriority = pending.decoderPriority,
             nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
             nvidiaRtxHdrEnabled = pending.nvidiaRtxHdrEnabled,
+            externalSubtitles = pending.externalSubtitles,
+            startupSubtitleSelection = pending.startupSubtitleSelection,
             onError = pending.onError,
         )
     }
@@ -1516,51 +1604,196 @@ internal class NativePlayerController(
         backend.selectAudioTrack(current, trackId)
     }
 
+    override fun setOnExternalSubtitleLoadFailed(listener: ((String) -> Unit)?) {
+        onExternalSubtitleLoadFailed = listener
+    }
+
     override fun selectSubtitleTrack(index: Int) {
+        cancelInFlightSubtitleLoad()
         val current = handle.takeIf { it != 0L } ?: return
         if (index < 0) {
             log.d { "selectSubtitleTrack off handle=$current" }
-            backend.selectSubtitleTrack(current, -1)
+            subtitleOps.selectSubtitleTrack(current, -1)
             return
         }
-        val tracks = decodeTracks { backend.subtitleTracksJson(it) }
+        val tracks = decodeTracks { subtitleOps.subtitleTracksJson(it) }
         val trackId = resolveTrackId(index, tracks) ?: run {
             log.w { "selectSubtitleTrack missing track index=$index count=${tracks.size} handle=$current" }
             return
         }
         log.d { "selectSubtitleTrack index=$index trackId=$trackId count=${tracks.size} handle=$current" }
-        backend.selectSubtitleTrack(current, trackId)
+        subtitleOps.selectSubtitleTrack(current, trackId)
         applyPendingSubtitleSettings()
     }
 
     override fun setSubtitleUri(url: String) {
-        log.d { "setSubtitleUri ${url.toPlaybackLogKey()} handle=$handle" }
-        handle.takeIf { it != 0L }?.let { current ->
-            backend.clearExternalSubtitles(current)
-            backend.addSubtitleUrl(current, url)
+        val currentHandle = handle.takeIf { it != 0L } ?: return
+        val generation = subtitleRequestGeneration.incrementAndGet()
+        activeSubtitleJob?.cancel()
+        val subtitleMeta = pendingSource?.externalSubtitles?.firstOrNull { it.url == url }
+        val targetPathIfLocal = url.takeIf { it.isLocalSubtitleUri() }
+            ?.let(resolveLocalFilePath)
+        if (targetPathIfLocal != null && targetPathIfLocal == startupSelectedLocalPath) {
+            val existingTracks = decodeTracks { subtitleOps.subtitleTracksJson(it) }
+            val matchingIndex = existingTracks.indexOfFirst { track ->
+                subtitleMeta?.name?.let { name -> track.label.contains(name, ignoreCase = true) } ?: false
+            }.takeIf { it >= 0 } ?: existingTracks.lastIndex.takeIf { it >= 0 }
+            if (matchingIndex != null) {
+                val trackId = resolveTrackId(matchingIndex, existingTracks)
+                if (trackId != null) {
+                    subtitleOps.selectSubtitleTrack(currentHandle, trackId)
+                    applyPendingSubtitleSettings()
+                    return
+                }
+            }
+        }
+        log.d { "setSubtitleUri async resolve ${url.toPlaybackLogKey()} handle=$currentHandle" }
+        activeSubtitleJob = subtitleScope.launch {
+            val localUri = resolvePlayableLocalSubtitle(
+                url,
+                subtitleMeta?.headers.orEmpty(),
+                subtitleMeta?.language,
+            )
+            val localPath = localUri?.let(resolveLocalFilePath)
+            if (subtitleRequestGeneration.get() != generation || releaseRequested) return@launch
+            val activeHandle = handle
+            if (activeHandle == 0L || activeHandle != currentHandle) return@launch
+
+            if (localPath != null) {
+                startupSelectedLocalPath = localPath
+                subtitleOps.clearExternalSubtitles(activeHandle)
+                subtitleOps.addSubtitleTrack(
+                    handle = activeHandle,
+                    url = localPath,
+                    title = subtitleMeta?.name.orEmpty(),
+                    language = subtitleMeta?.language.orEmpty(),
+                    select = true,
+                )
+            } else {
+                log.w { "setSubtitleUri timed out or failed validation; falling back to none for ${url.toPlaybackLogKey()}" }
+                startupSelectedLocalPath = null
+                subtitleOps.clearExternalSubtitles(activeHandle)
+                SwingUtilities.invokeLater {
+                    if (!releaseRequested && subtitleRequestGeneration.get() == generation) {
+                        onExternalSubtitleLoadFailed?.invoke(url)
+                    }
+                }
+            }
         }
     }
 
     override fun clearExternalSubtitle() {
+        cancelInFlightSubtitleLoad()
         log.d { "clearExternalSubtitle handle=$handle" }
-        handle.takeIf { it != 0L }?.let(backend::clearExternalSubtitles)
+        handle.takeIf { it != 0L }?.let(subtitleOps::clearExternalSubtitles)
     }
 
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
+        cancelInFlightSubtitleLoad()
         val current = handle.takeIf { it != 0L } ?: return
         val trackId = if (trackIndex < 0) {
             -1
         } else {
-            val tracks = decodeTracks { backend.subtitleTracksJson(it) }
+            val tracks = decodeTracks { subtitleOps.subtitleTracksJson(it) }
             resolveTrackId(trackIndex, tracks) ?: run {
                 log.w { "clearExternalSubtitleAndSelect missing track index=$trackIndex count=${tracks.size} handle=$current" }
                 return
             }
         }
         log.d { "clearExternalSubtitleAndSelect trackIndex=$trackIndex trackId=$trackId handle=$current" }
-        backend.clearExternalSubtitlesAndSelect(current, trackId)
+        subtitleOps.clearExternalSubtitlesAndSelect(current, trackId)
         applyPendingSubtitleSettings()
     }
+
+    internal fun applyStartupSubtitlesIfNeeded(
+        sourceUrl: String,
+        externalSubtitles: List<StreamSubtitle>,
+        startupSubtitleSelection: StartupSubtitleSelection?,
+    ) {
+        val current = handle.takeIf { it != 0L } ?: return
+        val pending = pendingSource ?: return
+        if (pending.sourceUrl != sourceUrl) return
+        if (startupConfiguredForSource == sourceUrl &&
+            pending.externalSubtitles == externalSubtitles &&
+            pending.startupSubtitleSelection == startupSubtitleSelection
+        ) {
+            return
+        }
+        val updated = pending.copy(
+            externalSubtitles = externalSubtitles,
+            startupSubtitleSelection = startupSubtitleSelection,
+        )
+        pendingSource = updated
+        if (externalSubtitles.any { it.url.isLocalSubtitleUri() }) {
+            subtitleOps.clearExternalSubtitles(current)
+            configureStartupSubtitlesSafe(current, updated)
+        } else {
+            triggerFallbackRemoteStartupSubtitleIfNeeded(updated)
+        }
+    }
+
+    private fun cancelInFlightSubtitleLoad() {
+        subtitleRequestGeneration.incrementAndGet()
+        activeSubtitleJob?.cancel()
+        activeSubtitleJob = null
+    }
+
+    private fun configureStartupSubtitlesSafe(nativeHandle: Long, pending: PendingSource) {
+        val localEntries = pending.externalSubtitles.mapNotNull { subtitle ->
+            if (!subtitle.url.isLocalSubtitleUri()) return@mapNotNull null
+            val path = resolveLocalFilePath(subtitle.url) ?: return@mapNotNull null
+            StartupSubtitleEntry(
+                originalUrl = subtitle.url,
+                localPath = path,
+                title = subtitle.name?.takeIf { it.isNotBlank() } ?: subtitle.language,
+                language = subtitle.language,
+            )
+        }
+        val selection = pending.startupSubtitleSelection
+        val selectedIndex = when {
+            localEntries.isEmpty() -> -1
+            selection != null -> selection.selectedUrl?.let { chosen ->
+                localEntries.indexOfFirst { it.originalUrl == chosen }
+            } ?: -1
+            else -> 0
+        }
+        val disableAutoSelect = selection?.disableAutoSelect == true || selection?.exhaustedOrTimedOut == true
+        startupConfiguredForSource = pending.sourceUrl
+        startupLoadedLocalPaths = localEntries.mapTo(LinkedHashSet()) { it.localPath }
+        startupSelectedLocalPath = localEntries.getOrNull(selectedIndex)?.localPath
+
+        if (localEntries.isEmpty() && !disableAutoSelect) return
+
+        val urls = localEntries.map { it.localPath }.toTypedArray()
+        val titles = localEntries.map { it.title }.toTypedArray()
+        val languages = localEntries.map { it.language }.toTypedArray()
+        subtitleOps.configureStartupSubtitles(
+            handle = nativeHandle,
+            urls = urls,
+            titles = titles,
+            languages = languages,
+            selectedIndex = selectedIndex,
+            disableAutoSelect = disableAutoSelect,
+        )
+    }
+
+    private fun triggerFallbackRemoteStartupSubtitleIfNeeded(pending: PendingSource) {
+        if (pending.startupSubtitleSelection?.disableAutoSelect == true ||
+            pending.startupSubtitleSelection?.exhaustedOrTimedOut == true
+        ) {
+            return
+        }
+        if (pending.externalSubtitles.any { it.url.isLocalSubtitleUri() }) return
+        val remoteCandidate = pending.externalSubtitles.firstOrNull { !it.url.isLocalSubtitleUri() } ?: return
+        setSubtitleUri(remoteCandidate.url)
+    }
+
+    private data class StartupSubtitleEntry(
+        val originalUrl: String,
+        val localPath: String,
+        val title: String,
+        val language: String,
+    )
 
     override fun setSubtitleVisible(visible: Boolean) {
         handle.takeIf { it != 0L }?.let { backend.setSubtitleVisible(it, visible) }
@@ -1734,6 +1967,8 @@ private data class PendingSource(
     val decoderPriority: Int,
     val nvidiaRtxSuperResolutionEnabled: Boolean,
     val nvidiaRtxHdrEnabled: Boolean,
+    val externalSubtitles: List<StreamSubtitle> = emptyList(),
+    val startupSubtitleSelection: StartupSubtitleSelection? = null,
     val onError: (String?) -> Unit,
 )
 

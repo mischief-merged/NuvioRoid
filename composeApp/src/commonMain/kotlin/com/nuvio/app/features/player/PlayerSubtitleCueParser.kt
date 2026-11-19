@@ -220,26 +220,31 @@ object PlayerSubtitleCueParser {
         return if (body.isBlank()) null else SubtitleSyncCue(startTimeMs = start, endTimeMs = end, text = body)
     }
 
-    private fun parseTtml(text: String): List<SubtitleSyncCue> =
-        Regex("""(?is)<p\b([^>]*)>(.*?)</p>""")
-            .findAll(text)
-            .mapNotNull { match ->
-                val attrs = match.groupValues[1]
-                val startRaw = attrs.attributeValue("begin")
-                    ?: attrs.attributeValue("start")
-                    ?: return@mapNotNull null
-                val endRaw = attrs.attributeValue("end")
-                val start = parseTtmlTimestamp(startRaw) ?: return@mapNotNull null
-                val end = endRaw?.let { parseTtmlTimestamp(it) } ?: (start + 3000L)
-                if (end - start <= 0) return@mapNotNull null
-                val body = normalizeCueText(
-                    match.groupValues[2]
-                        .replace(Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
-                )
-                if (body.isBlank()) null else SubtitleSyncCue(startTimeMs = start, endTimeMs = end, text = body)
+    private fun parseTtml(text: String): List<SubtitleSyncCue> {
+        val cues = ArrayList<SubtitleSyncCue>()
+        var attributes: String? = null
+        var bodyStart = 0
+        // Walk paragraph tags once; incomplete tags cannot scan across the next opening bracket.
+        for (tag in Regex("""(?is)<(/?)p\b([^<>]*)>""").findAll(text)) {
+            if (tag.groupValues[1].isEmpty()) {
+                attributes = tag.groupValues[2]
+                bodyStart = tag.range.last + 1
+                continue
             }
-            .sortedBy { it.startTimeMs }
-            .toList()
+            val attrs = attributes ?: continue
+            attributes = null
+            val startRaw = attrs.attributeValue("begin") ?: attrs.attributeValue("start") ?: continue
+            val start = parseTtmlTimestamp(startRaw) ?: continue
+            val end = attrs.attributeValue("end")?.let { parseTtmlTimestamp(it) } ?: (start + 3000L)
+            if (end <= start) continue
+            val body = normalizeCueText(
+                text.substring(bodyStart, tag.range.first)
+                    .replace(Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE), "\n"),
+            )
+            if (body.isNotBlank()) cues.add(SubtitleSyncCue(startTimeMs = start, endTimeMs = end, text = body))
+        }
+        return cues.sortedBy { it.startTimeMs }
+    }
 
     private fun parseTtmlTimestamp(raw: String): Long? {
         val cleaned = raw.trim().substringBefore(' ')

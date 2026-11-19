@@ -31,22 +31,45 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.youtube_resolution_failed
 import org.jetbrains.compose.resources.getString
 
+private fun PlayerScreenRuntime.streamSubtitleRequestForSwitch(
+    stream: StreamItem,
+    targetVideoId: String,
+): StartupSubtitleRequest = StartupSubtitleRequest(
+    type = contentType ?: parentMetaType,
+    videoId = targetVideoId,
+    parentMetaId = parentMetaId,
+    settings = playerSettingsUiState,
+    streamExternalSubtitles = stream.externalSubtitles,
+    videoHash = stream.behaviorHints.videoHash,
+    videoSizeBytes = stream.behaviorHints.videoSize,
+    filename = stream.behaviorHints.filename,
+)
+
 internal fun PlayerScreenRuntime.resolveDebridForPlayer(
     stream: StreamItem,
     season: Int?,
     episode: Int?,
-    onResolved: (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onResolved: (StreamItem, PreparedStartupSubtitles) -> Unit,
     onStale: () -> Unit,
 ): Boolean {
     if (!DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream)) return false
     scope.launch {
-        val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-            stream = stream,
-            season = season,
-            episode = episode,
+        val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = {
+                DirectDebridPlaybackResolver.resolveToPlayableStream(
+                    stream = stream,
+                    season = season,
+                    episode = episode,
+                )
+            },
+            extractStreamSubtitles = { result ->
+                (result as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+            },
         )
         when (resolved) {
-            is DirectDebridPlayableResult.Success -> onResolved(resolved.stream)
+            is DirectDebridPlayableResult.Success -> onResolved(resolved.stream, preparedSubs)
             else -> {
                 resolved.toastMessage()?.let { NuvioToastController.show(it) }
                 if (resolved == DirectDebridPlayableResult.Stale) {
@@ -60,13 +83,21 @@ internal fun PlayerScreenRuntime.resolveDebridForPlayer(
 
 internal fun PlayerScreenRuntime.prepareServerForPlayer(
     stream: StreamItem,
-    onPrepared: suspend (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onPrepared: suspend (StreamItem, PreparedStartupSubtitles) -> Unit,
 ): Boolean {
     if (!stream.needsServerPreparation) return false
     scope.launch {
-        runCatching { ServerPlayback.prepare(stream) }
-            .onFailure { if (it is CancellationException) throw it }
-            .onSuccess { onPrepared(it) }
+        val (result, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = {
+                runCatching { ServerPlayback.prepare(stream) }
+                    .onFailure { if (it is CancellationException) throw it }
+            },
+            extractStreamSubtitles = { res -> res.getOrNull()?.externalSubtitles.orEmpty() },
+        )
+        result
+            .onSuccess { onPrepared(it, preparedSubs) }
             .onFailure { NuvioToastController.show(it.serverPlaybackMessage()) }
     }
     return true
@@ -74,16 +105,20 @@ internal fun PlayerScreenRuntime.prepareServerForPlayer(
 
 internal fun PlayerScreenRuntime.resolveYouTubeForPlayer(
     stream: StreamItem,
-    onResolved: (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onResolved: (StreamItem, PreparedStartupSubtitles) -> Unit,
 ): Boolean {
     if (stream.youTubeIdToResolve == null) return false
     scope.launch {
-        val resolved = YouTubeStreamResolver.Default.resolve(stream)
+        val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = { YouTubeStreamResolver.Default.resolve(stream) },
+        )
         if (resolved == null) {
             NuvioToastController.show(getString(Res.string.youtube_resolution_failed))
             return@launch
         }
-        onResolved(resolved)
+        onResolved(resolved, preparedSubs)
     }
     return true
 }
@@ -306,18 +341,19 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
 internal fun PlayerScreenRuntime.switchToSource(
     stream: StreamItem,
     saveForReuse: Boolean = true,
+    preparedSubtitles: PreparedStartupSubtitles? = null,
 ) {
     // Even picking the source that is playing now ends a lookup for a replacement.
     restartSourceFailoverAfterUserChoice()
-    if (prepareServerForPlayer(stream) { switchToSource(it) }) return
+    if (prepareServerForPlayer(stream) { resolved, subs -> switchToSource(resolved, saveForReuse = saveForReuse, preparedSubtitles = subs) }) return
     // The resolved URL expires after a few hours, so it isn't kept for reuse.
-    if (resolveYouTubeForPlayer(stream) { switchToSource(it, saveForReuse = false) }) return
+    if (resolveYouTubeForPlayer(stream) { resolved, subs -> switchToSource(resolved, saveForReuse = false, preparedSubtitles = subs) }) return
     if (
         resolveDebridForPlayer(
             stream = stream,
             season = activeSeasonNumber,
             episode = activeEpisodeNumber,
-            onResolved = { switchToSource(it) },
+            onResolved = { resolved, subs -> switchToSource(resolved, saveForReuse = saveForReuse, preparedSubtitles = subs) },
             onStale = {
                 val vid = activeVideoId
                 if (vid != null) {
@@ -343,6 +379,17 @@ internal fun PlayerScreenRuntime.switchToSource(
         activeSourceIdentityKey = sourceIdentityKey ?: activeSourceIdentityKey
         return
     }
+    val targetVideoId = activeVideoId.orEmpty()
+    if (preparedSubtitles == null) {
+        showSourcesPanel = false
+        scope.launch {
+            val subs = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                streamSubtitleRequestForSwitch(stream, targetVideoId),
+            )
+            switchToSource(stream, saveForReuse = saveForReuse, preparedSubtitles = subs)
+        }
+        return
+    }
     val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
     flushWatchProgress()
     stopActiveP2pStream()
@@ -350,7 +397,8 @@ internal fun PlayerScreenRuntime.switchToSource(
     if (saveForReuse && playerSettingsUiState.streamReuseLastLinkEnabled && currentVideoId != null) {
         saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber)
     }
-    externalSubtitles = stream.externalSubtitles
+    externalSubtitles = preparedSubtitles.subtitles
+    startupSubtitleSelection = preparedSubtitles.selection
     activeSourceUrl = url
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -385,20 +433,28 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     serverResumeMs: Long? = null,
     saveForReuse: Boolean = true,
     autoSelection: PlayerSourceFallbackTried? = null,
+    preparedSubtitles: PreparedStartupSubtitles? = null,
 ) {
     if (
-        prepareServerForPlayer(stream) {
+        prepareServerForPlayer(stream, targetVideoId = episode.id) { resolved, subs ->
             switchToEpisodeStream(
-                it,
-                episode,
-                serverResumeMs = newerServerResumeMs(it, episode),
+                stream = resolved,
+                episode = episode,
+                serverResumeMs = newerServerResumeMs(resolved, episode),
                 autoSelection = autoSelection,
+                preparedSubtitles = subs,
             )
         }
     ) return
     if (
-        resolveYouTubeForPlayer(stream) { resolved ->
-            switchToEpisodeStream(resolved, episode, saveForReuse = false, autoSelection = autoSelection)
+        resolveYouTubeForPlayer(stream, targetVideoId = episode.id) { resolved, subs ->
+            switchToEpisodeStream(
+                resolved,
+                episode,
+                saveForReuse = false,
+                autoSelection = autoSelection,
+                preparedSubtitles = subs,
+            )
         }
     ) return
     if (
@@ -406,7 +462,15 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
             stream = stream,
             season = episode.season,
             episode = episode.episode,
-            onResolved = { resolvedStream -> switchToEpisodeStream(resolvedStream, episode, autoSelection = autoSelection) },
+            targetVideoId = episode.id,
+            onResolved = { resolvedStream, subs ->
+                switchToEpisodeStream(
+                    resolvedStream,
+                    episode,
+                    autoSelection = autoSelection,
+                    preparedSubtitles = subs,
+                )
+            },
             onStale = {
                 PlayerStreamsRepository.loadEpisodeStreams(
                     type = contentType ?: parentMetaType,
@@ -424,6 +488,22 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     }
     if (openExternalSourceUrl(stream)) return
     val url = stream.playableDirectUrl ?: return
+    if (preparedSubtitles == null) {
+        scope.launch {
+            val subs = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                streamSubtitleRequestForSwitch(stream, episode.id),
+            )
+            switchToEpisodeStream(
+                stream = stream,
+                episode = episode,
+                serverResumeMs = serverResumeMs,
+                saveForReuse = saveForReuse,
+                autoSelection = autoSelection,
+                preparedSubtitles = subs,
+            )
+        }
+        return
+    }
     resetEpisodePanelAndNextEpisodeState()
     flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
@@ -432,7 +512,8 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     if (saveForReuse && playerSettingsUiState.streamReuseLastLinkEnabled) {
         saveDirectStreamForReuse(stream, url, epVideoId, episode.season, episode.episode)
     }
-    externalSubtitles = stream.externalSubtitles
+    externalSubtitles = preparedSubtitles.subtitles
+    startupSubtitleSelection = preparedSubtitles.selection
     activeSourceUrl = url
     restartSourceFallback(url, autoSelection)
     activeSourceAudioUrl = null
@@ -484,36 +565,44 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
         ?.let { (it / 100f).coerceIn(0f, 1f) }
     val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
 
-    externalSubtitles = DownloadSubtitles.localSubtitles(localFileUri)
-    activeSourceUrl = localFileUri
-    restartSourceFallback(activeSourceUrl, autoSelection = null)
-    activeSourceAudioUrl = null
-    activeSourceHeaders = emptyMap()
-    activeSourceResponseHeaders = emptyMap()
-    activeStreamType = null
-    activeSourceIdentityKey = null
-    activeSourceFilename = null
-    activeStreamTitle = downloadItem.streamTitle.ifBlank {
-        episode.title.ifBlank { title }
+    scope.launch {
+        val prepared = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
+            settings = playerSettingsUiState,
+            parentMetaId = parentMetaId,
+        )
+        externalSubtitles = prepared.subtitles
+        startupSubtitleSelection = prepared.selection
+        activeSourceUrl = localFileUri
+        restartSourceFallback(activeSourceUrl, autoSelection = null)
+        activeSourceAudioUrl = null
+        activeSourceHeaders = emptyMap()
+        activeSourceResponseHeaders = emptyMap()
+        activeStreamType = null
+        activeSourceIdentityKey = null
+        activeSourceFilename = null
+        activeStreamTitle = downloadItem.streamTitle.ifBlank {
+            episode.title.ifBlank { title }
+        }
+        activeStreamSubtitle = downloadItem.streamSubtitle
+        activeStreamFilename = sourceFilenameFromUrl(localFileUri)
+        activeProviderName = downloadItem.providerName.ifBlank { downloadedLabel }
+        activeProviderAddonId = downloadItem.providerAddonId
+        activeStream = null
+        currentStreamBingeGroup = null
+        activeSubtitleExtras = null
+        currentStreamFilename = null
+        currentStreamInfoHash = null
+        activeSeasonNumber = episode.season
+        activeEpisodeNumber = episode.episode
+        activeEpisodeTitle = episode.title
+        activeEpisodeThumbnail = episode.thumbnail
+        activePauseDescription = episode.overview
+        activeVideoId = resolvedVideoId
+        activeInitialPositionMs = epResumePositionMs
+        activeInitialProgressFraction = epResumeFraction
+        controlsVisible = true
     }
-    activeStreamSubtitle = downloadItem.streamSubtitle
-    activeStreamFilename = sourceFilenameFromUrl(localFileUri)
-    activeProviderName = downloadItem.providerName.ifBlank { downloadedLabel }
-    activeProviderAddonId = downloadItem.providerAddonId
-    activeStream = null
-    currentStreamBingeGroup = null
-    activeSubtitleExtras = null
-    currentStreamFilename = null
-    currentStreamInfoHash = null
-    activeSeasonNumber = episode.season
-    activeEpisodeNumber = episode.episode
-    activeEpisodeTitle = episode.title
-    activeEpisodeThumbnail = episode.thumbnail
-    activePauseDescription = episode.overview
-    activeVideoId = resolvedVideoId
-    activeInitialPositionMs = epResumePositionMs
-    activeInitialProgressFraction = epResumeFraction
-    controlsVisible = true
     return DownloadedEpisodeSwitchResult.Accepted
 }
 

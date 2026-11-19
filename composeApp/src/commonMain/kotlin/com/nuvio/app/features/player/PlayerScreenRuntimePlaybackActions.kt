@@ -130,6 +130,7 @@ internal fun PlayerScreenRuntime.currentLaunch(launch: PlayerLaunch): PlayerLaun
         sourceHeaders = activeSourceHeaders,
         sourceResponseHeaders = activeSourceResponseHeaders,
         externalSubtitles = externalSubtitles,
+        startupSubtitleSelection = startupSubtitleSelection,
         streamType = activeStreamType,
         seasonNumber = activeSeasonNumber,
         episodeNumber = activeEpisodeNumber,

@@ -117,6 +117,7 @@ private fun PlayerScreenRuntime.restartServerStream(
             ServerPlayback.stop(playback.url)
             return@launch
         }
+        startupSubtitleSelection = null
         externalSubtitles = playback.subtitles
         activeSourceUrl = playback.url
         activeSourceHeaders = playback.headers

@@ -153,6 +153,7 @@ import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerSessionController
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.SubtitleLanguageOption
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.player.completeExternalPlayback
 import com.nuvio.app.features.player.launchPreparedExternalPlayback
 import com.nuvio.app.features.player.prepareExternalPlayerLaunch
@@ -992,17 +993,29 @@ internal fun MainAppContent(
             }
         }
 
-        fun launchLocalPlayer(playerLaunch: PlayerLaunch) {
-            if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
-                playerSessionController.launchExternalOrAskToReplace(
-                    launch = playerLaunch,
-                    allowSameTargetReopen = false,
-                ) {
-                    startExternalPlayback(playerLaunch)
+        fun launchLocalPlayer(savedLaunch: PlayerLaunch) {
+            coroutineScope.launch {
+                // The saved subtitle files are checked and the preferred one picked before playback starts.
+                val preparedSubtitles = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+                    localSubtitles = savedLaunch.externalSubtitles,
+                    settings = playerSettingsUiState,
+                    parentMetaId = savedLaunch.parentMetaId,
+                )
+                val playerLaunch = savedLaunch.copy(
+                    externalSubtitles = preparedSubtitles.subtitles,
+                    startupSubtitleSelection = preparedSubtitles.selection,
+                )
+                if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
+                    playerSessionController.launchExternalOrAskToReplace(
+                        launch = playerLaunch,
+                        allowSameTargetReopen = false,
+                    ) {
+                        startExternalPlayback(playerLaunch)
+                    }
+                    return@launch
                 }
-                return
+                openPlayerSession(playerLaunch)
             }
-            openPlayerSession(playerLaunch)
         }
 
         fun openDownloadedItem(item: DownloadItem) {
@@ -1074,13 +1087,24 @@ internal fun MainAppContent(
             resumePositionMs: Long?,
             resumeProgressFraction: Float?,
             startFromBeginning: Boolean,
-        ): Boolean =
-            when (
-                val resolved = CloudLibraryRepository.resolvePlayback(
-                    item = item,
-                    file = file,
-                )
-            ) {
+        ): Boolean {
+            val cloudVideoId = item.playbackVideoId(file)
+            val (resolved, preparedSubtitles) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = com.nuvio.app.features.player.StartupSubtitleRequest(
+                    type = CloudLibraryContentType,
+                    videoId = cloudVideoId,
+                    parentMetaId = item.stableKey,
+                    settings = playerSettingsUiState,
+                    filename = file.name,
+                ),
+                resolveSource = {
+                    CloudLibraryRepository.resolvePlayback(
+                        item = item,
+                        file = file,
+                    )
+                },
+            )
+            return when (resolved) {
                 is CloudLibraryPlaybackResult.Success -> {
                     val playbackTitle = resolved.filename
                         ?.takeIf { it.isNotBlank() }
@@ -1089,6 +1113,8 @@ internal fun MainAppContent(
                         profileId = activePlaybackProfileId,
                         title = playbackTitle,
                         sourceUrl = resolved.url,
+                        externalSubtitles = preparedSubtitles.subtitles,
+                        startupSubtitleSelection = preparedSubtitles.selection,
                         streamTitle = playbackTitle,
                         streamSubtitle = item.name.takeIf { it != playbackTitle },
                         providerName = item.providerName,
@@ -1112,6 +1138,7 @@ internal fun MainAppContent(
 
                 else -> false
             }
+        }
 
         suspend fun launchCloudLibraryFile(
             item: CloudLibraryItem,
