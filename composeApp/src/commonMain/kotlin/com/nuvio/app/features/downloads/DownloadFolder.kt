@@ -75,6 +75,8 @@ internal data class DownloadLocationInfo(
     val usedBytes: Long = totalBytes,
     /** The location is away, so [usedBytes] is what was known when it was last there. */
     val usedIsLastKnown: Boolean = false,
+    /** Locations on the same volume share their free-space budget. */
+    val volumeKey: String = id,
 )
 
 internal data class DownloadFolderState(

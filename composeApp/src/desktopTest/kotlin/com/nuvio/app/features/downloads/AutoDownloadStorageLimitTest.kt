@@ -17,6 +17,7 @@ class AutoDownloadStorageLimitTest {
     /** Keeps the stored payload in memory and never touches a file or the network. */
     private inner class FakeBackend : DownloadsBackend {
         var payload: String? = null
+        var removedPartials = 0
 
         override fun loadPayload(): String? = payload
 
@@ -41,7 +42,10 @@ class AutoDownloadStorageLimitTest {
 
         override fun removeFile(localFileUri: String?): Boolean = true
 
-        override fun removePartialFile(destinationFileName: String): Boolean = true
+        override fun removePartialFile(destinationFileName: String): Boolean {
+            removedPartials++
+            return true
+        }
 
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
     }
@@ -74,7 +78,7 @@ class AutoDownloadStorageLimitTest {
         DownloadsRepository.autoDownloadLimits = realLimits
     }
 
-    private fun enqueue(episode: Int, automatic: Boolean): Transfer {
+    private fun enqueue(episode: Int, automatic: Boolean, trip: Boolean = false): Transfer {
         DownloadsRepository.enqueueFromStream(
             contentType = "series",
             videoId = "$showId:1:$episode",
@@ -90,6 +94,7 @@ class AutoDownloadStorageLimitTest {
             episodeThumbnail = null,
             stream = testStream("https://example.com/$episode.mp4"),
             autoDownloadRuleKey = ruleKey.takeIf { automatic },
+            tripFill = trip,
         )
         return transfers.last()
     }
@@ -98,6 +103,102 @@ class AutoDownloadStorageLimitTest {
 
     private fun Transfer.stopFor(totalBytes: Long?, downloadedBytes: Long = 0) =
         assertNotNull(request.limits).stopFor(downloadedBytes, totalBytes, freeBytes = null)
+
+    @Test
+    fun a_failed_partial_is_resumed_with_the_same_identity_and_trip_limits() {
+        enqueue(1, automatic = false).onProgress(200, 900)
+        DownloadsRepository.pauseDownload(item(1).id)
+        val failed = item(1).copy(status = DownloadStatus.Failed, partialFileKey = "partial-identity")
+        backend.payload = storedPayload(listOf(failed))
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.resumeTripEpisode(failed, com.nuvio.app.features.profiles.ProfileRepository.activeProfileId)
+        assertEquals(failed.id, item(1).id)
+        assertEquals(200, item(1).downloadedBytes)
+        assertEquals("partial-identity", item(1).partialFileKey)
+        assertEquals(DownloadStatus.Downloading, item(1).status)
+        assertEquals(true, item(1).tripFill)
+        assertNotNull(transfers.last().request.limits)
+    }
+
+    @Test
+    fun a_resumed_trip_partial_is_kept_when_the_source_announces_a_bad_file() {
+        enqueue(1, automatic = false, trip = true).onProgress(300_000_000, 800_000_000)
+        DownloadsRepository.pauseDownload(item(1).id)
+        val failed = item(1).copy(status = DownloadStatus.Failed, partialFileKey = "partial-identity", expectedSizeBytes = 800_000_000)
+        backend.payload = storedPayload(listOf(failed))
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.resumeTripEpisode(failed, com.nuvio.app.features.profiles.ProfileRepository.activeProfileId)
+        transfers.last().onProgress(300_000_000, 1_000)
+        assertEquals(DownloadStatus.Failed, item(1).status)
+        assertEquals(DownloadFailureKind.BadFile, item(1).failureKind)
+        assertEquals(300_000_000, item(1).downloadedBytes)
+        assertEquals(800_000_000, item(1).totalBytes)
+        assertEquals("partial-identity", item(1).partialFileKey)
+        assertEquals(0, backend.removedPartials)
+    }
+
+    @Test
+    fun backup_sources_can_keep_all_completed_copies_owned_by_the_run() {
+        val show = TripShowCandidate("series", showId, "Show")
+        val episode = SeasonBatchEpisode("$showId:1:1", 1, 1, null, null, 45)
+        val owned = mutableSetOf<String>()
+        repeat(3) { number ->
+            val id = assertNotNull(DownloadsRepository.enqueueTripEpisode(
+                show, episode, testStream("https://example.com/source-$number.mp4"),
+                com.nuvio.app.features.profiles.ProfileRepository.activeProfileId, owned.toSet(),
+            ))
+            owned += id
+            transfers.last().onSuccess("file:/downloads/$id.mp4", 300)
+        }
+        assertEquals(3, DownloadsRepository.uiState.value.items.size)
+        assertEquals(owned, DownloadsRepository.uiState.value.items.map { it.id }.toSet())
+        assertEquals(true, DownloadsRepository.uiState.value.items.all { it.status == DownloadStatus.Completed })
+        assertEquals(0, backend.removedPartials)
+    }
+
+    @Test
+    fun trip_transfers_enforce_announced_sizes_and_free_space_after_enqueue() {
+        val transfer = enqueue(1, automatic = false, trip = true)
+        val guard = assertNotNull(transfer.request.limits)
+        assertEquals(AutoDownloadStop.StorageLimit, guard.stopBeforeBody(0, 8_000, 50_000))
+        assertEquals(AutoDownloadStop.LowDiskSpace, guard.stopBeforeBody(0, 800, 849))
+        assertNull(guard.stopBeforeBody(0, 800, 850))
+        assertEquals(AutoDownloadStop.StorageLimit, guard.stopFor(1_001, null, 50_000))
+    }
+
+    @Test
+    fun previous_trip_downloads_remain_in_the_budget_after_reload() {
+        enqueue(1, automatic = false, trip = true).onSuccess("file:/downloads/1.mp4", 800)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        assertEquals(800, DownloadsRepository.autoDownloadBytes())
+        assertEquals(AutoDownloadStop.StorageLimit, enqueue(2, automatic = false, trip = true).stopFor(300))
+    }
+
+    @Test
+    fun guarded_trip_enqueue_cannot_replace_an_intervening_download() {
+        enqueue(1, automatic = false).onProgress(200, 900)
+        val original = item(1)
+        DownloadsRepository.enqueueFromStream(
+            "series", "$showId:1:1", showId, "series", "Show", null, null, null, 1, 1, null, null,
+            testStream("https://example.com/replacement.mp4"), tripFill = true, onlyIfAbsent = true,
+        )
+        assertEquals(original.id, item(1).id)
+        assertEquals(200, item(1).downloadedBytes)
+        assertEquals(1, transfers.size)
+    }
+
+    @Test
+    fun guarded_trip_enqueue_rejects_another_profile() {
+        DownloadsRepository.enqueueFromStream(
+            "series", "$showId:1:1", showId, "series", "Show", null, null, null, 1, 1, null, null,
+            testStream("https://example.com/one.mp4"), tripFill = true,
+            expectedProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId + 1,
+        )
+        assertEquals(0, transfers.size)
+    }
 
     @Test
     fun a_download_the_user_starts_has_no_limits() {

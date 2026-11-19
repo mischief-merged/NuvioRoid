@@ -120,6 +120,7 @@ object DownloadsRepository {
 
     private fun removeTransfer(downloadId: String): ActiveTransfer? {
         clearCheck(downloadId)
+        rateTracker.clear(downloadId)
         return activeTransfers.remove(downloadId)
     }
 
@@ -130,6 +131,7 @@ object DownloadsRepository {
     // The transfer that currently owns each download. A transfer that was paused, replaced or removed
     // is no longer in this map, so whatever it reports afterwards is ignored.
     private val activeTransfers = mutableMapOf<String, ActiveTransfer>()
+    internal val rateTracker = DownloadRateTracker()
     @Volatile
     private var finishingSteps = DownloadFinishingSteps()
 
@@ -236,7 +238,10 @@ object DownloadsRepository {
     internal suspend fun prepareForQuit(): Boolean {
         val stopped = synchronized(stateLock) {
             activeTransfers.filterValues { !it.finishing }.toMap().also { transfers ->
-                transfers.keys.forEach { activeTransfers.remove(it) }
+                transfers.keys.forEach { id ->
+                    activeTransfers.remove(id)
+                    rateTracker.clear(id)
+                }
             }.values
         }
         stopped.forEach(ActiveTransfer::cancel)
@@ -260,6 +265,8 @@ object DownloadsRepository {
         if (deferLoadOnThisThread()) return
         loadAfterRecovery()
     }
+
+    internal fun selectProfileForDownloads(select: () -> Unit) = synchronized(stateLock) { select() }
 
     fun onProfileChanged() {
         beforeCatalogLoad()
@@ -286,6 +293,7 @@ object DownloadsRepository {
         val transfers = activeTransfers.values.toList()
         activeTransfers.clear()
         checkingTransfers.clear()
+        rateTracker.clearAll()
         finishingSteps = DownloadFinishingSteps()
         transfers.forEach(ActiveTransfer::cancel)
         progressJob?.cancel()
@@ -423,66 +431,18 @@ object DownloadsRepository {
         autoDownloadRuleKey: String? = null,
         /** The user picked this source for a title that has a finished download: it replaces that download's file. */
         userChoseReplacement: Boolean = false,
+        tripFill: Boolean = false,
+        expectedProfileId: Int? = null,
+        onlyIfAbsent: Boolean = false,
+        allowedExistingIds: Set<String> = emptySet(),
     ): DownloadEnqueueResult {
         ensureLoaded()
         return synchronized(stateLock) {
-            val sourceUrl = stream.playableDirectUrl
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
-                ?: return DownloadEnqueueResult.MissingUrl
-
-            if (!sourceUrl.isSupportedDownloadUrl()) {
-                return DownloadEnqueueResult.UnsupportedFormat
-            }
-            // Nobody looks at the address of a download that starts by itself, so it may only go to a
-            // public host.
-            if (autoDownloadRuleKey != null && !sourceUrl.hasPublicDownloadHost()) {
-                return DownloadEnqueueResult.UnsupportedFormat
-            }
-
-            val now = DownloadsClock.nowEpochMs()
-            val logicalKey = buildLogicalKey(
-                parentMetaId = parentMetaId,
-                seasonNumber = seasonNumber,
-                episodeNumber = episodeNumber,
-            )
-
-            var replacedExisting = false
-            val currentItems = _uiState.value.items.toMutableList()
-            // The sources this title had, and how many the app started by itself, go on with the new download.
-            val history = sourceHistoryFor(currentItems.filter { it.logicalContentKey == logicalKey }, stream, userChoseReplacement)
-            // What is replaced: a download that has no finished file. A finished file, marked as not the
-            // real video or not, is a stored file of the user: it is replaced only when the user chose
-            // to ([userChoseReplacement]), and then a marked one goes to the trash. Anything automatic
-            // leaves it and its record where they are and fetches the new copy beside it, under a name
-            // and a record of its own.
-            val replaced = currentItems.filter { item ->
-                item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed) &&
-                    !(item.awaitingCheck && item.localFileUri != null)
-            }
-            replaced.forEach { existing ->
-                replacedExisting = true
-                removeTransfer(existing.id)?.cancel()
-                currentItems.removeAll { it.id == existing.id }
-            }
-
-            val downloadId = nextDownloadId(now)
-            val fileName = buildFileName(
-                title = title,
-                seasonNumber = seasonNumber,
-                episodeNumber = episodeNumber,
-                episodeTitle = episodeTitle,
-                fallbackTitle = stream.streamLabel,
-                sourceUrl = sourceUrl,
-                downloadId = downloadId,
-            )
-
-            val item = DownloadItem(
-                id = downloadId,
+            enqueueFromStreamLocked(
                 contentType = contentType,
+                videoId = videoId,
                 parentMetaId = parentMetaId,
                 parentMetaType = parentMetaType,
-                videoId = videoId,
                 title = title,
                 logo = logo,
                 poster = poster,
@@ -491,70 +451,222 @@ object DownloadsRepository {
                 episodeNumber = episodeNumber,
                 episodeTitle = episodeTitle,
                 episodeThumbnail = episodeThumbnail,
-                streamTitle = stream.streamLabel,
-                streamSubtitle = stream.streamSubtitle,
-                providerName = stream.addonName,
-                providerAddonId = stream.addonId,
-                sourceUrl = sourceUrl,
-                sourceHeaders = sanitizeDownloadRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
-                sourceResponseHeaders = sanitizeDownloadResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
-                subtitleRequests = addonSubtitleRequests(
-                    type = contentType,
-                    videoId = videoId,
-                    extras = SubtitleRequestExtras.from(stream.behaviorHints, sourceUrl),
-                ),
-                sourceSubtitles = stream.externalSubtitles,
-                localFileUri = null,
-                fileName = fileName,
-                // A show stays where its downloaded episodes are; a movie goes to the default location.
-                locationId = backend.placementFor(currentItems, parentMetaId, seasonNumber != null && episodeNumber != null),
-                status = DownloadStatus.Downloading,
-                downloadedBytes = 0L,
-                totalBytes = null,
-                errorMessage = null,
-                createdAtEpochMs = now,
-                updatedAtEpochMs = now,
-                expectedVideoHash = stream.behaviorHints.videoHash.asVideoHash(),
+                stream = stream,
                 autoDownloadRuleKey = autoDownloadRuleKey,
-                triedSources = history.triedSources,
-                autoSourceAttempts = history.autoSourceAttempts,
-                sourceInfoHash = (stream.p2pInfoHash ?: stream.clientResolve?.infoHash)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
-                sourceFileIdx = stream.p2pFileIdx ?: stream.clientResolve?.fileIdx,
-                sourceFilename = stream.behaviorHints.filename ?: stream.clientResolve?.filename ?: stream.clientResolve?.stream?.raw?.filename,
-                sourceFileSizeBytes = (stream.behaviorHints.videoSize ?: stream.clientResolve?.stream?.raw?.size ?: stream.debridCacheStatus?.cachedSize)?.takeIf { it > 0L },
-                sourceBingeGroup = stream.behaviorHints.bingeGroup?.trim()?.takeIf { it.isNotEmpty() },
-                sourceDebridResolved = stream.debridResolved,
-                sourceClientResolve = stream.toDownloadClientResolve(),
+                userChoseReplacement = userChoseReplacement,
+                tripFill = tripFill,
+                expectedProfileId = expectedProfileId,
+                onlyIfAbsent = onlyIfAbsent,
+                allowedExistingIds = allowedExistingIds,
             )
+        }
+    }
 
-            // The size the source claims for the selected file, where that is established (see SourceSizeClaim).
-            val claimed = usableSizeClaim(stream, item.isEpisode, runtimeMinutesOf(item))
-            val queued = item.copy(expectedSizeBytes = claimed)
+    private fun enqueueFromStreamLocked(
+        contentType: String,
+        videoId: String,
+        parentMetaId: String,
+        parentMetaType: String,
+        title: String,
+        logo: String?,
+        poster: String?,
+        background: String?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        episodeTitle: String?,
+        episodeThumbnail: String?,
+        stream: StreamItem,
+        autoDownloadRuleKey: String? = null,
+        userChoseReplacement: Boolean = false,
+        tripFill: Boolean = false,
+        expectedProfileId: Int? = null,
+        onlyIfAbsent: Boolean = false,
+        allowedExistingIds: Set<String> = emptySet(),
+    ): DownloadEnqueueResult {
+        if (expectedProfileId != null && (loadedProfileId != expectedProfileId ||
+                com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != expectedProfileId)) {
+            return DownloadEnqueueResult.MissingUrl
+        }
 
-            currentItems.add(0, queued)
-            publish(currentItems)
-            // The list without the old record is on disk first; only then does its file go, so a crash or a
-            // failed save can leave a file without a record, never a record whose file is in the Trash.
-            val savedDurably = persist(durably = replaced.isNotEmpty())
-            replaced.forEach { existing ->
-                val oldUri = playableLocalFileUri(existing) ?: existing.localFileUri
-                // The old file goes to the Trash (a flagged placeholder too, so it can be looked at), and only when
-                // no other record of any profile uses it; where that cannot be told it stays where it is.
-                val keep = !savedDurably || oldUri != null &&
-                    backend.ownershipOf(existing, oldUri).let { it == FileOwnership.Owned || it == FileOwnership.Unknown }
-                if (!keep) {
-                    if (existing.isPlaceholder) oldUri?.let(backend::trashFile) else backend.discardFile(oldUri)
-                    // Each source has its own destination. Leave the previous partial file for the user.
-                }
-            }
-            startDownload(queued)
+        val sourceUrl = stream.playableDirectUrl
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: return DownloadEnqueueResult.MissingUrl
 
-            if (replacedExisting) {
-                DownloadEnqueueResult.Replaced
-            } else {
-                DownloadEnqueueResult.Started
+        if (!sourceUrl.isSupportedDownloadUrl()) {
+            return DownloadEnqueueResult.UnsupportedFormat
+        }
+        // Nobody looks at the address of a download that starts by itself, so it may only go to a
+        // public host.
+        if (autoDownloadRuleKey != null && !sourceUrl.hasPublicDownloadHost()) {
+            return DownloadEnqueueResult.UnsupportedFormat
+        }
+
+        val now = DownloadsClock.nowEpochMs()
+        val logicalKey = buildLogicalKey(
+            parentMetaId = parentMetaId,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+
+        if (onlyIfAbsent && _uiState.value.items.any { item ->
+                item.logicalContentKey == logicalKey && !item.isPlaceholder && (
+                    item.id !in allowedExistingIds || item.hasTripPartial ||
+                        item.status == DownloadStatus.Downloading || item.status == DownloadStatus.Paused
+                    )
+            }) return DownloadEnqueueResult.MissingUrl
+
+        var replacedExisting = false
+        val currentItems = _uiState.value.items.toMutableList()
+        val destinationLocationId = backend.placementFor(currentItems, parentMetaId, seasonNumber != null && episodeNumber != null)
+        // The sources this title had, and how many the app started by itself, go on with the new download.
+        val history = sourceHistoryFor(currentItems.filter { it.logicalContentKey == logicalKey }, stream, userChoseReplacement)
+        // What is replaced: a download that has no finished file. A finished file, marked as not the
+        // real video or not, is a stored file of the user: it is replaced only when the user chose
+        // to ([userChoseReplacement]), and then a marked one goes to the trash. Anything automatic
+        // leaves it and its record where they are and fetches the new copy beside it, under a name
+        // and a record of its own.
+        val replaced = currentItems.filter { item ->
+            item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed) &&
+                !(item.awaitingCheck && item.localFileUri != null)
+        }
+        replaced.forEach { existing ->
+            replacedExisting = true
+            removeTransfer(existing.id)?.cancel()
+            currentItems.removeAll { it.id == existing.id }
+        }
+
+        val downloadId = nextDownloadId(now)
+        val fileName = buildFileName(
+            title = title,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            episodeTitle = episodeTitle,
+            fallbackTitle = stream.streamLabel,
+            sourceUrl = sourceUrl,
+            downloadId = downloadId,
+        )
+
+        val item = DownloadItem(
+            id = downloadId,
+            contentType = contentType,
+            parentMetaId = parentMetaId,
+            parentMetaType = parentMetaType,
+            videoId = videoId,
+            title = title,
+            logo = logo,
+            poster = poster,
+            background = background,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            episodeTitle = episodeTitle,
+            episodeThumbnail = episodeThumbnail,
+            streamTitle = stream.streamLabel,
+            streamSubtitle = stream.streamSubtitle,
+            providerName = stream.addonName,
+            providerAddonId = stream.addonId,
+            sourceUrl = sourceUrl,
+            sourceHeaders = sanitizeDownloadRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
+            sourceResponseHeaders = sanitizeDownloadResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
+            subtitleRequests = addonSubtitleRequests(
+                type = contentType,
+                videoId = videoId,
+                extras = SubtitleRequestExtras.from(stream.behaviorHints, sourceUrl),
+            ),
+            sourceSubtitles = stream.externalSubtitles,
+            localFileUri = null,
+            fileName = fileName,
+            // A show stays where its downloaded episodes are; a movie goes to the default location.
+            locationId = destinationLocationId,
+            status = DownloadStatus.Downloading,
+            downloadedBytes = 0L,
+            totalBytes = null,
+            errorMessage = null,
+            createdAtEpochMs = now,
+            updatedAtEpochMs = now,
+            expectedVideoHash = stream.behaviorHints.videoHash.asVideoHash(),
+            autoDownloadRuleKey = autoDownloadRuleKey,
+            tripFill = tripFill,
+            triedSources = history.triedSources,
+            autoSourceAttempts = history.autoSourceAttempts,
+            sourceInfoHash = (stream.p2pInfoHash ?: stream.clientResolve?.infoHash)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
+            sourceFileIdx = stream.p2pFileIdx ?: stream.clientResolve?.fileIdx,
+            sourceFilename = stream.behaviorHints.filename ?: stream.clientResolve?.filename ?: stream.clientResolve?.stream?.raw?.filename,
+            sourceFileSizeBytes = (stream.behaviorHints.videoSize ?: stream.clientResolve?.stream?.raw?.size ?: stream.debridCacheStatus?.cachedSize)?.takeIf { it > 0L },
+            sourceBingeGroup = stream.behaviorHints.bingeGroup?.trim()?.takeIf { it.isNotEmpty() },
+            sourceDebridResolved = stream.debridResolved,
+            sourceClientResolve = stream.toDownloadClientResolve(),
+        )
+
+        // The size the source claims for the selected file, where that is established (see SourceSizeClaim).
+        val claimed = usableSizeClaim(stream, item.isEpisode, runtimeMinutesOf(item))
+        val queued = item.copy(expectedSizeBytes = claimed)
+
+        currentItems.add(0, queued)
+        publish(currentItems)
+        // The list without the old record is on disk first; only then does its file go, so a crash or a
+        // failed save can leave a file without a record, never a record whose file is in the Trash.
+        val savedDurably = persist(durably = replaced.isNotEmpty())
+        replaced.forEach { existing ->
+            val oldUri = playableLocalFileUri(existing) ?: existing.localFileUri
+            // The old file goes to the Trash (a flagged placeholder too, so it can be looked at), and only when
+            // no other record of any profile uses it; where that cannot be told it stays where it is.
+            val keep = !savedDurably || oldUri != null &&
+                backend.ownershipOf(existing, oldUri).let { it == FileOwnership.Owned || it == FileOwnership.Unknown }
+            if (!keep) {
+                if (existing.isPlaceholder) oldUri?.let(backend::trashFile) else backend.discardFile(oldUri)
+                // Each source has its own destination. Leave the previous partial file for the user.
             }
         }
+        startDownload(queued)
+
+        return if (replacedExisting) {
+            DownloadEnqueueResult.Replaced
+        } else {
+            DownloadEnqueueResult.Started
+        }
+    }
+
+    internal fun enqueueTripEpisode(
+        show: TripShowCandidate,
+        episode: SeasonBatchEpisode,
+        stream: StreamItem,
+        profileId: Int?,
+        allowedExistingIds: Set<String>,
+    ): String? {
+        ensureLoaded()
+        return synchronized(stateLock) {
+            val result = enqueueFromStreamLocked(
+                show.parentMetaType, episode.videoId, show.parentMetaId, show.parentMetaType, show.title,
+                show.logo, show.poster, show.background, episode.seasonNumber, episode.episodeNumber,
+                episode.title, episode.thumbnail, stream, tripFill = true, expectedProfileId = profileId,
+                onlyIfAbsent = true, allowedExistingIds = allowedExistingIds,
+            )
+            if (result != DownloadEnqueueResult.Started && result != DownloadEnqueueResult.Replaced) return@synchronized null
+            _uiState.value.items.firstOrNull {
+                it.parentMetaId == show.parentMetaId &&
+                    it.seasonNumber == episode.seasonNumber &&
+                    it.episodeNumber == episode.episodeNumber
+            }?.id
+        }
+    }
+
+    internal fun resumeTripEpisode(item: DownloadItem, profileId: Int?) {
+        ensureLoaded()
+        synchronized(stateLock) {
+            if (loadedProfileId != profileId || com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != profileId) return
+            if (_uiState.value.items.any { it.id == item.id && it.hasTripPartial }) {
+                mutateItem(item.id) { it.copy(tripFill = true) }
+                resumeDownloadLocked(item.id)
+            }
+        }
+    }
+
+    internal fun tripDestination(parentMetaId: String): TripDestination {
+        val state = DownloadFolders.controller.state.value
+        val locationId = backend.placementFor(_uiState.value.items, parentMetaId, true)
+        val location = state.location(locationId)
+        return TripDestination(location?.volumeKey ?: locationId.orEmpty(), location?.freeBytes)
     }
 
     /**
@@ -979,6 +1091,7 @@ object DownloadsRepository {
             synchronized(stateLock) {
                 if (catalogLoadingThread === Thread.currentThread()) catalogLoadingThread = null
             }
+            if (backend === PlatformDownloadsBackend) TripFillHost.onProfileLoaded(published.first)
         }
     }
 
@@ -1125,6 +1238,7 @@ object DownloadsRepository {
         // On a limited connection a download waits instead of starting, and goes on when that ends.
         // A file already on disk that only needs its check is not a transfer, so a hold does not stop it.
         if (!item.awaitingCheck && item.connectionHoldReason() != null) {
+            rateTracker.clear(item.id)
             mutateItem(item.id) { it.waitingForConnection() }
             return
         }
@@ -1158,6 +1272,7 @@ object DownloadsRepository {
             }
             return
         }
+        rateTracker.recordStart(item.id, item.downloadedBytes, DownloadsClock.nowEpochMs())
 
         val handle = backend.start(
             DownloadPlatformRequest(
@@ -1272,6 +1387,8 @@ object DownloadsRepository {
                 ifCurrent(item.id, transfer) {
                     val currentItem = _uiState.value.items.firstOrNull { it.id == item.id } ?: item
                     if (failIfAnnouncedAsPlaceholder(currentItem, totalBytes)) return@ifCurrent
+                    val now = DownloadsClock.nowEpochMs()
+                    rateTracker.recordProgress(item.id, downloadedBytes, now)
                     mutateItem(item.id, progressOnly = true) { current ->
                         if (current.status != DownloadStatus.Downloading) {
                             current
@@ -1279,7 +1396,7 @@ object DownloadsRepository {
                             current.copy(
                                 downloadedBytes = downloadedBytes.coerceAtLeast(0L),
                                 totalBytes = totalBytes?.takeIf { it > 0L },
-                                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                                updatedAtEpochMs = now,
                                 errorMessage = null,
                             )
                         }
@@ -1600,13 +1717,16 @@ object DownloadsRepository {
             else -> return false
         }
         removeTransfer(item.id)?.cancel()
-        backend.removeActivePartialOf(item)
+        if (!item.tripFill) backend.removeActivePartialOf(item)
         mutateItem(item.id) { current ->
             if (current.status != DownloadStatus.Downloading) {
                 current
             } else {
                 current.failedAsPlaceholder(reason)
-                    .copy(totalBytes = announcedBytes, downloadedBytes = 0L)
+                    .copy(
+                        totalBytes = if (current.tripFill && current.downloadedBytes > 0L) current.totalBytes else announcedBytes,
+                        downloadedBytes = if (current.tripFill) current.downloadedBytes else 0L,
+                    )
             }
         }
         return true
@@ -1804,6 +1924,13 @@ object DownloadsRepository {
         updatedAtEpochMs = DownloadsClock.nowEpochMs(),
     )
 
+    internal fun transferBytesPerSecond(downloadId: String, nowEpochMs: Long = DownloadsClock.nowEpochMs()): Long? =
+        rateTracker.bytesPerSecond(downloadId, nowEpochMs)
+
+    internal fun autoDownloadStorageLimitBytes(): Long? = autoDownloadLimits.storageLimitBytes()
+
+    internal fun autoDownloadMinFreeBytes(): Long = autoDownloadLimits.minFreeBytes
+
     /**
      * The bytes automatic downloads take: what each has recorded as downloaded, and for a running
      * transfer the full size once the server announced it.
@@ -1811,17 +1938,17 @@ object DownloadsRepository {
     internal fun autoDownloadBytes(exceptDownloadId: String? = null): Long =
         _uiState.value.items
             // Locations that are away are not counted; nothing is ever deleted to make room because of them.
-            .filter { it.autoDownloadRuleKey != null && it.id != exceptDownloadId && backend.isConnected(it) }
+            .filter { (it.autoDownloadRuleKey != null || it.tripFill) && it.id != exceptDownloadId && backend.isConnected(it) }
             .sumOf { item ->
-                if (item.status == DownloadStatus.Downloading) {
-                    maxOf(item.totalBytes ?: 0L, item.downloadedBytes)
+                if (item.status == DownloadStatus.Downloading || (item.tripFill && item.status == DownloadStatus.Paused)) {
+                    maxOf(item.totalBytes ?: (item.expectedSizeBytes.takeIf { item.tripFill }) ?: 0L, item.downloadedBytes)
                 } else {
                     item.downloadedBytes
                 }
             }
 
     private fun autoTransferLimits(item: DownloadItem, transfer: ActiveTransfer): DownloadTransferLimits? {
-        if (item.autoDownloadRuleKey == null) return null
+        if (item.autoDownloadRuleKey == null && !item.tripFill) return null
         val limits = autoDownloadLimits
         return DownloadTransferLimits(
             maxTotalBytes = { limits.storageLimitBytes()?.let { it - autoDownloadBytes(exceptDownloadId = item.id) } },
