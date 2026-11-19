@@ -209,8 +209,10 @@ static constexpr double kMaxVolumePercent = 200.0;
 - (void)focusControlsWebViewIfNeeded;
 - (void)layoutNativeSubviews;
 - (void)dispatchMediaKeyPlayerEvent:(NSString *)type;
+- (void)dispatchMediaSeekToMilliseconds:(long long)positionMs;
 - (void)activateRemoteCommands;
 - (void)deactivateRemoteCommands;
+- (void)pushCurrentNowPlayingInfoFromCache;
 - (void)setNowPlayingArtworkUrlString:(NSString *)urlString;
 - (void)setNowPlayingTitle:(NSString *)title subtitle:(NSString *)subtitle artworkUrl:(NSString *)artworkUrl;
 - (void)updateNowPlayingWithTitle:(NSString *)title
@@ -1132,6 +1134,12 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     NSPoint _windowTrackingStartMouse;
     NSRect _windowTrackingStartFrame;
     BOOL _remoteCommandsActive;
+    id _toggleCommandTarget;
+    id _playCommandTarget;
+    id _pauseCommandTarget;
+    id _nextCommandTarget;
+    id _previousCommandTarget;
+    id _changePositionCommandTarget;
     NSString *_lastNowPlayingTitle;
     BOOL _lastNowPlayingPaused;
     double _lastNowPlayingDuration;
@@ -2161,6 +2169,8 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     mpv_set_property(_mpv, "pause", MPV_FORMAT_FLAG, &flag);
     [self storeCachedPosition:[self estimatedPositionSeconds] at:CACurrentMediaTime()];
     _cachedPaused.store(paused);
+    _nowPlayingMetadataDirty = YES;
+    [self pushCurrentNowPlayingInfoFromCache];
 }
 
 - (BOOL)isPaused {
@@ -2180,6 +2190,8 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     const char *command[] = {"seek", seconds.c_str(), "absolute+exact", NULL};
     mpv_command(_mpv, command);
     [self storeCachedPosition:(double)positionMs / 1000.0 at:CACurrentMediaTime()];
+    _nowPlayingMetadataDirty = YES;
+    [self pushCurrentNowPlayingInfoFromCache];
 }
 
 - (void)seekByMilliseconds:(long long)offsetMs {
@@ -2187,7 +2199,9 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     std::string seconds = std::to_string((double)offsetMs / 1000.0);
     const char *command[] = {"seek", seconds.c_str(), "relative+exact", NULL};
     mpv_command(_mpv, command);
-    [self storeCachedPosition:[self estimatedPositionSeconds] + ((double)offsetMs / 1000.0) at:CACurrentMediaTime()];
+    [self storeCachedPosition:fmax(0.0, [self estimatedPositionSeconds] + ((double)offsetMs / 1000.0)) at:CACurrentMediaTime()];
+    _nowPlayingMetadataDirty = YES;
+    [self pushCurrentNowPlayingInfoFromCache];
 }
 
 - (void)setSpeed:(double)speed {
@@ -2934,10 +2948,14 @@ static void nuvioMpvWakeup(void *ctx) {
             eventType = @"keyboardToggle";
             break;
         case NX_KEYTYPE_NEXT:
+            eventType = @"mediaNext";
+            break;
         case NX_KEYTYPE_FAST:
             eventType = @"keyboardSeekForward";
             break;
         case NX_KEYTYPE_PREVIOUS:
+            eventType = @"mediaPrevious";
+            break;
         case NX_KEYTYPE_REWIND:
             eventType = @"keyboardSeekBack";
             break;
@@ -2974,34 +2992,74 @@ static void nuvioMpvWakeup(void *ctx) {
     _remoteCommandsActive = YES;
     __weak MpvWebPlayer *weakSelf = self;
     MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
-    [center.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        [weakSelf dispatchMediaKeyPlayerEvent:@"keyboardToggle"];
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    [center.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        MpvWebPlayer *strongSelf = weakSelf;
-        if (strongSelf && strongSelf->_cachedPaused.load()) {
+
+    center.togglePlayPauseCommand.enabled = YES;
+    _toggleCommandTarget = [center.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"keyboardToggle"];
+        });
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+
+    center.playCommand.enabled = YES;
+    _playCommandTarget = [center.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPlay"];
+        });
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+
+    center.pauseCommand.enabled = YES;
+    _pauseCommandTarget = [center.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPause"];
+        });
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+
+    center.nextTrackCommand.enabled = YES;
+    _nextCommandTarget = [center.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            [strongSelf dispatchMediaKeyPlayerEvent:@"mediaNext"];
+        });
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+
+    center.previousTrackCommand.enabled = YES;
+    _previousCommandTarget = [center.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPrevious"];
+        });
+        return MPRemoteCommandHandlerStatusSuccess;
+    }];
+
+    center.changePlaybackPositionCommand.enabled = YES;
+    _changePositionCommandTarget = [center.changePlaybackPositionCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
+        if (![event isKindOfClass:[MPChangePlaybackPositionCommandEvent class]]) {
+            return MPRemoteCommandHandlerStatusCommandFailed;
         }
+        double requestedSeconds = fmax(0.0, ((MPChangePlaybackPositionCommandEvent *)event).positionTime);
+        long long targetMs = (long long)llround(requestedSeconds * 1000.0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MpvWebPlayer *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            [strongSelf dispatchMediaSeekToMilliseconds:targetMs];
+        });
         return MPRemoteCommandHandlerStatusSuccess;
     }];
-    [center.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        MpvWebPlayer *strongSelf = weakSelf;
-        if (strongSelf && !strongSelf->_cachedPaused.load()) {
-            [strongSelf dispatchMediaKeyPlayerEvent:@"keyboardToggle"];
-        }
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    [center.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        [weakSelf dispatchMediaKeyPlayerEvent:@"keyboardSeekForward"];
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    [center.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
-        [weakSelf dispatchMediaKeyPlayerEvent:@"keyboardSeekBack"];
-        return MPRemoteCommandHandlerStatusSuccess;
-    }];
-    MPNowPlayingInfoCenter *info = [MPNowPlayingInfoCenter defaultCenter];
-    info.playbackState = MPNowPlayingPlaybackStatePlaying;
+
+    _nowPlayingMetadataDirty = YES;
+    [self pushCurrentNowPlayingInfoFromCache];
 }
 
 - (void)deactivateRemoteCommands {
@@ -3010,15 +3068,46 @@ static void nuvioMpvWakeup(void *ctx) {
     }
     _remoteCommandsActive = NO;
     MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
-    [center.togglePlayPauseCommand removeTarget:nil];
-    [center.playCommand removeTarget:nil];
-    [center.pauseCommand removeTarget:nil];
-    [center.nextTrackCommand removeTarget:nil];
-    [center.previousTrackCommand removeTarget:nil];
+    if (_toggleCommandTarget) {
+        [center.togglePlayPauseCommand removeTarget:_toggleCommandTarget];
+        _toggleCommandTarget = nil;
+    }
+    center.togglePlayPauseCommand.enabled = NO;
+    if (_playCommandTarget) {
+        [center.playCommand removeTarget:_playCommandTarget];
+        _playCommandTarget = nil;
+    }
+    center.playCommand.enabled = NO;
+    if (_pauseCommandTarget) {
+        [center.pauseCommand removeTarget:_pauseCommandTarget];
+        _pauseCommandTarget = nil;
+    }
+    center.pauseCommand.enabled = NO;
+    if (_nextCommandTarget) {
+        [center.nextTrackCommand removeTarget:_nextCommandTarget];
+        _nextCommandTarget = nil;
+    }
+    center.nextTrackCommand.enabled = NO;
+    if (_previousCommandTarget) {
+        [center.previousTrackCommand removeTarget:_previousCommandTarget];
+        _previousCommandTarget = nil;
+    }
+    center.previousTrackCommand.enabled = NO;
+    if (_changePositionCommandTarget) {
+        [center.changePlaybackPositionCommand removeTarget:_changePositionCommandTarget];
+        _changePositionCommandTarget = nil;
+    }
+    center.changePlaybackPositionCommand.enabled = NO;
+
     MPNowPlayingInfoCenter *info = [MPNowPlayingInfoCenter defaultCenter];
     info.playbackState = MPNowPlayingPlaybackStateStopped;
     info.nowPlayingInfo = nil;
     _lastNowPlayingTitle = nil;
+    _lastNowPlayingPaused = YES;
+    _lastNowPlayingDuration = 0.0;
+    _lastNowPlayingPosition = 0.0;
+    _lastNowPlayingSpeed = 1.0;
+    _nowPlayingMetadataDirty = NO;
     [_nowPlayingArtworkTask cancel];
     _nowPlayingArtworkTask = nil;
     _nowPlayingArtwork = nil;
@@ -3028,7 +3117,7 @@ static void nuvioMpvWakeup(void *ctx) {
 }
 
 - (void)setNowPlayingArtworkUrlString:(NSString *)urlString {
-    NSString *cleaned = urlString ?: @"";
+    NSString *cleaned = [urlString ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if ([cleaned isEqualToString:_nowPlayingArtworkUrl ?: @""]) {
         return;
     }
@@ -3036,19 +3125,26 @@ static void nuvioMpvWakeup(void *ctx) {
     [_nowPlayingArtworkTask cancel];
     _nowPlayingArtworkTask = nil;
     _nowPlayingArtwork = nil;
-    NSURL *url = (cleaned.length > 0) ? [NSURL URLWithString:cleaned] : nil;
+    if (cleaned.length == 0) {
+        _nowPlayingMetadataDirty = YES;
+        [self pushCurrentNowPlayingInfoFromCache];
+        return;
+    }
+    NSURL *url = [cleaned hasPrefix:@"/"]
+        ? [NSURL fileURLWithPath:cleaned]
+        : [NSURL URLWithString:cleaned];
     if (!url) {
-        [self pushNowPlayingArtwork];
+        _nowPlayingMetadataDirty = YES;
+        [self pushCurrentNowPlayingInfoFromCache];
         return;
     }
     __weak MpvWebPlayer *weakSelf = self;
-    _nowPlayingArtworkTask = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
+    auto applyImageData = ^(NSData *data) {
+        if (!data || data.length == 0) {
             return;
         }
         NSImage *image = [[NSImage alloc] initWithData:data];
-        if (!image) {
+        if (!image || image.size.width <= 0.0 || image.size.height <= 0.0) {
             return;
         }
         MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
@@ -3062,8 +3158,23 @@ static void nuvioMpvWakeup(void *ctx) {
             }
             strongSelf->_nowPlayingArtwork = artwork;
             strongSelf->_nowPlayingArtworkTask = nil;
-            [strongSelf pushNowPlayingArtwork];
+            strongSelf->_nowPlayingMetadataDirty = YES;
+            [strongSelf pushCurrentNowPlayingInfoFromCache];
         });
+    };
+    if (url.isFileURL) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSData *data = [NSData dataWithContentsOfURL:url];
+            applyImageData(data);
+        });
+        return;
+    }
+    _nowPlayingArtworkTask = [[NSURLSession sharedSession] dataTaskWithURL:url
+                                                         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            return;
+        }
+        applyImageData(data);
     }];
     [_nowPlayingArtworkTask resume];
 }
@@ -3073,29 +3184,47 @@ static void nuvioMpvWakeup(void *ctx) {
 - (void)setNowPlayingTitle:(NSString *)title subtitle:(NSString *)subtitle artworkUrl:(NSString *)artworkUrl {
     NSString *cleanTitle = title ?: @"";
     NSString *cleanSubtitle = subtitle ?: @"";
-    if (![cleanTitle isEqualToString:_nowPlayingTitleOverride ?: @""]
-        || ![cleanSubtitle isEqualToString:_nowPlayingSubtitle ?: @""]) {
+    BOOL metadataChanged = ![cleanTitle isEqualToString:_nowPlayingTitleOverride ?: @""]
+        || ![cleanSubtitle isEqualToString:_nowPlayingSubtitle ?: @""];
+    if (metadataChanged) {
         _nowPlayingTitleOverride = cleanTitle;
         _nowPlayingSubtitle = cleanSubtitle;
         _nowPlayingMetadataDirty = YES;
     }
     [self setNowPlayingArtworkUrlString:artworkUrl];
+    if (metadataChanged) {
+        [self pushCurrentNowPlayingInfoFromCache];
+    }
 }
 
-// Merges the artwork into whatever now-playing info is currently published,
-// without waiting for the next periodic update.
+- (void)pushCurrentNowPlayingInfoFromCache {
+    if (!_remoteCommandsActive) {
+        return;
+    }
+    if (!NSThread.isMainThread) {
+        __weak MpvWebPlayer *weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf pushCurrentNowPlayingInfoFromCache];
+        });
+        return;
+    }
+    double duration = fmax(0.0, _cachedDurationSeconds.load());
+    double position = fmax(0.0, [self estimatedPositionSeconds]);
+    BOOL paused = _cachedPaused.load();
+    double speed = fmax(0.25, _cachedSpeed.load());
+    _nowPlayingMetadataDirty = YES;
+    [self updateNowPlayingWithTitle:_lastNowPlayingTitle
+                           duration:duration
+                           position:position
+                             paused:paused
+                              speed:speed];
+}
+
 - (void)pushNowPlayingArtwork {
     if (!_remoteCommandsActive) {
         return;
     }
-    MPNowPlayingInfoCenter *info = [MPNowPlayingInfoCenter defaultCenter];
-    NSMutableDictionary *nowPlaying = [info.nowPlayingInfo mutableCopy] ?: [NSMutableDictionary dictionary];
-    if (_nowPlayingArtwork) {
-        nowPlaying[MPMediaItemPropertyArtwork] = _nowPlayingArtwork;
-    } else {
-        [nowPlaying removeObjectForKey:MPMediaItemPropertyArtwork];
-    }
-    info.nowPlayingInfo = nowPlaying;
+    [self pushCurrentNowPlayingInfoFromCache];
 }
 
 - (void)updateNowPlayingWithTitle:(NSString *)title
@@ -3125,7 +3254,7 @@ static void nuvioMpvWakeup(void *ctx) {
     _nowPlayingMetadataDirty = NO;
     _lastNowPlayingPaused = paused;
     _lastNowPlayingDuration = duration;
-    _lastNowPlayingPosition = position;
+    _lastNowPlayingPosition = fmax(0.0, position);
     _lastNowPlayingSpeed = speed;
     _lastNowPlayingTitle = displayTitle;
     _lastNowPlayingPushedAt = now;
@@ -3138,7 +3267,7 @@ static void nuvioMpvWakeup(void *ctx) {
     if (duration > 0.0) {
         nowPlaying[MPMediaItemPropertyPlaybackDuration] = @(duration);
     }
-    nowPlaying[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(position);
+    nowPlaying[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(fmax(0.0, position));
     nowPlaying[MPNowPlayingInfoPropertyPlaybackRate] = @(paused ? 0.0 : speed);
     if (_nowPlayingArtwork) {
         nowPlaying[MPMediaItemPropertyArtwork] = _nowPlayingArtwork;
@@ -3148,19 +3277,50 @@ static void nuvioMpvWakeup(void *ctx) {
     info.playbackState = paused ? MPNowPlayingPlaybackStatePaused : MPNowPlayingPlaybackStatePlaying;
 }
 
+- (void)dispatchMediaSeekToMilliseconds:(long long)positionMs {
+    long long clampedMs = positionMs > 0 ? positionMs : 0;
+    if (_eventSink && _eventMethod) {
+        [self storeCachedPosition:(double)clampedMs / 1000.0 at:CACurrentMediaTime()];
+        _nowPlayingMetadataDirty = YES;
+        [self pushCurrentNowPlayingInfoFromCache];
+        [self sendPlayerEvent:@"scrubFinish" value:(double)clampedMs];
+        return;
+    }
+    [self seekToMilliseconds:clampedMs];
+    [self syncControls];
+}
+
 - (void)dispatchMediaKeyPlayerEvent:(NSString *)type {
+    if ([type isEqualToString:@"mediaPlay"] || [type isEqualToString:@"mediaPause"]) {
+        BOOL shouldPlay = [type isEqualToString:@"mediaPlay"];
+        if (shouldPlay && [self isEnded]) {
+            [self seekToMilliseconds:0];
+        }
+        [self setPaused:!shouldPlay];
+        [self syncControls];
+        if (_eventSink && _eventMethod) {
+            [self sendPlayerEvent:type value:shouldPlay ? 1.0 : 0.0];
+        }
+        return;
+    }
+
     if (_eventSink && _eventMethod) {
         [self sendPlayerEvent:type value:0.0];
         return;
     }
 
     if ([type isEqualToString:@"keyboardToggle"]) {
-        [self setPaused:![self isPaused]];
+        if ([self isEnded]) {
+            [self seekToMilliseconds:0];
+            [self setPaused:NO];
+        } else {
+            [self setPaused:![self isPaused]];
+        }
         [self syncControls];
-    } else if ([type isEqualToString:@"keyboardSeekForward"]) {
+    } else if ([type isEqualToString:@"keyboardSeekForward"] || [type isEqualToString:@"mediaNext"]) {
         [self seekByMilliseconds:10 * 1000];
         [self syncControls];
-    } else if ([type isEqualToString:@"keyboardSeekBack"]) {
+    } else if ([type isEqualToString:@"keyboardSeekBack"] || [type isEqualToString:@"mediaPrevious"]) {
         [self seekByMilliseconds:-10 * 1000];
         [self syncControls];
     }

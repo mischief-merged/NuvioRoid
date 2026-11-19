@@ -14,6 +14,8 @@ import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaScreenSettingsUiState
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.DownloadItem
+import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsUiState
 import com.nuvio.app.features.p2p.P2pStreamingState
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
@@ -81,8 +83,14 @@ internal data class PendingEngineSwitchTrackPreference(
     val subtitleApplied: Boolean = false,
 )
 
+internal data class PlayerEpisodeCardState(val episode: NextEpisodeInfo, val isPrevious: Boolean)
+
 internal class PlayerScreenRuntime(
     args: PlayerScreenArgs,
+    val episodePlaybackOffline: () -> Boolean = ::isNetworkOffline,
+    val findEpisodeDownload: (String, MetaVideo) -> DownloadItem? = { parentId, video ->
+        DownloadsRepository.findPlayableDownload(parentId, video.season, video.episode, video.id)
+    },
 ) {
     var args by mutableStateOf(args)
 
@@ -287,6 +295,13 @@ internal class PlayerScreenRuntime(
     var sleepTimer by mutableStateOf(SleepTimerState())
     var sleepTimerRemainingLabel by mutableStateOf("")
     var lastSleepTimerEpisodeKey: String? = null
+    var nextEpisodeAutoPlayTarget by mutableStateOf<PlayerEpisodeCardState?>(null)
+    val episodeCardState: PlayerEpisodeCardState?
+        get() = (nextEpisodeAutoPlayTarget ?: nextEpisodeInfo?.let {
+            PlayerEpisodeCardState(it, isPrevious = false)
+        })?.takeIf {
+            isSeries && (showNextEpisodeCard || nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null)
+        }
     var nextEpisodePreloadJob by mutableStateOf<Job?>(null)
     var nextEpisodePreloadTriggered by mutableStateOf(false)
     var pendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)

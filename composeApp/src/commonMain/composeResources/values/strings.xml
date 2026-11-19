@@ -1683,6 +1683,7 @@
     <string name="custom_theme_preview">Preview</string>
     <string name="custom_theme_preview_accent">Your accent</string>
     <string name="player_next_episode">Next Episode</string>
+    <string name="player_previous_episode">Previous episode</string>
     <string name="player_next_episode_finding_source">Finding source…</string>
     <string name="player_next_episode_playing_via_countdown">Playing via %1$s in %2$ds…</string>
     <string name="player_next_episode_thumbnail">Next episode thumbnail</string>
@@ -3364,4 +3365,24 @@
     <string name="downloads_unrecognised_reason_unreadable_companion">The saved details beside this file could not be read.</string>
     <string name="downloads_unrecognised_reason_not_video">Not a complete video file.</string>
     <string name="downloads_unrecognised_size_location">%1$s • %2$s</string>
+    <string name="player_shortcuts_title">Keyboard shortcuts</string>
+    <string name="player_shortcuts_button">Keyboard shortcuts</string>
+    <string name="player_shortcut_group_playback">Playback</string>
+    <string name="player_shortcut_group_navigation">Navigation</string>
+    <string name="player_shortcut_play_pause">Play or pause</string>
+    <string name="player_shortcut_seek_back_forward">Seek back or forward 10 s</string>
+    <string name="player_shortcut_volume_up_down">Turn volume up or down</string>
+    <string name="player_shortcut_mute">Mute or unmute</string>
+    <string name="player_shortcut_fullscreen">Enter or exit fullscreen</string>
+    <string name="player_shortcut_exit_fullscreen">Exit fullscreen or close panel</string>
+    <string name="player_shortcut_skip_intro">Skip intro when shown</string>
+    <string name="player_shortcut_next_episode">Next episode</string>
+    <string name="player_shortcut_help">Show or hide shortcuts</string>
+    <string name="player_shortcut_subtitles">Subtitles</string>
+    <string name="player_shortcut_audio">Audio tracks</string>
+    <string name="player_shortcut_speed">Playback speed</string>
+    <string name="player_shortcut_speed_reset">Reset speed to 1x</string>
+    <string name="player_shortcut_episodes">Episodes</string>
+    <string name="player_shortcut_sources">Sources</string>
+    <string name="player_shortcut_pip">Picture-in-Picture</string>
 </resources>

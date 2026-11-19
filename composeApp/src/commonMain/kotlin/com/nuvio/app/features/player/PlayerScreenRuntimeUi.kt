@@ -52,6 +52,9 @@ import com.nuvio.app.core.ui.dispatchPlatformModalBack
 import com.nuvio.app.core.ui.hasOpenPlatformModal
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.p2p.formatP2pMegabytes
+import com.nuvio.app.features.player.skip.MediaTrackCommand
+import com.nuvio.app.features.player.skip.MediaTrackResolution
+import com.nuvio.app.features.player.skip.resolveMediaTrackCommand
 import com.nuvio.app.features.p2p.formatP2pSpeed
 import com.nuvio.app.features.player.skip.SkipIntroRepository
 import com.nuvio.app.features.streams.AddonStreamGroup
@@ -103,18 +106,20 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     val episodeTitle = activeEpisodeTitle
     val isEpisode = seasonNumber != null && episodeNumber != null
 
-    LaunchedEffect(runtime.title, runtime.poster, seasonNumber, episodeNumber, episodeTitle, playbackSnapshot.isPlaying) {
+    LaunchedEffect(runtime.title, activeStreamTitle, runtime.poster, runtime.background, seasonNumber, episodeNumber, episodeTitle, playbackSnapshot.isPlaying) {
         val episodeLabel = if (isEpisode) {
             val base = "S${seasonNumber}E${episodeNumber}"
             if (!episodeTitle.isNullOrBlank()) "$base - $episodeTitle" else base
         } else {
             null
         }
+        val artworkUrl = runtime.poster?.takeIf { it.isNotBlank() }
+            ?: runtime.background?.takeIf { it.isNotBlank() }
         AppPresenceState.publish(
             PresenceSnapshot.Player(
-                title = runtime.title,
+                title = runtime.title.ifBlank { activeStreamTitle },
                 episodeLabel = episodeLabel,
-                posterUrl = runtime.poster,
+                posterUrl = artworkUrl,
                 isPlaying = playbackSnapshot.isPlaying,
                 positionMs = playbackSnapshot.positionMs,
                 durationMs = playbackSnapshot.durationMs,
@@ -272,9 +277,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         initialLoadCompleted && !pausedOverlayVisible && !skipIntervalDismissed
     }
     val nativeSkipAction = nativeSkipInterval?.internalSkipAction(skipIntervals, playbackSnapshot.durationMs)
-    val nextEpisodeForControls = nextEpisodeInfo.takeIf { 
-        isSeries && (showNextEpisodeCard || nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) 
-    }
+    val episodeCard = episodeCardState
+    val nextEpisodeForControls = episodeCard?.episode
     val nextEpisodeStatus = when {
         nextEpisodeForControls == null -> ""
         !nextEpisodeForControls.hasAired && !nextEpisodeForControls.unairedMessage.isNullOrBlank() ->
@@ -339,6 +343,31 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         autoSyncedLabel = stringResource(Res.string.autosync_label_synced),
         streamInfoLabel = stringResource(Res.string.cd_stream_info),
         streamInfoSections = streamInfoSections,
+        shortcutsLabel = stringResource(Res.string.player_shortcuts_button),
+        shortcutsGroupPlaybackLabel = stringResource(Res.string.player_shortcut_group_playback),
+        shortcutsGroupNavigationLabel = stringResource(Res.string.player_shortcut_group_navigation),
+        shortcutsItems = if (isDesktop) {
+            listOf(
+                PlayerControlShortcutItem("Space / K", stringResource(Res.string.player_shortcut_play_pause), "playback"),
+                PlayerControlShortcutItem("Left / Right", stringResource(Res.string.player_shortcut_seek_back_forward), "playback"),
+                PlayerControlShortcutItem("Up / Down", stringResource(Res.string.player_shortcut_volume_up_down), "playback"),
+                PlayerControlShortcutItem("M", stringResource(Res.string.player_shortcut_mute), "playback"),
+                PlayerControlShortcutItem("F", stringResource(Res.string.player_shortcut_fullscreen), "navigation"),
+                PlayerControlShortcutItem("Esc", stringResource(Res.string.player_shortcut_exit_fullscreen), "navigation"),
+                PlayerControlShortcutItem("S", stringResource(Res.string.player_shortcut_skip_intro), "playback"),
+                PlayerControlShortcutItem("N", stringResource(Res.string.player_shortcut_next_episode), "navigation"),
+                PlayerControlShortcutItem("?", stringResource(Res.string.player_shortcut_help), "navigation"),
+                PlayerControlShortcutItem("C", stringResource(Res.string.player_shortcut_subtitles), "navigation"),
+                PlayerControlShortcutItem("A", stringResource(Res.string.player_shortcut_audio), "navigation"),
+                PlayerControlShortcutItem("`", stringResource(Res.string.player_shortcut_speed), "playback"),
+                PlayerControlShortcutItem("/", stringResource(Res.string.player_shortcut_speed_reset), "playback"),
+                PlayerControlShortcutItem("E", stringResource(Res.string.player_shortcut_episodes), "navigation"),
+                PlayerControlShortcutItem("Q", stringResource(Res.string.player_shortcut_sources), "navigation"),
+                PlayerControlShortcutItem("P", stringResource(Res.string.player_shortcut_pip), "navigation"),
+            )
+        } else {
+            emptyList()
+        },
         title = title,
         episodeText = episodeText,
         streamTitle = activeStreamTitle,
@@ -551,7 +580,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         skipPromptEndMs = nativeSkipAction?.targetMs?.coerceAtLeast(0L) ?: 0L,
         skipPromptDismissed = skipIntervalDismissed,
         nextEpisodeVisible = nextEpisodeForControls != null && !playerControlsLocked,
-        nextEpisodeHeaderLabel = stringResource(Res.string.player_next_episode),
+        nextEpisodeHeaderLabel = stringResource(
+            if (episodeCard?.isPrevious == true) Res.string.player_previous_episode else Res.string.player_next_episode,
+        ),
         nextEpisodeTitle = nextEpisodeForControls?.let {
             stringResource(
                 Res.string.compose_player_episode_title_format,
@@ -561,14 +592,14 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             )
         }.orEmpty(),
         nextEpisodeThumbnail = nextEpisodeForControls?.thumbnail.orEmpty(),
-        nextEpisodeThumbnailBlurred = metaScreenSettingsUiState.blurUnwatchedEpisodes && nextEpisodeInfo?.isWatched == false,
+        nextEpisodeThumbnailBlurred = metaScreenSettingsUiState.blurUnwatchedEpisodes && nextEpisodeForControls?.isWatched == false,
         nextEpisodeStatus = nextEpisodeStatus,
         nextEpisodeActionLabel = if (nextEpisodeForControls?.hasAired == true) {
             stringResource(Res.string.detail_btn_play)
         } else {
             stringResource(Res.string.player_next_episode_unaired)
         },
-        nextEpisodePlayable = nextEpisodeInfo?.hasAired == true,
+        nextEpisodePlayable = nextEpisodeForControls?.hasAired == true,
         sleepTimerLabel = stringResource(Res.string.player_sleep_timer),
         sleepTimerPanelTitle = stringResource(Res.string.player_sleep_timer),
         sleepTimerOffLabel = stringResource(Res.string.player_sleep_timer_off),
@@ -1138,6 +1169,41 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
         "keepChromeVisible" -> {
             controlsVisible = true
             controlsActivityTick += 1
+        }
+        "chromeInteraction" -> {
+            if (value >= 0.5) {
+                controlsVisible = true
+                controlsActivityTick += 1
+            }
+        }
+        "mediaPlay" -> applyNativePlaybackState(play = true)
+        "mediaPause" -> applyNativePlaybackState(play = false)
+        "mediaNext",
+        "mediaPrevious" -> {
+            val command = if (type == "mediaNext") MediaTrackCommand.NEXT else MediaTrackCommand.PREVIOUS
+            when (
+                resolveMediaTrackCommand(
+                    command = command,
+                    isSeries = isSeries,
+                    hasPlayableNextEpisode = nextEpisodeInfo?.hasAired == true,
+                    hasPlayablePreviousEpisode = resolvePlayablePreviousEpisode() != null,
+                    isEpisodeSwitchInProgress = nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null,
+                )
+            ) {
+                MediaTrackResolution.SWITCH_NEXT_EPISODE -> {
+                    if (!partyBlocksControl() && !playNextEpisode()) {
+                        return seekFromNativeControls(10_000L, revealControls = false)
+                    }
+                }
+                MediaTrackResolution.SWITCH_PREVIOUS_EPISODE -> {
+                    if (!partyBlocksControl() && !playPreviousEpisode()) {
+                        return seekFromNativeControls(-10_000L, revealControls = false)
+                    }
+                }
+                MediaTrackResolution.IGNORE_WHILE_SWITCHING -> Unit
+                MediaTrackResolution.SEEK_FORWARD -> return seekFromNativeControls(10_000L, revealControls = false)
+                MediaTrackResolution.SEEK_BACKWARD -> return seekFromNativeControls(-10_000L, revealControls = false)
+            }
         }
         "setPlaybackState",
         "setPlaybackStateQuiet" -> {
