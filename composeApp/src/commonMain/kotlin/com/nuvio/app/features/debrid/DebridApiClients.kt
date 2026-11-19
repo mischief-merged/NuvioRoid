@@ -27,7 +27,8 @@ internal object DebridApiJson {
 }
 
 internal object TorboxApiClient {
-    private const val BASE_URL = "https://api.torbox.app"
+    internal const val DEFAULT_BASE_URL = "https://api.torbox.app"
+    internal var baseUrl: String = DEFAULT_BASE_URL
     // Keep each page bounded; season packs can contain large file arrays.
     private const val cloudListResponseMaxBytes = 16 * 1024 * 1024
 
@@ -36,7 +37,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<TorboxDeviceAuthorizationDto>> =
         requestWithoutAuth(
             method = "GET",
-            url = "$BASE_URL/v1/api/user/auth/device/start?${
+            url = "$baseUrl/v1/api/user/auth/device/start?${
                 queryString("app" to appName)
             }",
         )
@@ -46,7 +47,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<TorboxDeviceTokenDto>> =
         requestWithoutAuth(
             method = "POST",
-            url = "$BASE_URL/v1/api/user/auth/device/token",
+            url = "$baseUrl/v1/api/user/auth/device/token",
             body = DebridApiJson.json.encodeToString(TorboxDeviceTokenRequestDto(deviceCode = deviceCode)),
             contentType = "application/json",
         )
@@ -57,7 +58,7 @@ internal object TorboxApiClient {
     private suspend fun getUser(apiKey: String): RawHttpResponse =
         httpRequestRaw(
             method = "GET",
-            url = "$BASE_URL/v1/api/user/me",
+            url = "$baseUrl/v1/api/user/me",
             headers = authHeaders(apiKey),
             body = "",
         )
@@ -82,7 +83,7 @@ internal object TorboxApiClient {
         )
         return request(
             method = "POST",
-            url = "$BASE_URL/v1/api/torrents/checkcached?format=object",
+            url = "$baseUrl/v1/api/torrents/checkcached?format=object",
             apiKey = apiKey,
             body = body,
             contentType = "application/json",
@@ -99,7 +100,7 @@ internal object TorboxApiClient {
         )
         return request(
             method = "POST",
-            url = "$BASE_URL/v1/api/torrents/createtorrent",
+            url = "$baseUrl/v1/api/torrents/createtorrent",
             apiKey = apiKey,
             body = body,
             contentType = "multipart/form-data; boundary=$boundary",
@@ -109,7 +110,7 @@ internal object TorboxApiClient {
     suspend fun getTorrent(apiKey: String, id: Int): DebridApiResponse<TorboxEnvelopeDto<TorboxTorrentDataDto>> =
         request(
             method = "GET",
-            url = "$BASE_URL/v1/api/torrents/mylist?${
+            url = "$baseUrl/v1/api/torrents/mylist?${
                 queryString(
                     "id" to id.toString(),
                     "bypass_cache" to "true",
@@ -134,7 +135,7 @@ internal object TorboxApiClient {
         fetchTorboxCloudPages { offset, limit ->
             request(
                 method = "GET",
-                url = "$BASE_URL/v1/api/$kind/mylist?offset=$offset&limit=$limit",
+                url = "$baseUrl/v1/api/$kind/mylist?offset=$offset&limit=$limit",
                 apiKey = apiKey,
                 maxResponseBodyBytes = cloudListResponseMaxBytes,
             )
@@ -147,7 +148,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<String>> =
         request(
             method = "GET",
-            url = "$BASE_URL/v1/api/torrents/requestdl?${
+            url = "$baseUrl/v1/api/torrents/requestdl?${
                 queryString(
                     "token" to apiKey,
                     "torrent_id" to torrentId.toString(),
@@ -167,7 +168,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<String>> =
         request(
             method = "GET",
-            url = "$BASE_URL/v1/api/torrents/requestdl?${
+            url = "$baseUrl/v1/api/torrents/requestdl?${
                 queryString(
                     "token" to apiKey,
                     "torrent_id" to torrentId,
@@ -187,7 +188,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<String>> =
         request(
             method = "GET",
-            url = "$BASE_URL/v1/api/usenet/requestdl?${
+            url = "$baseUrl/v1/api/usenet/requestdl?${
                 queryString(
                     "token" to apiKey,
                     "usenet_id" to usenetId,
@@ -207,7 +208,7 @@ internal object TorboxApiClient {
     ): DebridApiResponse<TorboxEnvelopeDto<String>> =
         request(
             method = "GET",
-            url = "$BASE_URL/v1/api/webdl/requestdl?${
+            url = "$baseUrl/v1/api/webdl/requestdl?${
                 queryString(
                     "token" to apiKey,
                     "web_id" to webId,
@@ -274,12 +275,13 @@ internal object TorboxApiClient {
 }
 
 internal object RealDebridApiClient {
-    private const val BASE_URL = "https://api.real-debrid.com/rest/1.0"
+    internal const val DEFAULT_BASE_URL = "https://api.real-debrid.com/rest/1.0"
+    internal var baseUrl: String = DEFAULT_BASE_URL
 
     suspend fun validateApiKey(apiKey: String): Boolean =
         httpRequestRaw(
             method = "GET",
-            url = "$BASE_URL/user",
+            url = "$baseUrl/user",
             headers = authHeaders(apiKey.trim()),
             body = "",
         ).status in 200..299
@@ -287,7 +289,7 @@ internal object RealDebridApiClient {
     suspend fun addMagnet(apiKey: String, magnet: String): DebridApiResponse<RealDebridAddTorrentDto> =
         formRequest(
             method = "POST",
-            url = "$BASE_URL/torrents/addMagnet",
+            url = "$baseUrl/torrents/addMagnet",
             apiKey = apiKey,
             fields = listOf("magnet" to magnet),
         )
@@ -295,14 +297,14 @@ internal object RealDebridApiClient {
     suspend fun getTorrentInfo(apiKey: String, id: String): DebridApiResponse<RealDebridTorrentInfoDto> =
         request(
             method = "GET",
-            url = "$BASE_URL/torrents/info/${encodePathSegment(id)}",
+            url = "$baseUrl/torrents/info/${encodePathSegment(id)}",
             apiKey = apiKey,
         )
 
     suspend fun selectFiles(apiKey: String, id: String, files: String): DebridApiResponse<Unit> =
         formRequest(
             method = "POST",
-            url = "$BASE_URL/torrents/selectFiles/${encodePathSegment(id)}",
+            url = "$baseUrl/torrents/selectFiles/${encodePathSegment(id)}",
             apiKey = apiKey,
             fields = listOf("files" to files),
         )
@@ -310,7 +312,7 @@ internal object RealDebridApiClient {
     suspend fun unrestrictLink(apiKey: String, link: String): DebridApiResponse<RealDebridUnrestrictLinkDto> =
         formRequest(
             method = "POST",
-            url = "$BASE_URL/unrestrict/link",
+            url = "$baseUrl/unrestrict/link",
             apiKey = apiKey,
             fields = listOf("link" to link),
         )
@@ -318,7 +320,7 @@ internal object RealDebridApiClient {
     suspend fun deleteTorrent(apiKey: String, id: String): DebridApiResponse<Unit> =
         request(
             method = "DELETE",
-            url = "$BASE_URL/torrents/delete/${encodePathSegment(id)}",
+            url = "$baseUrl/torrents/delete/${encodePathSegment(id)}",
             apiKey = apiKey,
         )
 
@@ -369,7 +371,8 @@ internal object RealDebridApiClient {
 }
 
 internal object PremiumizeApiClient {
-    private const val BASE_URL = "https://www.premiumize.me"
+    internal const val DEFAULT_BASE_URL = "https://www.premiumize.me"
+    internal var baseUrl: String = DEFAULT_BASE_URL
 
     suspend fun validateApiKey(apiKey: String): Boolean {
         val response = accountInfo(apiKey.trim())
@@ -381,7 +384,7 @@ internal object PremiumizeApiClient {
     ): DebridApiResponse<PremiumizeDeviceAuthorizationDto> =
         formRequestWithoutAuth(
             method = "POST",
-            url = "$BASE_URL/token",
+            url = "$baseUrl/token",
             fields = listOf(
                 "response_type" to "device_code",
                 "client_id" to clientId,
@@ -394,7 +397,7 @@ internal object PremiumizeApiClient {
     ): DebridApiResponse<PremiumizeDeviceTokenDto> =
         formRequestWithoutAuth(
             method = "POST",
-            url = "$BASE_URL/token",
+            url = "$baseUrl/token",
             fields = listOf(
                 "grant_type" to "device_code",
                 "code" to deviceCode,
@@ -405,14 +408,14 @@ internal object PremiumizeApiClient {
     suspend fun accountInfo(apiKey: String): DebridApiResponse<PremiumizeAccountInfoDto> =
         request(
             method = "GET",
-            url = "$BASE_URL/api/account/info",
+            url = "$baseUrl/api/account/info",
             apiKey = apiKey,
         )
 
     suspend fun listAllItems(apiKey: String): DebridApiResponse<PremiumizeItemListAllDto> =
         request(
             method = "GET",
-            url = "$BASE_URL/api/item/listall",
+            url = "$baseUrl/api/item/listall",
             apiKey = apiKey,
         )
 
@@ -422,7 +425,7 @@ internal object PremiumizeApiClient {
     ): DebridApiResponse<PremiumizeItemDetailsDto> =
         request(
             method = "GET",
-            url = "$BASE_URL/api/item/details?${queryString("id" to itemId)}",
+            url = "$baseUrl/api/item/details?${queryString("id" to itemId)}",
             apiKey = apiKey,
         )
 
@@ -432,7 +435,7 @@ internal object PremiumizeApiClient {
     ): DebridApiResponse<PremiumizeDirectDownloadDto> =
         formRequest(
             method = "POST",
-            url = "$BASE_URL/api/transfer/directdl",
+            url = "$baseUrl/api/transfer/directdl",
             apiKey = apiKey,
             fields = listOf("src" to source),
         )
@@ -451,7 +454,7 @@ internal object PremiumizeApiClient {
         }
         return formRequest(
             method = "POST",
-            url = "$BASE_URL/api/cache/check",
+            url = "$baseUrl/api/cache/check",
             apiKey = apiKey,
             fields = normalizedItems.map { "items[]" to it },
         )

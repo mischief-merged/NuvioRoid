@@ -14,12 +14,24 @@ internal data class RecordRef(
     val locationId: String?,
     val localFileUri: String?,
     val fileName: String,
+    val partialFileName: String? = null,
+    val supersededPartials: List<KeptPartialFile> = emptyList(),
 ) {
     val label: String get() = fileName.ifBlank { id }
+    val activePartialFileName: String get() = partialFileName?.takeIf { it.isNotBlank() } ?: "$fileName.part"
 
     companion object {
         fun of(profileId: Int, item: DownloadItem) =
-            RecordRef(profileId, item.id, item.status == DownloadStatus.Completed, item.locationId, item.localFileUri, item.fileName)
+            RecordRef(
+                profileId = profileId,
+                id = item.id,
+                completed = item.status == DownloadStatus.Completed,
+                locationId = item.locationId,
+                localFileUri = item.localFileUri,
+                fileName = item.fileName,
+                partialFileName = item.partialFileName,
+                supersededPartials = item.supersededPartials,
+            )
     }
 }
 
@@ -52,9 +64,17 @@ internal class DownloadOwnership(
             ).distinct()
         } else {
             val owner = locations.locationOfRecord(record.locationId, null).path
-            val reserved = if (record.fileName.isBlank()) emptyList() else listOf(owner.resolve(record.fileName + ".part"), owner.resolve(record.fileName))
+            val base = if (record.fileName.isBlank()) {
+                emptyList()
+            } else {
+                listOf(owner.resolve(record.activePartialFileName), owner.resolve(record.fileName))
+            }
+            val kept = record.supersededPartials.mapNotNull { entry ->
+                val keptName = entry.fileName.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                locations.locationOfRecord(entry.locationId ?: record.locationId, null).path.resolve(keptName)
+            }
             // A published file can have taken a free name while its record still awaits checks.
-            (reserved + listOfNotNull(
+            (base + kept + listOfNotNull(
                 record.localFileUri?.let(DownloadLocations::fileOfUri)?.toPath(),
                 locations.recordedPath(record.locationId, record.localFileUri),
             )).distinct()
@@ -115,7 +135,7 @@ internal fun legacyPartialKey(
     records: List<RecordRef>?,
 ): String? {
     if (item.partialFileKey != null || item.status == DownloadStatus.Completed || item.downloadedBytes <= 0L) return null
-    val own = locations.locationOfRecord(item.locationId, null).path.resolve(item.fileName + ".part").toAbsolutePath().normalize()
+    val own = locations.locationOfRecord(item.locationId, null).path.resolve(item.activePartialFileName).toAbsolutePath().normalize()
     if (partial.toAbsolutePath().normalize() != own) return null
     if (Files.isSymbolicLink(own) || !Files.isRegularFile(own, LinkOption.NOFOLLOW_LINKS)) return null
     val known = records ?: return null

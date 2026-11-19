@@ -47,15 +47,42 @@ private fun normalizedPart(text: String?): String = text.orEmpty().trim().lowerc
 internal fun sourceLabelKey(addonName: String?, label: String?, description: String?): String =
     "label:" + listOf(addonName, label, description).joinToString("\n", transform = ::normalizedPart)
 
-private fun sourceUrlKey(url: String?): String? = url?.trim()?.takeIf { it.isNotEmpty() }?.let { "url:$it" }
+internal fun sourceUrlKey(url: String?): String? = url?.trim()?.takeIf { it.isNotEmpty() }?.let { "url:$it" }
 
-/** What a source is known by, to tell whether it was tried already: its listing, and its address when it has one. */
+private fun sourceHashKey(addonName: String?, infoHash: String?, fileIdx: Int?): String? {
+    val hash = infoHash?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+    val idx = fileIdx?.toString().orEmpty()
+    return "hash:${normalizedPart(addonName)}|$hash|$idx"
+}
+
+private fun sourceFileKey(addonName: String?, filename: String?, sizeBytes: Long?): String? {
+    val name = filename?.trim()?.replace('\\', '/')?.trimStart('/')?.lowercase()?.takeIf { it.isNotEmpty() }
+        ?: return null
+    val size = sizeBytes?.takeIf { it > 0L } ?: return null
+    return "file:${normalizedPart(addonName)}|$name|$size"
+}
+
+/** What a source is known by, to tell whether it was tried already: its listing, hash/file identity, and its address when it has one. */
 internal val StreamItem.sourceIdentityKeys: List<String>
-    get() = listOfNotNull(sourceLabelKey(addonName, streamLabel, streamSubtitle), sourceUrlKey(playableDirectUrl))
+    get() = listOfNotNull(
+        sourceLabelKey(addonName, streamLabel, streamSubtitle),
+        sourceHashKey(addonName, p2pInfoHash, p2pFileIdx ?: clientResolve?.fileIdx),
+        sourceFileKey(
+            addonName,
+            behaviorHints.filename ?: clientResolve?.filename ?: clientResolve?.stream?.raw?.filename,
+            behaviorHints.videoSize ?: clientResolve?.stream?.raw?.size ?: debridCacheStatus?.cachedSize,
+        ),
+        sourceUrlKey(playableDirectUrl),
+    )
 
 /** What the source of this download is known by. */
 internal val DownloadItem.sourceIdentityKeys: List<String>
-    get() = listOfNotNull(sourceLabelKey(providerName, streamTitle, streamSubtitle), sourceUrlKey(sourceUrl))
+    get() = listOfNotNull(
+        sourceLabelKey(providerName, streamTitle, streamSubtitle),
+        sourceHashKey(providerName, sourceInfoHash, sourceFileIdx),
+        sourceFileKey(providerName, sourceFilename, sourceFileSizeBytes),
+        sourceUrlKey(sourceUrl),
+    )
 
 /** Whether [this] source is one of [tried]. */
 internal fun StreamItem.wasTried(tried: Set<String>): Boolean = tried.isNotEmpty() && sourceIdentityKeys.any { it in tried }
