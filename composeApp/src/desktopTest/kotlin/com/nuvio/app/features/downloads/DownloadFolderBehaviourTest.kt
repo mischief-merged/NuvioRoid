@@ -140,7 +140,7 @@ class DownloadFolderBehaviourTest {
     }
 
     @Test
-    fun without_a_system_trash_a_file_is_held_inside_its_own_location_and_purged_there() {
+    fun without_a_system_trash_a_file_is_held_inside_its_own_location_and_stays_there() {
         val drive = world.driveLocation("Archive")
         var now = 1_000L
         val trash = DesktopDownloadsTrash(
@@ -155,6 +155,12 @@ class DownloadFolderBehaviourTest {
         assertTrue(drive.path.resolve(".removed").exists(), "the file left the drive's volume")
         assertFalse(onDrive.exists())
 
-        assertEquals(1, trash.purgeHeldFiles(now + HeldFileDays * 24L * 60 * 60 * 1000 + 1))
+        val wellPastSevenDays = now + 30L * 24 * 60 * 60 * 1000
+        assertEquals(0, trash.purgeHeldFiles(wellPastSevenDays))
+        val kept = Files.list(drive.path.resolve(".removed")).use { it.toList() }
+            .filter { it.fileName.toString() != DesktopDownloadsTrash.IndexFileName }
+        assertEquals(1, kept.size)
+        assertTrue(kept.single().fileName.toString().endsWith("a.mp4"))
+        assertTrue(Files.size(kept.single()) > 0L)
     }
 }

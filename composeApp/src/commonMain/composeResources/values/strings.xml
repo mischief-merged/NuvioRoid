@@ -730,7 +730,7 @@
     <string name="downloads_empty_browse">Browse titles</string>
     <string name="downloads_delete_title">Delete %1$s?</string>
     <string name="downloads_delete_message_trash">It moves to the Trash. You can put it back from there.</string>
-    <string name="downloads_delete_message_held">It stays in the downloads folder for 7 days, then it is deleted for good.</string>
+    <string name="downloads_delete_message_held">It stays in the holding folder until you remove it.</string>
     <string name="downloads_delete_auto_note">Auto-download will not fetch this episode again.</string>
     <string name="downloads_delete_message_partial">This stops the download and removes what was downloaded so far.</string>
     <string name="downloads_delete_confirm_trash">Move to Trash</string>

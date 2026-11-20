@@ -56,8 +56,9 @@ private fun moveToSystemTrash(file: File): Boolean =
  * Only a regular file directly inside the downloads folder is moved. A symbolic link is refused and
  * never followed, so nothing outside the folder is touched. With [systemTrash] the file goes to the
  * trash of the system, and a trash that fails leaves the file where it is. Without one the file is
- * moved to a holding folder inside the downloads folder and listed in an index there;
- * [purgeHeldFiles] deletes only what that index lists, once it was held for [HeldFileDays] days.
+ * moved to a holding folder inside the downloads folder and listed in an index there. It stays
+ * there until you remove it. [purgeHeldFiles] moves what that index lists to the system Trash
+ * once that Trash can be used again, and does not delete it.
  */
 internal class DesktopDownloadsTrash(
     private val downloadsDir: () -> Path,
@@ -88,9 +89,9 @@ internal class DesktopDownloadsTrash(
     }
 
     /**
-     * Keep hard links outside the expiring holding folder until the move is accepted. They use no
-     * extra video storage and let cancellation restore both the video and subtitles even after the
-     * system has moved them. If links cannot be made on this volume, leave the download alone.
+     * Keep hard links beside the download until the move is accepted. They use no extra video
+     * storage and let cancellation restore both the video and subtitles even after the system has
+     * moved them. If links cannot be made on this volume, leave the download alone.
      */
     fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult = synchronized(this) {
         val trash = systemTrash ?: return AutoDownloadRemovalResult.NotMoved
@@ -186,8 +187,11 @@ internal class DesktopDownloadsTrash(
             runCatching { Files.isSameFile(first, second) }.getOrDefault(false)
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun purgeHeldFiles(nowEpochMs: Long): Int = synchronized(this) {
-        roots().sumOf { purgeHeldFilesIn(it, nowEpochMs) }
+        // Held videos and partials are not removed by age.
+        if (systemTrash == null) return 0
+        roots().sumOf { moveHeldToSystemTrash(it) }
     }
 
     private fun roots(): List<Path> =
@@ -196,28 +200,33 @@ internal class DesktopDownloadsTrash(
             .mapNotNull { runCatching { it.toRealPath() }.getOrNull() }
             .distinct()
 
-    private fun purgeHeldFilesIn(root: Path, nowEpochMs: Long): Int {
+    /**
+     * The system Trash can be used again. Move each listed file or folder out of the holding folder.
+     * A name that is not a direct child is ignored. A link is left in place and never followed.
+     * A file the Trash does not take stays listed.
+     */
+    private fun moveHeldToSystemTrash(root: Path): Int {
+        val trash = systemTrash ?: return 0
         val holding = root.resolve(HoldingFolderName)
         if (!holding.isDirectoryInside(root)) return 0
-        val maxAgeMs = HeldFileDays * 24L * 60 * 60 * 1000
-        var purged = 0
-        val remaining = readIndex(holding).filter { (heldAtEpochMs, name) ->
-            if (nowEpochMs - heldAtEpochMs < maxAgeMs) return@filter true
+        var moved = 0
+        val remaining = readIndex(holding).filter { (_, name) ->
             val entry = holding.resolve(name)
-            // Only a name this class wrote, directly inside the holding folder, and never through a link.
             val isOwn = entry.parent == holding && entry.fileName.toString() == name
             when {
                 !isOwn -> false
+                Files.isSymbolicLink(entry) -> true
                 !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) -> false
-                runCatching { deleteWithoutFollowingLinks(entry) }.isSuccess -> {
-                    purged++
+                runCatching { trash(entry.toFile()) }.getOrDefault(false) &&
+                    !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) -> {
+                    moved++
                     false
                 }
                 else -> true
             }
         }
         runCatching { writeIndex(holding, remaining) }
-        return purged
+        return moved
     }
 
     private fun hold(root: Path, source: Path) {
@@ -267,6 +276,7 @@ internal class DesktopDownloadsTrash(
             Files.isDirectory(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 
+    /** Removes a temporary recovery folder this class just made. Never a held video or partial. */
     private fun deleteWithoutFollowingLinks(entry: Path) {
         Files.walkFileTree(
             entry,

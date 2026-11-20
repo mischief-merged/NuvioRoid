@@ -857,7 +857,7 @@ object DownloadsRepository {
         return DownloadDeleteResult.Removed
     }
 
-    /** Whether the files of deleted downloads go to the trash of the system, or are held for days in the downloads folder. */
+    /** Whether deleted downloads go to the system Trash. When they do not, the files stay in the holding folder. */
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
 
     private fun loadFromDisk() {
@@ -1722,7 +1722,7 @@ object DownloadsRepository {
         if (item.autoDownloadRuleKey != ruleKey || item.status != DownloadStatus.Completed || item.isPlaceholder) {
             return AutoDownloadRemovalResult.Changed
         }
-        // Scheduled removals must never use a holding folder that is later emptied permanently.
+        // Scheduled removals need the system Trash. Without it the file is left where it is.
         if (!backend.usesSystemTrash) return AutoDownloadRemovalResult.NotMoved
         if (!stillWanted()) return AutoDownloadRemovalResult.Changed
         val fileUri = backend.resolveLocalFileUri(item.localFileUri, item.fileName)

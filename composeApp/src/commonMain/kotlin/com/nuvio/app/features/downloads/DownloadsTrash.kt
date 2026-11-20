@@ -1,10 +1,10 @@
 package com.nuvio.app.features.downloads
 
-/** Takes the file of a download out of the downloads folder without deleting it at once. */
+/** Takes the file of a download out of the downloads folder without deleting it. */
 internal expect object DownloadsTrash {
     /**
-     * True when files go to the trash of the system. False when there is none the app can use: the
-     * file is then held in the downloads folder and deleted for good after [HeldFileDays] days.
+     * True when files go to the trash of the system. False when there is none the app can use:
+     * the file then stays in the holding folder until you remove it.
      */
     val usesSystemTrash: Boolean
 
@@ -17,8 +17,9 @@ internal expect object DownloadsTrash {
     /** Whether two addresses name the same file, however they are spelled. */
     fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean
 
-    /** Deletes the held files whose days are over. Returns how many were deleted. */
+    /**
+     * When the system Trash can be used, moves held files there. Otherwise leaves them.
+     * Returns how many were moved.
+     */
     fun purgeHeldFiles(nowEpochMs: Long): Int
 }
-
-internal const val HeldFileDays = 7

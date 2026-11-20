@@ -92,7 +92,7 @@ class DesktopDownloadsTrashTest {
     }
 
     @Test
-    fun watched_removal_refuses_the_expiring_holding_folder() {
+    fun watched_removal_leaves_the_file_when_there_is_no_system_trash() {
         val video = video()
         assertEquals(AutoDownloadRemovalResult.NotMoved, withoutSystemTrash().moveWatchedAway(video.uri()) { true })
         assertEquals("video", video.readText())
@@ -122,22 +122,90 @@ class DesktopDownloadsTrashTest {
     }
 
     @Test
-    fun without_a_system_trash_the_file_is_held_and_deleted_only_after_seven_days() {
+    fun without_a_system_trash_a_held_video_and_a_held_partial_stay_well_past_seven_days() {
         val video = video()
         subtitlesOf(video)
+        val partial = downloadsDir.resolve("episode.mkv.part").also { it.writeText("partial-bytes") }
         val trash = withoutSystemTrash()
         assertFalse(trash.usesSystemTrash)
 
         assertTrue(trash.moveAway(video.uri()))
+        assertTrue(trash.moveToTrash(partial))
 
+        val heldVideo = holding.resolve("$now-episode.mkv")
+        val heldPartial = holding.resolve("$now-episode.mkv.part")
         assertFalse(video.exists())
-        assertEquals(listOf("$now-episode.mkv", "$now-episode.mkv.subtitles"), held())
+        assertFalse(partial.exists())
+        assertEquals("video", heldVideo.readText())
+        assertEquals("partial-bytes", heldPartial.readText())
+        assertTrue(holding.resolve("$now-episode.mkv.subtitles").resolve("en.srt").exists())
 
         assertEquals(0, trash.purgeHeldFiles(now + 7 * day - 1))
-        assertEquals(2, held().size)
-        assertEquals(2, trash.purgeHeldFiles(now + 7 * day))
-        assertEquals(emptyList(), held())
-        assertEquals(0, trash.purgeHeldFiles(now + 8 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 7 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals("video", heldVideo.readText())
+        assertEquals("partial-bytes", heldPartial.readText())
+        assertEquals("subtitles", holding.resolve("$now-episode.mkv.subtitles").resolve("en.srt").readText())
+    }
+
+    @Test
+    fun a_finished_watched_removal_removes_its_temporary_recovery_links() {
+        val video = video()
+        subtitlesOf(video)
+        val systemTrash = outside.resolve("trash").createDirectories()
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), systemTrash.resolve(file.name))
+            true
+        })
+
+        assertEquals(AutoDownloadRemovalResult.Removed, trash.moveWatchedAway(video.uri()) { true })
+
+        assertFalse(video.exists())
+        assertEquals("video", systemTrash.resolve("episode.mkv").readText())
+        assertEquals("subtitles", systemTrash.resolve("episode.mkv.subtitles").resolve("en.srt").readText())
+        assertTrue(downloadsDir.toFile().list().orEmpty().none { it.startsWith(".watched-removal-") })
+    }
+
+    @Test
+    fun a_subtitle_link_stops_watched_removal_and_its_recovery_links_are_removed() {
+        val video = video()
+        val subtitles = subtitlesOf(video)
+        val target = outside.resolve("keep.txt").also { it.writeText("keep") }
+        Files.createSymbolicLink(subtitles.resolve("link-to-outside"), target)
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), outside.resolve("trash").createDirectories().resolve(file.name))
+            true
+        })
+
+        assertEquals(AutoDownloadRemovalResult.NotMoved, trash.moveWatchedAway(video.uri()) { true })
+
+        assertEquals("video", video.readText())
+        assertEquals("keep", target.readText())
+        assertEquals("subtitles", subtitles.resolve("en.srt").readText())
+        assertTrue(downloadsDir.toFile().list().orEmpty().none { it.startsWith(".watched-removal-") })
+    }
+
+    @Test
+    fun when_the_system_trash_is_available_again_held_files_move_there_and_strays_stay() {
+        val holdingTrash = withoutSystemTrash()
+        val video = video()
+        val partial = downloadsDir.resolve("clip.mkv.part").also { it.writeText("part") }
+        assertTrue(holdingTrash.moveAway(video.uri()))
+        assertTrue(holdingTrash.moveToTrash(partial))
+        val stray = holding.resolve("not-ours.mkv").also { it.writeText("stray") }
+        val target = outside.resolve("keep.txt").also { it.writeText("keep") }
+        val index = holding.resolve(DesktopDownloadsTrash.IndexFileName)
+        Files.write(index, Files.readAllLines(index) + listOf("1\t../../outside/keep.txt", "1\t..", "1\t/etc/hosts"))
+
+        val later = withSystemTrash()
+        assertEquals(2, later.purgeHeldFiles(now))
+        assertEquals(0, later.purgeHeldFiles(now + 30 * day))
+
+        assertEquals(listOf("not-ours.mkv"), held())
+        assertEquals("stray", stray.readText())
+        assertEquals("keep", target.readText())
+        assertEquals(2, trashedBySystem.size)
+        assertTrue(trashedBySystem.all { it.name.endsWith("episode.mkv") || it.name.endsWith("clip.mkv.part") })
     }
 
     @Test
@@ -151,8 +219,9 @@ class DesktopDownloadsTrashTest {
 
         assertFalse(video.exists())
         assertTrue(downloadsDir.resolve("episode.mkv.subtitles").exists())
-        assertEquals(1, trash.purgeHeldFiles(now + 30 * day))
-        assertTrue(holding.resolve("$now-episode.mkv.subtitles").exists(), "something the app did not hold was deleted")
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals("video", holding.resolve("$now-episode.mkv").readText())
+        assertTrue(holding.resolve("$now-episode.mkv.subtitles").exists(), "something the app did not hold was removed")
     }
 
     @Test
@@ -234,31 +303,33 @@ class DesktopDownloadsTrashTest {
     }
 
     @Test
-    fun only_what_was_held_by_the_app_is_deleted_from_the_holding_folder() {
+    fun without_a_system_trash_nothing_in_the_holding_folder_is_removed() {
         val trash = withoutSystemTrash()
         trash.moveAway(video().uri())
         val stray = holding.resolve("${now - 100 * day}-not-ours.mkv").also { it.writeText("stray") }
         val strayFolder = holding.resolve("1-folder").createDirectories()
 
-        assertEquals(1, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
 
-        assertTrue(stray.exists())
+        assertEquals("video", holding.resolve("$now-episode.mkv").readText())
+        assertEquals("stray", stray.readText())
         assertTrue(strayFolder.exists())
     }
 
     @Test
-    fun deleting_held_subtitles_does_not_follow_a_link_inside_them() {
+    fun a_held_subtitles_folder_with_a_link_inside_is_left_in_place() {
         val video = video()
         val subtitles = subtitlesOf(video)
         val target = outside.resolve("keep.txt").also { it.writeText("keep") }
-        Files.createSymbolicLink(subtitles.resolve("link-to-outside"), outside)
+        Files.createSymbolicLink(subtitles.resolve("link-to-outside"), target)
         val trash = withoutSystemTrash()
         trash.moveAway(video.uri())
 
-        assertEquals(2, trash.purgeHeldFiles(now + 7 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
 
-        assertTrue(target.exists())
-        assertEquals(emptyList(), held())
+        assertEquals("keep", target.readText())
+        assertEquals("video", holding.resolve("$now-episode.mkv").readText())
+        assertTrue(Files.isSymbolicLink(holding.resolve("$now-episode.mkv.subtitles").resolve("link-to-outside")))
     }
 
     @Test
@@ -273,6 +344,7 @@ class DesktopDownloadsTrashTest {
 
         assertTrue(target.exists())
         assertTrue(outside.exists())
+        assertEquals("video", holding.resolve("$now-episode.mkv").readText())
     }
 
     @Test

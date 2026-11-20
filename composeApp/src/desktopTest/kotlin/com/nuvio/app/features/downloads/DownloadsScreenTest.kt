@@ -549,7 +549,7 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun without_a_system_trash_the_dialog_says_the_file_is_held_for_days() {
+    fun without_a_system_trash_the_dialog_says_the_file_stays_in_the_holding_folder() {
         backend.usesSystemTrash = false
         show(completedEpisode("a"))
         openShow()

@@ -86,7 +86,7 @@ internal interface AutoDownloadController {
     /** The watched episodes that were removed recently, oldest first. Only the last week is worth showing. */
     val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = NoDeletedEpisodes
 
-    /** False when removed files are held in the downloads folder and then deleted for good. */
+    /** False when removed files stay in the holding folder until you remove them. */
     val usesSystemTrash: Boolean
 
     /**
