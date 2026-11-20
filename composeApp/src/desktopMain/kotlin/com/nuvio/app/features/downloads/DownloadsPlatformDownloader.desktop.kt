@@ -1504,9 +1504,19 @@ internal const val SniffMinBytes = 64
 
 /** The first bytes of [body], which stay to be read. Gives up (closing the body) when nothing comes in time. */
 private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = coroutineScope {
+    val sniffing = AtomicBoolean(true)
     val guard = launch {
         delay(DownloadsPlatformDownloader.stallTimeoutMs)
-        runCatching { body.close() }
+        if (sniffing.get()) runCatching { body.close() }
+    }
+    // Cancelling while these first bytes are still waited for has to close the connection at once.
+    // The stall watch above only closes after the stall time.
+    val cancelCloser = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        try {
+            awaitCancellation()
+        } finally {
+            if (sniffing.get()) runCatching { body.close() }
+        }
     }
     try {
         runInterruptible(Dispatchers.IO) {
@@ -1519,9 +1529,10 @@ private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = cor
             }
             if (filled > 0) body.unread(head, 0, filled)
             head.copyOf(filled)
-        }
+        }.also { sniffing.set(false) }
     } finally {
         guard.cancel()
+        cancelCloser.cancel()
     }
 }
 
