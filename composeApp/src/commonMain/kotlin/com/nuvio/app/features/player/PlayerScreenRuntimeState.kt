@@ -13,6 +13,7 @@ import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaScreenSettingsUiState
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.downloads.DownloadItem
+import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsUiState
 import com.nuvio.app.features.p2p.P2pStreamingState
@@ -130,6 +131,28 @@ internal class PlayerScreenRuntime(
     lateinit var hapticFeedback: HapticFeedback
 
     var playerSettingsUiState by mutableStateOf(PlayerSettingsUiState())
+
+    /** Fresh check that a finished download is still playable. Runs off the UI thread. */
+    var verifyEpisodeDownload: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    }
+
+    /** Address of a downloaded file chosen for playback. */
+    var playableDownloadedUri: (DownloadItem) -> String? = { item ->
+        DownloadsRepository.playableLocalFileUri(item)
+    }
+
+    /** Subtitles prepared before a downloaded episode replaces the one on screen. */
+    var prepareDownloadedSubtitles: suspend (String) -> PreparedStartupSubtitles = { localFileUri ->
+        SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
+            settings = playerSettingsUiState,
+            parentMetaId = parentMetaId,
+        )
+    }
+
+    /** A downloaded episode whose subtitles are still being prepared. */
+    var downloadedEpisodeSwitch: DownloadedEpisodeSwitch? = null
     var p2pSettingsUiState by mutableStateOf(P2pSettingsUiState())
     var p2pStreamingState by mutableStateOf<P2pStreamingState>(P2pStreamingState.Idle)
     var metaScreenSettingsUiState: MetaScreenSettingsUiState = MetaScreenSettingsUiState()

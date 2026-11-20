@@ -9,7 +9,6 @@ import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.SavedDetails
 import com.nuvio.app.features.downloads.DownloadItem
-import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
@@ -25,6 +24,8 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.youtube_resolution_failed
@@ -502,12 +503,22 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     applyEpisodeStreamMetadata(stream, episode, resume)
 }
 
-internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: DownloadItem, episode: MetaVideo) {
-    val localFileUri = DownloadsRepository.playableLocalFileUri(downloadItem) ?: return
-    restartSourceFailoverAfterUserChoice(newVideo = true)
-    resetEpisodePanelAndNextEpisodeState()
-    flushProgressForEpisodeChange(episode)
-    stopActiveP2pStream()
+internal enum class DownloadedEpisodeSwitchResult { Accepted, Pending, Rejected }
+
+internal class DownloadedEpisodeSwitch(val episodeId: String, val job: Job)
+
+internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
+    downloadItem: DownloadItem,
+    episode: MetaVideo,
+    isStillValid: () -> Boolean = { true },
+): DownloadedEpisodeSwitchResult {
+    val localFileUri = playableDownloadedUri(downloadItem) ?: return DownloadedEpisodeSwitchResult.Rejected
+    if (!isStillValid()) return DownloadedEpisodeSwitchResult.Rejected
+    val inFlight = downloadedEpisodeSwitch
+    if (inFlight != null && inFlight.job.isActive) {
+        if (inFlight.episodeId == episode.id) return DownloadedEpisodeSwitchResult.Pending
+        inFlight.job.cancel()
+    }
 
     val fallbackVideoId = buildPlaybackVideoId(
         parentMetaId = parentMetaId,
@@ -516,24 +527,24 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
         fallbackVideoId = episode.id,
     )
     val resolvedVideoId = episode.id.takeIf { it.isNotBlank() } ?: fallbackVideoId
-    val epEntry = WatchProgressRepository.progressForVideo(
-        videoId = resolvedVideoId,
-        parentMetaId = parentMetaId,
-        seasonNumber = episode.season,
-        episodeNumber = episode.episode,
-    )
-        ?.takeIf { !it.isCompleted }
-    val epResumeFraction = epEntry?.progressPercent
-        ?.takeIf { it > 0f }
-        ?.let { (it / 100f).coerceIn(0f, 1f) }
-    val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
-
-    scope.launch {
-        val prepared = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
-            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
-            settings = playerSettingsUiState,
+    val job = scope.launch(start = CoroutineStart.LAZY) {
+        val prepared = prepareDownloadedSubtitles(localFileUri)
+        if (!isStillValid()) return@launch
+        restartSourceFailoverAfterUserChoice(newVideo = true)
+        resetEpisodePanelAndNextEpisodeState()
+        flushProgressForEpisodeChange(episode)
+        stopActiveP2pStream()
+        val epEntry = WatchProgressRepository.progressForVideo(
+            videoId = resolvedVideoId,
             parentMetaId = parentMetaId,
+            seasonNumber = episode.season,
+            episodeNumber = episode.episode,
         )
+            ?.takeIf { !it.isCompleted }
+        val epResumeFraction = epEntry?.progressPercent
+            ?.takeIf { it > 0f }
+            ?.let { (it / 100f).coerceIn(0f, 1f) }
+        val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
         externalSubtitles = prepared.subtitles
         startupSubtitleSelection = prepared.selection
         activeSourceUrl = localFileUri
@@ -565,6 +576,12 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
         activeInitialProgressFraction = epResumeFraction
         controlsVisible = true
     }
+    downloadedEpisodeSwitch = DownloadedEpisodeSwitch(episode.id, job)
+    job.invokeOnCompletion {
+        if (downloadedEpisodeSwitch?.job === job) downloadedEpisodeSwitch = null
+    }
+    job.start()
+    return DownloadedEpisodeSwitchResult.Accepted
 }
 
 internal fun PlayerScreenRuntime.resolvePlayablePreviousEpisode(): MetaVideo? {
@@ -629,6 +646,7 @@ private fun PlayerScreenRuntime.playTargetEpisode(
         cancelNextEpisodeAutoPlay()
         return false
     }
+    if (downloadedEpisodeSwitch?.job?.isActive == true) return true
     if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
     nextEpisodePreloadTriggered = false
     val playbackKey = activePlaybackKey
@@ -648,10 +666,15 @@ private fun PlayerScreenRuntime.playTargetEpisode(
         currentStreamBingeGroup = currentStreamBingeGroup,
         isOffline = episodePlaybackOffline,
         findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
+        verifyDownloadedEpisode = verifyEpisodeDownload,
         onDownloadedEpisodeSelected = { item, episode ->
             if (isCurrentRequest()) {
-                switchToDownloadedEpisode(item, episode)
-                downloadedEpisodeSelected = activePlaybackKey != playbackKey
+                when (switchToDownloadedEpisode(item, episode) { isCurrentRequest() }) {
+                    DownloadedEpisodeSwitchResult.Accepted,
+                    DownloadedEpisodeSwitchResult.Pending,
+                    -> downloadedEpisodeSelected = true
+                    DownloadedEpisodeSwitchResult.Rejected -> Unit
+                }
             }
         },
         onEpisodeStreamSelected = { stream, episode ->
@@ -691,7 +714,7 @@ private fun PlayerScreenRuntime.playTargetEpisode(
             }
         }
     }
-    return downloadedEpisodeSelected || job != null
+    return downloadedEpisodeSelected || job != null || downloadedEpisodeSwitch?.job?.isActive == true
 }
 
 internal fun PlayerScreenRuntime.openSourcesPanel() {
