@@ -3455,4 +3455,21 @@
     <string name="player_shortcut_episodes">Episodes</string>
     <string name="player_shortcut_sources">Sources</string>
     <string name="player_shortcut_pip">Picture-in-Picture</string>
+    <string name="travel_mode_title">Travel mode</string>
+    <string name="travel_mode_on">Travel mode on</string>
+    <string name="travel_mode_off">Travel mode off</string>
+    <string name="travel_mode_description">Pause automatic downloads, cap downloads you start, keep other apps first, turn off trailers, and prefer smaller streams.</string>
+    <string name="travel_network_title">Treat this network as travel</string>
+    <string name="travel_network_description">Remember this choice when you return to this network. No Location permission needed.</string>
+    <string name="travel_network_unknown">Wait until this network can be identified before saving this choice.</string>
+    <string name="travel_speed_title">Travel download speed limit</string>
+    <string name="travel_speed_description">Shared by all downloads. Other apps can make downloads run more slowly.</string>
+    <string name="travel_speed_value">%1$d kB/s</string>
+    <string name="travel_status">Travel mode on. Automatic downloads paused. Downloads you start share a limit of %1$d kB/s and give way to other apps. Trailers are off; smaller streams are preferred.</string>
+    <string name="travel_network_remembered">This network is saved as a travel network.</string>
+    <string name="downloads_held_travel">Automatic downloads paused for Travel mode</string>
+    <string name="downloads_checking_network">Checking the network before downloads resume…</string>
+    <string name="downloads_status_waiting_travel">Paused for Travel mode · %1$s</string>
+    <string name="downloads_status_checking_network">Checking the network before downloads resume · %1$s</string>
+    <string name="travel_polite_required">Travel mode keeps this on. Your usual choice returns when Travel mode is off.</string>
 </resources>

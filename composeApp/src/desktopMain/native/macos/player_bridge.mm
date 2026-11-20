@@ -4485,6 +4485,11 @@ nw_path_monitor_t gPathMonitor = nil;
 JavaVM *gPathJavaVm = nullptr;
 jobject gPathListener = nullptr;
 jmethodID gPathListenerMethod = nullptr;
+jmethodID gPathSleepMethod = nullptr;
+jmethodID gPathWakeMethod = nullptr;
+id gPathSleepObserver = nil;
+id gPathWakeObserver = nil;
+uint64_t gPathGeneration = 0;
 }
 
 static const char *NuvioInterfaceKind(nw_interface_type_t type) {
@@ -4621,7 +4626,7 @@ static void NuvioStartPlaybackMonitor(void) {
     dispatch_semaphore_wait(firstReport, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC));
 }
 
-static void NuvioReportPath(nw_path_t path) {
+static void NuvioReportPath(nw_path_t path, uint64_t generation) {
     const bool satisfied = nw_path_get_status(path) == nw_path_status_satisfied;
     const bool expensive = nw_path_is_expensive(path);
     const bool constrained = nw_path_is_constrained(path);
@@ -4637,7 +4642,7 @@ static void NuvioReportPath(nw_path_t path) {
     const std::string gateways = NuvioPathGateways(path);
 
     std::lock_guard<std::mutex> guard(gPathMonitorMutex);
-    if (!gPathJavaVm || !gPathListener || !gPathListenerMethod) return;
+    if (generation != gPathGeneration || !gPathJavaVm || !gPathListener || !gPathListenerMethod) return;
     JNIEnv *env = nullptr;
     bool didAttach = false;
     jint status = gPathJavaVm->GetEnv((void **)&env, JNI_VERSION_1_6);
@@ -4658,7 +4663,30 @@ static void NuvioReportPath(nw_path_t path) {
     if (didAttach) gPathJavaVm->DetachCurrentThread();
 }
 
+// Publish the sleep gate synchronously; download-list and storage work runs on a worker.
+static void NuvioReportPowerEvent(bool sleeping) {
+    std::lock_guard<std::mutex> guard(gPathMonitorMutex);
+    if (!gPathJavaVm || !gPathListener) return;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (gPathJavaVm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if (gPathJavaVm->AttachCurrentThreadAsDaemon((void **)&env, nullptr) != JNI_OK) return;
+        attached = true;
+    }
+    if (!env) return;
+    if (sleeping) ++gPathGeneration;
+    env->CallVoidMethod(gPathListener, sleeping ? gPathSleepMethod : gPathWakeMethod);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) gPathJavaVm->DetachCurrentThread();
+}
+
 static void NuvioStopPathMonitorLocked(JNIEnv *env) {
+    ++gPathGeneration;
+    NSNotificationCenter *center = [[NSWorkspace sharedWorkspace] notificationCenter];
+    if (gPathSleepObserver) [center removeObserver:gPathSleepObserver];
+    if (gPathWakeObserver) [center removeObserver:gPathWakeObserver];
+    gPathSleepObserver = nil;
+    gPathWakeObserver = nil;
     if (gPathMonitor) {
         nw_path_monitor_cancel(gPathMonitor);
         gPathMonitor = nil;
@@ -4676,8 +4704,10 @@ Java_com_nuvio_app_features_downloads_MacNetworkPathNative_startMonitor(JNIEnv *
     jclass listenerClass = env->GetObjectClass(listener);
     if (!listenerClass) return JNI_FALSE;
     jmethodID method = env->GetMethodID(listenerClass, "onPath", "(ZZZLjava/lang/String;Ljava/lang/String;)V");
+    jmethodID sleepMethod = env->GetMethodID(listenerClass, "onSleep", "()V");
+    jmethodID wakeMethod = env->GetMethodID(listenerClass, "onWake", "()V");
     env->DeleteLocalRef(listenerClass);
-    if (!method) {
+    if (!method || !sleepMethod || !wakeMethod) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         return JNI_FALSE;
     }
@@ -4699,10 +4729,20 @@ Java_com_nuvio_app_features_downloads_MacNetworkPathNative_startMonitor(JNIEnv *
         gPathJavaVm = javaVm;
         gPathListener = globalListener;
         gPathListenerMethod = method;
+        gPathSleepMethod = sleepMethod;
+        gPathWakeMethod = wakeMethod;
+        const uint64_t generation = ++gPathGeneration;
+        NSNotificationCenter *center = [[NSWorkspace sharedWorkspace] notificationCenter];
+        gPathSleepObserver = [center addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil usingBlock:^(NSNotification *) {
+            NuvioReportPowerEvent(true);
+        }];
+        gPathWakeObserver = [center addObserverForName:NSWorkspaceDidWakeNotification object:nil queue:nil usingBlock:^(NSNotification *) {
+            NuvioReportPowerEvent(false);
+        }];
         dispatch_queue_t queue = dispatch_queue_create("com.nuvio.network-path", DISPATCH_QUEUE_SERIAL);
         nw_path_monitor_set_queue(monitor, queue);
         nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
-            NuvioReportPath(path);
+            NuvioReportPath(path, generation);
             if (!reported->exchange(true)) dispatch_semaphore_signal(firstReport);
         });
         gPathMonitor = monitor;

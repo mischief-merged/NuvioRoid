@@ -111,6 +111,8 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         SettingsGroupDivider(isTablet = isTablet)
         LimitedConnectionSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
+        TravelModeSettings(isTablet)
+        SettingsGroupDivider(isTablet = isTablet)
         PoliteDownloadsSetting(isTablet)
         KeepDownloadingSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)

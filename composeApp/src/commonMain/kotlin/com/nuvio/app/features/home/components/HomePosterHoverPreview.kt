@@ -38,6 +38,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -127,7 +128,8 @@ internal fun HomePosterHoverPreview(
     }
 
     val posterCardStyle = rememberPosterCardStyleUiState()
-    val trailerPlaybackEnabled = AppFeaturePolicy.trailerPlaybackMode == TrailerPlaybackMode.IN_APP &&
+    val connection by com.nuvio.app.features.downloads.LimitedConnections.hold.state.collectAsStateWithLifecycle()
+    val trailerPlaybackEnabled = connection.travel.previewsAllowed && AppFeaturePolicy.trailerPlaybackMode == TrailerPlaybackMode.IN_APP &&
         posterCardStyle.hoverPreviewTrailerEnabled
     if (!posterCardStyle.hoverPreviewEnabled) {
         content(modifier)

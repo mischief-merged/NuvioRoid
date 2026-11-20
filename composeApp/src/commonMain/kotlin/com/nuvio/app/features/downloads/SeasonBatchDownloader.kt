@@ -316,6 +316,7 @@ internal fun rankStreamsByPreferences(
     audioLanguage: DebridStreamLanguage? = null,
     runtimeMinutes: Int? = null,
     wanted: WantedContent? = null,
+    travelMode: Boolean = LimitedConnections.hold.state.value.travel.enabled,
 ): List<StreamItem> {
     val runtimeSeconds = runtimeMinutes?.takeIf { it > 0 }?.let { it * 60L }
     val maxBitsPerEpisode = if (maxBitrateMbps != null && runtimeSeconds != null) {
@@ -334,7 +335,7 @@ internal fun rankStreamsByPreferences(
                 } else {
                     languageMatch(DebridStreamMetadata.audioLanguages(stream, wanted?.titles.orEmpty()), audioLanguage)
                 },
-                sizeBytes = facts.size?.takeIf { it > 0L && runtimeSeconds != null },
+                sizeBytes = facts.size?.takeIf { it > 0L && (runtimeSeconds != null || travelMode) },
             )
         }
         .filter { candidate ->
@@ -352,6 +353,9 @@ internal fun rankStreamsByPreferences(
                 .thenBy { it.stream.saysNotCached }
                 .thenBy { it.language == LanguageMatch.LooksForeign }
                 .thenBy { maxBitrateMbps != null && it.sizeBytes == null }
+                .thenBy { travelMode && it.sizeBytes == null }
+                .thenBy { if (travelMode) it.sizeBytes ?: Long.MAX_VALUE else 0L }
+                .thenBy { if (travelMode) it.resolution.value.takeIf { value -> value > 0 } ?: Int.MAX_VALUE else 0 }
                 .thenByDescending { it.resolution.value }
                 .thenBy { it.language }
                 .thenByDescending { if (maxBitrateMbps != null) it.sizeBytes ?: -1L else 0L }

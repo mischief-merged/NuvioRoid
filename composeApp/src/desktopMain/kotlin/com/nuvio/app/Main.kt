@@ -101,12 +101,11 @@ fun main(args: Array<String>) {
     // Load cached profile data synchronously so the profile color is available
     // on the very first Compose frame (matching Android's SharedPreferences behavior).
     ProfileRepository.loadCachedProfiles()
+    // The quality checker is ready before a fresh path can release the startup or wake hold.
+    runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
+    runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
     // Settles a folder move that was cut short, before the list of downloads is read.
     runCatching { com.nuvio.app.features.downloads.DesktopDownloads.install() }
-    // Watches for hotspots and Low Data Mode networks, on which downloads wait (when the setting is on).
-    runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
-    // Downloads leave the connection to other apps, and wait on a very slow network or one that blocks them.
-    runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
     AppIconRepository.ensureLoaded()
     AutoSyncPreferencesDesktop.initialize()
     DiscordPresenceManager.start()
