@@ -505,7 +505,7 @@ class LimitedConnectionDownloadsTest {
 }
 
 /** The hold over the real desktop downloader and a slow local server: the bytes of a paused transfer are kept and continued. */
-class LimitedConnectionRealTransferTest {
+class LimitedConnectionRealTransferTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private class RealDownloaderBackend : DownloadsBackend {
         @Volatile
         var payload: String? = null

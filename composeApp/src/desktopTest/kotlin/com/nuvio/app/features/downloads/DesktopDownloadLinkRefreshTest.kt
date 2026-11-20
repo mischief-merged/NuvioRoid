@@ -38,7 +38,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadLinkRefreshTest {
+class DesktopDownloadLinkRefreshTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val servers = mutableListOf<HttpServer>()
     private val installedAddonUrls = mutableListOf<String>()
     private lateinit var world: FolderWorld

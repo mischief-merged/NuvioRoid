@@ -21,7 +21,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.measureTime
 
-class StartupSubtitleBlockingTest {
+class StartupSubtitleBlockingTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val fullSubtitleStyle = SubtitleStyleState.DEFAULT.copy(useForcedSubtitles = false)
     @Test
     fun malformedSavedTtmlDoesNotBlockStartup() = runBlocking {
