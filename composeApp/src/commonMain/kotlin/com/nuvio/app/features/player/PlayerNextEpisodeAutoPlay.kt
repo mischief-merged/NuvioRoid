@@ -107,6 +107,10 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     if (isOffline()) return null
 
     previousJob?.cancel()
+    // Show the requested episode before the search starts, so the card is already the one that was asked for.
+    onSearchingChanged(true)
+    onSourceNameChanged(null)
+    onCountdownChanged(null)
     val type = contentType ?: parentMetaType
     val shouldAutoSelectInManualMode =
         settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
@@ -163,11 +167,15 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         }
         if (downloadedNextEpisode != null) {
             onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
+            onSearchingChanged(false)
             return@launch
         }
 
         // Offline: the auto-play fan-out is a network search, so skip it entirely.
-        if (isNetworkOffline()) return@launch
+        if (isNetworkOffline()) {
+            onSearchingChanged(false)
+            return@launch
+        }
 
         onSearchingChanged(true)
         onSourceNameChanged(null)
