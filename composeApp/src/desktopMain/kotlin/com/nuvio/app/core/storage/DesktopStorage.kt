@@ -11,14 +11,24 @@ import java.nio.file.StandardCopyOption
 import java.util.Comparator
 import java.util.Locale
 import java.util.Properties
+import java.util.ServiceLoader
 import kotlin.io.path.exists
+
+/** A data folder supplied with this build. The shipped app has none, so it uses its own folder. */
+internal interface AppDataDirSource {
+    fun path(): Path
+}
 
 internal object DesktopStorage {
     private val json = Json { ignoreUnknownKeys = true }
     private val stores = mutableMapOf<String, Store>()
 
     val rootDir: Path by lazy {
-        resolveAppDataDir().also { Files.createDirectories(it) }
+        val provided = ServiceLoader.load(
+            AppDataDirSource::class.java,
+            AppDataDirSource::class.java.classLoader,
+        ).iterator().asSequence().firstOrNull()?.path()
+        (provided ?: resolveAppDataDir()).also { Files.createDirectories(it) }
     }
 
     val cacheDir: Path by lazy {
@@ -99,11 +109,8 @@ internal object DesktopStorage {
         }
     }
 
-    private fun resolveAppDataDir(): Path {
-        // Tests pass nuvio.storageDir so they do not read or write the app's own data folder.
-        // The app itself does not set this.
-        val override = System.getProperty("nuvio.storageDir")?.takeIf { it.isNotBlank() }
-        if (override != null) return Paths.get(override)
+    /** The folder the shipped app uses for its own files. */
+    internal fun resolveAppDataDir(): Path {
         val osName = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
         val userHome = Paths.get(System.getProperty("user.home").orEmpty())
         return when {

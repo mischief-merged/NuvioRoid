@@ -1,0 +1,2 @@
+# Present only in a test build. The shipped app has no data-folder substitute.
+com.nuvio.app.core.storage.DesktopTestAppDataDirSource

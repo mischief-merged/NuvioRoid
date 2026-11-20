@@ -8,6 +8,7 @@ import com.sun.jna.ptr.IntByReference
 import com.sun.jna.ptr.PointerByReference
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.ServiceLoader
 import java.util.UUID
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -19,21 +20,21 @@ internal interface CredentialVault {
     fun remove(account: String)
 }
 
-/** Holds credentials in this process only. Used when the login keychain cannot be opened. */
-internal class MemoryCredentialVault : CredentialVault {
-    private val values = mutableMapOf<String, String>()
-    override fun read(account: String): String? = synchronized(values) { values[account] }
-    override fun write(account: String, value: String) { synchronized(values) { values[account] = value } }
-    override fun remove(account: String) { synchronized(values) { values.remove(account) } }
+/**
+ * A credential store supplied with this build. The shipped app has none, so saved logins stay in the
+ * keychain and a keychain failure is reported instead of being written to a file.
+ */
+internal interface CredentialVaultSource {
+    fun vault(): CredentialVault
 }
 
 internal object DesktopCredentials {
-    // Tests pass nuvio.credentialVault=memory so they do not use the login keychain. The app itself does not set this.
     val vault: CredentialVault? by lazy {
-        when (System.getProperty("nuvio.credentialVault")) {
-            "memory" -> MemoryCredentialVault()
-            else -> if (System.getProperty("os.name").orEmpty().contains("mac", true)) MacKeychainVault() else null
-        }
+        val provided = ServiceLoader.load(
+            CredentialVaultSource::class.java,
+            CredentialVaultSource::class.java.classLoader,
+        ).iterator().asSequence().firstOrNull()?.vault()
+        credentialVaultForPlatform(provided, System.getProperty("os.name").orEmpty())
     }
 
     val storeNames = setOf("nuvio_account_sessions", "nuvio_trakt_auth", "nuvio_mdblist_auth", "nuvio_simkl_auth",
@@ -56,6 +57,10 @@ internal object DesktopCredentials {
         Logger.withTag("CredentialStorage").w { "Secure storage is unavailable; existing saved credentials have been kept." }
     }
 }
+
+/** The store this operating system uses when the build itself did not supply one. */
+internal fun credentialVaultForPlatform(provided: CredentialVault?, osName: String): CredentialVault? =
+    provided ?: if (osName.contains("mac", ignoreCase = true)) MacKeychainVault() else null
 
 /** Immutable references make an interrupted file replacement safe, including its previous copy. */
 internal class CredentialCodec(
