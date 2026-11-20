@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -104,6 +105,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         DownloadsRepository.verifyCompletedDownload(item.id)
     },
     onDownloadVerificationJob: (Job) -> Unit = {},
+    onOfflineDownloadDeclined: () -> Unit = {},
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
@@ -177,7 +179,10 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                 onDownloadedEpisodeSelected(verified, nextVideo)
                 return@launch
             }
-            if (isOffline()) return@launch
+            if (isOffline()) {
+                if (isActive) onOfflineDownloadDeclined()
+                return@launch
+            }
             onSearchingChanged(true)
             onSourceNameChanged(null)
             onCountdownChanged(null)
