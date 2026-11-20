@@ -21,11 +21,12 @@ import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
-import io.ktor.client.HttpClient
-import io.ktor.client.call.body
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.request.get
-import io.ktor.client.request.header
+import com.nuvio.app.core.network.ArtworkMaxBytes
+import com.nuvio.app.core.network.guardedHttpClient
+import com.nuvio.app.core.network.readBounded
+import kotlinx.coroutines.withContext
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -52,13 +53,17 @@ private const val MAX_FRAME_DIMENSION = 512
 // How many decoded gif bytes we're willing to keep on disk between app runs.
 private const val MAX_DISK_CACHE_FILES = 200
 
-private val desktopGifHttpClient by lazy {
-    com.nuvio.app.core.network.createApiHttpClient().config {
-        followRedirects = true
+private val desktopGifHttpClient by lazy { guardedHttpClient().callTimeout(15, TimeUnit.SECONDS).build() }
+private val downloadSemaphore = Semaphore(4)
+
+internal suspend fun fetchCollectionAnimation(url: String): ByteArray = withContext(Dispatchers.IO) {
+    val request = Request.Builder().url(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").build()
+    desktopGifHttpClient.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) throw java.io.IOException("Artwork request failed")
+        response.body?.readBounded(ArtworkMaxBytes) ?: ByteArray(0)
     }
 }
-
-private val downloadSemaphore = Semaphore(4)
 
 // Disk-persisted cache of raw gif bytes, so a gif that was ever hovered doesn't need to hit
 // the network again on the next app launch - only the very first hover ever pays network cost.
@@ -173,12 +178,7 @@ private suspend fun decodeGifCodec(url: String): GifCodecHolder? {
     return try {
         // Disk cache first - avoids a network round-trip on every fresh app launch.
         val bytes = readGifDiskCache(url) ?: run {
-            val downloaded = desktopGifHttpClient.get(url) {
-                header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                )
-            }.body<ByteArray>()
+            val downloaded = fetchCollectionAnimation(url)
             writeGifDiskCache(url, downloaded)
             downloaded
         }

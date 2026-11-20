@@ -4,7 +4,8 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 
-internal actual fun createApiHttpClient(): HttpClient = HttpClient(desktopHttpEngine()) {
+internal actual fun createApiHttpClient(): HttpClient = HttpClient(OkHttp) {
+    engine { preconfigured = guardedHttpClient().build() }
     followRedirects = false
     expectSuccess = false
     install(HttpTimeout) {
@@ -14,7 +15,9 @@ internal actual fun createApiHttpClient(): HttpClient = HttpClient(desktopHttpEn
     }
 }
 
-internal actual fun platformHttpEngine(): io.ktor.client.engine.HttpClientEngine? = desktopHttpEngine()
+internal actual fun createBackendHttpEngine(): io.ktor.client.engine.HttpClientEngine? = OkHttp.create {
+    preconfigured = guardedHttpClient().build()
+}
 
 internal fun desktopHttpEngine(manager: javax.net.ssl.X509TrustManager = DesktopTls.trustManager): io.ktor.client.engine.HttpClientEngine = OkHttp.create {
     preconfigured = DesktopTls.clientBuilder(manager).followRedirects(false).followSslRedirects(false).build()

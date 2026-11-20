@@ -34,7 +34,7 @@ import org.jetbrains.skia.ImageInfo
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 
-class AnimatedImagePlaybackTest {
+class AnimatedImagePlaybackTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @get:Rule
     val compose = createComposeRule()
 

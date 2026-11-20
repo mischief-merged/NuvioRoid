@@ -22,6 +22,7 @@
 #include <mpv/client.h>
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
+#include "network_trust.h"
 
 #include <atomic>
 #include <algorithm>
@@ -62,6 +63,16 @@
 #endif
 
 static constexpr double kMaxVolumePercent = 200.0;
+static std::mutex gPlaybackNetworkMutex;
+static NSString *gPlaybackNetwork = @"";
+static unsigned long long gPlaybackNetworkGeneration = 0;
+static nw_path_monitor_t gPlaybackPathMonitor = nil;
+static void NuvioStartPlaybackMonitor(void);
+static NSString *NuvioPlaybackNetwork(void) {
+    std::lock_guard<std::mutex> guard(gPlaybackNetworkMutex);
+    return gPlaybackNetwork;
+}
+
 
 @class PlayerMetalView;
 @class MpvWebPlayer;
@@ -145,7 +156,11 @@ static constexpr double kMaxVolumePercent = 200.0;
                    decoderPriority:(int)decoderPriority
                            javaVm:(JavaVM *)javaVm
                         eventSink:(jobject)eventSink
-                      eventMethod:(jmethodID)eventMethod;
+                      eventMethod:(jmethodID)eventMethod
+                           caFile:(NSString *)caFile
+                          network:(NSString *)network
+                  allowUnverified:(BOOL)allowUnverified
+                     trustWarning:(NSString *)trustWarning;
 - (void)shutdown;
 - (void)updateControlsJson:(NSString *)controlsJson;
 - (void)requestFocus;
@@ -940,7 +955,15 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     NSTimeInterval _lastNowPlayingPushedAt;
     NSString *_nowPlayingArtworkUrl;
     MPMediaItemArtwork *_nowPlayingArtwork;
-    NSURLSessionDataTask *_nowPlayingArtworkTask;
+
+    NSString *_trustBundleFile;
+    NSString *_playbackNetwork;
+    NSString *_playbackSource;
+    NSString *_trustWarning;
+    NSTextField *_trustBanner;
+    BOOL _allowUnverified;
+    std::atomic_bool _certificateFailureSeen;
+    BOOL _certificatePromptSent;
     NSString *_nowPlayingTitleOverride;
     NSString *_nowPlayingSubtitle;
     BOOL _nowPlayingMetadataDirty;
@@ -1004,12 +1027,17 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                    decoderPriority:(int)decoderPriority
                            javaVm:(JavaVM *)javaVm
                         eventSink:(jobject)eventSink
-                      eventMethod:(jmethodID)eventMethod {
+                      eventMethod:(jmethodID)eventMethod
+                           caFile:(NSString *)caFile
+                          network:(NSString *)network
+                  allowUnverified:(BOOL)allowUnverified
+                     trustWarning:(NSString *)trustWarning {
     self = [super init];
     if (!self) {
         return nil;
     }
 
+    @try {
     _cachedDurationSeconds.store(0.0);
     _cachedPositionSeconds.store(initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0);
     _cachedPositionStamp = CACurrentMediaTime();
@@ -1021,11 +1049,18 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     _mpvEventQueue = dispatch_queue_create("com.nuvio.desktop.mpv-events", DISPATCH_QUEUE_SERIAL);
     _mpvDrainQueue = dispatch_queue_create("com.nuvio.desktop.mpv-drain", DISPATCH_QUEUE_SERIAL);
     _mpvDrainStopped.store(false);
+    _certificateFailureSeen.store(false);
     _aoIsAvfoundation.store(false);
     _requestedVolumePercent.store(100.0);
     _javaVm = javaVm;
     _eventSink = eventSink;
     _eventMethod = eventMethod;
+    _trustBundleFile = caFile;
+    _playbackNetwork = network;
+    _playbackSource = sourceUrl;
+    _trustWarning = trustWarning;
+    _allowUnverified = allowUnverified && network.length > 0 && [network isEqualToString:NuvioPlaybackNetwork()];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(playbackNetworkChanged:) name:@"NuvioPlaybackNetworkChanged" object:nil];
 
     _hostView = hostView;
     _hostView.wantsLayer = YES;
@@ -1114,6 +1149,12 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                                                        userInfo:nil
                                                         repeats:YES];
     return self;
+    } @catch (NSException *exception) {
+        // The JNI caller still owns this reference until initialization returns successfully.
+        _eventSink = nullptr;
+        [self shutdown];
+        @throw;
+    }
 }
 
 - (void)focusControlsWebViewIfNeeded {
@@ -1572,11 +1613,15 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     }
     _initialStartSeconds = initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0;
 
+    if (!NuvioSecureMpv(_mpv, _trustBundleFile.fileSystemRepresentation, _allowUnverified)) {
+        @throw [NSException exceptionWithName:@"PlayerBridgeError" reason:@"PLAYBACK_TRUST_SETUP" userInfo:nil];
+    }
+    mpv_request_log_messages(_mpv, "warn");
+    if (_allowUnverified) [self showTrustBanner];
     setMpvOptionString(_mpv, "config", "no");
     setMpvOptionString(_mpv, "terminal", "no");
-    setMpvOptionString(_mpv, "msg-level", "all=no");
     setMpvOptionString(_mpv, "osc", "no");
-    setMpvOptionString(_mpv, "input-default-bindings", "yes");
+    setMpvOptionString(_mpv, "input-default-bindings", "no");
     setMpvOptionString(_mpv, "input-vo-keyboard", "no");
     setMpvOptionString(_mpv, "keep-open", "yes");
     setMpvOptionString(_mpv, "volume-max", "200");
@@ -1611,6 +1656,9 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     if (headerLines.count > 0) {
         NSMutableArray *escaped = [NSMutableArray arrayWithCapacity:headerLines.count];
         for (NSString *line in headerLines) {
+            if (!NuvioValidHeader(line)) {
+                @throw [NSException exceptionWithName:@"PlayerBridgeError" reason:@"Invalid playback header" userInfo:nil];
+            }
             NSString *esc = [[line stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
                              stringByReplacingOccurrencesOfString:@"," withString:@"\\,"];
             [escaped addObject:esc];
@@ -1963,6 +2011,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
         dispatch_sync(_mpvEventQueue, ^{});
     }
     [self stopMpvEventDrain];
+    [_trustBanner removeFromSuperview]; _trustBanner = nil;
     [_videoView destroyMpvRenderContext];
     if (_mpv) {
         mpv_terminate_destroy(_mpv);
@@ -2070,6 +2119,33 @@ static void nuvioMpvWakeup(void *ctx) {
         mpv_event *event = mpv_wait_event(mpv, 0);
         if (!event || event->event_id == MPV_EVENT_NONE) break;
         switch (event->event_id) {
+            case MPV_EVENT_LOG_MESSAGE: {
+                mpv_event_log_message *line = (mpv_event_log_message *)event->data;
+                if (line && NuvioCertificateFailure(line->text)) {
+                    _certificateFailureSeen = YES;
+                    if (!_certificatePromptSent) {
+                        _certificatePromptSent = YES;
+                        // A failed segment or subtitle can otherwise be skipped without an end-file event.
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (!self->_mpv) return;
+                            const char *stop[] = {"stop", nullptr};
+                            mpv_command_async(self->_mpv, 0, stop);
+                            [self sendPlayerEvent:@"certificateFailure" value:0];
+                        });
+                    }
+                }
+                break;
+            }
+            case MPV_EVENT_END_FILE: {
+                mpv_event_end_file *end = (mpv_event_end_file *)event->data;
+                if (end && end->reason == MPV_END_FILE_REASON_ERROR && _certificateFailureSeen && !_certificatePromptSent) {
+                    _certificatePromptSent = YES;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self->_mpv) [self sendPlayerEvent:@"certificateFailure" value:0];
+                    });
+                }
+                break;
+            }
             case MPV_EVENT_PROPERTY_CHANGE: {
                 mpv_event_property *prop = (mpv_event_property *)event->data;
                 if (event->reply_userdata == 2 && prop && prop->format == MPV_FORMAT_STRING) {
@@ -2090,6 +2166,44 @@ static void nuvioMpvWakeup(void *ctx) {
                 break;
         }
     }
+}
+
+- (void)showTrustBanner {
+    if (!_trustBanner) {
+        _trustBanner = [NSTextField labelWithString:_trustWarning ?: @""];
+        _trustBanner.textColor = NSColor.whiteColor;
+        _trustBanner.backgroundColor = [NSColor colorWithRed:0.42 green:0.18 blue:0 alpha:0.96];
+        _trustBanner.drawsBackground = YES;
+        _trustBanner.alignment = NSTextAlignmentCenter;
+        _trustBanner.frame = NSMakeRect(0, 0, _hostView.bounds.size.width, 24);
+        _trustBanner.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        [_hostView addSubview:_trustBanner positioned:NSWindowAbove relativeTo:nil];
+    }
+}
+
+- (void)playbackNetworkChanged:(NSNotification *)notification {
+    if (!_mpv || !_allowUnverified) return;
+    NSString *reportedNetwork = notification.userInfo[@"network"] ?: NuvioPlaybackNetwork();
+    if (![notification.userInfo[@"force"] boolValue] && [_playbackNetwork isEqualToString:reportedNetwork]) return;
+    // Stop the old request before it can be reused on another path; future loads verify again.
+    const char *stop[] = {"stop", nullptr};
+    mpv_command_async(_mpv, 0, stop);
+    mpv_set_property_string(_mpv, "tls-verify", "yes");
+    _allowUnverified = NO;
+    [_trustBanner removeFromSuperview]; _trustBanner = nil;
+}
+
+- (BOOL)retryUnverifiedOnNetwork:(NSString *)network {
+    if (!_mpv || !network.length || ![network isEqualToString:NuvioPlaybackNetwork()]) return NO;
+    if (mpv_set_property_string(_mpv, "tls-verify", "no") < 0) return NO;
+    _playbackNetwork = network;
+    _allowUnverified = YES;
+    _certificateFailureSeen = NO;
+    [self showTrustBanner];
+    char start[64];
+    snprintf(start, sizeof(start), "start=%.3f", fmax(_initialStartSeconds, _cachedPositionSeconds.load()));
+    const char *load[] = {"loadfile", _playbackSource.UTF8String, "replace", "-1", start, nullptr};
+    return mpv_command(_mpv, load) >= 0;
 }
 
 - (void)stopMpvEventDrain {
@@ -2851,8 +2965,6 @@ static void nuvioMpvWakeup(void *ctx) {
     info.playbackState = MPNowPlayingPlaybackStateStopped;
     info.nowPlayingInfo = nil;
     _lastNowPlayingTitle = nil;
-    [_nowPlayingArtworkTask cancel];
-    _nowPlayingArtworkTask = nil;
     _nowPlayingArtwork = nil;
     _nowPlayingArtworkUrl = nil;
     _nowPlayingTitleOverride = nil;
@@ -2865,39 +2977,14 @@ static void nuvioMpvWakeup(void *ctx) {
         return;
     }
     _nowPlayingArtworkUrl = cleaned;
-    [_nowPlayingArtworkTask cancel];
-    _nowPlayingArtworkTask = nil;
     _nowPlayingArtwork = nil;
-    NSURL *url = (cleaned.length > 0) ? [NSURL URLWithString:cleaned] : nil;
-    if (!url) {
-        [self pushNowPlayingArtwork];
-        return;
+    NSData *data = NuvioArtworkData(cleaned);
+    NSImage *image = data ? [[NSImage alloc] initWithData:data] : nil;
+    if (image) {
+        _nowPlayingArtwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
+            requestHandler:^NSImage *(CGSize size) { return image; }];
     }
-    __weak MpvWebPlayer *weakSelf = self;
-    _nowPlayingArtworkTask = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                         completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            return;
-        }
-        NSImage *image = [[NSImage alloc] initWithData:data];
-        if (!image) {
-            return;
-        }
-        MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
-                                                                      requestHandler:^NSImage *(CGSize size) {
-            return image;
-        }];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || ![cleaned isEqualToString:strongSelf->_nowPlayingArtworkUrl ?: @""]) {
-                return;
-            }
-            strongSelf->_nowPlayingArtwork = artwork;
-            strongSelf->_nowPlayingArtworkTask = nil;
-            [strongSelf pushNowPlayingArtwork];
-        });
-    }];
-    [_nowPlayingArtworkTask resume];
+    [self pushNowPlayingArtwork];
 }
 
 // Title/subtitle come from the app's own metadata (show name, "S1E4 - Episode")
@@ -3079,7 +3166,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setMacosWindowFull
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_createMac(
     JNIEnv *env,
     jobject /* bridge */,
     jlong hostViewPtr,
@@ -3090,7 +3177,11 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     jstring controlsPageUrl,
     jint decoderPriority,
     jboolean nvidiaRtxSuperResolutionEnabled,
-    jobject eventSink
+    jobject eventSink,
+    jstring caFile,
+    jstring network,
+    jboolean allowUnverified,
+    jstring warning
 ) {
     NSView *hostView = (__bridge NSView *)(void *)(intptr_t)hostViewPtr;
     if (!hostView) {
@@ -3119,6 +3210,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     std::string source = jstringToString(env, sourceUrl);
     std::string controls = jstringToString(env, controlsPageUrl);
     NSArray<NSString *> *headers = jstringArrayToNSArray(env, headerLines);
+    NSString *trustFile = [NSString stringWithUTF8String:jstringToString(env, caFile).c_str()];
+    NSString *networkKey = [NSString stringWithUTF8String:jstringToString(env, network).c_str()];
+    NSString *trustWarning = [NSString stringWithUTF8String:jstringToString(env, warning).c_str()];
     __block MpvWebPlayer *player = nil;
     __block NSString *error = nil;
     runOnMainSync(^{
@@ -3133,7 +3227,11 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
                  decoderPriority:decoderPriority
                           javaVm:javaVm
                        eventSink:eventSinkRef
-                     eventMethod:eventMethod];
+                     eventMethod:eventMethod
+                          caFile:trustFile
+                         network:networkKey
+                 allowUnverified:allowUnverified == JNI_TRUE
+                    trustWarning:trustWarning];
         } @catch (NSException *exception) {
             error = exception.reason ?: exception.name;
         }
@@ -3705,6 +3803,7 @@ public:
         if (!mpv_) return false;
         const char *options[][2] = {
             {"config", "no"}, {"terminal", "no"}, {"msg-level", "all=no"}, {"load-scripts", "no"},
+            {"ytdl", "no"}, {"load-stats-overlay", "no"}, {"load-osd-console", "no"}, {"load-auto-profiles", "no"},
             {"ytdl", "no"}, {"osc", "no"}, {"input-default-bindings", "no"}, {"input-vo-keyboard", "no"},
             {"resume-playback", "no"}, {"save-position-on-quit", "no"},
             {"vo", "libmpv"}, {"ao", "null"}, {"aid", "no"}, {"sid", "no"}, {"osd-level", "0"},
@@ -4057,6 +4156,70 @@ static std::string NuvioPathGateways(nw_path_t path) {
     return gateways;
 }
 
+static void NuvioUpdatePlaybackPath(nw_path_t path) {
+    const bool satisfied = nw_path_get_status(path) == nw_path_status_satisfied;
+    const std::string gateways = NuvioPathGateways(path);
+    __block std::string interfaces;
+    nw_path_enumerate_interfaces(path, ^bool(nw_interface_t interface) {
+        if (!interfaces.empty()) interfaces += ",";
+        const char *name = nw_interface_get_name(interface);
+        interfaces += name ? name : "?";
+        interfaces += "/";
+        interfaces += NuvioInterfaceKind(nw_interface_get_type(interface));
+        return true;
+    });
+    NSString *nextNetwork;
+    {
+        std::lock_guard<std::mutex> guard(gPlaybackNetworkMutex);
+        ++gPlaybackNetworkGeneration;
+        if (satisfied && gateways.find('@') != std::string::npos) {
+            NSArray *parts = [[NSString stringWithUTF8String:gateways.c_str()] componentsSeparatedByString:@","];
+            NSString *names = [[[NSString stringWithUTF8String:interfaces.c_str()] componentsSeparatedByString:@","] sortedArrayUsingSelector:@selector(compare:)].description;
+            nextNetwork = [NSString stringWithFormat:@"network:%@|%@", names, [[parts sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","]];
+        } else {
+            nextNetwork = [NSString stringWithFormat:@"session:%llu", gPlaybackNetworkGeneration];
+        }
+        gPlaybackNetwork = nextNetwork;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"NuvioPlaybackNetworkChanged" object:nil userInfo:@{@"network": nextNetwork}];
+    });
+
+}
+
+// Playback keeps its own monitor for the process lifetime, independent of download holds.
+// Until the first report (or after cancellation), no verification exception can be granted.
+static void NuvioStartPlaybackMonitor(void) {
+    dispatch_semaphore_t firstReport = dispatch_semaphore_create(0);
+    auto reported = std::make_shared<std::atomic<bool>>(false);
+    {
+        std::lock_guard<std::mutex> guard(gPlaybackNetworkMutex);
+        if (gPlaybackPathMonitor) return;
+        nw_path_monitor_t monitor = nw_path_monitor_create();
+        if (!monitor) return;
+        nw_path_monitor_set_queue(monitor, dispatch_queue_create("com.nuvio.playback-path", DISPATCH_QUEUE_SERIAL));
+        nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
+            NuvioUpdatePlaybackPath(path);
+            if (!reported->exchange(true)) dispatch_semaphore_signal(firstReport);
+        });
+        nw_path_monitor_set_cancel_handler(monitor, ^{
+            {
+                std::lock_guard<std::mutex> lock(gPlaybackNetworkMutex);
+                gPlaybackNetwork = @"";
+                gPlaybackPathMonitor = nil;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSNotificationCenter defaultCenter] postNotificationName:@"NuvioPlaybackNetworkChanged" object:nil userInfo:@{@"force": @YES}];
+            });
+        });
+        gPlaybackPathMonitor = monitor;
+        nw_path_monitor_start(monitor);
+    }
+    // Creation runs off the UI thread. Give remembered choices a usable first identity,
+    // while retaining verified playback if a path report cannot be obtained promptly.
+    dispatch_semaphore_wait(firstReport, dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC));
+}
+
 static void NuvioReportPath(nw_path_t path) {
     const bool satisfied = nw_path_get_status(path) == nw_path_status_satisfied;
     const bool expensive = nw_path_is_expensive(path);
@@ -4232,5 +4395,78 @@ Java_com_nuvio_app_features_downloads_MacDownloadPowerNative_setSleepPrevention(
             CFRelease(gDownloadPowerSource);
             gDownloadPowerSource = nullptr;
         }
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_playbackNetworkIdentity(JNIEnv *env, jobject) {
+    NuvioStartPlaybackMonitor();
+    return env->NewStringUTF(NuvioPlaybackNetwork().UTF8String);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_systemTrustPem(JNIEnv *env, jobject) {
+    NSString *pem = NuvioSystemTrustPEM();
+    if (!pem) { throwJavaError(env, @"PLAYBACK_TRUST_SETUP"); return nullptr; }
+    return env->NewStringUTF(pem.UTF8String);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_retryUnverified(JNIEnv *env, jobject, jlong handle, jstring network) {
+    if (!handle) return JNI_FALSE;
+    NSString *key = [NSString stringWithUTF8String:jstringToString(env, network).c_str()];
+    MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
+    __block BOOL result = NO;
+    runOnMainSync(^{ result = [player retryUnverifiedOnNetwork:key]; });
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_requireVerifiedPlayback(JNIEnv *, jobject) {
+    runOnMainSync(^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"NuvioPlaybackNetworkChanged" object:nil userInfo:@{@"force": @YES}];
+    });
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_verifyServerCertificates(JNIEnv *env, jobject, jobjectArray chain, jstring hostname) {
+    @autoreleasepool {
+        if (!chain || !hostname) return JNI_FALSE;
+        NSMutableArray<NSData *> *certificates = [NSMutableArray array];
+        for (jsize i = 0; i < env->GetArrayLength(chain); i++) {
+            jbyteArray item = (jbyteArray)env->GetObjectArrayElement(chain, i);
+            if (!item) return JNI_FALSE;
+            jsize size = env->GetArrayLength(item);
+            NSMutableData *der = [NSMutableData dataWithLength:size];
+            env->GetByteArrayRegion(item, 0, size, (jbyte *)der.mutableBytes);
+            env->DeleteLocalRef(item);
+            if (env->ExceptionCheck()) return JNI_FALSE;
+            [certificates addObject:der];
+        }
+        NSString *host = [NSString stringWithUTF8String:jstringToString(env, hostname).c_str()];
+        return NuvioEvaluateServerTrust(certificates, host) ? JNI_TRUE : JNI_FALSE;
+    }
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_systemTrustCertificates(JNIEnv *env, jobject) {
+    @autoreleasepool {
+        NSSet<NSData *> *certificates = NuvioCertificateCandidates([NSMutableSet set]);
+        if (!certificates) { throwJavaError(env, @"PLAYBACK_TRUST_SETUP"); return nullptr; }
+        jclass bytesClass = env->FindClass("[B");
+        if (!bytesClass) return nullptr;
+        jobjectArray result = env->NewObjectArray((jsize)certificates.count, bytesClass, nullptr);
+        env->DeleteLocalRef(bytesClass);
+        if (!result) return nullptr;
+        jsize index = 0;
+        for (NSData *der in certificates) {
+            jbyteArray bytes = env->NewByteArray((jsize)der.length);
+            if (!bytes) return nullptr;
+            env->SetByteArrayRegion(bytes, 0, (jsize)der.length, (const jbyte *)der.bytes);
+            env->SetObjectArrayElement(result, index++, bytes);
+            env->DeleteLocalRef(bytes);
+            if (env->ExceptionCheck()) return nullptr;
+        }
+        return result;
     }
 }

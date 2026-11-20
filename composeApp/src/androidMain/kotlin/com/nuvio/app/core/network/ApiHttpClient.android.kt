@@ -22,4 +22,4 @@ internal actual fun createApiHttpClient(): HttpClient = HttpClient(OkHttp) {
     }
 }
 
-internal actual fun platformHttpEngine(): io.ktor.client.engine.HttpClientEngine? = null
+internal actual fun createBackendHttpEngine(): io.ktor.client.engine.HttpClientEngine? = null

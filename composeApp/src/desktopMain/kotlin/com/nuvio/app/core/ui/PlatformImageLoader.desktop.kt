@@ -17,6 +17,10 @@ internal actual fun ImageLoader.Builder.configurePlatformImageLoader(): ImageLoa
 }
 
 internal actual fun ComponentRegistry.Builder.addPlatformDecoders() {
+    add(coil3.network.NetworkFetcher.Factory(
+        networkClient = { BoundedArtworkClient() },
+        cacheStrategy = { coil3.network.cachecontrol.CacheControlCacheStrategy() },
+    ))
     add(SkiaGifDecoder.Factory())
     add(SvgEmbeddedImageDecoder.Factory())
 }

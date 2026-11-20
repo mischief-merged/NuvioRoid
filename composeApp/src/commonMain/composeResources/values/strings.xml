@@ -3270,4 +3270,21 @@
     <string name="offline_connect_to_play">Connect to the internet to play this</string>
     <string name="profile_pin_storage_unavailable">Your PIN could not be checked. Please try again.</string>
     <string name="secure_storage_unavailable">Saved credentials are unavailable. Unlock your Mac’s Keychain and allow access, then try again.</string>
+    <string name="network_home_server_blocked">This address is on a private network. Add its host to Trusted home servers in Plugins settings to allow it.</string>
+    <string name="network_https_required">Plugin downloads need a secure HTTPS address.</string>
+    <string name="network_response_too_large">This response is too large. Try another source.</string>
+    <string name="network_trusted_servers">Trusted home servers</string>
+    <string name="network_trusted_servers_help">Allow plugins and downloads to reach these exact hosts on your home network. Add only servers you trust.</string>
+    <string name="network_server_address">Server address</string>
+    <string name="network_add_server">Add server</string>
+    <string name="network_remove_server">Remove</string>
+    <string name="network_invalid_server">Enter a valid server address without a username or password.</string>
+    <string name="playback_tls_title">This connection could not be verified</string>
+    <string name="playback_tls_message">The video server’s certificate is not trusted by this Mac. You can stop here, or allow unverified playback on this network. Someone on the network could change what you receive.</string>
+    <string name="playback_tls_anyway">Play anyway on this network</string>
+    <string name="playback_tls_stop">Stop playback</string>
+    <string name="playback_tls_active">Unverified playback is allowed on this network.</string>
+    <string name="playback_tls_forget">Require verified playback again</string>
+    <string name="playback_invalid_headers">This video source sent an invalid request header. Try another source.</string>
+    <string name="playback_trust_setup_failed">The video connection could not be checked. Restart the app and try again.</string>
 </resources>

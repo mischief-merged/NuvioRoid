@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.desktop
 
+import nuvio.composeapp.generated.resources.*
 import androidx.compose.ui.graphics.Color
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
@@ -58,7 +59,22 @@ internal class NativePlayerController(
     private val host: NativePlayerHost,
     private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink ->
         NativePlayerBridge.ensureLoaded()
-        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
+        if (DesktopHostOs.current == DesktopHostOs.MACOS) {
+            val network = NativePlayerBridge.playbackNetworkIdentity()
+            val pem = NativePlayerBridge.systemTrustPem()
+            val bundle = java.nio.file.Files.createTempFile(com.nuvio.app.core.storage.DesktopStorage.cacheDir, "playback-trust-", ".pem")
+            java.nio.file.Files.writeString(bundle, pem)
+            try {
+                NativePlayerBridge.createMac(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink,
+                    bundle.toString(), network, PlaybackNetworkTrust.choices.allows(network),
+                    kotlinx.coroutines.runBlocking { org.jetbrains.compose.resources.getString(Res.string.playback_tls_active) })
+            } finally {
+                // mpv reads this bundle during subsequent connections, so the native player owns its lifetime.
+                bundle.toFile().deleteOnExit()
+            }
+        } else {
+            NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
+        }
     },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
@@ -67,6 +83,18 @@ internal class NativePlayerController(
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
     private val onCreateWaitCompleted: () -> Unit = {},
+    private val networkIdentity: () -> String = NativePlayerBridge::playbackNetworkIdentity,
+    private val nativeRetryUnverified: (Long, String) -> Boolean = NativePlayerBridge::retryUnverified,
+    private val rememberPlaybackNetwork: (String) -> Unit = PlaybackNetworkTrust.choices::remember,
+    private val confirmUnverified: () -> Boolean = {
+        val labels = kotlinx.coroutines.runBlocking {
+            listOf(Res.string.playback_tls_title, Res.string.playback_tls_message, Res.string.playback_tls_stop, Res.string.playback_tls_anyway)
+                .map { org.jetbrains.compose.resources.getString(it) }
+        }
+        javax.swing.JOptionPane.showOptionDialog(host, labels[1], labels[0],
+            javax.swing.JOptionPane.DEFAULT_OPTION, javax.swing.JOptionPane.WARNING_MESSAGE, null,
+            arrayOf(labels[2], labels[3]), labels[2]) == 1
+    },
 ) : PlayerEngineController {
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
@@ -111,6 +139,8 @@ internal class NativePlayerController(
     private var releaseInFlight: Thread? = null
     private var releaseTimedOut: Boolean = false
     private var terminalReleaseFailure: String? = null
+    private var certificateFailurePending: Any? = null
+    private var activeEventToken: Any? = null
     private var controlsState = PlayerControlsState()
     private var pictureInPictureActive = false
     @Volatile
@@ -123,9 +153,12 @@ internal class NativePlayerController(
     private var onEvent: (String, Double) -> Boolean = { _, _ -> false }
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
-    private val eventSink = NativePlayerEventSink { type, value ->
+    private fun eventSink(pending: PendingSource, token: Any) = NativePlayerEventSink { type, value ->
         SwingUtilities.invokeLater {
-            handlePlayerEvent(type, value)
+            val current = synchronized(lifecycleLock) {
+                !releaseRequested && pendingSource === pending && activeEventToken === token
+            }
+            if (current) handlePlayerEvent(type, value, token)
         }
     }
 
@@ -138,9 +171,13 @@ internal class NativePlayerController(
         nvidiaRtxSuperResolutionEnabled: Boolean,
         onError: (String?) -> Unit,
     ) {
+        val headerLines = try { sourceHeaders.toHeaderLines() } catch (error: IllegalArgumentException) {
+            onError(error.message)
+            return
+        }
         val pending = PendingSource(
             sourceUrl = sourceUrl,
-            headerLines = sourceHeaders.toHeaderLines(),
+            headerLines = headerLines,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs.coerceAtLeast(0L),
             decoderPriority = decoderPriority,
@@ -157,6 +194,8 @@ internal class NativePlayerController(
                 }
                 else -> {
                     pendingSource = pending
+                    activeEventToken = null
+                    certificateFailurePending = null
                     true
                 }
             }
@@ -290,7 +329,7 @@ internal class NativePlayerController(
         val hostViewPtr = runCatching { resolveHostView() }
             .getOrElse { error ->
                 log.w(error) { "attach failed to resolve host source=${pending.sourceUrl.toPlaybackLogKey()}" }
-                if (!releaseRequested && pendingSource === pending) pending.onError(error.message)
+                if (!releaseRequested && pendingSource === pending) pending.onError(playbackFailureText(error.message))
                 return
             }
         val resolvedSource = if (pending.sourceUrl.startsWith("file:", ignoreCase = true)) {
@@ -307,6 +346,7 @@ internal class NativePlayerController(
         // messages. Creating on the EDT is therefore the same circular wait that the teardown had:
         // the app stops responding and Windows closes it as "stopped interacting" (Hang 1002).
         // Create off the EDT and come back to it for the parts that touch Swing state.
+        val eventToken = Any()
         val createWorker = Thread({
             try {
                 runCatching {
@@ -319,11 +359,11 @@ internal class NativePlayerController(
                         NativePlayerBridge.controlsPageUrl,
                         pending.decoderPriority,
                         pending.nvidiaRtxSuperResolutionEnabled,
-                        eventSink,
+                        eventSink(pending, eventToken),
                     ).also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
                     val accepted = synchronized(lifecycleLock) {
-                        if (!releaseRequested && terminalReleaseFailure == null && pendingSource === pending) {
+                        if (!releaseRequested && terminalReleaseFailure == null && pendingSource === pending && activeEventToken === eventToken) {
                             handle = created
                             true
                         } else {
@@ -360,11 +400,15 @@ internal class NativePlayerController(
                             setNowPlayingMetadata(currentNowPlayingTitle, currentNowPlayingSubtitle, currentArtworkUrl)
                         }
                         applyPendingSubtitleSettings()
+                        if (certificateFailurePending === eventToken) {
+                            certificateFailurePending = null
+                            handlePlayerEvent("certificateFailure", 0.0, eventToken)
+                        }
                     }
                 }.onFailure { error ->
                     log.w(error) { "attach failed source=${pending.sourceUrl.toPlaybackLogKey()}" }
                     SwingUtilities.invokeLater {
-                        if (!releaseRequested && pendingSource === pending) pending.onError(error.message)
+                        if (!releaseRequested && pendingSource === pending) pending.onError(playbackFailureText(error.message))
                     }
                 }
             } finally {
@@ -382,6 +426,7 @@ internal class NativePlayerController(
                     false
                 }
                 else -> {
+                    activeEventToken = eventToken
                     createsInFlight += createWorker
                     createWorker.start()
                     true
@@ -507,16 +552,23 @@ internal class NativePlayerController(
 
     fun setNowPlayingMetadata(title: String?, subtitle: String?, artworkUrl: String?) {
         if (DesktopHostOs.current != DesktopHostOs.MACOS) return
-        currentNowPlayingTitle = title.orEmpty()
-        currentNowPlayingSubtitle = subtitle.orEmpty()
-        currentArtworkUrl = artworkUrl.orEmpty()
-        handle.takeIf { it != 0L }?.let { current ->
-            NativePlayerBridge.setNowPlayingMetadata(
-                current,
-                currentNowPlayingTitle,
-                currentNowPlayingSubtitle,
-                currentArtworkUrl,
-            )
+        synchronized(lifecycleLock) {
+            currentNowPlayingTitle = title.orEmpty()
+            currentNowPlayingSubtitle = subtitle.orEmpty()
+            currentArtworkUrl = artworkUrl.orEmpty()
+            val url = currentArtworkUrl
+            val image = WebviewImages.resolve(url) {
+                SwingUtilities.invokeLater {
+                    synchronized(lifecycleLock) {
+                        if (currentArtworkUrl == url && !releaseRequested) {
+                            setNowPlayingMetadata(currentNowPlayingTitle, currentNowPlayingSubtitle, url)
+                        }
+                    }
+                }
+            }
+            if (!releaseRequested && handle != 0L) {
+                NativePlayerBridge.setNowPlayingMetadata(handle, currentNowPlayingTitle, currentNowPlayingSubtitle, image)
+            }
         }
     }
 
@@ -547,11 +599,28 @@ internal class NativePlayerController(
         }
     }
 
-    private fun handlePlayerEvent(type: String, value: Double) {
+    private fun handlePlayerEvent(type: String, value: Double, eventToken: Any? = activeEventToken) {
         if (type.shouldLogNativeControlEvent()) {
             log.d { "event received handle=$handle type=$type value=$value" }
         }
         when (type) {
+            "certificateFailure" -> {
+                val (current, source) = synchronized(lifecycleLock) {
+                    if (releaseRequested || activeEventToken !== eventToken) return
+                    if (handle == 0L) { certificateFailurePending = eventToken; return }
+                    handle to pendingSource
+                }
+                val network = networkIdentity()
+                if (network.isBlank()) return
+                val approved = confirmUnverified()
+                // The dialog runs a nested event loop. Revalidate its source, network and handle
+                // afterward, and keep ownership locked through the native call.
+                synchronized(lifecycleLock) {
+                    if (approved && handle == current && activeEventToken === eventToken && pendingSource === source && !releaseRequested && networkIdentity() == network) {
+                        if (nativeRetryUnverified(current, network)) rememberPlaybackNetwork(network)
+                    }
+                }
+            }
             "cursorActivity" -> host.noteCursorActivity()
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
@@ -737,6 +806,8 @@ internal class NativePlayerController(
     ) {
         synchronized(lifecycleLock) {
             releaseRequested = true
+            activeEventToken = null
+            certificateFailurePending = null
         }
         host.resetCursorVisibility()
         invalidateForRelease()
@@ -849,6 +920,8 @@ internal class NativePlayerController(
                 false
             } else {
                 pendingSource = null
+                activeEventToken = null
+                certificateFailurePending = null
                 true
             }
         }
@@ -860,6 +933,8 @@ internal class NativePlayerController(
     private fun cancelPendingAttachment() {
         synchronized(lifecycleLock) {
             pendingSource = null
+            activeEventToken = null
+            certificateFailurePending = null
         }
         host.onPeerReady = null
     }
@@ -921,6 +996,8 @@ internal class NativePlayerController(
     private fun detachPlayerHandle(): Long = synchronized(lifecycleLock) {
         val current = handle
         handle = 0L
+        activeEventToken = null
+        certificateFailurePending = null
         lastSentControlsStructureKey = null
         current
     }
@@ -951,6 +1028,8 @@ internal class NativePlayerController(
     private fun disposePlayerHandle() {
         synchronized(lifecycleLock) {
             if (releaseRequested) return
+            activeEventToken = null
+            certificateFailurePending = null
             val current = handle
             if (current == 0L) return
             handle = 0L
@@ -1253,8 +1332,11 @@ private data class PendingSource(
     val onError: (String?) -> Unit,
 )
 
-private fun Map<String, String>.toHeaderLines(): List<String> =
+internal fun Map<String, String>.toHeaderLines(): List<String> =
     entries.mapNotNull { (key, value) ->
+        require(key.none { it == '\r' || it == '\n' } && value.none { it == '\r' || it == '\n' }) {
+            kotlinx.coroutines.runBlocking { org.jetbrains.compose.resources.getString(nuvio.composeapp.generated.resources.Res.string.playback_invalid_headers) }
+        }
         val cleanKey = key.trim()
         val cleanValue = value.trim()
         if (cleanKey.isBlank() || cleanValue.isBlank()) {
@@ -1317,7 +1399,7 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonField("pauseOverlayWatchingLabel", pauseOverlayWatchingLabel)
         append(',')
-        appendJsonField("pauseOverlayLogo", pauseOverlayLogo.orEmpty())
+        appendJsonField("pauseOverlayLogo", WebviewImages.resolve(pauseOverlayLogo.orEmpty(), onImageReady))
         append(',')
         appendJsonField("pauseOverlayEpisodeInfo", pauseOverlayEpisodeInfo)
         append(',')
@@ -1576,9 +1658,9 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonField("showOpeningOverlay", showOpeningOverlay)
         append(',')
-        appendJsonField("openingArtwork", openingArtwork.orEmpty())
+        appendJsonField("openingArtwork", WebviewImages.resolve(openingArtwork.orEmpty(), onImageReady))
         append(',')
-        appendJsonField("openingLogo", openingLogo.orEmpty())
+        appendJsonField("openingLogo", WebviewImages.resolve(openingLogo.orEmpty(), onImageReady))
         append(',')
         appendJsonField("openingTitle", openingTitle)
         append(',')
@@ -1602,7 +1684,7 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonField("nextEpisodeTitle", nextEpisodeTitle)
         append(',')
-        appendJsonField("nextEpisodeThumbnail", nextEpisodeThumbnail)
+        appendJsonField("nextEpisodeThumbnail", WebviewImages.resolve(nextEpisodeThumbnail, onImageReady))
         append(',')
         appendJsonField("nextEpisodeThumbnailBlurred", nextEpisodeThumbnailBlurred)
         append(',')
@@ -1632,9 +1714,9 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }
         append(',')
-        appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it) }
+        appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it, onImageReady) }
         append(',')
-        appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it) }
+        appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it, onImageReady) }
         append(',')
         appendJsonArrayField("episodeSeasons", episodeSeasons) { appendSeasonItemJson(it) }
         append(',')
@@ -1646,7 +1728,7 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonArrayField("episodeStreamFilters", episodeStreamFilters) { appendFilterItemJson(it) }
         append(',')
-        appendJsonArrayField("episodeStreamItems", episodeStreamItems) { appendSourceItemJson(it) }
+        appendJsonArrayField("episodeStreamItems", episodeStreamItems) { appendSourceItemJson(it, onImageReady) }
         append(',')
         appendJsonField("blurUnwatchedEpisodes", blurUnwatchedEpisodes)
         append(',')
@@ -1839,7 +1921,7 @@ private fun StringBuilder.appendSeasonItemJson(item: PlayerControlSeasonItem) {
     append('}')
 }
 
-private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem) {
+private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem, onImageReady: () -> Unit) {
     append('{')
     appendJsonField("index", item.index)
     append(',')
@@ -1851,7 +1933,7 @@ private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem) {
     append(',')
     appendJsonField("addonName", item.addonName)
     append(',')
-    appendJsonField("addonLogo", item.addonLogo)
+    appendJsonField("addonLogo", WebviewImages.resolve(item.addonLogo, onImageReady))
     append(',')
     appendJsonField("showAddonLogo", item.showAddonLogo)
     append(',')
@@ -1867,7 +1949,7 @@ private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem) {
         append('{')
         appendJsonField("name", badge.name)
         append(',')
-        appendJsonField("imageURL", badge.imageURL)
+        appendJsonField("imageURL", WebviewImages.resolve(badge.imageURL, onImageReady))
         append(',')
         appendJsonField("tagColor", badge.tagColor)
         append(',')
@@ -1879,7 +1961,7 @@ private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem) {
     append('}')
 }
 
-private fun StringBuilder.appendEpisodeItemJson(item: PlayerControlEpisodeItem) {
+private fun StringBuilder.appendEpisodeItemJson(item: PlayerControlEpisodeItem, onImageReady: () -> Unit) {
     append('{')
     appendJsonField("index", item.index)
     append(',')
@@ -1891,7 +1973,7 @@ private fun StringBuilder.appendEpisodeItemJson(item: PlayerControlEpisodeItem) 
     append(',')
     appendJsonField("overview", item.overview)
     append(',')
-    appendJsonField("thumbnail", item.thumbnail)
+    appendJsonField("thumbnail", WebviewImages.resolve(item.thumbnail, onImageReady))
     append(',')
     appendJsonField("released", item.released)
     append(',')
@@ -2031,3 +2113,8 @@ private fun String.toJsonString(): String =
         }
         append('"')
     }
+
+private fun playbackFailureText(message: String?): String? =
+    if (message?.contains("PLAYBACK_TRUST_SETUP") == true) kotlinx.coroutines.runBlocking {
+        org.jetbrains.compose.resources.getString(Res.string.playback_trust_setup_failed)
+    } else message

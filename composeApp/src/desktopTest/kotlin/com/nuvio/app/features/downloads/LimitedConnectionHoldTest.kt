@@ -25,7 +25,7 @@ private val lowData = NetworkPathReport.Known(expensive = false, constrained = t
 private val home = NetworkPathReport.Known(expensive = false, constrained = false, networkKey = pathKey("en0/wifi", "192.168.1.1@aa:bb:cc:00:00:05"))
 
 /** The rule alone: when the connection hold holds, and what ends a "Download anyway". */
-class ConnectionHoldRuleTest {
+class ConnectionHoldRuleTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun an_unknown_path_never_holds() {
         val hold = ConnectionHold()

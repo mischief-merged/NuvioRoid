@@ -17,7 +17,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** A hold that arrives while the finished file is being published must let that transfer finish. */
-class LimitedConnectionPublishWindowTest {
+class LimitedConnectionPublishWindowTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val hold = ConnectionHold()
     private val realBackend = DownloadsRepository.backend
     private val realHold = DownloadsRepository.connectionHold

@@ -21,7 +21,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-class SeasonBatchDownloaderIntegrationTest {
+class SeasonBatchDownloaderIntegrationTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     // A Matroska signature followed by filler, so the downloads are accepted as video files.
     private val payload = matroskaFile(mediaBytes = 256 * 1024)
     private val showId = "$ShowIdPrefix${System.nanoTime()}"

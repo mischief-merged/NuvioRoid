@@ -60,3 +60,5 @@ internal fun currentPluginPlatformTags(): Set<String> {
 }
 
 internal fun currentEpochMillis(): Long = System.currentTimeMillis()
+
+internal suspend fun fetchPluginText(url: String): String = com.nuvio.app.features.addons.getPluginText(url)

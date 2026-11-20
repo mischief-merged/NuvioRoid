@@ -515,3 +515,5 @@ private fun parseContentRangeTotal(headerValue: String?): Long? {
     if (totalPart == "*") return null
     return totalPart.toLongOrNull()?.takeIf { it > 0L }
 }
+
+internal actual fun isTrustedHomeDownloadHost(host: String): Boolean = false

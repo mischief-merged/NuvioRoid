@@ -19,7 +19,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_error_not_enough_space
 import nuvio.composeapp.generated.resources.downloads_error_not_durable
-import nuvio.composeapp.generated.resources.downloads_error_private_address
 import org.jetbrains.compose.resources.getString
 import java.awt.Desktop
 import java.io.File
@@ -27,21 +26,15 @@ import java.io.IOException
 import java.nio.file.Files
 import java.security.MessageDigest
 import nuvio.composeapp.generated.resources.downloads_error_file_checksum
-import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.io.path.createDirectories
 
-private val desktopDownloadHttpClient: HttpClient = HttpClient.newBuilder()
-    .sslContext(com.nuvio.app.core.network.DesktopTls.context)
-    .connectTimeout(Duration.ofSeconds(60))
-    .followRedirects(HttpClient.Redirect.NORMAL)
+private val desktopDownloadHttpClient = com.nuvio.app.core.network.guardedHttpClient()
+    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
     .build()
 
 internal actual object DownloadsPlatformDownloader {
@@ -219,6 +212,10 @@ internal actual object DownloadsPlatformDownloader {
                     request.limits?.onStopped?.invoke(error.reason)
                     return@launch
                 } catch (error: IOException) {
+                    if (error is com.nuvio.app.core.network.NetworkPolicyException) {
+                        onFailure(error.message.orEmpty())
+                        return@launch
+                    }
                     // A full disk is still full after a wait, so it is not tried again.
                     if (classifyDownloadFailure(error.message.orEmpty()) == DownloadFailureKind.NotEnoughSpace) {
                         onFailure(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
@@ -320,28 +317,28 @@ internal actual object DownloadsPlatformDownloader {
         limiter: DownloadSpeedLimiter = DownloadBandwidth.limiter.also { DownloadBandwidth.applyStoredLimit() },
         /** Which partial file is this transfer's own. Callers that made the file themselves may trust it. */
         partial: OwnedPartial = OwnedPartial.trustingCaller(),
-    ): Transferred {
+    ): Transferred = coroutineScope {
         if (Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) && !partial.proven(tempFile.toPath())) throw PartialNotOurs()
-        // The address check at queue time reads only the text of the URL. Here the name is resolved.
-        if (request.item.autoDownloadRuleKey != null && !resolvesToPublicAddresses(request.sourceUrl)) {
-            error(runBlocking { getString(Res.string.downloads_error_private_address) })
-        }
 
         var resumeFromBytes = tempFile.partialLength()
         var attemptedRangeRequest = resumeFromBytes > 0L
         var response = sendDownloadRequest(request, if (attemptedRangeRequest) resumeFromBytes else null)
-
-        if (attemptedRangeRequest && response.statusCode() == 416) {
-            response.body().close()
+        val active = AtomicBoolean(true)
+        val cancelConnection = launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            try { awaitCancellation() } finally { if (active.get()) response.cancel() }
+        }
+        try {
+        if (attemptedRangeRequest && response.code == 416) {
+            response.body!!.byteStream().close()
             if (!partial.removeIfOurs(tempFile.toPath())) throw PartialNotOurs()
             resumeFromBytes = 0L
             attemptedRangeRequest = false
             response = sendDownloadRequest(request, null)
         }
 
-        val statusCode = response.statusCode()
+        val statusCode = response.code
         if (statusCode !in 200..299) {
-            response.body().close()
+            response.body!!.byteStream().close()
             if (statusCode == 408 || statusCode == 429 || statusCode in 500..599) {
                 throw IOException("Download failed with HTTP $statusCode")
             }
@@ -352,8 +349,8 @@ internal actual object DownloadsPlatformDownloader {
         // its first bytes, since a portal may send it unlabelled or labelled as a file. Nothing of it is written
         // and the partial file is left as it is; the transfer is tried again like a dropped connection.
         // The first bytes are read and pushed back, so the reads that follow come straight from the connection as before.
-        val body = java.io.PushbackInputStream(response.body(), SniffBytes)
-        if (isWebPage(response.headers().firstValue("Content-Type").orElse(null)) || startsLikeWebPage(peekHead(body))) {
+        val body = java.io.PushbackInputStream(response.body!!.byteStream(), SniffBytes)
+        if (isWebPage(response.header("Content-Type")) || startsLikeWebPage(peekHead(body))) {
             body.close()
             throw PageInsteadOfFile()
         }
@@ -369,8 +366,8 @@ internal actual object DownloadsPlatformDownloader {
         val totalBytes = resolveTotalBytes(
             startingBytes = startingBytes,
             isPartialResume = isPartialResume,
-            contentRangeHeader = response.headers().firstValue("Content-Range").orElse(null),
-            contentLength = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull(),
+            contentRangeHeader = response.header("Content-Range"),
+            contentLength = response.header("Content-Length")?.toLongOrNull(),
         )
         var downloadedBytes = startingBytes
         val traffic = DownloadTraffic.app
@@ -380,7 +377,7 @@ internal actual object DownloadsPlatformDownloader {
         if (totalBytes != null) {
             val free = freeBytesFor(request.item)?.plus(reclaimedBytes)
             if (free != null && totalBytes - startingBytes > free) {
-                response.body().close()
+                response.body!!.byteStream().close()
                 error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
             }
         }
@@ -388,16 +385,16 @@ internal actual object DownloadsPlatformDownloader {
         // the limits of an automatic download is not started.
         val limits = request.limits
         limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item)?.plus(reclaimedBytes))?.let { reason ->
-            response.body().close()
+            response.body!!.byteStream().close()
             throw TransferStoppedByLimit(reason)
         }
         if (discardPartial && !partial.removeIfOurs(tempFile.toPath())) {
-            response.body().close()
+            response.body!!.byteStream().close()
             throw PartialNotOurs()
         }
         onProgress(downloadedBytes, totalBytes)
         val expectedDigest = if (statusCode == 200 && !appendToTemp) {
-            expectedBodyDigest { name -> response.headers().firstValue(name).orElse(null) }
+            expectedBodyDigest { name -> response.header(name) }
         } else {
             null
         }
@@ -409,12 +406,14 @@ internal actual object DownloadsPlatformDownloader {
                 // ends it, and the transfer is then tried again like any other dropped connection.
                 val lastReadAtNanos = AtomicLong(System.nanoTime())
                 val stalled = AtomicBoolean(false)
+                val reading = AtomicBoolean(true)
                 // Cancelling the transfer closes the body, which ends a read that is blocked on a
                 // silent connection, so a pause or a move does not wait for data that never comes.
                 val closer = launch {
                     try {
                         awaitCancellation()
                     } finally {
+                        if (reading.get()) response.cancel()
                         runCatching { input.close() }
                     }
                 }
@@ -424,6 +423,7 @@ internal actual object DownloadsPlatformDownloader {
                         delay((timeoutMs / 4).coerceAtLeast(1L))
                         if (System.nanoTime() - lastReadAtNanos.get() > timeoutMs * 1_000_000L) {
                             stalled.set(true)
+                            response.cancel()
                             runCatching { input.close() }
                             break
                         }
@@ -466,6 +466,7 @@ internal actual object DownloadsPlatformDownloader {
                     throw if (stalled.get()) IOException("Connection stalled") else error
                 } finally {
                     traffic.end(trafficToken)
+                    reading.set(false)
                     stallWatch.cancel()
                     closer.cancel()
                     // The last value is always reported, whether the transfer ended, failed or was stopped.
@@ -479,53 +480,53 @@ internal actual object DownloadsPlatformDownloader {
         if (totalBytes != null && downloadedBytes < totalBytes) {
             throw IOException("Connection closed after $downloadedBytes of $totalBytes bytes")
         }
-        return Transferred(
+        Transferred(
             totalBytes = totalBytes,
             digestMatched = if (digest != null && expectedDigest != null) digest.digest().contentEquals(expectedDigest.value) else null,
         )
+        } finally {
+            active.set(false)
+            cancelConnection.cancel()
+            response.body?.close()
+        }
     }
 
     private suspend fun sendDownloadRequest(
         request: DownloadPlatformRequest,
         rangeStart: Long?,
-    ): HttpResponse<java.io.InputStream> {
-        val builder = HttpRequest.newBuilder()
-            .uri(URI(request.sourceUrl))
-            .timeout(Duration.ofSeconds(60))
-            .GET()
+    ): DownloadResponse {
+        val builder = okhttp3.Request.Builder().url(request.sourceUrl).get()
         request.sourceHeaders.forEach { (key, value) ->
-            if (key.isNotBlank() && value.isNotBlank()) {
-                builder.header(key, value)
-            }
+            if (key.isNotBlank() && value.isNotBlank()) builder.header(key, value)
         }
-        if (rangeStart != null && rangeStart > 0L) {
-            builder.header("Range", "bytes=$rangeStart-")
-        }
-        // Interrupted when the transfer is cancelled, so that waiting for a server does not hold it.
-        return runInterruptible(Dispatchers.IO) {
-            desktopDownloadHttpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        // Downloads are byte ranges of the original representation.
+        builder.header("Accept-Encoding", "identity")
+        if (rangeStart != null && rangeStart > 0L) builder.header("Range", "bytes=$rangeStart-")
+        return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            val call = desktopDownloadHttpClient.newCall(builder.build())
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : okhttp3.Callback {
+                override fun onFailure(call: okhttp3.Call, e: IOException) {
+                    continuation.resumeWith(Result.failure(e))
+                }
+                override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                    continuation.resume(DownloadResponse(response, call)) { _, value, _ -> value.close() }
+                }
+            })
         }
     }
 }
 
-/** False when the host of [url] cannot be resolved or any of its addresses is not a public one. */
-private fun resolvesToPublicAddresses(url: String): Boolean {
-    val addresses = runCatching { InetAddress.getAllByName(URI(url).host) }.getOrNull()
-    return !addresses.isNullOrEmpty() && addresses.none(::isPrivateNetworkAddress)
+private class DownloadResponse(private val response: okhttp3.Response, private val call: okhttp3.Call) {
+    val code: Int get() = response.code
+    val body: okhttp3.ResponseBody? get() = response.body
+    fun header(name: String): String? = response.header(name)
+    fun cancel() = call.cancel()
+    fun close() { call.cancel(); response.close() }
 }
 
-/** Loopback, link-local, private-network and carrier-shared addresses, and the unspecified address. */
-internal fun isPrivateNetworkAddress(address: InetAddress): Boolean {
-    val bytes = address.address
-    val first = bytes[0].toInt() and 0xff
-    val second = bytes[1].toInt() and 0xff
-    return address.isLoopbackAddress ||
-        address.isAnyLocalAddress ||
-        address.isLinkLocalAddress ||
-        address.isSiteLocalAddress ||
-        (address is Inet6Address && (first and 0xfe) == 0xfc) ||
-        (bytes.size == 4 && (first == 0 || (first == 100 && second in 64..127)))
-}
+internal fun isPrivateNetworkAddress(address: InetAddress): Boolean =
+    com.nuvio.app.core.network.isLocalDestination(address)
 
 private fun openDirectoryWithPlatformCommand(directory: File): Boolean {
     val osName = System.getProperty("os.name").orEmpty().lowercase()
@@ -873,3 +874,5 @@ internal fun startsLikeWebPage(head: ByteArray): Boolean {
     val text = head.copyOfRange(start, minOf(head.size, start + 16)).decodeToString().lowercase()
     return listOf("<!doctype html", "<html", "<head", "<body", "<?xml").any { text.startsWith(it) }
 }
+
+internal actual fun isTrustedHomeDownloadHost(host: String): Boolean = com.nuvio.app.core.network.TrustedHomeServers.contains(host)

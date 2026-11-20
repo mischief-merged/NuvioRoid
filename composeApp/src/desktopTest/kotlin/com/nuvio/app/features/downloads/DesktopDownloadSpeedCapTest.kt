@@ -14,7 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadSpeedCapTest {
+class DesktopDownloadSpeedCapTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun a_transfer_reports_every_byte_to_its_limiter_and_preserves_the_file() = runBlocking {
         val payload = ByteArray(100_000) { (it % 251).toByte() }
