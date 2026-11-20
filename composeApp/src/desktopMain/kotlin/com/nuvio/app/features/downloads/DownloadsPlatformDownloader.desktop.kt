@@ -791,7 +791,7 @@ internal actual object DownloadsPlatformDownloader {
         // and the partial file is left as it is; the transfer is tried again like a dropped connection.
         // The first bytes are read and pushed back, so the reads that follow come straight from the connection as before.
         val body = java.io.PushbackInputStream(raw, SniffBytes)
-        if (isWebPage(response.header("Content-Type")) || startsLikeWebPage(peekHead(body))) {
+        if (isWebPage(response.header("Content-Type")) || startsLikeWebPage(peekHead(body) { response.cancel() })) {
             body.close()
             response.cancel()
             throw PageInsteadOfFile()
@@ -1502,20 +1502,22 @@ internal const val SniffBytes = 512
 /** ...and waited for, at least (or the end of a shorter body): enough to see past a byte order mark and white space. */
 internal const val SniffMinBytes = 64
 
-/** The first bytes of [body], which stay to be read. Gives up (closing the body) when nothing comes in time. */
-private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = coroutineScope {
+/**
+ * The first bytes of [body], which stay to be read. Gives up, by [cancelCall], when nothing comes in time
+ * or the transfer is cancelled. [body] is not closed here: its read holds its own lock, so closing it from
+ * this watcher would wait behind that read and the connection would stay open.
+ */
+private suspend fun peekHead(body: java.io.PushbackInputStream, cancelCall: () -> Unit): ByteArray = coroutineScope {
     val sniffing = AtomicBoolean(true)
     val guard = launch {
         delay(DownloadsPlatformDownloader.stallTimeoutMs)
-        if (sniffing.get()) runCatching { body.close() }
+        if (sniffing.get()) cancelCall()
     }
-    // Cancelling while these first bytes are still waited for has to close the connection at once.
-    // The stall watch above only closes after the stall time.
     val cancelCloser = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
         try {
             awaitCancellation()
         } finally {
-            if (sniffing.get()) runCatching { body.close() }
+            if (sniffing.get()) cancelCall()
         }
     }
     try {
