@@ -851,13 +851,6 @@ private fun NativePlayerController.startTrackedDisposeForTest(value: Long) {
     }
 }
 
-private fun NativePlayerController.setNativeHandleForTest(value: Long) {
-    javaClass.getDeclaredField("handle").also { field ->
-        field.isAccessible = true
-        field.setLong(this, value)
-    }
-}
-
 private fun NativePlayerController.disposeInFlightForTest(): Thread? =
     javaClass.getDeclaredField("disposeInFlight").let { field ->
         field.isAccessible = true

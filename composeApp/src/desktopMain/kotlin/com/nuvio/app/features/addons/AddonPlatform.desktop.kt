@@ -8,12 +8,16 @@ import com.nuvio.app.core.network.PluginMaxBytes
 import com.nuvio.app.core.network.SubtitleMaxBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.network_empty_response_body
 import nuvio.composeapp.generated.resources.network_request_failed_http
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,6 +26,7 @@ import okhttp3.ResponseBody
 import org.jetbrains.compose.resources.getString
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 internal actual object AddonStorage {
@@ -158,18 +163,31 @@ private suspend fun executeTextRequest(
     headers: Map<String, String> = emptyMap(),
     body: String = "",
     maxBytes: Int = MetadataMaxBytes,
-): String = withContext(Dispatchers.IO) {
+): String = suspendCancellableCoroutine { continuation ->
     val request = buildDesktopRequest(method, url, headers, body)
-    desktopHttpClient.newCall(request).execute().use { response ->
-        val payload = readResponseBody(response.body, maxBytes)
-        if (!response.isSuccessful) {
-            error(runBlocking { getString(Res.string.network_request_failed_http, response.code) })
+    val call = desktopHttpClient.newCall(request)
+    continuation.invokeOnCancellation { call.cancel() }
+    call.enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            continuation.resumeWith(Result.failure(e))
         }
-        if (payload.isBlank()) {
-            throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
+
+        override fun onResponse(call: Call, response: Response) {
+            val result = runCatching {
+                response.use {
+                    val payload = readResponseBody(it.body, maxBytes)
+                    if (!it.isSuccessful) {
+                        error(runBlocking { getString(Res.string.network_request_failed_http, it.code) })
+                    }
+                    if (payload.isBlank()) {
+                        throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
+                    }
+                    payload
+                }
+            }
+            continuation.resumeWith(result)
         }
-        payload
-    }
+    })
 }
 
 private fun buildDesktopRequest(

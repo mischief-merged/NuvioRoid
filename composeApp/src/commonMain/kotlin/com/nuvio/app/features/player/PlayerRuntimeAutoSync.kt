@@ -39,10 +39,13 @@ internal fun PlayerScreenRuntime.configureAutoSyncController(
             SUBTITLE_DELAY_MAX_MS,
         )
         subtitleDelayMs = appliedDelayMs
-        PlayerTrackPreferenceStorage.saveSubtitleDelayMs(
-            playbackSession.videoId,
-            appliedDelayMs,
-        )
+        if (appliedDelayMs != 0) {
+            saveShowSubtitleDelayMs(
+                parentMetaId = parentMetaId,
+                videoId = playbackSession.videoId,
+                delayMs = appliedDelayMs,
+            )
+        }
     }
 }
 

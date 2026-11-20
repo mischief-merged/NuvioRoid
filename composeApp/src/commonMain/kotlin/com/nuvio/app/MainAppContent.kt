@@ -107,7 +107,6 @@ import com.nuvio.app.features.collection.CollectionSyncService
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaScreenSettingsRepository
 import com.nuvio.app.features.downloads.DownloadItem
-import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.downloads.DownloadCompanions
 import com.nuvio.app.features.downloads.DownloadRechecks
@@ -150,6 +149,7 @@ import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.SubtitleLanguageOption
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.player.prepareExternalPlayerLaunch
 import com.nuvio.app.features.player.LockPlayerToLandscape
 import com.nuvio.app.features.player.HidePlayerSystemBars
@@ -910,19 +910,25 @@ internal fun MainAppContent(
                 item = item,
                 onUnavailable = { NuvioToastController.show(playbackUnavailableMessage) },
                 onLocalPlaybackReady = { resolved ->
-                    val resumeEntry = resolved.item.videoId
-                        .takeIf { it.isNotBlank() }
-                        ?.let(WatchProgressRepository::progressForVideo)
-                        ?.takeIf { it.isResumable }
-
-                    launchLocalPlayer(
+                    coroutineScope.launch {
+                        val preparedSubtitles = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+                            localSubtitles = resolved.externalSubtitles,
+                            settings = playerSettingsUiState,
+                            parentMetaId = resolved.item.parentMetaId,
+                        )
+                        val resumeEntry = resolved.item.videoId
+                            .takeIf { it.isNotBlank() }
+                            ?.let(WatchProgressRepository::progressForVideo)
+                            ?.takeIf { it.isResumable }
+                        launchLocalPlayer(
                         PlayerLaunch(
                             profileId = activePlaybackProfileId,
                             title = resolved.item.title,
                             sourceUrl = resolved.sourceUrl,
                             sourceHeaders = emptyMap(),
                             sourceResponseHeaders = emptyMap(),
-                            externalSubtitles = resolved.externalSubtitles,
+                            externalSubtitles = preparedSubtitles.subtitles,
+                            startupSubtitleSelection = preparedSubtitles.selection,
                             streamType = null,
                             logo = resolved.item.logo,
                             poster = resolved.item.poster,
@@ -942,7 +948,8 @@ internal fun MainAppContent(
                             initialPositionMs = resumeEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L,
                             initialProgressFraction = resumeEntry?.progressFraction?.takeIf { it > 0f },
                         ),
-                    )
+                        )
+                    }
                 },
             )
         }
@@ -964,12 +971,23 @@ internal fun MainAppContent(
             resumeProgressFraction: Float? = null,
             startFromBeginning: Boolean = false,
         ): Boolean {
-            return when (
-                val resolved = CloudLibraryRepository.resolvePlayback(
-                    item = item,
-                    file = file,
-                )
-            ) {
+            val cloudVideoId = item.playbackVideoId(file)
+            val (resolved, preparedSubtitles) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = com.nuvio.app.features.player.StartupSubtitleRequest(
+                    type = CloudLibraryContentType,
+                    videoId = cloudVideoId,
+                    parentMetaId = item.stableKey,
+                    settings = playerSettingsUiState,
+                    filename = file.name,
+                ),
+                resolveSource = {
+                    CloudLibraryRepository.resolvePlayback(
+                        item = item,
+                        file = file,
+                    )
+                },
+            )
+            return when (resolved) {
                 is CloudLibraryPlaybackResult.Success -> {
                     val playbackTitle = resolved.filename
                         ?.takeIf { it.isNotBlank() }
@@ -978,6 +996,8 @@ internal fun MainAppContent(
                         profileId = activePlaybackProfileId,
                         title = playbackTitle,
                         sourceUrl = resolved.url,
+                        externalSubtitles = preparedSubtitles.subtitles,
+                        startupSubtitleSelection = preparedSubtitles.selection,
                         streamTitle = playbackTitle,
                         streamSubtitle = item.name.takeIf { it != playbackTitle },
                         providerName = item.providerName,
@@ -1075,14 +1095,21 @@ internal fun MainAppContent(
                 },
                 onLocalPlaybackReady = { resolved ->
                     val downloadedItem = resolved.item
-                    launchLocalPlayer(
+                    coroutineScope.launch {
+                        val preparedSubtitles = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+                            localSubtitles = resolved.externalSubtitles,
+                            settings = playerSettingsUiState,
+                            parentMetaId = parentMetaId,
+                        )
+                        launchLocalPlayer(
                         PlayerLaunch(
                             profileId = activePlaybackProfileId,
                             title = title,
                             sourceUrl = resolved.sourceUrl,
                             sourceHeaders = emptyMap(),
                             sourceResponseHeaders = emptyMap(),
-                            externalSubtitles = resolved.externalSubtitles,
+                            externalSubtitles = preparedSubtitles.subtitles,
+                            startupSubtitleSelection = preparedSubtitles.selection,
                             logo = logo,
                             poster = poster,
                             background = background,
@@ -1102,7 +1129,8 @@ internal fun MainAppContent(
                             initialPositionMs = targetResumePositionMs,
                             initialProgressFraction = targetResumeProgressFraction,
                         ),
-                    )
+                        )
+                    }
                 },
             )
         }

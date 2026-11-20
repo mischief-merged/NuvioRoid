@@ -303,6 +303,18 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         }
 
         val selected = selectedStream?.let { stream ->
+            SubtitleStartupCoordinator.prefetchForStream(
+                StartupSubtitleRequest(
+                    type = type,
+                    videoId = nextVideo.id,
+                    parentMetaId = parentMetaId,
+                    settings = settings,
+                    streamExternalSubtitles = stream.externalSubtitles,
+                    videoHash = stream.behaviorHints.videoHash,
+                    videoSizeBytes = stream.behaviorHints.videoSize,
+                    filename = stream.behaviorHints.filename,
+                ),
+            )
             when (val result = DirectDebridPlaybackResolver.resolveToPlayableStream(stream, nextVideo.season, nextVideo.episode)) {
                 is DirectDebridPlayableResult.Success -> result.stream
                 else -> {

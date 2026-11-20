@@ -28,7 +28,10 @@ import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerSettingsRepository
+import com.nuvio.app.features.player.PreparedStartupSubtitles
+import com.nuvio.app.features.player.StartupSubtitleRequest
 import com.nuvio.app.features.player.SubtitleRequestExtras
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.player.resolveContentLanguage
 import com.nuvio.app.features.player.sanitizePlaybackHeaders
 import com.nuvio.app.features.player.sanitizePlaybackResponseHeaders
@@ -291,6 +294,34 @@ internal fun StreamDestination(
         )
     }
 
+    fun buildStreamSubtitleRequest(
+        stream: StreamItem? = null,
+        filename: String? = null,
+        videoHash: String? = null,
+        videoSizeBytes: Long? = null,
+    ): StartupSubtitleRequest = StartupSubtitleRequest(
+        type = launch.type,
+        videoId = effectiveVideoId,
+        parentMetaId = launch.parentMetaId ?: effectiveVideoId,
+        settings = playerSettings,
+        streamExternalSubtitles = stream?.externalSubtitles.orEmpty(),
+        videoHash = videoHash ?: stream?.behaviorHints?.videoHash,
+        videoSizeBytes = videoSizeBytes ?: stream?.behaviorHints?.videoSize,
+        filename = filename ?: stream?.behaviorHints?.filename,
+    )
+
+    LaunchedEffect(
+        effectiveVideoId,
+        hasResolvedVideoId,
+        launch.type,
+        launch.parentMetaId,
+        playerSettings.preferredSubtitleLanguage,
+        playerSettings.secondaryPreferredSubtitleLanguage,
+    ) {
+        if (!hasResolvedVideoId) return@LaunchedEffect
+        SubtitleStartupCoordinator.prefetchForStream(buildStreamSubtitleRequest())
+    }
+
     var reuseHandled by rememberSaveable(launch.videoId, effectiveVideoId) { mutableStateOf(false) }
     var reuseNavigated by remember { mutableStateOf(false) }
     LaunchedEffect(effectiveVideoId, hasResolvedVideoId, playerSettings.streamReuseLastLinkEnabled, launch.manualSelection) {
@@ -337,13 +368,21 @@ internal fun StreamDestination(
                 reuseNavigated = true
                 return@LaunchedEffect
             }
+            val preparedSubtitles = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                buildStreamSubtitleRequest(
+                    filename = cached.filename,
+                    videoHash = cached.videoHash,
+                    videoSizeBytes = cached.videoSize,
+                ),
+            )
             val playerLaunch = PlayerLaunch(
                 profileId = launch.profileId,
                 title = launch.title,
                 sourceUrl = cached.url,
                 sourceHeaders = sanitizePlaybackHeaders(cached.requestHeaders),
                 sourceResponseHeaders = sanitizePlaybackResponseHeaders(cached.responseHeaders),
-                externalSubtitles = emptyList(),
+                externalSubtitles = preparedSubtitles.subtitles,
+                startupSubtitleSelection = preparedSubtitles.selection,
                 streamType = cached.streamType,
                 logo = launch.logo,
                 poster = launch.poster,
@@ -438,25 +477,41 @@ internal fun StreamDestination(
         if (autoPlayHandled) return@LaunchedEffect
         if (streamsUiState.requestToken != expectedStreamsRequestToken) return@LaunchedEffect
         val selectedStream = streamsUiState.autoPlayStream ?: return@LaunchedEffect
+        var autoPlayPreparedSubtitles = PreparedStartupSubtitles()
         val stream = if (selectedStream.needsServerPreparation) {
             StreamsRepository.setOverlayVisible(true, getString(Res.string.player_loading_preparing))
-            runCatching { ServerPlayback.prepare(selectedStream) }
-                .onFailure { if (it is CancellationException) throw it }
-                .getOrElse { error ->
-                    if (!StreamsRepository.skipAutoPlayStream(selectedStream)) {
-                        NuvioToastController.show(error.serverPlaybackMessage())
-                    }
-                    return@LaunchedEffect
+            val (prepared, subs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = buildStreamSubtitleRequest(selectedStream),
+                resolveSource = {
+                    runCatching { ServerPlayback.prepare(selectedStream) }
+                        .onFailure { if (it is CancellationException) throw it }
+                },
+                extractStreamSubtitles = { result -> result.getOrNull()?.externalSubtitles.orEmpty() },
+            )
+            autoPlayPreparedSubtitles = subs
+            prepared.getOrElse { error ->
+                if (!StreamsRepository.skipAutoPlayStream(selectedStream)) {
+                    NuvioToastController.show(error.serverPlaybackMessage())
                 }
+                return@LaunchedEffect
+            }
         } else if (DirectDebridPlaybackResolver.shouldResolveToPlayableStream(selectedStream)) {
             StreamsRepository.setOverlayVisible(true, getString(Res.string.debrid_resolving_stream))
-            when (
-                val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-                    stream = selectedStream,
-                    season = launch.seasonNumber,
-                    episode = launch.episodeNumber,
-                )
-            ) {
+            val (resolved, subs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = buildStreamSubtitleRequest(selectedStream),
+                resolveSource = {
+                    DirectDebridPlaybackResolver.resolveToPlayableStream(
+                        stream = selectedStream,
+                        season = launch.seasonNumber,
+                        episode = launch.episodeNumber,
+                    )
+                },
+                extractStreamSubtitles = { result ->
+                    (result as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+                },
+            )
+            autoPlayPreparedSubtitles = subs
+            when (resolved) {
                 is DirectDebridPlayableResult.Success -> resolved.stream
                 else -> {
                     val hasNextCandidate = StreamsRepository.skipAutoPlayStream(selectedStream)
@@ -477,6 +532,9 @@ internal fun StreamDestination(
                 }
             }
         } else {
+            autoPlayPreparedSubtitles = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                buildStreamSubtitleRequest(selectedStream),
+            )
             selectedStream
         }
         val sourceUrl = stream.playableDirectUrl
@@ -533,7 +591,8 @@ internal fun StreamDestination(
             sourceUrl = sourceUrl,
             sourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
             sourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
-            externalSubtitles = stream.externalSubtitles,
+            externalSubtitles = autoPlayPreparedSubtitles.subtitles,
+            startupSubtitleSelection = autoPlayPreparedSubtitles.selection,
             streamType = stream.streamType,
             logo = launch.logo,
             poster = launch.poster,
@@ -595,6 +654,8 @@ internal fun StreamDestination(
         return
     }
 
+    var launchingDirectStream by remember { mutableStateOf(false) }
+
     fun openSelectedStream(
         stream: StreamItem,
         resolvedResumePositionMs: Long?,
@@ -602,18 +663,25 @@ internal fun StreamDestination(
         forceExternal: Boolean,
         forceInternal: Boolean,
         saveForReuse: Boolean = true,
+        preResolvedSubtitles: PreparedStartupSubtitles? = null,
     ) {
         if (stream.needsServerPreparation) {
             if (preparingServerStream) return
             streamRouteScope.launch {
                 preparingServerStream = true
-                val prepared = runCatching { ServerPlayback.prepare(stream) }
-                    .onFailure { if (it is CancellationException) throw it }
-                    .getOrElse { error ->
-                        preparingServerStream = false
-                        NuvioToastController.show(error.serverPlaybackMessage())
-                        return@launch
-                    }
+                val (preparedResult, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                    request = buildStreamSubtitleRequest(stream),
+                    resolveSource = {
+                        runCatching { ServerPlayback.prepare(stream) }
+                            .onFailure { if (it is CancellationException) throw it }
+                    },
+                    extractStreamSubtitles = { result -> result.getOrNull()?.externalSubtitles.orEmpty() },
+                )
+                val prepared = preparedResult.getOrElse { error ->
+                    preparingServerStream = false
+                    NuvioToastController.show(error.serverPlaybackMessage())
+                    return@launch
+                }
                 val serverResumeMs = serverResumePositionMs(prepared)
                 preparingServerStream = false
                 openSelectedStream(
@@ -622,6 +690,7 @@ internal fun StreamDestination(
                     resolvedResumeProgressFraction = resolvedResumeProgressFraction.takeIf { serverResumeMs == null },
                     forceExternal = false,
                     forceInternal = true,
+                    preResolvedSubtitles = preparedSubs,
                 )
             }
             return
@@ -630,10 +699,18 @@ internal fun StreamDestination(
             if (resolvingDebridStream) return
             streamRouteScope.launch {
                 resolvingDebridStream = true
-                val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-                    stream = stream,
-                    season = launch.seasonNumber,
-                    episode = launch.episodeNumber,
+                val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                    request = buildStreamSubtitleRequest(stream),
+                    resolveSource = {
+                        DirectDebridPlaybackResolver.resolveToPlayableStream(
+                            stream = stream,
+                            season = launch.seasonNumber,
+                            episode = launch.episodeNumber,
+                        )
+                    },
+                    extractStreamSubtitles = { result ->
+                        (result as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+                    },
                 )
                 resolvingDebridStream = false
                 when (resolved) {
@@ -643,6 +720,7 @@ internal fun StreamDestination(
                         resolvedResumeProgressFraction = resolvedResumeProgressFraction,
                         forceExternal = forceExternal,
                         forceInternal = forceInternal,
+                        preResolvedSubtitles = preparedSubs,
                     )
                     else -> {
                         resolved.toastMessage()?.let { NuvioToastController.show(it) }
@@ -676,7 +754,10 @@ internal fun StreamDestination(
             if (resolvingYouTubeStream) return
             streamRouteScope.launch {
                 resolvingYouTubeStream = true
-                val resolved = YouTubeStreamResolver.Default.resolve(stream)
+                val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                    request = buildStreamSubtitleRequest(stream),
+                    resolveSource = { YouTubeStreamResolver.Default.resolve(stream) },
+                )
                 resolvingYouTubeStream = false
                 if (resolved == null) {
                     NuvioToastController.show(getString(Res.string.youtube_resolution_failed))
@@ -690,6 +771,7 @@ internal fun StreamDestination(
                     forceInternal = forceInternal,
                     // The resolved URL expires after a few hours, so it isn't kept for reuse.
                     saveForReuse = false,
+                    preResolvedSubtitles = preparedSubs,
                 )
             }
             return
@@ -730,13 +812,37 @@ internal fun StreamDestination(
                 streamDescription = stream.streamSubtitle,
             )
         }
+
+        if (preResolvedSubtitles == null) {
+            if (launchingDirectStream) return
+            streamRouteScope.launch {
+                launchingDirectStream = true
+                val preparedSubs = try {
+                    SubtitleStartupCoordinator.prepareStreamSubtitles(buildStreamSubtitleRequest(stream))
+                } finally {
+                    launchingDirectStream = false
+                }
+                openSelectedStream(
+                    stream = stream,
+                    resolvedResumePositionMs = resolvedResumePositionMs,
+                    resolvedResumeProgressFraction = resolvedResumeProgressFraction,
+                    forceExternal = forceExternal,
+                    forceInternal = forceInternal,
+                    saveForReuse = false,
+                    preResolvedSubtitles = preparedSubs,
+                )
+            }
+            return
+        }
+
         val playerLaunch = PlayerLaunch(
             profileId = launch.profileId,
             title = launch.title,
             sourceUrl = sourceUrl,
             sourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request),
             sourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
-            externalSubtitles = stream.externalSubtitles,
+            externalSubtitles = preResolvedSubtitles.subtitles,
+            startupSubtitleSelection = preResolvedSubtitles.selection,
             streamType = stream.streamType,
             logo = launch.logo,
             poster = launch.poster,

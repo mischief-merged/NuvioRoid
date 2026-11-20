@@ -1459,12 +1459,19 @@ internal object AutomaticSubtitleSync {
         url: String,
         headers: Map<String, String>,
         languageHint: String? = null,
-    ): String =
-        downloadSubtitleTextWithSingle429Retry(
+    ): String {
+        if (url.trim().startsWith("file:", ignoreCase = true) || url.trim().startsWith("/")) {
+            return com.nuvio.app.features.player.SubtitleLocalFilePlatform.readLocalSubtitleText(
+                uriOrPath = url,
+                maxBytes = MAX_SUBTITLE_RESPONSE_BYTES,
+            ) ?: error("Unable to read local subtitle file")
+        }
+        return downloadSubtitleTextWithSingle429Retry(
             url = url,
             headers = headers,
             languageHint = languageHint,
         )
+    }
 
     private suspend fun downloadSubtitleTextWithSingle429Retry(
         url: String,

@@ -53,6 +53,7 @@ internal fun PlayerScreenRuntime.playReplacementSource(
     videoId: String,
     resumePositionMs: Long? = null,
     byFailover: Boolean = false,
+    preparedSubtitles: PreparedStartupSubtitles? = null,
 ) {
     if (playerSettingsUiState.streamReuseLastLinkEnabled) {
         saveDirectStreamForReuse(stream, url, videoId, activeSeasonNumber, activeEpisodeNumber)
@@ -67,7 +68,8 @@ internal fun PlayerScreenRuntime.playReplacementSource(
     }
     flushWatchProgress()
     stopActiveP2pStream()
-    externalSubtitles = stream.externalSubtitles
+    externalSubtitles = preparedSubtitles?.subtitles ?: stream.externalSubtitles
+    startupSubtitleSelection = preparedSubtitles?.selection
     activeSourceUrl = url
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -414,9 +416,25 @@ internal fun PlayerScreenRuntime.tryFallbackToNextSourceAfterError(
                 sourceFallbackAttempts++
                 sourceFailoverTryingName = next.failoverDisplayName()
 
-                val playable = when (
-                    val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(next, season, episode)
-                ) {
+                val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                    request = StartupSubtitleRequest(
+                        type = contentType ?: parentMetaType,
+                        videoId = videoId,
+                        parentMetaId = parentMetaId,
+                        settings = playerSettingsUiState,
+                        streamExternalSubtitles = next.externalSubtitles,
+                        videoHash = next.behaviorHints.videoHash,
+                        videoSizeBytes = next.behaviorHints.videoSize,
+                        filename = next.behaviorHints.filename,
+                    ),
+                    resolveSource = {
+                        DirectDebridPlaybackResolver.resolveToPlayableStream(next, season, episode)
+                    },
+                    extractStreamSubtitles = { res ->
+                        (res as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+                    },
+                )
+                val playable = when (resolved) {
                     is DirectDebridPlayableResult.Success -> resolved.stream
                     else -> null
                 }
@@ -437,7 +455,14 @@ internal fun PlayerScreenRuntime.tryFallbackToNextSourceAfterError(
                     break
                 }
                 log.i { "Source failed (${failure.name}), moving on to ${playable.streamLabel} from ${playable.addonName}" }
-                playReplacementSource(playable, url, videoId, resumePositionMs = resumeMs, byFailover = true)
+                playReplacementSource(
+                    stream = playable,
+                    url = url,
+                    videoId = videoId,
+                    resumePositionMs = resumeMs,
+                    byFailover = true,
+                    preparedSubtitles = preparedSubs,
+                )
                 // A placeholder may have played to its end, which stops playback: the real video is to play.
                 if (failure == SourceFailure.PlaceholderClip) shouldPlay = true
                 sourceFailoverPlayingName = next.failoverDisplayName()

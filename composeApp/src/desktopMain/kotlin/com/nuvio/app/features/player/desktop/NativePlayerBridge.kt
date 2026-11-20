@@ -126,6 +126,21 @@ internal object NativePlayerBridge {
     external fun setAudioLanguages(handle: Long, languages: String)
     external fun selectSubtitleTrack(handle: Long, trackId: Int)
     external fun addSubtitleUrl(handle: Long, url: String)
+    external fun addSubtitleTrack(
+        handle: Long,
+        url: String,
+        title: String,
+        language: String,
+        select: Boolean,
+    )
+    external fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    )
     external fun clearExternalSubtitles(handle: Long)
     external fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int)
     external fun applyWindowChrome(

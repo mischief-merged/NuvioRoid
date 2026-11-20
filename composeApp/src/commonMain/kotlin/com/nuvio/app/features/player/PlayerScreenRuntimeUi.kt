@@ -677,8 +677,11 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         if (renderPlayerSurface) {
             val surfaceSource = currentPlayerSurfaceSource
             val sourceAvailable = surfaceSource != null
-            PlatformPlayerSurface(
-                sourceUrl = surfaceSource?.sourceUrl.orEmpty(),
+            androidx.compose.runtime.CompositionLocalProvider(
+                LocalStartupSubtitlePlan provides startupSubtitleSelection,
+            ) {
+                PlatformPlayerSurface(
+                    sourceUrl = surfaceSource?.sourceUrl.orEmpty(),
                 sourceAvailable = sourceAvailable,
                 sourceAudioUrl = surfaceSource?.sourceAudioUrl,
                 sourceHeaders = surfaceSource?.sourceHeaders.orEmpty(),
@@ -743,6 +746,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                     }
                 },
             )
+            }
         }
 
         AnimatedVisibility(

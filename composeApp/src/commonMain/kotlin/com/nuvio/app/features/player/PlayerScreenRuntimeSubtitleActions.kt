@@ -64,7 +64,11 @@ internal fun PlayerScreenRuntime.setSubtitleDelay(delayMs: Int) {
     (playerController as? AutoSyncPlayerController)?.cancelForManualSubtitleDelay() // AutoSync hook
     val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
     subtitleDelayMs = clamped
-    PlayerTrackPreferenceStorage.saveSubtitleDelayMs(playbackSession.videoId, clamped)
+    saveShowSubtitleDelayMs(
+        parentMetaId = parentMetaId,
+        videoId = playbackSession.videoId,
+        delayMs = clamped,
+    )
     playerController?.setSubtitleDelayMs(clamped)
 }
 

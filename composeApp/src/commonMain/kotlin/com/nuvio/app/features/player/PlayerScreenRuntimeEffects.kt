@@ -264,13 +264,48 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         }
     }
 
-    LaunchedEffect(playbackSession.videoId) {
-        subtitleDelayMs = PlayerTrackPreferenceStorage.loadSubtitleDelayMs(playbackSession.videoId) ?: 0
+    LaunchedEffect(parentMetaId, playbackSession.videoId) {
+        subtitleDelayMs = loadShowSubtitleDelayMs(
+            parentMetaId = parentMetaId,
+            videoId = playbackSession.videoId,
+        ) ?: 0
         subtitleAutoSyncState = SubtitleAutoSyncUiState()
     }
 
     LaunchedEffect(playerController, subtitleDelayMs) {
         playerController?.setSubtitleDelayMs(subtitleDelayMs)
+    }
+
+    LaunchedEffect(playerController) {
+        val controller = playerController ?: return@LaunchedEffect
+        controller.setOnExternalSubtitleLoadFailed { _ ->
+            selectedAddonSubtitleId = null
+            selectedSubtitleIndex = -1
+            useCustomSubtitles = false
+            isUserExplicitSubtitleSelection = false
+            refreshTracks()
+        }
+    }
+
+    LaunchedEffect(
+        activeSourceUrl,
+        externalSubtitles,
+        playerSettingsUiState.preferredSubtitleLanguage,
+        playerSettingsUiState.secondaryPreferredSubtitleLanguage,
+        parentMetaId,
+    ) {
+        if (activeSourceUrl.startsWith("file:", ignoreCase = true) &&
+            externalSubtitles.isNotEmpty() &&
+            startupSubtitleSelection == null
+        ) {
+            val prepared = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+                localSubtitles = externalSubtitles,
+                settings = playerSettingsUiState,
+                parentMetaId = parentMetaId,
+            )
+            externalSubtitles = prepared.subtitles
+            startupSubtitleSelection = prepared.selection
+        }
     }
 
     BindAudioDelayEffects()
@@ -342,7 +377,11 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         addonSubtitleFetchKey,
         networkCondition,
     ) {
-        if (activeSourceUrl.startsWith("file:") && externalSubtitles.isNotEmpty()) return@LaunchedEffect
+        if (activeSourceUrl.startsWith("file:", ignoreCase = true) &&
+            (externalSubtitles.isNotEmpty() || startupSubtitleSelection?.exhaustedOrTimedOut == true)
+        ) {
+            return@LaunchedEffect
+        }
         val fetchKey = addonSubtitleFetchKey ?: return@LaunchedEffect
         // For P2P streams, wait until the local engine URL is available before
         // triggering the fetch so that hash computation can use the real HTTP URL.
@@ -1100,14 +1139,30 @@ internal fun PlayerScreenRuntime.tryRefreshExpiredLinkAfterError(message: String
             }
             // Debrid links are always requested anew; a prepared or in-memory one may be the expired link.
             val unresolved = if (candidate.debridResolved) candidate.copy(url = null, debridResolved = false) else candidate
-            val stream = when (
-                val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-                    stream = unresolved,
-                    season = season,
-                    episode = episode,
-                    forceRefresh = true,
-                )
-            ) {
+            val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = StartupSubtitleRequest(
+                    type = type,
+                    videoId = currentVideoId,
+                    parentMetaId = parentMetaId,
+                    settings = playerSettingsUiState,
+                    streamExternalSubtitles = unresolved.externalSubtitles,
+                    videoHash = unresolved.behaviorHints.videoHash,
+                    videoSizeBytes = unresolved.behaviorHints.videoSize,
+                    filename = unresolved.behaviorHints.filename,
+                ),
+                resolveSource = {
+                    DirectDebridPlaybackResolver.resolveToPlayableStream(
+                        stream = unresolved,
+                        season = season,
+                        episode = episode,
+                        forceRefresh = true,
+                    )
+                },
+                extractStreamSubtitles = { res ->
+                    (res as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+                },
+            )
+            val stream = when (resolved) {
                 is DirectDebridPlayableResult.Success -> resolved.stream
                 else -> {
                     showErrorUnlessSourceFallback(message)
@@ -1121,7 +1176,7 @@ internal fun PlayerScreenRuntime.tryRefreshExpiredLinkAfterError(message: String
                 return@launch
             }
 
-            playReplacementSource(stream, refreshedUrl, currentVideoId)
+            playReplacementSource(stream, refreshedUrl, currentVideoId, preparedSubtitles = preparedSubs)
         } finally {
             PlayerStreamsRepository.stopSourcesLoading()
         }
@@ -1143,6 +1198,7 @@ private fun PlayerScreenRuntime.retryServerSourceAfterError(message: String?): B
             controlsVisible = !playerControlsLocked
             return@launch
         }
+        startupSubtitleSelection = null
         externalSubtitles = playback.subtitles
         activeSourceUrl = playback.url
         activeSourceHeaders = playback.headers
