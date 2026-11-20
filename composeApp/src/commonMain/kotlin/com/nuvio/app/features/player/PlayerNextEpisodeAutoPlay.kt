@@ -92,25 +92,25 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     findDownloadedEpisode: (MetaVideo) -> DownloadItem? = { video ->
         DownloadsRepository.findPlayableDownload(parentMetaId, video.season, video.episode, video.id)
     },
+    verifyDownloadedEpisode: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    },
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
     if (nextEpisodeInfo.hasAired != true) return null
 
-    val downloadedNextEpisode = findDownloadedEpisode(nextVideo)
-    if (downloadedNextEpisode != null) {
-        onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
-        return null
-    }
-
-    // Offline: the auto-play fan-out is a network search, so skip it entirely.
-    if (isOffline()) return null
+    val hasDownload = findDownloadedEpisode(nextVideo) != null
+    // Offline with nothing saved: there is no network search to start, and no file to check.
+    if (!hasDownload && isOffline()) return null
 
     previousJob?.cancel()
-    // Show the requested episode before the search starts, so the card is already the one that was asked for.
-    onSearchingChanged(true)
-    onSourceNameChanged(null)
-    onCountdownChanged(null)
+    // A saved file is checked before it is chosen. Searching starts only once that file is ruled out.
+    if (!hasDownload) {
+        onSearchingChanged(true)
+        onSourceNameChanged(null)
+        onCountdownChanged(null)
+    }
     val type = contentType ?: parentMetaType
     val shouldAutoSelectInManualMode =
         settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
@@ -157,29 +157,22 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     }
 
     return launch {
-        val downloadedNextEpisode = withContext(Dispatchers.IO) {
-            DownloadsRepository.findPlayableDownload(
-                parentMetaId = parentMetaId,
-                seasonNumber = nextVideo.season,
-                episodeNumber = nextVideo.episode,
-                videoId = nextVideo.id,
-            )?.takeIf { DownloadsRepository.verifyCompletedDownload(it.id) }
+        if (hasDownload) {
+            val candidate = findDownloadedEpisode(nextVideo)
+            val verified = if (candidate != null && withContext(Dispatchers.IO) { verifyDownloadedEpisode(candidate) }) {
+                candidate
+            } else {
+                null
+            }
+            if (verified != null) {
+                onDownloadedEpisodeSelected(verified, nextVideo)
+                return@launch
+            }
+            if (isOffline()) return@launch
+            onSearchingChanged(true)
+            onSourceNameChanged(null)
+            onCountdownChanged(null)
         }
-        if (downloadedNextEpisode != null) {
-            onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
-            onSearchingChanged(false)
-            return@launch
-        }
-
-        // Offline: the auto-play fan-out is a network search, so skip it entirely.
-        if (isNetworkOffline()) {
-            onSearchingChanged(false)
-            return@launch
-        }
-
-        onSearchingChanged(true)
-        onSourceNameChanged(null)
-        onCountdownChanged(null)
 
         // Connectivity may have dropped between the request and the actual search.
         if (isOffline()) {
