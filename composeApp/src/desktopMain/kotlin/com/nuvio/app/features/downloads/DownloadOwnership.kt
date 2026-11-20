@@ -30,7 +30,11 @@ internal data class RecordRef(
  * Unicode NFC, letter case ignored (macOS and Windows volumes usually ignore it; on a volume that does
  * not, this only refuses more).
  */
-internal class DownloadOwnership(private val locations: DownloadLocations, records: List<RecordRef>) {
+internal class DownloadOwnership(
+    private val locations: DownloadLocations,
+    records: List<RecordRef>,
+    private val pathKey: (Path) -> String = ::keyOf,
+) {
     private class Claim(val owner: RecordRef, val key: String)
 
     private val claims: List<Claim> = records.flatMap(::claimsOf)
@@ -51,13 +55,13 @@ internal class DownloadOwnership(private val locations: DownloadLocations, recor
             if (record.fileName.isBlank()) emptyList() else listOf(owner.resolve(record.fileName + ".part"), owner.resolve(record.fileName))
         }
         val videos = files.filterNot { it.fileName.toString().endsWith(".part") }
-        return files.map { Claim(record, keyOf(it)) } +
-            videos.map { Claim(record, keyOf(it.resolveSibling(DownloadSidecarFiles.sidecarFolderName(it.fileName.toString())))) }
+        return files.map { Claim(record, pathKey(it)) } +
+            videos.map { Claim(record, pathKey(it.resolveSibling(DownloadSidecarFiles.sidecarFolderName(it.fileName.toString())))) }
     }
 
     /** The record, other than [profileId]/[id], that owns [path], or null. */
     fun otherOwner(profileId: Int, id: String, path: Path): RecordRef? {
-        val key = keyOf(path)
+        val key = pathKey(path)
         fun other(r: RecordRef) = !(r.profileId == profileId && r.id == id)
         val names = generateSequence(path) { it.parent }.mapNotNull { it.fileName?.toString() }.map(::nameKey).toSet()
         unplaced.firstOrNull { (r, name) -> other(r) && (name in names || names.any { it.startsWith("$name.subtitles") }) }?.let { return it.first }

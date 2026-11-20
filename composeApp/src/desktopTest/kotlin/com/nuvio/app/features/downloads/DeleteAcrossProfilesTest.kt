@@ -27,7 +27,9 @@ class DeleteAcrossProfilesTest {
         val events = mutableListOf<String>()
         var syncWorks = true
         override fun loadPayload() = inner.payload
+        override fun loadPayload(profileId: Int) = loadPayload()
         override fun savePayload(payload: String) { inner.payload = payload; events += "save ${decodeStoredDownloads(payload)!!.map { it.id }}" }
+        override fun savePayload(profileId: Int, payload: String) = savePayload(payload)
         override fun syncPayload(): Boolean { events += "sync $syncWorks"; return syncWorks }
         override fun trashFile(localFileUri: String): Boolean { events += "trash"; return inner.trashFile(localFileUri) }
         override fun removeFile(localFileUri: String?): Boolean = inner.removeFile(localFileUri)

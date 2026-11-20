@@ -68,10 +68,12 @@ object DownloadsRepository {
     // The UI, downloader callbacks and background workers reach this object from different threads.
     // Every read-modify-write of the item list, and every use of activeTransfers, holds this lock.
     //
-    // LOCK ORDER, everywhere: the per-video lock (SidecarLocks) FIRST, then this state lock. Code that
-    // holds this lock never waits for a per-video lock, and code that holds a per-video lock never
-    // takes this one: the guard behind every sidecar write (videoFileIsThere) reads the disk through
-    // the backend only. Both delete paths therefore take the per-video lock before entering here.
+    // LOCK ORDER, everywhere: the per-video lock (SidecarLocks) FIRST, then loadLock (only in
+    // ensureLoaded / onProfileChanged), then this state lock. Code that holds stateLock never
+    // acquires loadLock or calls ensureLoaded(), and never waits for a per-video lock: the guard
+    // behind every sidecar write (videoFileIsThere) reads the disk through the backend only. Both
+    // delete paths therefore take the per-video lock before entering here.
+    private val loadLock = SynchronizedObject()
     private val stateLock = SynchronizedObject()
 
     // The transfer that currently owns each download. A transfer that was paused, replaced or removed
@@ -132,13 +134,18 @@ object DownloadsRepository {
     /** Runs [block] inside the state lock. Tests only: proves what must not need it. */
     internal fun holdStateLockForTest(block: () -> Unit) = synchronized(stateLock) { block() }
 
-    fun ensureLoaded(): Unit = synchronized(stateLock) {
+    fun ensureLoaded() {
         if (hasLoaded) return
-        loadFromDisk()
+        synchronized(loadLock) {
+            if (hasLoaded) return
+            loadFromDisk()
+        }
     }
 
     fun onProfileChanged() {
-        loadFromDisk()
+        synchronized(loadLock) {
+            loadFromDisk()
+        }
     }
 
     fun markCompletedSeen() {
@@ -398,8 +405,9 @@ object DownloadsRepository {
         autoDownloadRuleKey: String? = null,
         /** The user picked this source for a title that has a finished download: it replaces that download's file. */
         userChoseReplacement: Boolean = false,
-    ): DownloadEnqueueResult = synchronized(stateLock) {
+    ): DownloadEnqueueResult {
         ensureLoaded()
+        return synchronized(stateLock) {
 
         val sourceUrl = stream.playableDirectUrl
             ?.trim()
@@ -521,6 +529,7 @@ object DownloadsRepository {
         } else {
             DownloadEnqueueResult.Started
         }
+        }
     }
 
     /**
@@ -528,37 +537,41 @@ object DownloadsRepository {
      * downloads with a bad source are marked, so that the app does not look again and the user is
      * offered to pick one. Nothing else about them changes; a file stays where it is.
      */
-    internal fun markNoWorkingSourceFound(titleKey: String): Unit = synchronized(stateLock) {
+    internal fun markNoWorkingSourceFound(titleKey: String) {
         ensureLoaded()
-        val items = _uiState.value.items
-        if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
-        publish(
-            items.map { item ->
-                if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
-            },
-        )
-        persist()
+        synchronized(stateLock) {
+            val items = _uiState.value.items
+            if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
+            publish(
+                items.map { item ->
+                    if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
+                },
+            )
+            persist()
+        }
     }
 
-    fun pauseDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun pauseDownload(downloadId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        // One that waits for a better connection becomes paused by the user: it stays paused when that ends.
-        if (item.status == DownloadStatus.Paused && item.pausedByConnection) {
-            mutateItem(downloadId) { it.copy(pausedByConnection = false, updatedAtEpochMs = DownloadsClock.nowEpochMs()) }
-            return
-        }
-        if (item.status != DownloadStatus.Downloading) return
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            // One that waits for a better connection becomes paused by the user: it stays paused when that ends.
+            if (item.status == DownloadStatus.Paused && item.pausedByConnection) {
+                mutateItem(downloadId) { it.copy(pausedByConnection = false, updatedAtEpochMs = DownloadsClock.nowEpochMs()) }
+                return
+            }
+            if (item.status != DownloadStatus.Downloading) return
 
-        activeTransfers.remove(downloadId)?.cancel()
-        mutateItem(downloadId) { current ->
-            current.copy(
-                status = DownloadStatus.Paused,
-                pausedByFolder = false,
-                pausedByConnection = false,
-                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                errorMessage = null,
-            )
+            activeTransfers.remove(downloadId)?.cancel()
+            mutateItem(downloadId) { current ->
+                current.copy(
+                    status = DownloadStatus.Paused,
+                    pausedByFolder = false,
+                    pausedByConnection = false,
+                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                    errorMessage = null,
+                )
+            }
         }
     }
 
@@ -575,8 +588,8 @@ object DownloadsRepository {
      * be looked at or moved. False when it did not stop in time. Never holds the state lock while waiting.
      */
     internal fun pauseAndWait(downloadId: String, timeoutMs: Long = 30_000L): Boolean {
+        ensureLoaded()
         val transfer = synchronized(stateLock) {
-            ensureLoaded()
             val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return true
             if (item.status != DownloadStatus.Downloading) return true
             activeTransfers.remove(downloadId).also {
@@ -594,8 +607,14 @@ object DownloadsRepository {
         return transfer?.cancelAndWait(timeoutMs) ?: true
     }
 
-    fun resumeDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun resumeDownload(downloadId: String) {
         ensureLoaded()
+        synchronized(stateLock) {
+            resumeDownloadLocked(downloadId)
+        }
+    }
+
+    private fun resumeDownloadLocked(downloadId: String) {
         val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
         if (item.status != DownloadStatus.Paused && item.status != DownloadStatus.Failed) return
 
@@ -624,34 +643,38 @@ object DownloadsRepository {
      * those again would give the same bad file, so they wait for another source. Returns how many
      * were started.
      */
-    fun retryAllFailed(): Int = synchronized(stateLock) {
+    fun retryAllFailed(): Int {
         ensureLoaded()
-        val retryable = _uiState.value.items
-            .filter { it.status == DownloadStatus.Failed && !it.needsAnotherSource }
-            .map { it.id }
-        retryable.forEach(::resumeDownload)
-        retryable.size
+        return synchronized(stateLock) {
+            val retryable = _uiState.value.items
+                .filter { it.status == DownloadStatus.Failed && !it.needsAnotherSource }
+                .map { it.id }
+            retryable.forEach(::resumeDownloadLocked)
+            retryable.size
+        }
     }
 
     /** Removes every failed download from the list. A failed download has no file; only a partial one is cleaned up. Returns how many. */
-    fun clearFailed(): Int = synchronized(stateLock) {
+    fun clearFailed(): Int {
         ensureLoaded()
-        // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
-        val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && backend.isConnected(it) }
-            .filter { ItemLocks.tryAcquire(it.id) }
-        if (failed.isEmpty()) return 0
-        try {
-            failed.forEach { item ->
-                activeTransfers.remove(item.id)?.cancel()
-                backend.removePartialOf(item)
+        return synchronized(stateLock) {
+            // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
+            val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && backend.isConnected(it) }
+                .filter { ItemLocks.tryAcquire(it.id) }
+            if (failed.isEmpty()) return 0
+            try {
+                failed.forEach { item ->
+                    activeTransfers.remove(item.id)?.cancel()
+                    backend.removePartialOf(item)
+                }
+                val ids = failed.mapTo(mutableSetOf()) { it.id }
+                publish(_uiState.value.items.filterNot { it.id in ids })
+                persist()
+            } finally {
+                failed.forEach { ItemLocks.release(it.id) }
             }
-            val ids = failed.mapTo(mutableSetOf()) { it.id }
-            publish(_uiState.value.items.filterNot { it.id in ids })
-            persist()
-        } finally {
-            failed.forEach { ItemLocks.release(it.id) }
+            failed.size
         }
-        failed.size
     }
 
     internal fun reattachBackgroundDownload(downloadId: String): Unit = synchronized(stateLock) {
@@ -664,28 +687,30 @@ object DownloadsRepository {
         if (restored.status == DownloadStatus.Downloading) startDownload(restored)
     }
 
-    fun cancelDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun cancelDownload(downloadId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        // On a location that is away, or while a move has the item, nothing is cancelled or removed.
-        if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
-        try {
-            backend.withListLock {
-                val fileUri = playableLocalFileUri(item) ?: item.localFileUri
-                // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
-                val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
-                if (used == null) return@withListLock
-                activeTransfers.remove(downloadId)?.cancel()
-                // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
-                if (!removeRecordDurably(item)) return@withListLock
-                if (fileUri != null && !used && !backend.discardFile(fileUri)) {
-                    restoreRecord(item)
-                    return@withListLock
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            // On a location that is away, or while a move has the item, nothing is cancelled or removed.
+            if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
+            try {
+                backend.withListLock {
+                    val fileUri = playableLocalFileUri(item) ?: item.localFileUri
+                    // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
+                    val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
+                    if (used == null) return@withListLock
+                    activeTransfers.remove(downloadId)?.cancel()
+                    // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
+                    if (!removeRecordDurably(item)) return@withListLock
+                    if (fileUri != null && !used && !backend.discardFile(fileUri)) {
+                        restoreRecord(item)
+                        return@withListLock
+                    }
+                    backend.removePartialOf(item)
                 }
-                backend.removePartialOf(item)
+            } finally {
+                ItemLocks.release(downloadId)
             }
-        } finally {
-            ItemLocks.release(downloadId)
         }
     }
 
@@ -713,7 +738,6 @@ object DownloadsRepository {
 
     /** Null when the file is no longer where [lockedUri] said: the caller starts again with the right lock. */
     private fun deleteWithLocksHeld(downloadId: String, lockedUri: String?, permanently: Boolean): DownloadDeleteResult? = synchronized(stateLock) {
-        ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return DownloadDeleteResult.Gone
         val current = if (item.status == DownloadStatus.Completed) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
@@ -760,67 +784,177 @@ object DownloadsRepository {
     /** Whether the files of deleted downloads go to the trash of the system, or are held for days in the downloads folder. */
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
 
-    private fun loadFromDisk(): Unit = synchronized(stateLock) {
-        _hasUnseenCompleted.value = false
-        hasLoaded = true
-        loadedProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
-        loadedPayload = null
-        savingIsUnsafe = false
-        val payload = backend.loadPayload().orEmpty().trim()
-        var decoded = if (payload.isEmpty()) null else DownloadsCodec.decode(payload)
-        val payloadUnreadable = payload.isNotEmpty() && decoded == null
-        if (decoded == null && payload.isNotEmpty()) {
-            // A payload that cannot be read is put aside before anything can be saved in its place,
-            // and the one from before the last write is read instead when there is one. That one
-            // is fetched first: putting the payload aside is a write, after which the copy from
-            // before the last write is no longer this one.
-            val previous = runCatching { backend.loadPreviousPayload() }.getOrNull()
-            savingIsUnsafe = runCatching { backend.saveUnreadablePayload(payload, DownloadsClock.nowEpochMs()) }.isFailure
-            decoded = previous
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?.let(DownloadsCodec::decode)
-        }
-        // A payload with content that could not be read is a problem to show, whatever was read in its place.
-        val storeProblem = when {
-            !payloadUnreadable -> null
-            savingIsUnsafe -> DownloadsStoreProblem.NotSaving
-            decoded != null -> DownloadsStoreProblem.EarlierCopyShown
-            else -> DownloadsStoreProblem.StartedEmpty
-        }
-        if (decoded == null) {
-            _uiState.value = DownloadsUiState(storeProblem = storeProblem)
-            scheduleOfflineIndexRefresh(emptyList(), force = true)
-            notifyLiveStatusPlatform()
-            return
-        }
-        loadedPayload = decoded
-        baseline = decoded.items
-        baseRevision = DownloadsCodec.revisionOf(payload)
-
-        var shouldPersistNormalized = false
-        val normalized = decoded.items
-            .map { item ->
-                val statusNormalized = backend.restoreItem(item)
-
-                val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized).withoutLostFile()
-                if (localUriNormalized != item) {
-                    shouldPersistNormalized = true
-                }
-                localUriNormalized
+    private fun loadFromDisk() {
+        val (profileId, storeProblem, normalized) = synchronized(stateLock) {
+            _hasUnseenCompleted.value = false
+            val profileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
+            loadedProfileId = profileId
+            loadedPayload = null
+            baseline = emptyList()
+            baseRevision = 0L
+            savingIsUnsafe = false
+            val payload = backend.loadPayload(profileId).orEmpty().trim()
+            var decoded = if (payload.isEmpty()) null else DownloadsCodec.decode(payload)
+            val payloadUnreadable = payload.isNotEmpty() && decoded == null
+            if (decoded == null && payload.isNotEmpty()) {
+                // A payload that cannot be read is put aside before anything can be saved in its place,
+                // and the one from before the last write is read instead when there is one. That one
+                // is fetched first: putting the payload aside is a write, after which the copy from
+                // before the last write is no longer this one.
+                val previous = runCatching { backend.loadPreviousPayload(profileId) }.getOrNull()
+                savingIsUnsafe = runCatching { backend.saveUnreadablePayload(profileId, payload, DownloadsClock.nowEpochMs()) }.isFailure
+                decoded = previous
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let(DownloadsCodec::decode)
+            }
+            // A payload with content that could not be read is a problem to show, whatever was read in its place.
+            val storeProblem = when {
+                !payloadUnreadable -> null
+                savingIsUnsafe -> DownloadsStoreProblem.NotSaving
+                decoded != null -> DownloadsStoreProblem.EarlierCopyShown
+                else -> DownloadsStoreProblem.StartedEmpty
+            }
+            if (decoded != null) {
+                loadedPayload = decoded
+                baseline = decoded.items
+                baseRevision = DownloadsCodec.revisionOf(payload)
+            } else if (payloadUnreadable && !savingIsUnsafe) {
+                baseRevision = DownloadsCodec.revisionOf(payload)
             }
 
-        _uiState.value = DownloadsUiState(normalized, storeProblem)
-        scheduleOfflineIndexRefresh(normalized, force = true)
-        notifyLiveStatusPlatform()
-        if (shouldPersistNormalized) {
-            persist()
+            var shouldPersistNormalized = false
+            val normalized = decoded?.items.orEmpty()
+                .map { item ->
+                    val statusNormalized = backend.restoreItem(item)
+
+                    val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized).withoutLostFile()
+                    if (localUriNormalized != item) {
+                        shouldPersistNormalized = true
+                    }
+                    localUriNormalized
+                }
+
+            _uiState.value = DownloadsUiState(
+                items = normalized,
+                storeProblem = storeProblem,
+            )
+            scheduleOfflineIndexRefresh(normalized, force = true)
+            notifyLiveStatusPlatform()
+            if (shouldPersistNormalized) {
+                persist()
+            }
+            // Stored items can be used while discovery is still waiting on the filesystem.
+            hasLoaded = true
+            // Resume the stored list before discovery waits on any download volume.
+            val resumed = _uiState.value.items.filter { it.status == DownloadStatus.Downloading && it.id !in activeTransfers }
+            downloadsResumedAtLoad = downloadsResumedAtLoad + resumed.map { it.id }
+            resumed.forEach(::startDownload)
+            // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
+            applyConnectionHold()
+            Triple(profileId, storeProblem, normalized)
         }
-        val resumed = normalized.filter { it.status == DownloadStatus.Downloading && it.id !in activeTransfers }
-        downloadsResumedAtLoad = downloadsResumedAtLoad + resumed.map { it.id }
-        resumed.forEach(::startDownload)
-        // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
-        applyConnectionHold()
+
+        // Run the disk scan outside stateLock so UI actions are never blocked on filesystem I/O.
+        val scanResult = if (backend.supportsDiskScan) {
+            runCatching {
+                backend.scanDownloadsOnDisk(
+                    activeProfileId = profileId,
+                    inMemoryItems = normalized,
+                    nextDownloadId = ::nextDownloadId,
+                    nowEpochMs = DownloadsClock.nowEpochMs(),
+                )
+            }.getOrDefault(DiskScanResult())
+        } else {
+            DiskScanResult()
+        }
+
+        synchronized(stateLock) {
+            if (loadedProfileId != profileId) return
+            val currentItems = _uiState.value.items
+            val newRecovered = scanResult.recoveredItems.filterNot { candidate ->
+                currentItems.any { existing -> existing.sameRecoveredFileAs(candidate) }
+            }
+            val finalItems = currentItems + newRecovered
+            _uiState.value = _uiState.value.copy(
+                items = finalItems,
+                storeProblem = storeProblem,
+                unrecognisedFiles = scanResult.unrecognisedFiles,
+            )
+            scheduleOfflineIndexRefresh(finalItems, force = true)
+            notifyLiveStatusPlatform()
+            if (newRecovered.isNotEmpty()) {
+                persist()
+            }
+        }
+    }
+
+    internal fun canScanDisk(): Boolean = backend.supportsDiskScan
+
+    /** Scans every available storage location for completed downloads whose records are missing. */
+    internal fun findDownloadsOnDisk(
+        controllerScanner: ((activeProfileId: Int, inMemoryItems: List<DownloadItem>, nextDownloadId: (Long) -> String, nowEpochMs: Long) -> DiskScanResult)? = null,
+    ): DiskScanSummary {
+        ensureLoaded()
+        val (scanFn, profileId, snapshotItems) = synchronized(stateLock) {
+            val fn: ((Int, List<DownloadItem>, (Long) -> String, Long) -> DiskScanResult) = when {
+                backend.supportsDiskScan -> backend::scanDownloadsOnDisk
+                controllerScanner != null -> controllerScanner
+                else -> return DiskScanSummary(0, _uiState.value.unrecognisedFiles.size)
+            }
+            Triple(
+                fn,
+                loadedProfileId ?: com.nuvio.app.features.profiles.ProfileRepository.activeProfileId,
+                _uiState.value.items,
+            )
+        }
+        // Run the filesystem scan outside stateLock so UI actions are never blocked.
+        val result = runCatching {
+            scanFn(
+                profileId,
+                snapshotItems,
+                ::nextDownloadId,
+                DownloadsClock.nowEpochMs(),
+            )
+        }.getOrDefault(DiskScanResult())
+        if (result.busy) {
+            return DiskScanSummary(0, _uiState.value.unrecognisedFiles.size, skippedBusy = true)
+        }
+        return synchronized(stateLock) {
+            // Discard stale results if the active profile changed while scanning.
+            if (!hasLoaded || loadedProfileId != profileId) {
+                return@synchronized DiskScanSummary(0, _uiState.value.unrecognisedFiles.size)
+            }
+            val currentItems = _uiState.value.items
+            val newRecovered = result.recoveredItems.filterNot { candidate ->
+                currentItems.any { existing -> existing.sameRecoveredFileAs(candidate) }
+            }
+            val updatedItems = if (newRecovered.isNotEmpty()) {
+                currentItems + newRecovered
+            } else {
+                currentItems
+            }
+            _uiState.value = _uiState.value.copy(
+                items = updatedItems,
+                unrecognisedFiles = result.unrecognisedFiles,
+            )
+            notifyLiveStatusPlatform()
+            if (newRecovered.isNotEmpty()) {
+                persist()
+            }
+            DiskScanSummary(
+                addedCount = newRecovered.size,
+                unrecognisedCount = result.unrecognisedFiles.size,
+            )
+        }
+    }
+
+    private fun DownloadItem.sameRecoveredFileAs(other: DownloadItem): Boolean {
+        if (id == other.id) return true
+        val uriA = localFileUri ?: return false
+        val uriB = other.localFileUri ?: return false
+        if (backend.isSameFile(uriA, uriB)) return true
+        return uriA.localFilePath().equals(uriB.localFilePath(), ignoreCase = true)
     }
 
     /**
@@ -840,7 +974,7 @@ object DownloadsRepository {
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByConnection && it.connectionHoldReason() == null }
-            .forEach { resumeDownload(it.id) }
+            .forEach { resumeDownloadLocked(it.id) }
     }
 
     /** Why this download waits for the connection now: some reasons hold automatic downloads only. */
@@ -1373,7 +1507,6 @@ object DownloadsRepository {
         stillWanted: () -> Boolean,
         lockedUri: String?,
     ): AutoDownloadRemovalResult? = synchronized(stateLock) {
-        ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return AutoDownloadRemovalResult.Changed
         // A file flagged as a placeholder is never removed automatically.
@@ -1498,11 +1631,12 @@ object DownloadsRepository {
      */
     private fun persist(durably: Boolean = false): Boolean {
         if (savingIsUnsafe) return false
+        val profileId = loadedProfileId ?: com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
         // A lock that cannot be had, or a save that fails, is a save not done: false, and nothing is assumed saved.
         return runCatching {
             backend.withListLock {
-                val revision = if (backend.rereadsPayload) mergeNewerStored() ?: return@withListLock false else null
-                backend.savePayload(DownloadsCodec.encode(_uiState.value.items, loadedPayload, revision))
+                val revision = if (backend.rereadsPayload) mergeNewerStored(profileId) ?: return@withListLock false else null
+                backend.savePayload(profileId, DownloadsCodec.encode(_uiState.value.items, loadedPayload, revision))
                 baseline = _uiState.value.items
                 if (revision != null) baseRevision = revision
                 !durably || backend.syncPayload()
@@ -1515,8 +1649,10 @@ object DownloadsRepository {
      * changes onto it and publishes the result. The revision to save next, or null when the stored list
      * is newer and cannot be read (nothing may be saved over it then).
      */
-    private fun mergeNewerStored(): Long? {
-        val stored = runCatching { backend.loadFreshPayload() }.getOrNull()?.trim().orEmpty()
+    private fun mergeNewerStored(
+        profileId: Int = loadedProfileId ?: com.nuvio.app.features.profiles.ProfileRepository.activeProfileId,
+    ): Long? {
+        val stored = runCatching { backend.loadFreshPayload(profileId) }.getOrNull()?.trim().orEmpty()
         val storedRevision = if (stored.isEmpty()) 0L else DownloadsCodec.revisionOf(stored)
         if (storedRevision > baseRevision) {
             val decoded = DownloadsCodec.decode(stored) ?: return null
@@ -1603,13 +1739,15 @@ object DownloadsRepository {
      * A download that waits for a location that is not there is put in another one, at the user's
      * request, and starts.
      */
-    internal fun chooseLocationForWaiting(downloadId: String, locationId: String): Unit = synchronized(stateLock) {
+    internal fun chooseLocationForWaiting(downloadId: String, locationId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        if (item.status != DownloadStatus.Paused || !item.pausedByFolder) return
-        backend.removePartialOf(item)
-        mutateItem(downloadId) { it.copy(locationId = locationId) }
-        resumeDownload(downloadId)
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            if (item.status != DownloadStatus.Paused || !item.pausedByFolder) return
+            backend.removePartialOf(item)
+            mutateItem(downloadId) { it.copy(locationId = locationId) }
+            resumeDownloadLocked(downloadId)
+        }
     }
 
     /** Whether the location that holds the show's downloads (or would take a new one) cannot be used now. */
@@ -1624,7 +1762,7 @@ object DownloadsRepository {
         if (!hasLoaded) return
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByFolder && !backend.heldByFolder(it) }
-            .forEach { resumeDownload(it.id) }
+            .forEach { resumeDownloadLocked(it.id) }
     }
 
     internal fun nextDownloadId(nowEpochMs: Long): String {
@@ -1691,13 +1829,17 @@ private class ActiveTransfer {
 
 internal interface DownloadsBackend {
     fun loadPayload(): String?
+    fun loadPayload(profileId: Int): String? = loadPayload()
     fun savePayload(payload: String)
+    fun savePayload(profileId: Int, payload: String) = savePayload(payload)
 
     /** The payload from before the last one that was saved. Null where no such copy is kept. */
     fun loadPreviousPayload(): String? = null
+    fun loadPreviousPayload(profileId: Int): String? = loadPreviousPayload()
 
     /** Keeps a payload that could not be read, apart from the one [savePayload] writes. */
     fun saveUnreadablePayload(payload: String, atEpochMs: Long) = Unit
+    fun saveUnreadablePayload(profileId: Int, payload: String, atEpochMs: Long) = saveUnreadablePayload(payload, atEpochMs)
 
     /** Removes a file the downloader just published that turned out bad. Only that file, where that can be proven. */
     fun removeJustPublished(localFileUri: String): Boolean = removeFile(localFileUri)
@@ -1716,6 +1858,7 @@ internal interface DownloadsBackend {
 
     /** The stored list as it is now. Null where it is not read again. */
     fun loadFreshPayload(): String? = null
+    fun loadFreshPayload(profileId: Int): String? = loadFreshPayload()
 
     /** Runs [block] holding the lock every save of a list takes, across processes where there is one. */
     fun <T> withListLock(block: () -> T): T = block()
@@ -1768,6 +1911,17 @@ internal interface DownloadsBackend {
 
     /** The location a new download goes to. Null where there are no locations. */
     fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? = null
+
+    /** Whether this backend can scan storage locations on disk for missing downloads. */
+    val supportsDiskScan: Boolean get() = false
+
+    /** Scans every available storage location for completed downloads whose records are missing. */
+    fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult = DiskScanResult()
 }
 
 /** The stored lists of downloads, one per profile, as the move reads and saves them. */
@@ -1828,12 +1982,21 @@ internal enum class AutoDownloadRemovalResult {
 private object PlatformDownloadsBackend : DownloadsBackend {
     override fun loadPayload(): String? = DownloadsStorage.loadPayload()
 
+    override fun loadPayload(profileId: Int): String? = DownloadsStorage.loadPayload(profileId)
+
     override fun savePayload(payload: String) = DownloadsStorage.savePayload(payload)
+
+    override fun savePayload(profileId: Int, payload: String) = DownloadsStorage.savePayload(profileId, payload)
 
     override fun loadPreviousPayload(): String? = DownloadsStorage.loadPreviousPayload()
 
+    override fun loadPreviousPayload(profileId: Int): String? = DownloadsStorage.loadPreviousPayload(profileId)
+
     override fun saveUnreadablePayload(payload: String, atEpochMs: Long) =
         DownloadsStorage.saveUnreadablePayload(payload, atEpochMs)
+
+    override fun saveUnreadablePayload(profileId: Int, payload: String, atEpochMs: Long) =
+        DownloadsStorage.saveUnreadablePayload(profileId, payload, atEpochMs)
 
     override val rereadsPayload: Boolean get() = DownloadsStorage.rereadsPayload
 
@@ -1849,6 +2012,8 @@ private object PlatformDownloadsBackend : DownloadsBackend {
         localFileUri?.let { DownloadFolders.controller.discardFile(it) } ?: removeFile(localFileUri)
 
     override fun loadFreshPayload(): String? = DownloadsStorage.loadFreshPayload()
+
+    override fun loadFreshPayload(profileId: Int): String? = DownloadsStorage.loadFreshPayload(profileId)
 
     override fun <T> withListLock(block: () -> T): T = DownloadsStorage.withListLock(block)
 
@@ -1900,6 +2065,20 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? =
         DownloadFolders.controller.placementFor(items, parentMetaId, isEpisode)
+
+    override val supportsDiskScan: Boolean get() = DownloadFolders.controller.supported
+
+    override fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult = DownloadFolders.controller.scanDownloadsOnDisk(
+        activeProfileId = activeProfileId,
+        inMemoryItems = inMemoryItems,
+        nextDownloadId = nextDownloadId,
+        nowEpochMs = nowEpochMs,
+    )
 }
 
 /**

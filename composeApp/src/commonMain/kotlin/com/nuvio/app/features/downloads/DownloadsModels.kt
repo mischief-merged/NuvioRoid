@@ -175,6 +175,8 @@ data class DownloadsUiState(
     val items: List<DownloadItem> = emptyList(),
     /** Set when the stored list could not be read. The screen must not present the list as simply empty then. */
     val storeProblem: DownloadsStoreProblem? = null,
+    /** Files in download folders that could not be matched confidently during a scan. */
+    val unrecognisedFiles: List<UnrecognisedFile> = emptyList(),
 ) {
     /** What is not downloaded: running, paused, failed, and finished files that are not the video. */
     val activeItems: List<DownloadItem>

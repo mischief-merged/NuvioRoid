@@ -278,6 +278,14 @@ internal interface DownloadFolderController {
      * any profile uses it. Nothing is moved, copied or deleted.
      */
     fun adoptFile(item: DownloadItem, path: String): Boolean = false
+
+    /** Scans every available storage location for completed downloads whose records are missing. */
+    fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult = DiskScanResult()
 }
 
 internal enum class FileOwnership {
