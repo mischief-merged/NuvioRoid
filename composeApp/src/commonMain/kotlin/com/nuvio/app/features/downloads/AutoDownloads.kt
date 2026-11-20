@@ -27,6 +27,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import nuvio.composeapp.generated.resources.downloads_delete_setting_save_failed
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast_soon
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_auto_delete_failed_toast
 import nuvio.composeapp.generated.resources.downloads_auto_delete_not_connected_toast
@@ -59,6 +62,9 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
     }
 }
 
+private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
+internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
 /** What the interface needs from automatic downloads. */
@@ -68,6 +74,11 @@ internal interface AutoDownloadController {
 
     /** The storage limit for automatic downloads, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?>
+
+    val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
+    val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
+    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
+    fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
 
     /** The watched episodes that are going to be removed. */
     val removals: StateFlow<List<AutoDownloadRemoval>>
@@ -174,15 +185,16 @@ internal object AutoDownloads : AutoDownloadController {
                 episodeNumber = item.episodeNumber,
             )?.isCompleted == true
         },
-        isInPlayer = { item ->
-            playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
-        },
+        isInPlayer = ::isPlaying,
         hasLaterEpisode = { rule, item -> engine.knownEpisodes(rule.key)?.let { hasLaterReleasedEpisode(item, it) } },
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
     )
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
+
+    override val deleteAfterWatchingMode get() = store.deleteAfterWatchingMode
+    override val keptDownloadIds get() = store.keptDownloadIds
 
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
@@ -295,6 +307,18 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    override fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) {
+        scope.launch {
+            if (!runCatching { store.setDeleteAfterWatchingMode(profileId, mode) }.getOrDefault(false)) {
+                NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
+            }
+        }
+    }
+
+    override fun undoKeepDownload(profileId: Int, downloadId: String) {
+        scope.launch { runCatching { store.undoKeep(profileId, downloadId) } }
+    }
+
     override fun keepDownload(profileId: Int, downloadId: String) {
         scope.launch { runCatching { deleteAfterWatching.keep(profileId, downloadId) } }
     }
@@ -316,10 +340,14 @@ internal object AutoDownloads : AutoDownloadController {
 
     /** Whether the player has the file of [item] open. A download that is playing is not moved. */
     fun isPlaying(item: DownloadItem): Boolean =
-        playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
+        playingFileUri.value?.let { playing ->
+            // The row can be temporarily absent while its removal is being saved.
+            item.localFileUri?.let { DownloadsRepository.backend.isSameFile(playing, it) } == true ||
+                DownloadsRepository.findCompletedDownloadByLocalFile(playing)?.id == item.id
+        } == true
 
-    /** The player opened or closed a local file. A download that is open is not removed. */
-    fun onLocalFileOpened(localFileUri: String) {
+    /** Record playback and cancel a removal without waiting for its disk work. */
+    fun onLocalFileOpened(localFileUri: String) = WatchedRemovalGuard.signalChange {
         playingFileUri.value = localFileUri
     }
 
@@ -396,7 +424,11 @@ internal object AutoDownloads : AutoDownloadController {
 }
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
-private suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+    if (!item.isEpisode) {
+        return if (hours < 1) getString(Res.string.downloads_movie_scheduled_toast_soon, item.title)
+        else getPluralString(Res.plurals.downloads_movie_scheduled_toast, hours, item.title, hours)
+    }
     val season = item.seasonNumber ?: 0
     val episode = item.episodeNumber ?: 0
     return if (hours < 1) {

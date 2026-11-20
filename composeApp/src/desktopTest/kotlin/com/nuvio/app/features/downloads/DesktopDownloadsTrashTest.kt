@@ -6,6 +6,7 @@ import java.nio.file.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.writeText
+import kotlin.io.path.readText
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -59,6 +60,44 @@ class DesktopDownloadsTrashTest {
     private fun held() = holding.toFile().list().orEmpty().filter { it != DesktopDownloadsTrash.IndexFileName }.sorted()
 
     private fun Path.uri() = toUri().toString()
+
+    @Test
+    fun cancellation_after_subtitles_move_restores_the_video_and_subtitles() {
+        val video = video()
+        val subtitles = subtitlesOf(video)
+        val systemTrash = outside.resolve("trash").createDirectories()
+        var wanted = true
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), systemTrash.resolve(file.name))
+            if (file.toPath() == subtitles) wanted = false
+            true
+        })
+        assertEquals(AutoDownloadRemovalResult.Changed, trash.moveWatchedAway(video.uri()) { wanted })
+        assertEquals("video", video.readText())
+        assertEquals("subtitles", subtitles.resolve("en.srt").readText())
+        assertFalse(holding.exists())
+        assertTrue(downloadsDir.toFile().list().orEmpty().none { it.startsWith(".watched-removal-") })
+    }
+
+    @Test
+    fun a_trash_move_that_throws_after_moving_restores_the_original_file() {
+        val video = video()
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), outside.resolve(file.name))
+            error("Move interrupted")
+        })
+        assertEquals(AutoDownloadRemovalResult.NotMoved, trash.moveWatchedAway(video.uri()) { true })
+        assertEquals("video", video.readText())
+        assertFalse(holding.exists())
+    }
+
+    @Test
+    fun watched_removal_refuses_the_expiring_holding_folder() {
+        val video = video()
+        assertEquals(AutoDownloadRemovalResult.NotMoved, withoutSystemTrash().moveWatchedAway(video.uri()) { true })
+        assertEquals("video", video.readText())
+        assertFalse(holding.exists())
+    }
 
     @Test
     fun a_download_and_its_subtitles_go_to_the_system_trash() {

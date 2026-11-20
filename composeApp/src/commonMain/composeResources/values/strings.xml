@@ -2294,8 +2294,8 @@
     <string name="downloads_auto_choices_note">Uses your saved quality, maximum bitrate and language preferences. Change them in Settings, Playback, Quality and language preferences.</string>
     <string name="downloads_auto_delete_heading">After watching</string>
     <string name="downloads_auto_delete_after">Delete episodes 24 hours after I watch them</string>
-    <string name="downloads_auto_delete_note">Only auto-downloaded episodes. Your own downloads are never deleted. You can keep or delete one early in Downloads.</string>
-    <string name="downloads_auto_delete_no_trash_note">This computer has no trash Nuvio can use. Deleted episodes are kept in the downloads folder for 7 days, then deleted permanently.</string>
+    <string name="downloads_auto_delete_note">This applies to episodes from this rule. Delete after watching in Settings can turn all removals off. Use Keep in Downloads to hold on to an episode.</string>
+    <string name="downloads_auto_delete_no_trash_note">The Trash is not available on this computer. Watched downloads stay where they are.</string>
     <string name="downloads_auto_pending_heading">Deleting after you watch</string>
     <string name="downloads_auto_pending_row">%1$s S%2$d E%3$d • %4$s</string>
     <plurals name="downloads_auto_pending_in_hours">
@@ -2305,8 +2305,8 @@
     <string name="downloads_auto_pending_soon">in less than an hour</string>
     <string name="downloads_auto_keep">Keep</string>
     <plurals name="downloads_auto_scheduled_toast">
-        <item quantity="one">%1$s S%2$d E%3$d will be deleted in about %5$d hour</item>
-        <item quantity="other">%1$s S%2$d E%3$d will be deleted in about %5$d hours</item>
+        <item quantity="one">%1$s S%2$d E%3$d will be deleted in about %4$d hour</item>
+        <item quantity="other">%1$s S%2$d E%3$d will be deleted in about %4$d hours</item>
     </plurals>
     <string name="downloads_auto_scheduled_toast_soon">%1$s S%2$d E%3$d will be deleted soon</string>
     <plurals name="downloads_row_deletes_in_hours">
@@ -2326,9 +2326,9 @@
     <string name="downloads_auto_delete_now_description">Delete %1$s S%2$d E%3$d now</string>
     <string name="downloads_auto_delete_now_title">Delete this episode now?</string>
     <string name="downloads_auto_delete_now_message_trash">%1$s S%2$d E%3$d is moved to the trash.</string>
-    <string name="downloads_auto_delete_now_message_held">%1$s S%2$d E%3$d is kept in the downloads folder for 7 days, then deleted permanently.</string>
-    <string name="downloads_auto_deleted_toast">Episode deleted</string>
-    <string name="downloads_auto_delete_playing_toast">Couldn't delete yet: the episode is playing</string>
+    <string name="downloads_auto_delete_now_message_held">The Trash is not available. %1$s S%2$d E%3$d will stay where it is.</string>
+    <string name="downloads_auto_deleted_toast">Download moved to the Trash</string>
+    <string name="downloads_auto_delete_playing_toast">Couldn't delete yet: the download is playing</string>
     <string name="downloads_auto_delete_failed_toast">Couldn't delete: the file could not be moved</string>
     <string name="downloads_auto_turn_on">Turn on</string>
     <string name="downloads_auto_turn_off">Turn off</string>
@@ -3482,4 +3482,24 @@
     <string name="downloads_status_waiting_travel">Paused for Travel mode · %1$s</string>
     <string name="downloads_status_checking_network">Checking the network before downloads resume · %1$s</string>
     <string name="travel_polite_required">Travel mode keeps this on. Your usual choice returns when Travel mode is off.</string>
+    <string name="settings_delete_after_watching_title">Delete after watching</string>
+    <string name="settings_delete_after_watching_off">Off</string>
+    <string name="settings_delete_after_watching_automatic">Automatic downloads only</string>
+    <string name="settings_delete_after_watching_all">All downloads</string>
+    <string name="settings_delete_after_watching_description">Watched downloads move to the Trash 24 hours after you finish them. Use Keep on any download you want to hold on to. Each show’s rule still decides for automatic downloads.</string>
+    <string name="downloads_delete_setting_save_failed">Could not save the download setting. Try again.</string>
+    <string name="downloads_kept">Kept</string>
+    <string name="downloads_undo_keep">Undo Keep</string>
+    <string name="downloads_keep_description">Keep %1$s</string>
+    <string name="downloads_undo_keep_description">Undo Keep for %1$s</string>
+    <plurals name="downloads_movie_scheduled_toast">
+        <item quantity="one">%1$s will move to the Trash in about %2$d hour</item>
+        <item quantity="other">%1$s will move to the Trash in about %2$d hours</item>
+    </plurals>
+    <string name="downloads_movie_scheduled_toast_soon">%1$s will move to the Trash soon</string>
+    <string name="downloads_movie_removal_row">%1$s • %2$s</string>
+    <string name="downloads_movie_delete_now_description">Delete %1$s now</string>
+    <string name="downloads_movie_delete_now_title">Delete this movie now?</string>
+    <string name="downloads_movie_delete_now_message_held">The Trash is not available. %1$s will stay where it is.</string>
+    <string name="downloads_movie_delete_now_message_trash">%1$s is moved to the Trash.</string>
 </resources>

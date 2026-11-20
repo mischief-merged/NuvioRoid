@@ -181,6 +181,7 @@ internal fun DownloadsScreenContent(
     }
     val network by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
     val scheduledRemovals by (autoDownloads?.removals ?: NoScheduledRemovals).collectAsStateWithLifecycle()
+    val keptDownloadIds by (autoDownloads?.keptDownloadIds ?: NoKeptDownloads).collectAsStateWithLifecycle()
     val removalByDownload = remember(scheduledRemovals) { scheduledRemovals.associateBy { it.downloadId } }
     val activeProfileId = ProfileRepository.activeProfileId
     val anyDownloading = uiState.items.any { it.status == DownloadStatus.Downloading }
@@ -233,7 +234,15 @@ internal fun DownloadsScreenContent(
     val polite by politeState.collectAsStateWithLifecycle()
     val searches = sourceSearches?.collectAsStateWithLifecycle()?.value
     val clock = RowClock(
-        nowEpochMs = now, offline = network.isOfflineLike, extras = extras, limitedBy = holdState.reason, searches = searches,
+        nowEpochMs = now,
+        offline = network.isOfflineLike,
+        extras = extras,
+        limitedBy = holdState.reason,
+        searches = searches,
+        removals = removalByDownload,
+        keptDownloadIds = keptDownloadIds,
+        onKeep = autoDownloads?.let { controller -> { id -> controller.keepDownload(activeProfileId, id) } },
+        onUndoKeep = autoDownloads?.let { controller -> { id -> controller.undoKeepDownload(activeProfileId, id) } },
     )
     // What the list builder needs is read here, in composition, once. A list builder that reads state
     // itself is run again whenever that state changes, also in the middle of a layout pass, which the
@@ -551,8 +560,6 @@ internal fun DownloadsScreenContent(
                 clock = clock,
                 onOpenDownload = onOpenDownload,
                 onDeleteDownload = { downloadPendingDeletionId = it },
-                scheduledDeletions = removalByDownload,
-                onKeepScheduled = { autoDownloads?.keepDownload(activeProfileId, it) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = checkAgain,
             )
@@ -688,6 +695,10 @@ private data class RowClock(
     val limitedBy: LimitedConnectionReason? = null,
     /** The app's own searches for another source, by title. Null where the app does not search by itself. */
     val searches: Map<String, SourceSearchProgress>? = null,
+    val removals: Map<String, AutoDownloadRemoval> = emptyMap(),
+    val keptDownloadIds: Set<String> = emptySet(),
+    val onKeep: ((String) -> Unit)? = null,
+    val onUndoKeep: ((String) -> Unit)? = null,
 )
 
 /** What the rows need to know about locations, selection and moving. Null where there are no locations. */
@@ -959,8 +970,6 @@ private fun LazyListScope.downloadsShowContent(
     clock: RowClock,
     onOpenDownload: (DownloadItem) -> Unit,
     onDeleteDownload: (String) -> Unit,
-    scheduledDeletions: Map<String, AutoDownloadRemoval>,
-    onKeepScheduled: (downloadId: String) -> Unit,
     episodeLinks: DownloadEpisodeLinks?,
     onCheckAgain: ((DownloadItem) -> Unit)?,
 ) {
@@ -1021,8 +1030,6 @@ private fun LazyListScope.downloadsShowContent(
                 onResume = { DownloadsRepository.resumeDownload(item.id) },
                 onRetry = { DownloadsRepository.retryDownload(item.id) },
                 onDelete = { onDeleteDownload(item.id) },
-                scheduledDeletionDueAtEpochMs = scheduledDeletions[item.id]?.dueAtEpochMs,
-                onKeepScheduled = { onKeepScheduled(item.id) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
             )
@@ -1040,15 +1047,14 @@ private fun DownloadRow(
     onResume: () -> Unit,
     onRetry: () -> Unit,
     onDelete: () -> Unit,
-    /** When finishing the episode scheduled its deletion: the time it is due. Null otherwise. */
-    scheduledDeletionDueAtEpochMs: Long? = null,
-    onKeepScheduled: () -> Unit = {},
     episodeLinks: DownloadEpisodeLinks? = null,
     /** Looks at the file again. Null where that is not offered. */
     onCheckAgain: ((DownloadItem) -> Unit)? = null,
     /** A marked file has a good new copy beside it: offers to replace it with that copy (the file goes to the trash). */
     newCopyReady: Boolean = false,
 ) {
+    val scheduledDeletionDueAtEpochMs = clock.removals[item.id]?.dueAtEpochMs
+    val isKept = item.id in clock.keptDownloadIds
     val extras = clock.extras
     val location = extras?.folderState?.location(extras.locationIdOf(item))
     val availability = location?.availability ?: FolderAvailability.Available
@@ -1193,14 +1199,15 @@ private fun DownloadRow(
                     if (onCheckAgain != null && (rowStatus.result == DownloadResult.NotChecked || rowStatus.result == DownloadResult.CouldNotCompare)) {
                         CheckAgainButton(item = item, onCheckAgain = onCheckAgain)
                     }
+                    if (isKept) {
+                        Text(
+                            text = stringResource(Res.string.downloads_kept),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (scheduledDeletionDueAtEpochMs != null) {
                         val hours = removalHoursLeft(scheduledDeletionDueAtEpochMs, clock.nowEpochMs)
-                        val keepDescription = stringResource(
-                            Res.string.downloads_auto_keep_description,
-                            item.title,
-                            item.seasonNumber ?: 0,
-                            item.episodeNumber ?: 0,
-                        )
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = if (hours < 1) {
@@ -1211,17 +1218,31 @@ private fun DownloadRow(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            TextButton(
-                                modifier = Modifier.semantics { contentDescription = keepDescription },
-                                onClick = onKeepScheduled,
-                            ) {
-                                Text(text = stringResource(Res.string.downloads_auto_keep), style = MaterialTheme.typography.labelLarge)
-                            }
                         }
                     }
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (clock.onKeep != null) {
+                        val keepDescription = if (isKept) {
+                            stringResource(Res.string.downloads_undo_keep_description, name)
+                        } else if (item.isEpisode) {
+                            stringResource(Res.string.downloads_auto_keep_description, item.title, item.seasonNumber ?: 0, item.episodeNumber ?: 0)
+                        } else {
+                            stringResource(Res.string.downloads_keep_description, name)
+                        }
+                        TextButton(
+                            modifier = Modifier.semantics { contentDescription = keepDescription },
+                            onClick = {
+                                if (isKept) clock.onUndoKeep?.invoke(item.id) else clock.onKeep.invoke(item.id)
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(if (isKept) Res.string.downloads_undo_keep else Res.string.downloads_auto_keep),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
                     when (item.status) {
                         DownloadStatus.Downloading -> {
                             IconButton(onClick = onPause) {

@@ -18,6 +18,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.isDesktop
@@ -117,5 +118,11 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         KeepDownloadingSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
         DownloadFolderSetting(isTablet)
+        SettingsGroupDivider(isTablet = isTablet)
+        val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
+        DeleteAfterWatchingSetting(
+            isTablet,
+            profileId = profileState.activeProfile?.profileIndex ?: ProfileRepository.activeProfileId,
+        )
     }
 }

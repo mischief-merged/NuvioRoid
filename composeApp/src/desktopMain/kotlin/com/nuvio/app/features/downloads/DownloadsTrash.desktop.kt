@@ -31,6 +31,9 @@ internal actual object DownloadsTrash {
 
     actual fun moveAway(localFileUri: String): Boolean = trash.moveAway(localFileUri)
 
+    actual fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
+        trash.moveWatchedAway(localFileUri, stillWanted)
+
     actual fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
         trash.isSameFile(firstFileUri, secondFileUri)
 
@@ -82,6 +85,82 @@ internal class DesktopDownloadsTrash(
         // The file is out. Subtitles that cannot follow it stay beside where it was.
         subtitles?.let { runCatching { hold(root, it) } }
         return true
+    }
+
+    /**
+     * Keep hard links outside the expiring holding folder until the move is accepted. They use no
+     * extra video storage and let cancellation restore both the video and subtitles even after the
+     * system has moved them. If links cannot be made on this volume, leave the download alone.
+     */
+    fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult = synchronized(this) {
+        val trash = systemTrash ?: return AutoDownloadRemovalResult.NotMoved
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        val file = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return AutoDownloadRemovalResult.NotMoved
+        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
+            return if (stillWanted()) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.Changed
+        }
+        val root = roots().firstOrNull { file.isRegularFileInside(it) } ?: return AutoDownloadRemovalResult.NotMoved
+        val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
+        val sources = listOfNotNull(file, subtitles)
+        val recovery = runCatching { Files.createTempDirectory(root, ".watched-removal-") }.getOrNull()
+            ?: return AutoDownloadRemovalResult.NotMoved
+        try {
+            sources.forEach { linkForRecovery(it, recovery.resolve(it.fileName)) }
+        } catch (_: Exception) {
+            runCatching { deleteWithoutFollowingLinks(recovery) }
+            return AutoDownloadRemovalResult.NotMoved
+        }
+
+        fun restore() {
+            sources.forEach { source ->
+                val saved = recovery.resolve(source.fileName)
+                restoreRecovery(saved, source)
+            }
+        }
+
+        var accepted = false
+        try {
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            val moved = runCatching { trash(file.toFile()) }.getOrDefault(false)
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            if (!moved || Files.exists(file, LinkOption.NOFOLLOW_LINKS)) return AutoDownloadRemovalResult.NotMoved
+            subtitles?.let { runCatching { trash(it.toFile()) } }
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            accepted = true
+            AutoDownloadRemovalResult.Removed
+        } finally {
+            // If restoring fails, keep the recovery links. Never discard the only remaining copy.
+            if (accepted || runCatching { restore() }.isSuccess) {
+                runCatching { deleteWithoutFollowingLinks(recovery) }
+            }
+        }
+    }
+
+    private fun restoreRecovery(saved: Path, source: Path) {
+        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+            Files.move(saved, source)
+        } else if (Files.isDirectory(saved, LinkOption.NOFOLLOW_LINKS) &&
+            !Files.isSymbolicLink(source) && Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)
+        ) {
+            Files.newDirectoryStream(saved).use { children ->
+                children.forEach { restoreRecovery(it, source.resolve(it.fileName)) }
+            }
+        } else if (Files.isSymbolicLink(source) || !Files.isSameFile(saved, source)) {
+            throw IOException("The original path has changed; its recovery copy has been kept")
+        }
+    }
+
+    private fun linkForRecovery(source: Path, destination: Path) {
+        if (Files.isSymbolicLink(source)) throw IOException("A link cannot be saved for removal")
+        if (Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createDirectory(destination)
+            Files.newDirectoryStream(source).use { children ->
+                children.forEach { linkForRecovery(it, destination.resolve(it.fileName)) }
+            }
+        } else {
+            if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) throw IOException("Not a regular file")
+            Files.createLink(destination, source)
+        }
     }
 
     /**
