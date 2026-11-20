@@ -201,30 +201,6 @@ internal actual object DownloadsLiveStatusPlatform {
         }
     }
 
-    private fun formatBytes(bytes: Long): String {
-        val safe = bytes.coerceAtLeast(0L).toDouble()
-        val units = runBlocking {
-            arrayOf(
-                getString(Res.string.unit_bytes_b),
-                getString(Res.string.unit_bytes_kb),
-                getString(Res.string.unit_bytes_mb),
-                getString(Res.string.unit_bytes_gb),
-                getString(Res.string.unit_bytes_tb),
-            )
-        }
-        var value = safe
-        var unitIndex = 0
-        while (value >= 1024.0 && unitIndex < units.lastIndex) {
-            value /= 1024.0
-            unitIndex += 1
-        }
-        return if (unitIndex == 0) {
-            "${value.toLong()} ${units[unitIndex]}"
-        } else {
-            "${"%.1f".format(value)} ${units[unitIndex]}"
-        }
-    }
-
     private fun progressPercent(item: DownloadItem): Int {
         val total = item.totalBytes?.takeIf { it > 0L } ?: return -1
         return ((item.downloadedBytes.toDouble() / total.toDouble()) * 100.0)

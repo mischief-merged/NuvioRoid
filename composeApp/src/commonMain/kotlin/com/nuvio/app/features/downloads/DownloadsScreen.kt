@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -21,6 +22,7 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -63,9 +65,11 @@ import com.nuvio.app.core.ui.NuvioScreen
 import com.nuvio.app.core.ui.NuvioScreenHeader
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.LocalOpenSettingsPage
 import com.nuvio.app.features.settings.SettingsPage
+import com.nuvio.app.features.settings.SettingsSectionFocus
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.pluralStringResource
@@ -244,6 +248,12 @@ internal fun DownloadsScreenContent(
         DownloadBandwidth.userCapBytesPerSecond
     }.collectAsStateWithLifecycle()
     val openSettingsPage = LocalOpenSettingsPage.current
+    val openDownloadSettings = openSettingsPage?.let { open ->
+        {
+            SettingsSectionFocus.request(SettingsSectionFocus.PlaybackDownloads)
+            open(SettingsPage.Playback)
+        }
+    }
 
     var selectedShowId by rememberSaveable(initialShowId) { mutableStateOf(initialShowId) }
     var downloadPendingDeletionId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -278,6 +288,7 @@ internal fun DownloadsScreenContent(
                     }
                 },
                 actions = {
+                    val headerColor = MaterialTheme.nuvio.colors.textPrimary
                     if (extras != null && uiState.completedItems.isNotEmpty()) {
                         TextButton(
                             onClick = {
@@ -288,6 +299,23 @@ internal fun DownloadsScreenContent(
                             Text(
                                 text = stringResource(if (selecting) Res.string.downloads_select_done else Res.string.downloads_select),
                                 style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
+                    if (openDownloadSettings != null) {
+                        TextButton(onClick = openDownloadSettings) {
+                            Icon(
+                                imageVector = Icons.Rounded.Settings,
+                                contentDescription = null,
+                                tint = headerColor,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = stringResource(Res.string.downloads_open_settings),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
                             )
                         }
                     }
@@ -310,6 +338,7 @@ internal fun DownloadsScreenContent(
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
                                 contentDescription = checkAllText,
+                                tint = headerColor,
                             )
                         }
                     }
@@ -323,6 +352,7 @@ internal fun DownloadsScreenContent(
                         Icon(
                             imageVector = Icons.Rounded.Folder,
                             contentDescription = stringResource(Res.string.downloads_open_directory),
+                            tint = headerColor,
                         )
                     }
                 },
@@ -341,7 +371,11 @@ internal fun DownloadsScreenContent(
                     DownloadStorageSummary(
                         state = folderStateNow,
                         autoLimitGb = storageLimitNow,
-                        onManageLocations = openSettingsPage?.let { open -> { open(SettingsPage.Playback) } },
+                        onManageLocations = openDownloadSettings,
+                        onChangeStorageLimit = autoDownloads?.let { controller ->
+                            { profile, limit -> controller.setStorageLimit(profile, limit) }
+                        },
+                        profileId = activeProfileId,
                     )
                 }
             }
@@ -365,7 +399,7 @@ internal fun DownloadsScreenContent(
                 item(key = "speed-limit") {
                     SpeedLimitLine(
                         megabytesPerSecond = (limit / 1_000_000L).toInt().coerceAtLeast(1),
-                        onChange = openSettingsPage?.let { open -> { open(SettingsPage.Playback) } },
+                        onChange = openDownloadSettings,
                     )
                 }
             }
@@ -1649,15 +1683,12 @@ private fun resultText(status: DownloadRowStatus, saved: DownloadCompanionsNote?
 }
 
 internal fun formatBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 ${localizedByteUnit("B")}"
-    val kib = 1024.0
-    val mib = kib * 1024.0
-    val gib = mib * 1024.0
-    val value = bytes.toDouble()
-    return when {
-        value >= gib -> "${((value / gib) * 10.0).toInt() / 10.0} ${localizedByteUnit("GB")}"
-        value >= mib -> "${((value / mib) * 10.0).toInt() / 10.0} ${localizedByteUnit("MB")}"
-        value >= kib -> "${((value / kib) * 10.0).toInt() / 10.0} ${localizedByteUnit("KB")}"
-        else -> "$bytes ${localizedByteUnit("B")}"
+    val size = decimalByteSize(bytes)
+    val unit = when (size.scale) {
+        DecimalByteScale.Bytes -> localizedByteUnit("B")
+        DecimalByteScale.Kilobytes -> localizedByteUnit("KB")
+        DecimalByteScale.Megabytes -> localizedByteUnit("MB")
+        DecimalByteScale.Gigabytes -> localizedByteUnit("GB")
     }
+    return "${size.amount} $unit"
 }

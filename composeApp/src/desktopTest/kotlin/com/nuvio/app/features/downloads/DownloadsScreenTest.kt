@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -19,6 +20,9 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.features.settings.LocalOpenSettingsPage
+import com.nuvio.app.features.settings.SettingsPage
+import com.nuvio.app.features.settings.SettingsSectionFocus
 import com.nuvio.app.core.ui.NuvioToastController
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
@@ -79,7 +83,9 @@ import nuvio.composeapp.generated.resources.downloads_failed_next_not_enough_spa
 import nuvio.composeapp.generated.resources.downloads_failed_next_other
 import nuvio.composeapp.generated.resources.downloads_failed_next_source_refused
 import nuvio.composeapp.generated.resources.downloads_empty_title
+import nuvio.composeapp.generated.resources.downloads_check_all
 import nuvio.composeapp.generated.resources.downloads_open_directory
+import nuvio.composeapp.generated.resources.downloads_open_settings
 import nuvio.composeapp.generated.resources.downloads_result_picture_ok
 import nuvio.composeapp.generated.resources.downloads_store_problem_earlier_copy
 import nuvio.composeapp.generated.resources.downloads_store_problem_not_saving
@@ -180,6 +186,7 @@ class DownloadsScreenTest {
         clearBatchRuns()
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = realBackend
+        SettingsSectionFocus.clear()
     }
 
     private fun text(resource: StringResource, vararg arguments: Any) = runBlocking { getString(resource, *arguments) }
@@ -689,6 +696,43 @@ class DownloadsScreenTest {
         showPayload()
 
         compose.onNodeWithText(text(Res.string.downloads_store_problem_not_saving)).assertIsDisplayed()
+    }
+
+    @Test
+    fun the_header_checks_downloads_opens_the_folder_and_opens_download_settings() {
+        SettingsSectionFocus.clear()
+        val opened = mutableListOf<SettingsPage>()
+        backend.payload = null
+        compose.setContent {
+            CompositionLocalProvider(LocalOpenSettingsPage provides { page -> opened += page }) {
+                NuvioTheme {
+                    DownloadsScreen(
+                        onBack = {},
+                        onOpenDownload = {},
+                        showAutoDownloads = false,
+                        openDownloadsFolder = {
+                            folderOpened++
+                            true
+                        },
+                    )
+                }
+            }
+        }
+
+        compose.onNodeWithContentDescription(text(Res.string.downloads_check_all)).assertIsDisplayed().assertHasClickAction()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_open_directory)).assertIsDisplayed().performClick()
+        compose.onNodeWithText(text(Res.string.downloads_open_settings)).assertIsDisplayed().performClick()
+
+        assertEquals(1, folderOpened)
+        assertEquals(listOf(SettingsPage.Playback), opened)
+        assertEquals(SettingsSectionFocus.PlaybackDownloads, SettingsSectionFocus.pending)
+    }
+
+    @Test
+    fun download_settings_is_absent_where_settings_cannot_be_opened() {
+        show()
+
+        compose.onNodeWithText(text(Res.string.downloads_open_settings)).assertDoesNotExist()
     }
 
     @Test

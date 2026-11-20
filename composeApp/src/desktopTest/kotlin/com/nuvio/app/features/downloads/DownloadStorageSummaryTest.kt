@@ -155,15 +155,15 @@ class DownloadStorageSummaryTest {
     private fun location(id: String, name: String, used: Long, free: Long?, availability: FolderAvailability = FolderAvailability.Available, lastKnown: Boolean = false) =
         DownloadLocationInfo(id, "/x/$name", name, isDefault = id == "app", isAppFolder = id == "app", availability = availability, itemCount = 1, totalBytes = used, freeBytes = free, usedBytes = used, usedIsLastKnown = lastKnown)
 
-    private val gb = 1024L * 1024 * 1024
+    private val gb = 1_000_000_000L
 
     @Test
     fun the_summary_is_one_readable_line_with_units_spoken_properly() {
         val state = DownloadFolderState(listOf(location("app", "downloads", 48 * gb + gb / 5, 512 * gb)), usageMeasured = true, totalFreeBytes = 512 * gb)
         compose.setContent { NuvioTheme { DownloadStorageSummary(state, autoLimitGb = null, onManageLocations = null) } }
 
-        compose.onNodeWithText(text(Res.string.downloads_storage_summary, "48.1 GB", "512.0 GB")).assertExists()
-        compose.onNode(hasContentDescription("Downloads use 48.1 gigabytes, 512.0 gigabytes free")).assertExists()
+        compose.onNodeWithText(text(Res.string.downloads_storage_summary, "48.2 GB", "512.0 GB")).assertExists()
+        compose.onNode(hasContentDescription("Downloads use 48.2 gigabytes, 512.0 gigabytes free")).assertExists()
     }
 
     @Test
@@ -175,7 +175,7 @@ class DownloadStorageSummaryTest {
         compose.setContent { NuvioTheme { DownloadStorageSummary(state, autoLimitGb = 100, onManageLocations = null) } }
 
         compose.onNodeWithText(text(Res.string.downloads_storage_auto, formatBytes(31_000_000_000), formatBytes(100_000_000_000))).assertExists()
-        val spoken = text(Res.string.downloads_storage_auto_spoken, "28.8 gigabytes", "93.1 gigabytes")
+        val spoken = text(Res.string.downloads_storage_auto_spoken, "31.0 gigabytes", "100.0 gigabytes")
         compose.onNode(
             hasContentDescription(spoken) and
                 SemanticsMatcher("has progress") { node ->

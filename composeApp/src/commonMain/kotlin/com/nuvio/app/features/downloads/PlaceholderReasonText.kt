@@ -13,7 +13,7 @@ import nuvio.composeapp.generated.resources.downloads_error_placeholder_small_fi
 import org.jetbrains.compose.resources.getString
 
 /**
- * The reason a file is not the video, as the plain sentence the row shows: "Not the real video: 8.1 MB
+ * The reason a file is not the video, as the plain sentence the row shows: "Not the real video: 8.5 MB
  * arrived, the source said 9.5 GB". The sizes that arrived are written as the list writes them, the
  * size the source claimed in the units its text used.
  */
