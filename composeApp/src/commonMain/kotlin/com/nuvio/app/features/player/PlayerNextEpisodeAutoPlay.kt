@@ -21,6 +21,7 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.watching.domain.isShortPlaceholderDuration
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -95,6 +96,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     verifyDownloadedEpisode: suspend (DownloadItem) -> Boolean = { item ->
         DownloadsRepository.verifyCompletedDownload(item.id)
     },
+    onDownloadVerificationJob: (Job) -> Unit = {},
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
@@ -156,7 +158,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         null
     }
 
-    return launch {
+    val job = launch(start = CoroutineStart.LAZY) {
         if (hasDownload) {
             val candidate = findDownloadedEpisode(nextVideo)
             val verified = if (candidate != null && withContext(Dispatchers.IO) { verifyDownloadedEpisode(candidate) }) {
@@ -347,6 +349,9 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             onNextEpisodeCardVisibleChanged(false)
         }
     }
+    if (hasDownload) onDownloadVerificationJob(job)
+    job.start()
+    return job
 }
 
 internal fun PlayerScreenRuntime.preloadNextEpisodeSources() {

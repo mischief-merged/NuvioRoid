@@ -151,8 +151,11 @@ internal class PlayerScreenRuntime(
         )
     }
 
-    /** A downloaded episode whose subtitles are still being prepared. */
+    /** A downloaded episode whose file is being checked, or whose subtitles are still being prepared. */
     var downloadedEpisodeSwitch: DownloadedEpisodeSwitch? = null
+
+    /** Keeps a second press from cancelling the check the first press already started. */
+    internal val episodeSwitchLock = Any()
     var p2pSettingsUiState by mutableStateOf(P2pSettingsUiState())
     var p2pStreamingState by mutableStateOf<P2pStreamingState>(P2pStreamingState.Idle)
     var metaScreenSettingsUiState: MetaScreenSettingsUiState = MetaScreenSettingsUiState()

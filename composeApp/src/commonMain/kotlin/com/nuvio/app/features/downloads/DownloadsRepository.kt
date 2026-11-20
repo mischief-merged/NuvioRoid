@@ -1531,8 +1531,9 @@ object DownloadsRepository {
             _uiState.value.items.firstOrNull { it.id == downloadId }
         } ?: return false
         if (!initial.isVerifiedCompletedStatus()) return false
-        // A move has the item: its file is in the middle of changing places, which is not a file that is lost.
-        if (!ItemLocks.tryAcquire(downloadId)) return true
+        // A move has the item. Its file is in the middle of changing places, so this check cannot say the file is lost,
+        // and it also cannot say the file is playable.
+        if (!ItemLocks.tryAcquire(downloadId)) return false
         try {
             var snapshot = initial
             for (attempt in 0..2) {
