@@ -10,6 +10,7 @@ import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.Sync
 import org.gradle.api.tasks.TaskAction
+import org.gradle.api.tasks.testing.Test
 import org.gradle.jvm.tasks.Jar
 import org.gradle.language.jvm.tasks.ProcessResources
 import org.gradle.process.ExecOperations
@@ -1695,6 +1696,13 @@ val bootIosTestSimulator by tasks.registering(Exec::class) {
 tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     standalone.set(false)
     dependsOn(bootIosTestSimulator)
+}
+
+// The desktop test process cannot open the login keychain. The app itself does not set this.
+tasks.withType<Test>().configureEach {
+    if (name == "desktopTest") {
+        systemProperty("nuvio.credentialVault", "memory")
+    }
 }
 
 configurations.matching { it.name == "iosMainImplementation" }.configureEach {

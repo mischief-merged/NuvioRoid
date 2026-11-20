@@ -19,9 +19,21 @@ internal interface CredentialVault {
     fun remove(account: String)
 }
 
+/** Holds credentials in this process only. Used when the login keychain cannot be opened. */
+internal class MemoryCredentialVault : CredentialVault {
+    private val values = mutableMapOf<String, String>()
+    override fun read(account: String): String? = synchronized(values) { values[account] }
+    override fun write(account: String, value: String) { synchronized(values) { values[account] = value } }
+    override fun remove(account: String) { synchronized(values) { values.remove(account) } }
+}
+
 internal object DesktopCredentials {
+    // Tests pass nuvio.credentialVault=memory so they do not use the login keychain. The app itself does not set this.
     val vault: CredentialVault? by lazy {
-        if (System.getProperty("os.name").orEmpty().contains("mac", true)) MacKeychainVault() else null
+        when (System.getProperty("nuvio.credentialVault")) {
+            "memory" -> MemoryCredentialVault()
+            else -> if (System.getProperty("os.name").orEmpty().contains("mac", true)) MacKeychainVault() else null
+        }
     }
 
     val storeNames = setOf("nuvio_account_sessions", "nuvio_trakt_auth", "nuvio_mdblist_auth", "nuvio_simkl_auth",
