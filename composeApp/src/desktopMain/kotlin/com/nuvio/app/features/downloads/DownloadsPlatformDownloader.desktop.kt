@@ -340,6 +340,12 @@ internal actual object DownloadsPlatformDownloader {
                     val finalSize = published.length()
                     // Remembered, so that a file found bad right after this can be removed only while it is still this one.
                     DownloadMover.identityOf(published.toPath())?.let { publishedKeys[published.toURI().toString()] = it }
+                    // Nothing left to retire: the file is already closed, so the token is free before success
+                    // is reported. A caller that starts another transfer from that report must not see this
+                    // writer still holding it. When an older partial is still kept, the token stays until
+                    // after success, because retirement runs only once the repository has accepted the file.
+                    if (keptPartials.isEmpty()) releaseWriter()
+                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
                     if (request.isCompletionAccepted()) {
                         val retiredKeys = retireKeptPartials(
                             keptPartials = keptPartials,
@@ -353,10 +359,6 @@ internal actual object DownloadsPlatformDownloader {
                             request.onSupersededPartialsRetired(retiredKeys)
                         }
                     }
-                    // Old partials are retired first, while this writer still holds the token. Success is
-                    // reported only after the token is free.
-                    releaseWriter()
-                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
                     return@launch
                 } catch (error: CancellationException) {
                     onPaused()
