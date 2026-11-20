@@ -142,13 +142,6 @@ class DesktopPlayerMediaCommandsTest {
     }
 }
 
-private fun NativePlayerController.setNativeHandleForTest(value: Long) {
-    javaClass.getDeclaredField("handle").also { field ->
-        field.isAccessible = true
-        field.setLong(this, value)
-    }
-}
-
 private fun NativePlayerController.handlePlayerEventForTest(type: String, value: Double) {
     javaClass.getDeclaredMethod("handlePlayerEvent", String::class.java, Double::class.javaPrimitiveType).also { method ->
         method.isAccessible = true
