@@ -43,7 +43,7 @@ internal actual object AddonStorage {
     }
 }
 
-internal val desktopHttpClient = OkHttpClient.Builder()
+internal val desktopHttpClient = com.nuvio.app.core.network.DesktopTls.clientBuilder()
     .dns(DesktopIPv4FirstDns())
     .connectTimeout(60, TimeUnit.SECONDS)
     .readTimeout(60, TimeUnit.SECONDS)

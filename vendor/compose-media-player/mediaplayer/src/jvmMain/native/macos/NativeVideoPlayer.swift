@@ -292,8 +292,6 @@ class MacVideoPlayer {
                   HLS Error Log:
                   - Error Domain: \(lastEvent.errorDomain)
                   - Error Code: \(lastEvent.errorStatusCode)
-                  - Error Comment: \(lastEvent.errorComment ?? "None")
-                  - Server Address: \(lastEvent.serverAddress ?? "Unknown")
               """)
     }
 
@@ -330,7 +328,7 @@ class MacVideoPlayer {
                         }
                     }
                 } catch {
-                    print("Error loading HLS variants: \(error.localizedDescription)")
+                    print("Error loading HLS variants: [details omitted]")
                 }
             }
         }
@@ -408,7 +406,7 @@ class MacVideoPlayer {
 
             return nil
         } catch {
-            print("Error detecting MIME type: \(error.localizedDescription)")
+            print("Error detecting MIME type: [details omitted]")
             return nil
         }
     }
@@ -435,7 +433,7 @@ class MacVideoPlayer {
                         }
                     }
                 } catch {
-                    print("Error loading metadata: \(error.localizedDescription)")
+                    print("Error loading metadata: [details omitted]")
                 }
             }
         } else {
@@ -475,7 +473,7 @@ class MacVideoPlayer {
                                     print("Calculated bitrate from file size: \(calculatedBitrate) bits/s")
                                 }
                             } catch {
-                                print("Error loading duration: \(error.localizedDescription)")
+                                print("Error loading duration: [details omitted]")
                             }
                         }
                     } else {
@@ -492,7 +490,7 @@ class MacVideoPlayer {
             } catch {
                 // This is expected for HLS streams
                 if !isHLSStream {
-                    print("Error getting file attributes: \(error.localizedDescription)")
+                    print("Error getting file attributes: [details omitted]")
                 }
             }
         }
@@ -516,7 +514,7 @@ class MacVideoPlayer {
                                     print("Got bitrate from estimatedDataRate: \(videoBitrate) bits/s")
                                 }
                             } catch {
-                                print("Error getting estimatedDataRate: \(error.localizedDescription)")
+                                print("Error getting estimatedDataRate: [details omitted]")
                             }
                         }
 
@@ -566,7 +564,7 @@ class MacVideoPlayer {
                         }
                     }
                 } catch {
-                    print("Error extracting metadata: \(error.localizedDescription)")
+                    print("Error extracting metadata: [details omitted]")
                 }
             }
         } else {
@@ -639,7 +637,7 @@ class MacVideoPlayer {
         asset.loadTracks(withMediaType: .video) { [self] tracks, error in
             guard let videoTrack = tracks?.first, error == nil else {
                 print(
-                    "Error loading video tracks: \(error?.localizedDescription ?? "Unknown")"
+                    "Error loading video tracks: [details omitted]"
                 )
                 return
             }
@@ -658,7 +656,7 @@ class MacVideoPlayer {
                         // Set capture rate to the lower of the two rates
                         self.updateCaptureFrameRate()
                     } catch {
-                        print("Error loading nominal frame rate: \(error.localizedDescription)")
+                        print("Error loading nominal frame rate: [details omitted]")
                         // Fallback to common default if detection fails
                         self.videoFrameRate = 30.0
                         self.updateCaptureFrameRate()
@@ -696,7 +694,7 @@ class MacVideoPlayer {
         let url = resolveUrl(uri)
         isHLSStream = isHLSUrl(url)
         if isHLSStream {
-            print("Detected HLS stream: \(url)")
+            print("Detected HLS stream")
         }
 
         var asset = makeAsset(url: url, fallbackMimeType: nil)
@@ -739,7 +737,7 @@ class MacVideoPlayer {
     private func prepareSingleAsset(_ asset: AVURLAsset) {
         asset.loadTracks(withMediaType: .video) { [self] tracks, error in
             guard let videoTrack = tracks?.first, error == nil else {
-                print("Error loading video tracks: \(error?.localizedDescription ?? "Unknown")")
+                print("Error loading video tracks: [details omitted]")
                 if isHLSStream {
                     frameWidth = 1920
                     frameHeight = 1080
@@ -766,7 +764,7 @@ class MacVideoPlayer {
                             : (try? await AVVideoComposition.videoComposition(withPropertiesOf: asset))
                         self.setupVideoOutputAndPlayer(with: asset, videoComposition: videoComposition)
                     } catch {
-                        print("Error loading video track properties: \(error.localizedDescription)")
+                        print("Error loading video track properties: [details omitted]")
                         if self.isHLSStream {
                             self.frameWidth = 1920
                             self.frameHeight = 1080
@@ -847,7 +845,7 @@ class MacVideoPlayer {
                 self.setupVideoOutputAndPlayer(with: playbackAsset, videoComposition: videoComposition)
             } catch {
                 self.lastError = error.localizedDescription
-                print("Error preparing separate media tracks: \(error.localizedDescription)")
+                print("Error preparing separate media tracks: [details omitted]")
             }
         }
     }
@@ -1087,7 +1085,7 @@ class MacVideoPlayer {
         // Load audio tracks asynchronously
         asset.loadTracks(withMediaType: .audio) { tracks, error in
             guard let audioTrack = tracks?.first, error == nil else {
-                print("No audio track found or error: \(error?.localizedDescription ?? "unknown")")
+                print("No audio track found or error: [details omitted]")
                 return
             }
 
@@ -1191,7 +1189,7 @@ class MacVideoPlayer {
                             playerItem.audioMix = audioMix
                         }
                     } catch {
-                        print("Error loading audio tracks for volume adjustment: \(error.localizedDescription)")
+                        print("Error loading audio tracks for volume adjustment: [details omitted]")
                     }
                 }
             } else {

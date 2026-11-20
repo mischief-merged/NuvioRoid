@@ -1573,6 +1573,8 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     _initialStartSeconds = initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0;
 
     setMpvOptionString(_mpv, "config", "no");
+    setMpvOptionString(_mpv, "terminal", "no");
+    setMpvOptionString(_mpv, "msg-level", "all=no");
     setMpvOptionString(_mpv, "osc", "no");
     setMpvOptionString(_mpv, "input-default-bindings", "yes");
     setMpvOptionString(_mpv, "input-vo-keyboard", "no");

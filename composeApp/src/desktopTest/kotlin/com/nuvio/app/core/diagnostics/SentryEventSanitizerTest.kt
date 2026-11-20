@@ -6,7 +6,7 @@ import io.sentry.protocol.Request
 import io.sentry.protocol.User
 import kotlin.test.Test
 import kotlin.test.assertNull
-import kotlin.test.assertSame
+import kotlin.test.assertNotNull
 
 class SentryEventSanitizerTest {
     @Test
@@ -17,10 +17,10 @@ class SentryEventSanitizerTest {
             serverName = "private-computer"
         }
 
-        assertSame(event, SentryEventSanitizer.sanitize(event))
-        assertNull(event.request)
-        assertNull(event.user)
-        assertNull(event.serverName)
+        val clean = assertNotNull(SentryEventSanitizer.sanitize(event))
+        assertNull(clean.request)
+        assertNull(clean.user)
+        assertNull(clean.serverName)
     }
 
     @Test

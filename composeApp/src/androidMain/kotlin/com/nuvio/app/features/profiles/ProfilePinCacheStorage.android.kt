@@ -12,6 +12,9 @@ actual object ProfilePinCacheStorage {
         preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
     }
 
+    actual fun loadAttempts(profileIndex: Int): String? = preferences?.getString("pin_attempts_$profileIndex", null)
+    actual fun saveAttempts(profileIndex: Int, payload: String) { preferences?.edit()?.putString("pin_attempts_$profileIndex", payload)?.commit() }
+
     actual fun loadPayload(profileIndex: Int): String? =
         preferences?.getString(payloadKey(profileIndex), null)
 

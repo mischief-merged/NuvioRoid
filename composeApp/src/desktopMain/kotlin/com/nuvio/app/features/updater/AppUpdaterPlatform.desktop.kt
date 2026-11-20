@@ -29,6 +29,7 @@ private const val ignoredTagKey = "ignored_release_tag"
 private const val updateChannelKey = "update_channel"
 
 private val desktopUpdaterHttpClient: HttpClient = HttpClient.newBuilder()
+    .sslContext(com.nuvio.app.core.network.DesktopTls.context)
     .connectTimeout(Duration.ofSeconds(60))
     .followRedirects(HttpClient.Redirect.NORMAL)
     .build()

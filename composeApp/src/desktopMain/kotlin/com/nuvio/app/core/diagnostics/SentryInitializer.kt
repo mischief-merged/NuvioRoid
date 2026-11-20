@@ -98,6 +98,13 @@ object SentryInitializer {
         options.cacheDirPath = DesktopStorage.cacheDir.resolve("sentry").toString()
         options.addInAppInclude("com.nuvio.app")
         options.setIgnoredErrors(SentryEventSanitizer.ignoredIssueText)
+        options.beforeBreadcrumb = SentryOptions.BeforeBreadcrumbCallback { breadcrumb, _ ->
+            breadcrumb.message = breadcrumb.message?.let(CredentialRedactor::redact)
+            // Request bodies and arbitrary objects do not belong in the breadcrumb buffer.
+            breadcrumb.data.keys.toList().forEach(breadcrumb::removeData)
+            breadcrumb.unknown = null
+            breadcrumb
+        }
         options.beforeSend = SentryOptions.BeforeSendCallback { event, _ ->
             SentryEventSanitizer.sanitize(event)
         }

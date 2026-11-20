@@ -53,11 +53,8 @@ private const val MAX_FRAME_DIMENSION = 512
 private const val MAX_DISK_CACHE_FILES = 200
 
 private val desktopGifHttpClient by lazy {
-    HttpClient(CIO) {
+    com.nuvio.app.core.network.createApiHttpClient().config {
         followRedirects = true
-        engine {
-            requestTimeout = 15_000
-        }
     }
 }
 

@@ -81,6 +81,7 @@ internal object DesktopPoliteDownloads {
     }
 
     private val client: HttpClient = HttpClient.newBuilder()
+        .sslContext(com.nuvio.app.core.network.DesktopTls.context)
         .connectTimeout(Duration.ofSeconds(5))
         .followRedirects(HttpClient.Redirect.NEVER)
         .build()

@@ -134,19 +134,27 @@ internal fun InlinePinEntry(
                     if (pin.length == 4) {
                         isVerifying = true
                         scope.launch {
-                            val result = verifyPin(pin)
-                            if (result.unlocked) {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                onVerified()
-                            } else {
-                                error = if (result.retryAfterSeconds > 0) {
-                                    getString(Res.string.pin_locked_try_again, result.retryAfterSeconds)
+                            try {
+                                val result = verifyPin(pin)
+                                if (result.unlocked) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onVerified()
                                 } else {
-                                    getString(Res.string.pin_incorrect)
+                                    error = result.message ?: if (result.retryAfterSeconds > 0) {
+                                        getString(Res.string.pin_locked_try_again, result.retryAfterSeconds)
+                                    } else {
+                                        getString(Res.string.pin_incorrect)
+                                    }
+                                    pin = ""
                                 }
+                            } catch (error: kotlinx.coroutines.CancellationException) {
+                                throw error
+                            } catch (_: Exception) {
                                 pin = ""
+                                error = getString(Res.string.profile_pin_storage_unavailable)
+                            } finally {
+                                isVerifying = false
                             }
-                            isVerifying = false
                         }
                     }
                 }

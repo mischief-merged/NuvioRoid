@@ -3,6 +3,9 @@ package com.nuvio.app.features.profiles
 import platform.Foundation.NSUserDefaults
 
 actual object ProfilePinCacheStorage {
+    actual fun loadAttempts(profileIndex: Int): String? = NSUserDefaults.standardUserDefaults.stringForKey("pin_attempts_$profileIndex")
+    actual fun saveAttempts(profileIndex: Int, payload: String) { NSUserDefaults.standardUserDefaults.setObject(payload, forKey = "pin_attempts_$profileIndex") }
+
     actual fun loadPayload(profileIndex: Int): String? =
         NSUserDefaults.standardUserDefaults.stringForKey(payloadKey(profileIndex))
 

@@ -77,6 +77,8 @@ private const val MacosDarkAquaAppearance = "NSAppearanceNameDarkAqua"
 
 @OptIn(ExperimentalComposeUiApi::class)
 fun main(args: Array<String>) {
+    com.nuvio.app.core.diagnostics.DesktopLogRedaction.install()
+    com.nuvio.app.core.network.DesktopTls.install()
     // One copy of the app per app data folder: a second copy says so and stops before touching anything.
     if (!com.nuvio.app.core.storage.DesktopSingleInstance.acquireForApp(com.nuvio.app.core.storage.DesktopStorage.rootDir)) {
         showAlreadyOpen()
@@ -368,7 +370,7 @@ fun main(args: Array<String>) {
                     ProvideDesktopWindowInsets(
                         isFullscreen = windowState.placement == WindowPlacement.Fullscreen,
                     ) {
-                        MiddleClickAutoscroll { App() }
+                        MiddleClickAutoscroll { com.nuvio.app.core.storage.CredentialStorageGate { App() } }
                     }
                     askedAboutDownloads?.let { running ->
                         AppEnvironment {

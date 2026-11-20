@@ -337,7 +337,13 @@ object ProfileRepository {
         }
     }
 
-    suspend fun verifyPin(profileIndex: Int, pin: String): PinVerifyResult {
+    private val pinRequests = ProfilePinRequests()
+
+    suspend fun verifyPin(profileIndex: Int, pin: String): PinVerifyResult = withContext(Dispatchers.Default) {
+        pinRequests.verify(profileIndex) { verifyPinUnchecked(profileIndex, pin) }
+    }
+
+    private suspend fun verifyPinUnchecked(profileIndex: Int, pin: String): PinVerifyResult {
         if (AuthRepository.state.value !is AuthState.Authenticated) {
             return verifyPinLocally(profileIndex, pin)
         }
@@ -382,7 +388,11 @@ object ProfileRepository {
         }
     }
 
-    suspend fun clearPin(profileIndex: Int, currentPin: String? = null): PinVerifyResult {
+    suspend fun clearPin(profileIndex: Int, currentPin: String? = null): PinVerifyResult = withContext(Dispatchers.Default) {
+        pinRequests.clear(profileIndex) { clearPinUnchecked(profileIndex, currentPin) }
+    }
+
+    private suspend fun clearPinUnchecked(profileIndex: Int, currentPin: String?): PinVerifyResult {
         if (AuthRepository.state.value !is AuthState.Authenticated) {
             return PinVerifyResult(unlocked = false, message = getString(Res.string.profile_pin_clear_requires_internet))
         }
@@ -479,7 +489,7 @@ object ProfileRepository {
         syncPinCache(profiles)
     }
 
-    private fun rememberVerifiedPin(profileIndex: Int, pin: String) {
+    private suspend fun rememberVerifiedPin(profileIndex: Int, pin: String) = withContext(Dispatchers.Default) {
         val profile = _state.value.profiles.find { it.profileIndex == profileIndex }
         val salt = generateProfilePinSalt()
         val payload = CachedProfilePinPayload(
@@ -487,7 +497,8 @@ object ProfileRepository {
             digest = hashProfilePin(profileIndex = profileIndex, salt = salt, pin = pin),
             profileUpdatedAt = profile?.updatedAt.orEmpty(),
         )
-        ProfilePinCacheStorage.savePayload(profileIndex, json.encodeToString(payload))
+        runCatching { ProfilePinCacheStorage.savePayload(profileIndex, json.encodeToString(payload)) }
+            .onFailure { log.w { "Could not save the verified profile PIN for offline use." } }
     }
 
     private fun verifyPinLocally(profileIndex: Int, pin: String): PinVerifyResult {
@@ -523,8 +534,10 @@ object ProfileRepository {
             )
         }
 
-        val digest = hashProfilePin(profileIndex = profileIndex, salt = cached.salt, pin = pin)
-        return if (digest == cached.digest) {
+        val verified = verifyAndUpgradeProfilePin(profileIndex, pin, cached) { upgraded ->
+            ProfilePinCacheStorage.savePayload(profileIndex, json.encodeToString(upgraded))
+        }
+        return if (verified) {
             PinVerifyResult(unlocked = true)
         } else {
             PinVerifyResult(unlocked = false, message = localizedString(Res.string.pin_incorrect))

@@ -84,22 +84,30 @@ fun PinEntryDialog(
             if (pin.length == 4) {
                 isVerifying = true
                 scope.launch {
-                    val result = onVerify(pin)
-                    if (result.unlocked) {
-                        onVerified?.invoke(pin)
-                    } else {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        error = result.message ?: if (result.retryAfterSeconds > 0) {
-                            getString(
-                                Res.string.pin_locked_try_again,
-                                result.retryAfterSeconds,
-                            )
+                    try {
+                        val result = onVerify(pin)
+                        if (result.unlocked) {
+                            onVerified?.invoke(pin)
                         } else {
-                            getString(Res.string.pin_incorrect)
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            error = result.message ?: if (result.retryAfterSeconds > 0) {
+                                getString(
+                                    Res.string.pin_locked_try_again,
+                                    result.retryAfterSeconds,
+                                )
+                            } else {
+                                getString(Res.string.pin_incorrect)
+                            }
+                            pin = ""
                         }
+                    } catch (error: kotlinx.coroutines.CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
                         pin = ""
+                        error = getString(Res.string.profile_pin_storage_unavailable)
+                    } finally {
+                        isVerifying = false
                     }
-                    isVerifying = false
                 }
             }
         }

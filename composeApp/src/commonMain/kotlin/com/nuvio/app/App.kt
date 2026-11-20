@@ -89,6 +89,7 @@ internal fun AppEnvironment(content: @Composable () -> Unit) {
                     add(SvgDecoder.Factory())
                     add(
                         coil3.network.ktor3.KtorNetworkFetcherFactory(
+                            httpClient = { com.nuvio.app.core.network.createApiHttpClient().config { followRedirects = true } },
                             cacheStrategy = { coil3.network.cachecontrol.CacheControlCacheStrategy() },
                         ),
                     )

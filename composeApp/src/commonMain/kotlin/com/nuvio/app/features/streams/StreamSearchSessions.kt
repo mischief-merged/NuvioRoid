@@ -240,7 +240,7 @@ private fun CoroutineScope.launchStreamSearchTasks(
                 type = targets.type,
                 id = targets.videoId,
             )
-            log.d { "Fetching streams from: $url" }
+            log.d { "Fetching streams from: ${com.nuvio.app.core.diagnostics.CredentialRedactor.redact(url)}" }
             val group = runCatchingUnlessCancelled {
                 val payload = fetchAddonResponseText(url = url, forceRefresh = forceRefresh)
                 StreamParser.parse(

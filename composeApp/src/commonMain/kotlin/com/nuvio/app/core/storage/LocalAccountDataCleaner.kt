@@ -42,17 +42,16 @@ import com.nuvio.app.features.watched.WatchedRepository
 
 internal object LocalAccountDataCleaner {
     fun wipe() {
-        ensureTrackingProvidersRegistered()
+        prepareAccountWipe(SyncManager::cancelAccountSync, ::wipePlatformStorage) {
+            ensureTrackingProvidersRegistered()
+            LibraryRepository.runAccountStorageWipe {}
+        }
         TrackingProviderRegistry.removeStoredProfiles(1..MAX_PROFILES)
-        SyncManager.cancelAccountSync()
         WatchProgressSourceCoordinator.clearLocalState()
         ProfileSettingsSync.clearAccountState()
         ContinueWatchingEnrichmentCache.clearLocalState()
         WatchProgressRepository.clearLocalState()
         WatchedRepository.clearLocalState()
-        LibraryRepository.runAccountStorageWipe {
-            wipePlatformStorage()
-        }
 
         ProfileRepository.clearInMemory()
         MemberAccessRepository.clearLocalState()
@@ -100,4 +99,10 @@ internal object LocalAccountDataCleaner {
 
 internal expect object PlatformLocalAccountDataCleaner {
     fun wipe()
+}
+
+internal fun prepareAccountWipe(cancelSync: () -> Unit, wipeStorage: () -> Unit, prepareRuntime: () -> Unit) {
+    cancelSync()
+    wipeStorage()
+    prepareRuntime()
 }

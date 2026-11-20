@@ -57,37 +57,39 @@ object AuthRepository {
         }
 
         sessionStatusJob = scope.launch {
-            if (AuthStorage.loadFlag(KEY_SIGNED_OUT_NOTICE)) {
-                _error.value = getString(Res.string.auth_notice_signed_out)
-            }
-            SupabaseProvider.client.auth.sessionStatus.collect { status ->
-                if (AuthStorage.loadAnonymousUserId() != null) return@collect
-                when (status) {
-                    is SessionStatus.Authenticated -> {
-                        val user = status.session.user
-                        val userId = user?.id.orEmpty()
-                        if (!validateRemoteSession(userId)) return@collect
-                        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, true)
-                        AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, false)
-                        _state.value = AuthState.Authenticated(
-                            userId = userId,
-                            email = user?.email,
-                            isAnonymous = false,
-                        )
-                    }
-                    is SessionStatus.NotAuthenticated -> {
-                        if (AuthStorage.loadFlag(KEY_HAD_ACCOUNT_SESSION)) {
-                            resetAfterLostSession()
-                        } else {
-                            _state.value = AuthState.Unauthenticated
+            com.nuvio.app.core.storage.credentialAccess.run {
+                if (AuthStorage.loadFlag(KEY_SIGNED_OUT_NOTICE)) {
+                    _error.value = getString(Res.string.auth_notice_signed_out)
+                }
+                SupabaseProvider.client.auth.sessionStatus.collect { status ->
+                    if (AuthStorage.loadAnonymousUserId() != null) return@collect
+                    when (status) {
+                        is SessionStatus.Authenticated -> {
+                            val user = status.session.user
+                            val userId = user?.id.orEmpty()
+                            if (!validateRemoteSession(userId)) return@collect
+                            AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, true)
+                            AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, false)
+                            _state.value = AuthState.Authenticated(
+                                userId = userId,
+                                email = user?.email,
+                                isAnonymous = false,
+                            )
                         }
-                    }
-                    is SessionStatus.Initializing -> {
-                        if (AuthStorage.loadAnonymousUserId() == null) {
-                            _state.value = AuthState.Loading
+                        is SessionStatus.NotAuthenticated -> {
+                            if (AuthStorage.loadFlag(KEY_HAD_ACCOUNT_SESSION)) {
+                                resetAfterLostSession()
+                            } else {
+                                _state.value = AuthState.Unauthenticated
+                            }
                         }
+                        is SessionStatus.Initializing -> {
+                            if (AuthStorage.loadAnonymousUserId() == null) {
+                                _state.value = AuthState.Loading
+                            }
+                        }
+                        is SessionStatus.RefreshFailure -> Unit
                     }
-                    is SessionStatus.RefreshFailure -> Unit
                 }
             }
         }

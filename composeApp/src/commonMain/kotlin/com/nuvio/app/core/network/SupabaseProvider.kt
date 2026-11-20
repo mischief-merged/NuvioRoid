@@ -41,6 +41,7 @@ object SupabaseProvider {
             supabaseUrl = configuration.backendUrl,
             supabaseKey = configuration.publishableKey,
         ) {
+            platformHttpEngine()?.let { httpEngine = it }
             httpConfig {
                 install(BackendRateLimitPlugin) {
                     coordinator = rateLimitCoordinator
@@ -110,7 +111,7 @@ object SupabaseProvider {
                     contentConverter = KotlinxWebsocketSerializationConverter(supabaseJson)
                 }
             }
-            install(Auth)
+            install(Auth) { configurePlatformCredentialStorage(configuration.backendUrl) }
             install(Postgrest)
             install(Functions)
             install(Storage)

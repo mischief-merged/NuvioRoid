@@ -219,21 +219,28 @@ internal fun AppGate(
         }
     }
 
-    suspend fun selectProfile(profile: NuvioProfile, sync: Boolean) {
+    suspend fun selectProfile(profile: NuvioProfile, sync: Boolean): Boolean {
         if (!renderMainContent) {
             appGateController?.beginContentReload()
         }
         switchingProfile = profile
-        try {
-            ProfileRepository.switchToProfile(profile.profileIndex)
-            warmProfileBoundRepositories()
-            if (sync) {
-                withContext(Dispatchers.Default) {
-                    SyncManager.pullAllForProfile(profile.profileIndex)
+        var completed = false
+        return try {
+            com.nuvio.app.core.storage.credentialAccess.run {
+                ProfileRepository.switchToProfile(profile.profileIndex)
+                warmProfileBoundRepositories()
+                if (sync) {
+                    withContext(Dispatchers.Default) {
+                        SyncManager.pullAllForProfile(profile.profileIndex)
+                    }
                 }
-            }
+            }.also { completed = it }
         } finally {
             switchingProfile = null
+            if (!completed) {
+                profileSelectionLoading = false
+                profileSelectionTransitionActive = false
+            }
         }
     }
 
@@ -285,7 +292,7 @@ internal fun AppGate(
             profileSelectionLoading = true
             profileSelectionTransitionActive = true
             skipProfileSelectionEnterAnimation = true
-            selectProfile(profile, sync = true)
+            if (!selectProfile(profile, sync = true)) return@collect
             gateScreen = AppGateScreen.Main.name
             onActivate?.invoke(AppScreenTab.Home)
         }
@@ -334,7 +341,7 @@ internal fun AppGate(
         }
 
         rememberedStartupProfile(profiles)?.let { profile ->
-            selectProfile(profile, sync = syncOnEnter)
+            if (!selectProfile(profile, sync = syncOnEnter)) return
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
             return
@@ -347,7 +354,7 @@ internal fun AppGate(
                 gateScreen = AppGateScreen.ProfileSelection.name
                 return
             }
-            selectProfile(onlyProfile, sync = syncOnEnter)
+            if (!selectProfile(onlyProfile, sync = syncOnEnter)) return
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
         } else {
@@ -415,7 +422,7 @@ internal fun AppGate(
             gateScreen == AppGateScreen.ProfileSelection.name
         ) {
             rememberedStartupProfile(profileState.profiles)?.let { profile ->
-                selectProfile(profile, sync = true)
+                if (!selectProfile(profile, sync = true)) return@LaunchedEffect
                 gateScreen = AppGateScreen.Main.name
                 autoSkipProfileSelection = false
                 return@LaunchedEffect
@@ -426,7 +433,7 @@ internal fun AppGate(
             val onlyProfile = profileState.profiles.first()
             if (onlyProfile.pinEnabled) return@LaunchedEffect
 
-            selectProfile(onlyProfile, sync = true)
+            if (!selectProfile(onlyProfile, sync = true)) return@LaunchedEffect
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
         }
@@ -605,10 +612,10 @@ internal fun AppGate(
                             profileSelectionTransitionActive = true
                             skipProfileSelectionEnterAnimation = false
                             gateScope.launch {
-                                selectProfile(
+                                if (!selectProfile(
                                     profile = profile,
                                     sync = authState is AuthState.Authenticated,
-                                )
+                                )) return@launch
                                 gateScreen = AppGateScreen.Main.name
                                 if (!renderMainContent) {
                                     onActivate?.invoke(AppScreenTab.Home)

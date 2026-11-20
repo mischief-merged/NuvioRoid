@@ -33,7 +33,11 @@ data class ServersUiState(
         get() = connections.filter { it.enabled }
 }
 
-object ServerRepository {
+open class ServerConnectionRepository internal constructor(
+    private val readValue: (String) -> String? = ServerStorage::read,
+    private val writeValue: (String, String?) -> Unit = ServerStorage::write,
+    private val currentProfile: () -> Int = { ProfileRepository.activeProfileId },
+) {
     private val log = Logger.withTag("ServerRepository")
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -44,6 +48,7 @@ object ServerRepository {
 
     @Volatile
     private var loadedProfileId: Int? = null
+    private var storageReadable = true
 
     @Volatile
     private var generation = 0L
@@ -54,12 +59,12 @@ object ServerRepository {
     val localChanges: SharedFlow<Int> = _localChanges.asSharedFlow()
 
     fun ensureLoaded() {
-        val profileId = ProfileRepository.activeProfileId
-        if (loadedProfileId != profileId) load(profileId)
+        val profileId = currentProfile()
+        if (loadedProfileId != profileId || !storageReadable) load(profileId)
     }
 
     fun onProfileChanged() {
-        load(ProfileRepository.activeProfileId)
+        load(currentProfile())
     }
 
     fun clearLocalState() {
@@ -74,8 +79,8 @@ object ServerRepository {
 
     fun removeProfile(profileId: Int) {
         readConnections(profileId).forEach { deleteCredential(it.credentialRef) }
-        runCatching { ServerStorage.write(connectionsKey(profileId), null) }
-        runCatching { ServerStorage.write(syncKey(profileId), null) }
+        runCatching { writeValue(connectionsKey(profileId), null) }
+        runCatching { writeValue(syncKey(profileId), null) }
         if (loadedProfileId == profileId) load(profileId)
     }
 
@@ -223,7 +228,7 @@ object ServerRepository {
             profileId = profileId,
             version = localVersion,
             servers = _uiState.value.connections.mapNotNull { connection ->
-                token(connection.credentialRef)?.let(connection::toSynced)
+                connection.toSynced(checkNotNull(token(connection.credentialRef)) { "Saved server credential is unavailable" })
             },
             pendingPush = syncState.pendingPush,
             syncedKeys = syncState.syncedKeys?.toSet(),
@@ -231,6 +236,7 @@ object ServerRepository {
     }
 
     fun applySync(snapshot: ServerSyncSnapshot, servers: List<SyncedServer>, keys: Set<String>): Boolean {
+        ensureLoaded()
         if (loadedProfileId != snapshot.profileId || localVersion != snapshot.version) return false
         val current = _uiState.value.connections
         val currentByKey = current.associateBy { serverKey(it.providerId, it.remoteServerId, it.remoteUserId) }
@@ -248,12 +254,12 @@ object ServerRepository {
             }
             server.toConnection(id, credentialRef)
         }
+        syncState = ServerSyncState(pendingPush = false, syncedKeys = keys.toList())
+        if (changed || connections != current) saveConnections(connections, invalidate = true, local = false)
         current.filter { it.id !in usedIds }.forEach { removed ->
             deleteCredential(removed.credentialRef)
             setFailure(removed.id, null)
         }
-        syncState = ServerSyncState(pendingPush = false, syncedKeys = keys.toList())
-        if (changed || connections != current) saveConnections(connections, invalidate = true, local = false)
         persistSyncState()
         return true
     }
@@ -268,15 +274,16 @@ object ServerRepository {
     }
 
     private fun load(profileId: Int) {
+        storageReadable = false
+        val connections = readConnections(profileId)
+        val savedSyncState = readSyncState(profileId)
         generation++
         synchronized(lock) { tokens.clear() }
         loadedProfileId = profileId
-        syncState = readSyncState(profileId)
+        syncState = savedSyncState
+        storageReadable = true
         ServerMatcher.shared.clear()
-        _uiState.value = ServersUiState(
-            connections = readConnections(profileId),
-            revision = _uiState.value.revision + 1,
-        )
+        _uiState.value = ServersUiState(connections = connections, revision = _uiState.value.revision + 1)
     }
 
     private fun updateConnection(connectionId: String, transform: (ServerConnection) -> ServerConnection) {
@@ -286,36 +293,26 @@ object ServerRepository {
     }
 
     private fun saveConnections(connections: List<ServerConnection>, invalidate: Boolean, local: Boolean = true) {
+        check(storageReadable) { "Saved server connections are unavailable" }
         val profileId = loadedProfileId ?: return
+        writeValue(connectionsKey(profileId), json.encodeToString(ListSerializer(ServerConnection.serializer()), connections))
         if (local) {
             syncState = syncState.copy(pendingPush = true)
             localVersion++
-            persistSyncState()
         }
-        runCatching {
-            ServerStorage.write(
-                connectionsKey(profileId),
-                json.encodeToString(ListSerializer(ServerConnection.serializer()), connections),
-            )
-        }.onFailure { log.w(it) { "Unable to save server connections" } }
-        if (invalidate) {
-            generation++
-            }
+        if (invalidate) generation++
         _uiState.update { it.copy(connections = connections, revision = it.revision + 1) }
+        persistSyncState()
         if (local) _localChanges.tryEmit(profileId)
     }
 
     private fun persistSyncState() {
         val profileId = loadedProfileId ?: return
-        runCatching {
-            ServerStorage.write(syncKey(profileId), json.encodeToString(ServerSyncState.serializer(), syncState))
-        }.onFailure { log.w(it) { "Unable to save server sync state" } }
+        writeValue(syncKey(profileId), json.encodeToString(ServerSyncState.serializer(), syncState))
     }
 
     private fun readSyncState(profileId: Int): ServerSyncState =
-        runCatching {
-            ServerStorage.read(syncKey(profileId))?.let { json.decodeFromString(ServerSyncState.serializer(), it) }
-        }.getOrNull() ?: ServerSyncState()
+        readSaved { readValue(syncKey(profileId))?.let { json.decodeFromString(ServerSyncState.serializer(), it) } ?: ServerSyncState() }
 
     private fun token(ref: String): String? = synchronized(lock) {
         tokens[ref] ?: readCredential(ref)?.also { tokens[ref] = it }
@@ -330,22 +327,21 @@ object ServerRepository {
     }
 
     private fun readConnections(profileId: Int): List<ServerConnection> =
-        runCatching {
-            ServerStorage.read(connectionsKey(profileId))
-                ?.let { json.decodeFromString(ListSerializer(ServerConnection.serializer()), it) }
-        }.getOrNull().orEmpty()
+        readSaved { readValue(connectionsKey(profileId))?.let { json.decodeFromString(ListSerializer(ServerConnection.serializer()), it) }.orEmpty() }
 
-    private fun readCredential(ref: String): String? =
-        runCatching { ServerStorage.read(credentialKey(ref)) }.getOrNull()
+    private fun <T> readSaved(read: () -> T): T = try { read() }
+        catch (_: Exception) { throw com.nuvio.app.core.storage.SecureStorageUnavailable() }
+
+    private fun readCredential(ref: String): String? = readValue(credentialKey(ref))
 
     private fun writeCredential(ref: String, token: String) {
-        ServerStorage.write(credentialKey(ref), token)
+        writeValue(credentialKey(ref), token)
         synchronized(lock) { tokens[ref] = token }
     }
 
     private fun deleteCredential(ref: String) {
         synchronized(lock) { tokens.remove(ref) }
-        runCatching { ServerStorage.write(credentialKey(ref), null) }
+        writeValue(credentialKey(ref), null)
     }
 
     private fun mergeLibraries(previous: List<ServerLibrary>, current: List<ServerLibrary>): List<ServerLibrary> {
@@ -362,3 +358,5 @@ object ServerRepository {
     private fun newId(prefix: String): String =
         prefix + (0 until 15).joinToString("") { Random.nextInt(16).toString(16) }
 }
+
+object ServerRepository : ServerConnectionRepository()

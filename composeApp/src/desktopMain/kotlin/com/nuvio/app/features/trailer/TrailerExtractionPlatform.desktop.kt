@@ -27,7 +27,7 @@ internal object TrailerExtractionPlatform {
             "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
     )
 
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = com.nuvio.app.core.network.DesktopTls.clientBuilder()
         .connectTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .writeTimeout(TRAILER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -35,7 +35,7 @@ internal object TrailerExtractionPlatform {
         .followSslRedirects(true)
         .build()
 
-    private val probeClient = OkHttpClient.Builder()
+    private val probeClient = com.nuvio.app.core.network.DesktopTls.clientBuilder()
         .connectTimeout(2, TimeUnit.SECONDS)
         .readTimeout(2, TimeUnit.SECONDS)
         .followRedirects(true)

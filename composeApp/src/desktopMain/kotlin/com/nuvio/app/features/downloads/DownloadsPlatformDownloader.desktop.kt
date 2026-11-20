@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.io.path.createDirectories
 
 private val desktopDownloadHttpClient: HttpClient = HttpClient.newBuilder()
+    .sslContext(com.nuvio.app.core.network.DesktopTls.context)
     .connectTimeout(Duration.ofSeconds(60))
     .followRedirects(HttpClient.Redirect.NORMAL)
     .build()
