@@ -17,12 +17,16 @@ internal enum class AutoDownloadSaveResult {
 /** Saves [rule] for [profileId]. Never throws: a failure is [AutoDownloadSaveResult.NotSaved]. */
 internal fun saveAutoDownloadRule(store: AutoDownloadStore, profileId: Int, rule: AutoDownloadRule): AutoDownloadSaveResult =
     try {
-        val existed = store.rule(profileId, rule.key) != null
-        when {
-            !store.upsert(profileId, rule) -> AutoDownloadSaveResult.NotSaved
-            existed -> AutoDownloadSaveResult.Changed
-            else -> AutoDownloadSaveResult.TurnedOn
+        val save = {
+            val existed = store.rule(profileId, rule.key) != null
+            when {
+                !store.upsert(profileId, rule) -> AutoDownloadSaveResult.NotSaved
+                existed -> AutoDownloadSaveResult.Changed
+                else -> AutoDownloadSaveResult.TurnedOn
+            }
         }
+        // The existence check also waits for the lock, so cancel before it when disabling removal.
+        if (!rule.deleteAfterWatching) WatchedRemovalGuard.change(save) else save()
     } catch (error: CancellationException) {
         throw error
     } catch (error: Throwable) {

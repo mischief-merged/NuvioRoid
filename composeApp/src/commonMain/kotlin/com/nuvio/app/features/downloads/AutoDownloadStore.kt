@@ -197,15 +197,21 @@ internal class AutoDownloadStore(
     }
 
     /** Adds [rule] or replaces the rule of the same show. What the earlier rule downloaded is kept. */
-    fun upsert(profileId: Int, rule: AutoDownloadRule): Boolean = change(profileId) { rules ->
-        val existing = rules.firstOrNull { it.key == rule.key }
-        val saved = rule.normalized().copy(ownedEpisodeKeys = rule.ownedEpisodeKeys + existing?.ownedEpisodeKeys.orEmpty())
-        if (existing == null) rules + saved else rules.map { if (it.key == saved.key) saved else it }
+    fun upsert(profileId: Int, rule: AutoDownloadRule): Boolean {
+        val saveRule = {
+            change(profileId) { rules ->
+                val existing = rules.firstOrNull { it.key == rule.key }
+                val saved = rule.normalized().copy(ownedEpisodeKeys = rule.ownedEpisodeKeys + existing?.ownedEpisodeKeys.orEmpty())
+                if (existing == null) rules + saved else rules.map { if (it.key == saved.key) saved else it }
+            }
+        }
+        // Signal before reading the existing rule, since that read also waits for the removal lock.
+        return if (!rule.deleteAfterWatching) WatchedRemovalGuard.change(saveRule) else saveRule()
     }
 
     /** Removes a rule and the removals that were scheduled because of it. */
-    fun remove(profileId: Int, ruleKey: String): Boolean = synchronized(lock) {
-        if (ensureLoaded() != profileId) return false
+    fun remove(profileId: Int, ruleKey: String): Boolean = WatchedRemovalGuard.change {
+        if (ensureLoaded() != profileId) return@change false
         save(
             profileId,
             state.copy(

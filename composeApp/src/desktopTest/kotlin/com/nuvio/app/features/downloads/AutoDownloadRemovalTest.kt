@@ -5,6 +5,7 @@ import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import javax.swing.SwingUtilities
 import kotlin.concurrent.thread
 import kotlin.io.path.readText
 import kotlin.io.path.createDirectories
@@ -189,11 +190,46 @@ class AutoDownloadRemovalTest {
     fun automatic_only_after_the_trash_move_restores_a_manual_file_and_record() =
         cancelDuringRemoval(afterMove = true) { store, _ -> store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AutomaticOnly) }
 
-    private fun cancelDuringRemoval(afterMove: Boolean, change: (AutoDownloadStore, String) -> Unit) {
-        val file = download(1, automatic = false)
+    @Test
+    fun turning_off_a_rule_during_the_list_save_keeps_the_file_and_record() =
+        cancelDuringRemoval(afterMove = false, automatic = true) { store, _ -> store.remove(1, ruleKey) }
+
+    @Test
+    fun turning_off_a_rule_after_the_trash_move_restores_the_file_and_record() =
+        cancelDuringRemoval(afterMove = true, automatic = true) { store, _ -> store.remove(1, ruleKey) }
+
+    @Test
+    fun turning_off_a_rules_removal_switch_during_the_list_save_keeps_the_file_and_record() =
+        cancelDuringRemoval(afterMove = false, automatic = true) { store, _ ->
+            store.upsert(1, testRule(showId = showId).copy(deleteAfterWatching = false))
+        }
+
+    @Test
+    fun turning_off_a_rules_removal_switch_after_the_trash_move_restores_the_file_and_record() =
+        cancelDuringRemoval(afterMove = true, automatic = true) { store, _ ->
+            store.upsert(1, testRule(showId = showId).copy(deleteAfterWatching = false))
+        }
+
+    @Test
+    fun saving_a_disabled_switch_signals_before_reading_the_rule_during_the_list_save() =
+        cancelDuringRemoval(afterMove = false, automatic = true) { store, _ ->
+            assertEquals(AutoDownloadSaveResult.Changed,
+                saveAutoDownloadRule(store, 1, testRule(showId = showId).copy(deleteAfterWatching = false)))
+        }
+
+    @Test
+    fun saving_a_disabled_switch_signals_before_reading_the_rule_after_the_move() =
+        cancelDuringRemoval(afterMove = true, automatic = true) { store, _ ->
+            assertEquals(AutoDownloadSaveResult.Changed,
+                saveAutoDownloadRule(store, 1, testRule(showId = showId).copy(deleteAfterWatching = false)))
+        }
+
+    private fun cancelDuringRemoval(afterMove: Boolean, automatic: Boolean = false, change: (AutoDownloadStore, String) -> Unit) {
+        val file = download(1, automatic = automatic)
         val original = item(1)!!
         val store = AutoDownloadStore(MemoryAutoDownloadPayloads()) { 1 }
         store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        if (automatic) store.upsert(1, testRule(showId = showId).copy(deleteAfterWatching = true))
         val feature = DeleteAfterWatching(
             store, { DownloadsRepository.uiState.value.items }, { true }, { false }, { _, _ -> true },
             DownloadsRepository::removeWatchedAutoDownload, { 0L }, holdMs = 0L,
@@ -231,6 +267,69 @@ class AutoDownloadRemovalTest {
         assertTrue(heldFiles().isEmpty())
         assertTrue(store.removals(1).isEmpty())
         assertTrue(store.recentlyDeleted.value.isEmpty())
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        assertEquals(original, item(1))
+    }
+
+    @Test
+    fun opening_the_player_returns_on_the_ui_thread_while_another_thread_is_saving_removal() =
+        openWhileRemovalIsPaused(afterMove = false)
+
+    @Test
+    fun opening_the_player_returns_on_the_ui_thread_while_another_thread_is_moving_the_file() =
+        openWhileRemovalIsPaused(afterMove = true)
+
+    private fun openWhileRemovalIsPaused(afterMove: Boolean) {
+        val file = download(1, automatic = false)
+        val original = item(1)!!
+        val uri = file.toUri().toString()
+        val paused = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val opened = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>()
+        val result = AtomicReference<AutoDownloadRemovalResult?>()
+        var intercepted = false
+        val pause = {
+            if (!intercepted) {
+                intercepted = true
+                paused.countDown()
+                check(release.await(10, TimeUnit.SECONDS))
+            }
+        }
+        if (afterMove) afterTrashMove = pause else backend.afterSave = pause
+        val removal = thread(isDaemon = true) {
+            runCatching {
+                result.set(DownloadsRepository.removeWatchedAutoDownload(original.id, null) { !AutoDownloads.isPlaying(original) })
+            }.onFailure { failure.set(it) }
+        }
+        try {
+            assertTrue(paused.await(5, TimeUnit.SECONDS))
+            assertEquals(!afterMove, file.exists())
+            SwingUtilities.invokeLater {
+                try {
+                    AutoDownloads.onLocalFileOpened(uri)
+                } catch (error: Throwable) {
+                    failure.set(error)
+                } finally {
+                    opened.countDown()
+                }
+            }
+            assertTrue(opened.await(2, TimeUnit.SECONDS), "Opening must return before the removal lock is released")
+            assertTrue(removal.isAlive)
+            assertTrue(AutoDownloads.isPlaying(original), "Playback must be recorded while removal still holds the lock")
+        } finally {
+            release.countDown()
+            removal.join(5_000)
+            opened.await(5, TimeUnit.SECONDS)
+            AutoDownloads.onLocalFileClosed(uri)
+        }
+        assertFalse(removal.isAlive)
+        assertNull(failure.get())
+        assertEquals(AutoDownloadRemovalResult.Changed, result.get())
+        assertEquals(original, item(1))
+        assertEquals("video 1", file.readText())
+        assertTrue(heldFiles().isEmpty())
         DownloadsRepository.clearLocalState()
         DownloadsRepository.ensureLoaded()
         assertEquals(original, item(1))

@@ -346,8 +346,8 @@ internal object AutoDownloads : AutoDownloadController {
                 DownloadsRepository.findCompletedDownloadByLocalFile(playing)?.id == item.id
         } == true
 
-    /** Signal an opened file before waiting for a removal to finish or roll back. */
-    fun onLocalFileOpened(localFileUri: String) = WatchedRemovalGuard.change {
+    /** Record playback and cancel a removal without waiting for its disk work. */
+    fun onLocalFileOpened(localFileUri: String) = WatchedRemovalGuard.signalChange {
         playingFileUri.value = localFileUri
     }
 

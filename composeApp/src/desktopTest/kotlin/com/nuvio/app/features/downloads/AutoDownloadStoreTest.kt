@@ -12,6 +12,18 @@ class AutoDownloadStoreTest {
     private val store = AutoDownloadStore(payloads) { activeProfile }
 
     @Test
+    fun recording_owned_episodes_does_not_cancel_a_removal() {
+        val rule = testRule().copy(deleteAfterWatching = true)
+        store.upsert(1, rule)
+        val stillWanted = WatchedRemovalGuard.check { true }
+
+        assertTrue(store.update(1, rule.key) { it.copy(ownedEpisodeKeys = it.ownedEpisodeKeys + "1|2") })
+
+        assertTrue(stillWanted())
+        assertEquals(setOf("1|2"), store.rule(1, rule.key)?.ownedEpisodeKeys)
+    }
+
+    @Test
     fun a_saved_rule_is_read_back_by_a_new_store() {
         store.upsert(1, testRule(keepCount = 5, scope = AutoDownloadScope.LatestReleased))
 
