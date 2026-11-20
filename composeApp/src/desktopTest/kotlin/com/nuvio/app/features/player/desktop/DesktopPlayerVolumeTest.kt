@@ -33,6 +33,30 @@ class DesktopPlayerVolumeTest {
     }
 
     @Test
+    fun `a sleep fade keeps a muted player silent`() {
+        assertEquals(
+            0f,
+            sleepTimerFadeOutputLevel(audibleLevel = 0f, rememberedLevel = 1f, fraction = 1f),
+        )
+        assertEquals(
+            0f,
+            sleepTimerFadeOutputLevel(audibleLevel = 0f, rememberedLevel = 1.5f, fraction = 0.5f),
+        )
+        assertEquals(
+            0.4f,
+            sleepTimerFadeOutputLevel(audibleLevel = 0.4f, rememberedLevel = 1f, fraction = 1f),
+        )
+        assertEquals(
+            0.2f,
+            sleepTimerFadeOutputLevel(audibleLevel = 0.4f, rememberedLevel = 1f, fraction = 0.5f),
+        )
+        assertEquals(
+            0.75f,
+            sleepTimerFadeOutputLevel(audibleLevel = 1.5f, rememberedLevel = 1.5f, fraction = 0.5f),
+        )
+    }
+
+    @Test
     fun `requested level wins and remembered level is the final fallback`() {
         assertEquals(
             1.25f,

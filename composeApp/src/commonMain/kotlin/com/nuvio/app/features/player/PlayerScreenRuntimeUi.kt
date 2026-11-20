@@ -328,6 +328,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             title = chapter.title ?: stringResource(Res.string.compose_player_chapter_number, index + 1),
         )
     }
+    val sleepTimerStopAfterText = stringResource(Res.string.player_sleep_timer_stop_after)
+    val sleepTimerClockLabel = sleepTimerRemainingLabel.ifBlank {
+        if (sleepTimer.stopAfterEpisode) sleepTimerStopAfterText else ""
+    }
     val playerControlsState = PlayerControlsState(
         chapters = controlChapters,
         chapterTitleEnabled = playerSettingsUiState.chapterTitleEnabled,
@@ -600,6 +604,22 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         } else {
             canPlayNextEpisode
         },
+        sleepTimerLabel = stringResource(Res.string.player_sleep_timer),
+        sleepTimerPanelTitle = stringResource(Res.string.player_sleep_timer),
+        sleepTimerOffLabel = stringResource(Res.string.player_sleep_timer_off),
+        sleepTimer15Label = stringResource(Res.string.player_sleep_timer_15),
+        sleepTimer30Label = stringResource(Res.string.player_sleep_timer_30),
+        sleepTimer45Label = stringResource(Res.string.player_sleep_timer_45),
+        sleepTimer60Label = stringResource(Res.string.player_sleep_timer_60),
+        sleepTimer90Label = stringResource(Res.string.player_sleep_timer_90),
+        sleepTimerEndLabel = stringResource(Res.string.player_sleep_timer_end),
+        sleepTimerStopAfterLabel = sleepTimerStopAfterText,
+        sleepTimerShortcutLabel = stringResource(Res.string.player_sleep_timer_shortcut),
+        sleepTimerOption = sleepTimer.option.wire,
+        sleepTimerStopAfter = sleepTimer.stopAfterEpisode,
+        sleepTimerRemainingLabel = sleepTimerClockLabel,
+        sleepTimerFading = sleepTimer.phase == SleepTimerPhase.Fading,
+        sleepTimerActive = sleepTimer.phase != SleepTimerPhase.Idle || sleepTimer.stopAfterEpisode,
     )
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
     val fold = LocalFold.current?.takeIf { !isInPip }
@@ -1283,6 +1303,11 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
                 if (!partyBlocksControl()) playNextEpisode()
             }
         }
+        "sleepTimerOption" -> {
+            val option = sleepTimerOptionFromControl(value) ?: return true
+            selectSleepTimerOption(option)
+        }
+        "toggleStopAfterEpisode" -> toggleStopAfterThisEpisode()
         "enableP2pForPlayerControls" -> enableP2pForPlayerControls()
         "cancelP2pForPlayerControls" -> {
             playerControlsPendingP2pSwitch = null

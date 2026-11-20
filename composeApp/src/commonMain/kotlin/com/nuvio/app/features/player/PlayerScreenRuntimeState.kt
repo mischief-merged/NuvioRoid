@@ -287,6 +287,9 @@ internal class PlayerScreenRuntime(
         })?.takeIf {
             isSeries && (showNextEpisodeCard || nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null)
         }
+    var sleepTimer by mutableStateOf(SleepTimerState())
+    var sleepTimerRemainingLabel by mutableStateOf("")
+    var lastSleepTimerEpisodeKey: String? = null
     var nextEpisodePreloadJob by mutableStateOf<Job?>(null)
     var nextEpisodePreloadTriggered by mutableStateOf(false)
     var pendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)

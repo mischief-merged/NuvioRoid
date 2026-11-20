@@ -1157,18 +1157,32 @@ object WatchProgressRepository {
         session: WatchProgressPlaybackSession,
         snapshot: PlayerPlaybackSnapshot,
         syncRemote: Boolean = true,
+        holdIncomplete: Boolean = false,
     ) {
         ensureLoaded()
-        upsert(session = session, snapshot = snapshot, persist = true, syncRemote = syncRemote)
+        upsert(
+            session = session,
+            snapshot = snapshot,
+            persist = true,
+            syncRemote = syncRemote,
+            holdIncomplete = holdIncomplete,
+        )
     }
 
     fun flushPlaybackProgress(
         session: WatchProgressPlaybackSession,
         snapshot: PlayerPlaybackSnapshot,
         syncRemote: Boolean = true,
+        holdIncomplete: Boolean = false,
     ) {
         ensureLoaded()
-        upsert(session = session, snapshot = snapshot, persist = true, syncRemote = syncRemote)
+        upsert(
+            session = session,
+            snapshot = snapshot,
+            persist = true,
+            syncRemote = syncRemote,
+            holdIncomplete = holdIncomplete,
+        )
     }
 
     fun applyExternalProgress(entries: List<WatchProgressEntry>) {
@@ -1314,16 +1328,19 @@ object WatchProgressRepository {
         snapshot: PlayerPlaybackSnapshot,
         persist: Boolean,
         syncRemote: Boolean,
+        holdIncomplete: Boolean = false,
     ) {
         val targetProfileId = session.profileId
         val positionMs = snapshot.positionMs.coerceAtLeast(0L)
         val durationMs = snapshot.durationMs.coerceAtLeast(0L)
-        val isCompleted = isWatchProgressComplete(
+        val completion = resolvePlaybackCompletion(
             positionMs = positionMs,
             durationMs = durationMs,
             isEnded = snapshot.isEnded,
+            holdIncomplete = holdIncomplete,
         )
-        if (!isCompleted && !shouldStoreWatchProgress(positionMs = positionMs, durationMs = durationMs)) {
+        val isCompleted = completion.isCompleted
+        if (!completion.completionHeld && !isCompleted && !shouldStoreWatchProgress(positionMs = positionMs, durationMs = durationMs)) {
             return
         }
 
@@ -1346,7 +1363,7 @@ object WatchProgressRepository {
             episodeNumber = session.episodeNumber,
             episodeTitle = session.episodeTitle,
             episodeThumbnail = session.episodeThumbnail,
-            lastPositionMs = if (isCompleted && durationMs > 0L) durationMs else positionMs,
+            lastPositionMs = completion.storedPositionMs,
             durationMs = durationMs,
             lastUpdatedEpochMs = WatchProgressClock.nowEpochMs(),
             providerName = session.providerName,
@@ -1356,6 +1373,7 @@ object WatchProgressRepository {
             pauseDescription = session.pauseDescription,
             lastSourceUrl = session.lastSourceUrl,
             isCompleted = isCompleted,
+            completionHeld = completion.completionHeld,
         ).normalizedCompletion()
 
         if (targetProfileId != currentProfileId || ProfileRepository.activeProfileId != targetProfileId) {

@@ -17,6 +17,11 @@ interface PlayerEngineController {
     fun retry()
     fun setPlaybackSpeed(speed: Float)
     fun setMuted(muted: Boolean) {}
+    /**
+     * Plays the listener's volume scaled by [fraction] without remembering the quieter level.
+     * 1 restores the listener's volume. Used while a sleep timer fades the audio out.
+     */
+    fun setVolumeFade(fraction: Float) {}
     fun getAudioTracks(): List<AudioTrack>
     fun getSubtitleTracks(): List<SubtitleTrack>
     fun applyAudioLanguagePreferences(languages: List<String>)
@@ -329,6 +334,22 @@ data class PlayerControlsState(
     val shortcutsGroupPlaybackLabel: String = "Playback",
     val shortcutsGroupNavigationLabel: String = "Navigation",
     val shortcutsItems: List<PlayerControlShortcutItem> = emptyList(),
+    val sleepTimerLabel: String = "Sleep timer",
+    val sleepTimerPanelTitle: String = "Sleep timer",
+    val sleepTimerOffLabel: String = "Off",
+    val sleepTimer15Label: String = "15 minutes",
+    val sleepTimer30Label: String = "30 minutes",
+    val sleepTimer45Label: String = "45 minutes",
+    val sleepTimer60Label: String = "60 minutes",
+    val sleepTimer90Label: String = "90 minutes",
+    val sleepTimerEndLabel: String = "End of episode",
+    val sleepTimerStopAfterLabel: String = "Stop after this episode",
+    val sleepTimerShortcutLabel: String = "Sleep timer (Z)",
+    val sleepTimerOption: String = "off",
+    val sleepTimerStopAfter: Boolean = false,
+    val sleepTimerRemainingLabel: String = "",
+    val sleepTimerFading: Boolean = false,
+    val sleepTimerActive: Boolean = false,
 )
 
 data class PlayerControlShortcutItem(

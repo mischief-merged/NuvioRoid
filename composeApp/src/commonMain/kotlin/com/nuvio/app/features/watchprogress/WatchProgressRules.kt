@@ -95,6 +95,44 @@ internal fun isWatchProgressComplete(
     isEnded = isEnded,
 )
 
+internal data class PlaybackCompletion(
+    val isCompleted: Boolean,
+    val completionHeld: Boolean,
+    val storedPositionMs: Long,
+)
+
+/**
+ * A sleep-timer stop keeps the real position and refuses the watched mark, including when the
+ * file has ended or the position is past the usual line. A normal stop still stores the duration
+ * once the episode counts as watched.
+ */
+internal fun resolvePlaybackCompletion(
+    positionMs: Long,
+    durationMs: Long,
+    isEnded: Boolean,
+    holdIncomplete: Boolean,
+): PlaybackCompletion {
+    val safePosition = positionMs.coerceAtLeast(0L)
+    val safeDuration = durationMs.coerceAtLeast(0L)
+    if (holdIncomplete) {
+        return PlaybackCompletion(
+            isCompleted = false,
+            completionHeld = true,
+            storedPositionMs = safePosition,
+        )
+    }
+    val completed = isWatchProgressComplete(
+        positionMs = safePosition,
+        durationMs = safeDuration,
+        isEnded = isEnded,
+    )
+    return PlaybackCompletion(
+        isCompleted = completed,
+        completionHeld = false,
+        storedPositionMs = if (completed && safeDuration > 0L) safeDuration else safePosition,
+    )
+}
+
 internal fun List<WatchProgressEntry>.resumeEntryForSeries(metaId: String): WatchProgressEntry? {
     val candidates = newestByProgressKey().values.toList()
     val normalizedMetaId = metaId.trim()

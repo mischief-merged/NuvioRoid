@@ -2509,6 +2509,16 @@
     <!-- PlayerControls a11y -->
     <string name="player_action_submit_intro">Submit Intro</string>
     <string name="player_action_video_settings">Video settings</string>
+    <string name="player_sleep_timer">Sleep timer</string>
+    <string name="player_sleep_timer_off">Off</string>
+    <string name="player_sleep_timer_15">15 minutes</string>
+    <string name="player_sleep_timer_30">30 minutes</string>
+    <string name="player_sleep_timer_45">45 minutes</string>
+    <string name="player_sleep_timer_60">60 minutes</string>
+    <string name="player_sleep_timer_90">90 minutes</string>
+    <string name="player_sleep_timer_end">End of episode</string>
+    <string name="player_sleep_timer_stop_after">Stop after this episode</string>
+    <string name="player_sleep_timer_shortcut">Sleep timer (Z)</string>
     <!-- CloudLibrary -->
     <string name="cloud_library_provider_unavailable">Cloud library is not available for %1$s.</string>
     <!-- Player iOS video settings modal -->

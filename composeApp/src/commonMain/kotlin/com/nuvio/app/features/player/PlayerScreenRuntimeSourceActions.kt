@@ -311,7 +311,7 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
         return
     }
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = resolveEpisodeResume(epVideoId, episode)
@@ -484,7 +484,7 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
         return
     }
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = serverResumeMs?.let { EpisodeResume(positionMs = it, fraction = null) } ?: resolveEpisodeResume(epVideoId, episode)
@@ -506,7 +506,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     val localFileUri = DownloadsRepository.playableLocalFileUri(downloadItem) ?: return
     restartSourceFailoverAfterUserChoice(newVideo = true)
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
 
     val fallbackVideoId = buildPlaybackVideoId(
@@ -625,6 +625,10 @@ private fun PlayerScreenRuntime.playTargetEpisode(
     isPrevious: Boolean = false,
     isStillValid: (PlaybackKey) -> Boolean,
 ): Boolean {
+    if (automatic && sleepTimer.blocksAutomaticNextEpisode()) {
+        cancelNextEpisodeAutoPlay()
+        return false
+    }
     if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
     nextEpisodePreloadTriggered = false
     val playbackKey = activePlaybackKey
@@ -729,6 +733,19 @@ internal fun PlayerScreenRuntime.openEpisodesPanel() {
 }
 
 private data class EpisodeResume(val positionMs: Long, val fraction: Float?)
+
+private fun PlayerScreenRuntime.flushProgressForEpisodeChange(episode: MetaVideo) {
+    flushWatchProgress(
+        leavingEpisode = isLeavingPlaybackEpisode(
+            currentVideoId = activeVideoId,
+            currentSeason = activeSeasonNumber,
+            currentEpisode = activeEpisodeNumber,
+            nextVideoId = episode.id,
+            nextSeason = episode.season,
+            nextEpisode = episode.episode,
+        ),
+    )
+}
 
 private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
     showNextEpisodeCard = false
