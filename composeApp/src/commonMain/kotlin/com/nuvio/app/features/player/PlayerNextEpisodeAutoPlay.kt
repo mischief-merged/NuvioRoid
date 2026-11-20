@@ -69,6 +69,7 @@ internal fun PlayerScreenRuntime.cancelNextEpisodeAutoPlay() {
     nextEpisodeAutoPlaySearching = false
     nextEpisodeAutoPlaySourceName = null
     nextEpisodeAutoPlayCountdown = null
+    nextEpisodeAutoPlayTarget = null
 }
 
 internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
@@ -87,10 +88,23 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     onSourceNameChanged: (String?) -> Unit,
     onCountdownChanged: (Int?) -> Unit,
     onNextEpisodeCardVisibleChanged: (Boolean) -> Unit,
+    isOffline: () -> Boolean = ::isNetworkOffline,
+    findDownloadedEpisode: (MetaVideo) -> DownloadItem? = { video ->
+        DownloadsRepository.findPlayableDownload(parentMetaId, video.season, video.episode, video.id)
+    },
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
     if (nextEpisodeInfo.hasAired != true) return null
+
+    val downloadedNextEpisode = findDownloadedEpisode(nextVideo)
+    if (downloadedNextEpisode != null) {
+        onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
+        return null
+    }
+
+    // Offline: the auto-play fan-out is a network search, so skip it entirely.
+    if (isOffline()) return null
 
     previousJob?.cancel()
     val type = contentType ?: parentMetaType
@@ -160,7 +174,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         onCountdownChanged(null)
 
         // Connectivity may have dropped between the request and the actual search.
-        if (isNetworkOffline()) {
+        if (isOffline()) {
             onSearchingChanged(false)
             return@launch
         }

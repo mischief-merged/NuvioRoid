@@ -90,6 +90,9 @@
     <symbol id="icon-info" viewBox="0 0 24 24">
       <path d="M11 7h2v2h-2V7Zm0 4h2v6h-2v-6Zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8Z"/>
     </symbol>
+    <symbol id="icon-help" viewBox="0 0 24 24">
+      <path d="M11 17h2v-2h-2v2Zm1-15C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8Zm0-14a4 4 0 0 0-4 4h2a2 2 0 1 1 2 2c-1.1 0-2 .9-2 2v.5h2V14c0-.28.22-.5.5-.5a3.5 3.5 0 0 0-.5-6.96V6Z"/>
+    </symbol>
     <symbol id="icon-sync" viewBox="0 0 24 24">
       <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8Zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3Z"/>
     </symbol>
@@ -169,6 +172,7 @@
           <button class="header-button" id="submitIntroButton" data-command="submitIntro" aria-label="Submit intro"><svg><use href="#icon-flag"></use></svg></button>
           <button class="header-button" id="partyButton" type="button" aria-label="Watch party" hidden><svg><use href="#icon-party"></use></svg></button>
           <button class="header-button" id="videoSettingsButton" data-command="videoSettings" aria-label="Video settings"><svg><use href="#icon-build"></use></svg></button>
+          <button class="header-button" id="shortcutsButton" type="button" aria-label="Keyboard shortcuts"><svg><use href="#icon-help"></use></svg></button>
           <button class="header-button pip-lock-button" id="pipLockButton" type="button" aria-pressed="false" aria-label="Lock player controls"><svg><use href="#icon-lock"></use></svg></button>
           <button class="header-button" id="pipButton" data-command="pictureInPicture" aria-label="Picture in picture"><svg><use href="#icon-pip"></use></svg></button>
           <button class="header-button" id="fullscreenButton" data-command="toggleFullscreen" aria-label="Enter fullscreen"><svg><use id="fullscreenIcon" href="#icon-fullscreen"></use></svg></button>
@@ -570,6 +574,17 @@
               <button class="party-button danger" id="partyConfirmAccept" type="button" aria-label="Confirm"></button>
             </div>
           </div>
+        </div>
+      </section>
+      <section class="modal-layer" id="shortcutsModal" aria-label="Keyboard shortcuts" hidden>
+        <div class="track-panel wide shortcuts-panel">
+          <div class="track-header-row">
+            <div class="track-title" id="shortcutsModalTitle">Keyboard shortcuts</div>
+            <div class="panel-actions">
+              <button class="panel-button" id="shortcutsCloseButton" type="button">Close</button>
+            </div>
+          </div>
+          <div class="shortcuts-body" id="shortcutsGrid"></div>
         </div>
       </section>
       <section class="modal-layer" id="p2pConsentModal" aria-label="P2P streaming consent" hidden>

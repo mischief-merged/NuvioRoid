@@ -286,7 +286,7 @@ private fun NativePlayerSurface(
     LaunchedEffect(controller) {
         AppPresenceState.current.collect { snapshot ->
             val player = snapshot as? PresenceSnapshot.Player
-            controller.setNowPlayingMetadata(player?.title, player?.episodeLabel, player?.posterUrl)
+            controller.updatePresenceNowPlayingFallback(player?.title, player?.episodeLabel, player?.posterUrl)
         }
     }
 

@@ -49,6 +49,7 @@ import com.nuvio.app.features.player.desktop.applyNativeDesktopWindowChrome
 import com.nuvio.app.features.player.desktop.configureMacosWindowBeforePeer
 import com.nuvio.app.features.player.desktop.installDesktopAppFullscreenShortcuts
 import com.nuvio.app.features.player.desktop.macosTitleBarDoubleClick
+import com.nuvio.app.features.player.desktop.notifyDesktopAppFullscreenChanged
 import com.nuvio.app.features.player.desktop.MacosAppMenuBar
 import com.nuvio.app.features.player.desktop.preloadNativePlayerBridgeAsync
 import com.nuvio.app.features.player.desktop.registerDesktopAppFullscreenToggle
@@ -307,12 +308,13 @@ fun main(args: Array<String>) {
             LaunchedEffect(windowState) {
                 // Covers OS-driven placement changes too (e.g. the native macOS
                 // green-button fullscreen toggle), not just our own shortcuts.
-                if (DesktopHostOs.current != DesktopHostOs.WINDOWS) {
-                    snapshotFlow { windowState.placement }
-                        .collect { placement ->
+                snapshotFlow { windowState.placement }
+                    .collect { placement ->
+                        if (DesktopHostOs.current != DesktopHostOs.WINDOWS) {
                             DesktopWindowModeStorage.saveWasFullscreen(placement == WindowPlacement.Fullscreen)
                         }
-                }
+                        notifyDesktopAppFullscreenChanged()
+                    }
             }
             LaunchedEffect(windowState) {
                 // Only persist geometry while windowed: fullscreen/native-Windows-fullscreen

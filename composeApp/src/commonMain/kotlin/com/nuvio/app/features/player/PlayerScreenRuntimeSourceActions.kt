@@ -13,6 +13,8 @@ import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
+import com.nuvio.app.features.player.skip.NextEpisodeInfo
+import com.nuvio.app.features.player.skip.PlayerNextEpisodeRules
 import com.nuvio.app.features.servers.ServerPlayback
 import com.nuvio.app.features.servers.serverPlaybackMessage
 import com.nuvio.app.features.streams.StreamBehaviorHints
@@ -480,47 +482,107 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     controlsVisible = true
 }
 
-internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false) {
-    if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return
+internal fun PlayerScreenRuntime.resolvePlayablePreviousEpisode(): MetaVideo? {
+    if (!isSeries || playerMetaVideos.isEmpty()) return null
+    val previous = PlayerNextEpisodeRules.resolvePreviousEpisode(
+        videos = playerMetaVideos,
+        currentSeason = activeSeasonNumber,
+        currentEpisode = activeEpisodeNumber,
+    ) ?: return null
+    if (previous.season == null || previous.episode == null) return null
+    if (!PlayerNextEpisodeRules.hasEpisodeAired(previous.released)) return null
+    return previous
+}
+
+internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false): Boolean {
+    val targetInfo = nextEpisodeInfo?.takeIf { it.hasAired } ?: return false
+    return playTargetEpisode(
+        targetInfo = targetInfo,
+        automatic = automatic,
+        isStillValid = { playbackKey ->
+            playbackKey == activePlaybackKey &&
+                nextEpisodeInfo?.videoId == targetInfo.videoId &&
+                (!automatic || (
+                    playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
+                        !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
+                    ))
+        },
+    )
+}
+
+internal fun PlayerScreenRuntime.playPreviousEpisode(): Boolean {
+    val previous = resolvePlayablePreviousEpisode() ?: return false
+    val season = previous.season ?: return false
+    val episode = previous.episode ?: return false
+    val targetInfo = NextEpisodeInfo(
+        videoId = previous.id,
+        season = season,
+        episode = episode,
+        title = previous.title,
+        thumbnail = previous.thumbnail,
+        overview = previous.overview,
+        released = previous.released,
+        hasAired = true,
+        isWatched = false,
+        unairedMessage = null,
+    )
+    return playTargetEpisode(
+        targetInfo = targetInfo,
+        automatic = false,
+        isPrevious = true,
+        isStillValid = { playbackKey -> playbackKey == activePlaybackKey },
+    )
+}
+
+private fun PlayerScreenRuntime.playTargetEpisode(
+    targetInfo: NextEpisodeInfo,
+    automatic: Boolean,
+    isPrevious: Boolean = false,
+    isStillValid: (PlaybackKey) -> Boolean,
+): Boolean {
+    if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
     nextEpisodePreloadTriggered = false
     val playbackKey = activePlaybackKey
-    val nextVideoId = nextEpisodeInfo?.takeIf { it.hasAired }?.videoId ?: return
-    fun isCurrentRequest(): Boolean = playbackKey == activePlaybackKey &&
-        nextEpisodeInfo?.videoId == nextVideoId &&
-        (!automatic || (
-            playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
-                !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
-            ))
-    if (!isCurrentRequest()) return
+    fun isCurrentRequest(): Boolean = isStillValid(playbackKey)
+    if (!isCurrentRequest()) return false
     nextEpisodeAutoPlayAutomatic = automatic
+    var downloadedEpisodeSelected = false
 
-    scope.launchPlayerNextEpisodeAutoPlay(
+    val job = scope.launchPlayerNextEpisodeAutoPlay(
         previousJob = nextEpisodeAutoPlayJob,
-        nextEpisodeInfo = nextEpisodeInfo,
+        nextEpisodeInfo = targetInfo,
         allEpisodes = playerMetaVideos,
         parentMetaId = parentMetaId,
         parentMetaType = parentMetaType,
         contentType = contentType,
         settings = playerSettingsUiState,
         currentStreamBingeGroup = currentStreamBingeGroup,
+        isOffline = episodePlaybackOffline,
+        findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
         onDownloadedEpisodeSelected = { item, episode ->
-            if (isCurrentRequest()) switchToDownloadedEpisode(item, episode)
+            if (isCurrentRequest()) {
+                switchToDownloadedEpisode(item, episode)
+                downloadedEpisodeSelected = activePlaybackKey != playbackKey
+            }
         },
         onEpisodeStreamSelected = { stream, episode ->
             if (isCurrentRequest()) switchToEpisodeStream(stream, episode)
         },
-        onManualSelectionRequired = { nextVideo ->
+        onManualSelectionRequired = { targetVideo ->
             if (isCurrentRequest()) {
                 nextEpisodeCardDismissed = true
                 episodeStreamsPanelState = EpisodeStreamsPanelState(
                     showStreams = true,
-                    selectedEpisode = nextVideo,
+                    selectedEpisode = targetVideo,
                 )
                 showEpisodesPanel = true
             }
         },
         onSearchingChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySearching = it
+            if (playbackKey == activePlaybackKey) {
+                if (it) nextEpisodeAutoPlayTarget = PlayerEpisodeCardState(targetInfo, isPrevious)
+                nextEpisodeAutoPlaySearching = it
+            }
         },
         onSourceNameChanged = {
             if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySourceName = it
@@ -531,9 +593,16 @@ internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false) {
         onNextEpisodeCardVisibleChanged = {
             if (playbackKey == activePlaybackKey) showNextEpisodeCard = it
         },
-    )?.let { job ->
+    )
+    if (job != null) {
         nextEpisodeAutoPlayJob = job
+        job.invokeOnCompletion {
+            if (nextEpisodeAutoPlayJob === job && playbackKey == activePlaybackKey) {
+                nextEpisodeAutoPlayTarget = null
+            }
+        }
     }
+    return downloadedEpisodeSelected || job != null
 }
 
 internal fun PlayerScreenRuntime.openSourcesPanel() {

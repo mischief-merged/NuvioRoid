@@ -324,6 +324,16 @@ data class PlayerControlsState(
     val autoSyncedLabel: String = "Auto synced",
     val streamInfoLabel: String = "Stream info",
     val streamInfoSections: List<PlayerControlInfoSection> = emptyList(),
+    val shortcutsLabel: String = "Keyboard shortcuts",
+    val shortcutsGroupPlaybackLabel: String = "Playback",
+    val shortcutsGroupNavigationLabel: String = "Navigation",
+    val shortcutsItems: List<PlayerControlShortcutItem> = emptyList(),
+)
+
+data class PlayerControlShortcutItem(
+    val keys: String = "",
+    val label: String = "",
+    val group: String = "playback",
 )
 
 data class PlayerControlFilterItem(

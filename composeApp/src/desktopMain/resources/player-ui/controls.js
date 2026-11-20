@@ -83,6 +83,11 @@ const streamInfoButton = document.getElementById("streamInfoButton");
 const streamInfoLabel = document.getElementById("streamInfoLabel");
 const streamInfoModal = document.getElementById("streamInfoModal");
 const streamInfoContent = document.getElementById("streamInfoContent");
+const shortcutsButton = document.getElementById("shortcutsButton");
+const shortcutsModal = document.getElementById("shortcutsModal");
+const shortcutsModalTitle = document.getElementById("shortcutsModalTitle");
+const shortcutsCloseButton = document.getElementById("shortcutsCloseButton");
+const shortcutsGrid = document.getElementById("shortcutsGrid");
 const chaptersPanelTitle = document.getElementById("chaptersPanelTitle");
 const chaptersCloseButton = document.getElementById("chaptersCloseButton");
 const chapterList = document.getElementById("chapterList");
@@ -318,6 +323,10 @@ let state = {
   isPlaying: false,
   isLoading: true,
   controlsVisible: true,
+  shortcutsLabel: "Keyboard shortcuts",
+  shortcutsGroupPlaybackLabel: "Playback",
+  shortcutsGroupNavigationLabel: "Navigation",
+  shortcutsItems: [],
   parentalWarnings: [],
   showParentalGuide: false,
   showOpeningOverlay: false,
@@ -432,6 +441,7 @@ let submitIntroDraft = {
   status: "",
 };
 let hasReceivedPlayerControls = false;
+let lastKotlinControlsVisible = undefined;
 let parentalGuideRunId = 0;
 let parentalGuideStartedKey = "";
 let parentalGuideCompletedKey = "";
@@ -451,6 +461,7 @@ let chromeInteractionLastNotedAt = 0;
 let isChromePointerInside = false;
 let isChromePointerDown = false;
 let isChromeFocusInside = false;
+let lastSentChromeInteracting = false;
 let hiddenCursorTimer = 0;
 let hiddenCursorTemporarilyVisible = false;
 let cursorActivityLastSentAt = 0;
@@ -515,10 +526,13 @@ const setPipLocked = locked => {
 const prefersReducedMotion = window.matchMedia &&
   window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const modalTransitionMs = prefersReducedMotion ? 1 : 240;
-const chromeAutoHideDelayMs = 3500;
+const chromeAutoHideDelayMs = 3000;
 const chromeActivityThrottleMs = 300;
 const hiddenCursorHideDelayMs = 3000;
 const cursorActivityThrottleMs = 100;
+let lastPointerMoveX = null;
+let lastPointerMoveY = null;
+let lastCursorWakeSentWhileHidden = false;
 const playerToastDurationMs = 1400;
 const chromeInteractionSelector = [
   "button",
@@ -1054,6 +1068,7 @@ const modalByName = {
   episodes: episodesModal,
   chapters: chaptersModal,
   streamInfo: streamInfoModal,
+  shortcuts: shortcutsModal,
   submitIntro: submitIntroModal,
   p2pConsent: p2pConsentModal,
   party: partyModal,
@@ -1110,7 +1125,11 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   }
   if (closingModal === "episodes") onEpisodesModalClosed();
   if (closingModal === "party") onPartyModalClosed();
+  syncNativeChromeInteraction();
   renderChrome();
+  if (state.controlsVisible) {
+    noteChromeActivity(true);
+  }
 };
 
 const openPlayerModal = modal => {
@@ -1122,6 +1141,10 @@ const openPlayerModal = modal => {
   if (activeModal === "party" && modal !== "party") onPartyModalClosed();
   if (modal === "party" && activeModal !== "party") onPartyModalOpened();
   activeModal = modal;
+  clearChromeAutoHideTimer();
+  syncNativeChromeInteraction();
+  hiddenCursorTemporarilyVisible = false;
+  syncHiddenCursor();
   if (modal === "submitIntro") {
     const contentKey = state.submitIntroContentKey || "";
     if (submitIntroDraft.contentKey !== contentKey) {
@@ -2435,6 +2458,89 @@ const renderChapterMarks = () => {
   setText(chapterTitle, index >= 0 && state.chapterTitleEnabled !== false ? chapters[index].title : "");
 };
 
+const defaultShortcutOverlayItems = [
+  { keys: "Space / K", label: "Play or pause", group: "playback" },
+  { keys: "Left / Right", label: "Seek back or forward 10 s", group: "playback" },
+  { keys: "Up / Down", label: "Turn volume up or down", group: "playback" },
+  { keys: "M", label: "Mute or unmute", group: "playback" },
+  { keys: "F", label: "Enter or exit fullscreen", group: "navigation" },
+  { keys: "Esc", label: "Exit fullscreen or close panel", group: "navigation" },
+  { keys: "S", label: "Skip intro when shown", group: "playback" },
+  { keys: "N", label: "Next episode", group: "navigation" },
+  { keys: "?", label: "Show or hide shortcuts", group: "navigation" },
+  { keys: "C", label: "Subtitles", group: "navigation" },
+  { keys: "A", label: "Audio tracks", group: "navigation" },
+  { keys: "`", label: "Playback speed", group: "playback" },
+  { keys: "/", label: "Reset speed to 1x", group: "playback" },
+  { keys: "E", label: "Episodes", group: "navigation" },
+  { keys: "Q", label: "Sources", group: "navigation" },
+  { keys: "P", label: "Picture-in-Picture", group: "navigation" },
+];
+
+const renderShortcutsModal = () => {
+  if (!shortcutsGrid) return;
+  const titleText = state.shortcutsLabel || "Keyboard shortcuts";
+  if (shortcutsModalTitle) shortcutsModalTitle.textContent = titleText;
+  if (shortcutsCloseButton) shortcutsCloseButton.textContent = state.panelCloseLabel || "Close";
+  if (shortcutsModal) shortcutsModal.setAttribute("aria-label", titleText);
+
+  const items = Array.isArray(state.shortcutsItems) && state.shortcutsItems.length > 0
+    ? state.shortcutsItems
+    : defaultShortcutOverlayItems;
+  const groups = [
+    { key: "playback", title: state.shortcutsGroupPlaybackLabel || "Playback" },
+    { key: "navigation", title: state.shortcutsGroupNavigationLabel || "Navigation" },
+  ];
+
+  shortcutsGrid.textContent = "";
+  groups.forEach(group => {
+    const groupItems = items.filter(item => (item.group || "playback") === group.key);
+    if (groupItems.length === 0) return;
+
+    const section = document.createElement("div");
+    section.className = "shortcuts-group";
+
+    const heading = document.createElement("div");
+    heading.className = "shortcuts-group-title";
+    heading.textContent = group.title;
+    section.appendChild(heading);
+
+    const list = document.createElement("div");
+    list.className = "shortcuts-list";
+
+    groupItems.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "shortcut-row";
+
+      const desc = document.createElement("span");
+      desc.className = "shortcut-desc";
+      desc.textContent = item.label || "";
+
+      const keysWrap = document.createElement("span");
+      keysWrap.className = "shortcut-keys";
+      String(item.keys || "").split(" / ").forEach((token, idx) => {
+        if (idx > 0) {
+          const sep = document.createElement("span");
+          sep.textContent = "/";
+          sep.style.opacity = "0.5";
+          sep.style.fontSize = "12px";
+          keysWrap.appendChild(sep);
+        }
+        const kbd = document.createElement("kbd");
+        kbd.className = "shortcut-key";
+        kbd.textContent = token.trim();
+        keysWrap.appendChild(kbd);
+      });
+
+      row.append(desc, keysWrap);
+      list.appendChild(row);
+    });
+
+    section.appendChild(list);
+    shortcutsGrid.appendChild(section);
+  });
+};
+
 const renderActiveModal = (modalOpened = false) => {
   if (activeModal === "audio") renderAudioTrackList();
   if (activeModal === "subtitles") renderSubtitleModal();
@@ -2443,6 +2549,7 @@ const renderActiveModal = (modalOpened = false) => {
   if (activeModal === "episodes") renderEpisodesModal(modalOpened);
   if (activeModal === "chapters") renderChaptersModal(modalOpened);
   if (activeModal === "streamInfo") renderStreamInfoModal();
+  if (activeModal === "shortcuts") renderShortcutsModal();
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
   if (activeModal === "party") renderPartyModal();
@@ -2460,8 +2567,13 @@ window.nuvioNativeViewportChanged = () => {
 };
 
 window.nuvioNativeResizeEnded = () => {
+  pipPointerDown = false;
+  clearSuppressNextRootClick();
   window.clearTimeout(nativeViewportTimer);
   root.classList.remove("native-resizing");
+  if (document.body.style.cursor && document.body.style.cursor.includes("resize")) {
+    document.body.style.cursor = "";
+  }
   noteChromeActivity(true);
   syncSkipPromptPlacement(skipPrompt.classList.contains("visible"));
   if (activeModal) renderActiveModal();
@@ -2653,13 +2765,12 @@ const isChromeInteractionTarget = target =>
   Boolean(target && target.closest && target.closest(chromeInteractionSelector));
 
 const isInteractingWithChrome = () =>
-  Boolean(isChromePointerInside || isChromePointerDown || isChromeFocusInside);
+  Boolean(isChromePointerDown || isScrubbing || isTextEntryTarget(document.activeElement) || isChromeFocusInside);
 
 const canAutoHideChrome = showOpening => Boolean(
   state.controlsVisible &&
   !state.isLoading &&
   !activeModal &&
-  !isScrubbing &&
   !isInteractingWithChrome() &&
   !playbackErrorText() &&
   !showOpening,
@@ -2670,10 +2781,8 @@ const currentChromeAutoHideKey = showOpening => {
   return [
     chromeAutoHideActivity,
     state.controlsVisible ? "visible" : "hidden",
-    state.isPlaying ? "playing" : "paused",
     state.isLoading ? "loading" : "ready",
     activeModal || "none",
-    isScrubbing ? "scrubbing" : "idle",
     isInteractingWithChrome() ? "interacting" : "idle-controls",
     showOpening ? "opening" : "ready",
   ].join(":");
@@ -2687,7 +2796,13 @@ const clearChromeAutoHideTimer = () => {
 
 const shouldHideCursorForIdleChrome = () => Boolean(
   !playbackErrorText() &&
-  !state.controlsVisible,
+  !state.controlsVisible &&
+  !activeModal &&
+  !isChromePointerDown &&
+  !isScrubbing &&
+  !state.isLoading &&
+  !isOpeningOverlayActive() &&
+  !isTextEntryTarget(document.activeElement),
 );
 
 const clearHiddenCursorTimer = () => {
@@ -2702,12 +2817,27 @@ const syncHiddenCursor = () => {
     root.classList.remove("cursor-hidden");
     return;
   }
-  root.classList.toggle("cursor-hidden", !hiddenCursorTemporarilyVisible);
+  const hidden = !hiddenCursorTemporarilyVisible;
+  root.classList.toggle("cursor-hidden", hidden);
+  if (hidden && !state.isInPip && document.body.style.cursor && document.body.style.cursor.includes("resize")) {
+    document.body.style.cursor = "";
+  }
 };
 
 const noteCursorActivity = () => {
   if (!shouldHideCursorForIdleChrome()) {
+    lastCursorWakeSentWhileHidden = false;
     syncHiddenCursor();
+    return;
+  }
+
+  if (!state.isLocked && !isOpeningOverlayActive()) {
+    lastCursorWakeSentWhileHidden = true;
+    cursorActivityLastSentAt = window.performance ? window.performance.now() : Date.now();
+    chromeAutoHideActivity += 1;
+    state = { ...state, controlsVisible: true };
+    renderChrome();
+    send("cursorActivity", 0);
     return;
   }
 
@@ -2718,10 +2848,12 @@ const noteCursorActivity = () => {
   hiddenCursorTimer = window.setTimeout(() => {
     hiddenCursorTimer = 0;
     hiddenCursorTemporarilyVisible = false;
+    lastCursorWakeSentWhileHidden = false;
     syncHiddenCursor();
   }, hiddenCursorHideDelayMs);
 
-  if (now - cursorActivityLastSentAt >= cursorActivityThrottleMs) {
+  if (!lastCursorWakeSentWhileHidden || now - cursorActivityLastSentAt >= cursorActivityThrottleMs) {
+    lastCursorWakeSentWhileHidden = true;
     cursorActivityLastSentAt = now;
     send("cursorActivity", 0);
   }
@@ -2729,6 +2861,8 @@ const noteCursorActivity = () => {
 
 const hideChromeFromAutoTimer = () => {
   if (!canAutoHideChrome(isOpeningOverlayActive())) return;
+  lastCursorWakeSentWhileHidden = false;
+  hiddenCursorTemporarilyVisible = false;
   state = { ...state, controlsVisible: false };
   renderChrome();
   send("hideChrome", 0);
@@ -2752,34 +2886,61 @@ const syncChromeAutoHideTimer = showOpening => {
   }, chromeAutoHideDelayMs);
 };
 
+const isChromeHoldBlockingAutoHide = () =>
+  Boolean(isChromePointerDown || isScrubbing || activeModal || isTextEntryTarget(document.activeElement) || isChromeFocusInside);
+
+const syncNativeChromeInteraction = () => {
+  const interacting = isChromeHoldBlockingAutoHide();
+  if (interacting === lastSentChromeInteracting) return;
+  lastSentChromeInteracting = interacting;
+  send("chromeInteraction", interacting ? 1 : 0);
+};
+
 const noteChromeActivity = (force = false) => {
   if (!state.controlsVisible) return;
   const now = window.performance ? window.performance.now() : Date.now();
+  chromeAutoHideActivity += 1;
+  syncChromeAutoHideTimer(isOpeningOverlayActive());
   if (!force && now - chromeInteractionLastNotedAt < chromeActivityThrottleMs) {
-    syncChromeAutoHideTimer(isOpeningOverlayActive());
     return;
   }
   chromeInteractionLastNotedAt = now;
-  chromeAutoHideActivity += 1;
-  syncChromeAutoHideTimer(isOpeningOverlayActive());
-  send("keepChromeVisible", 0);
+  send("keepChromeVisible", isChromeHoldBlockingAutoHide() ? 1 : 0);
 };
 
 const updateChromePointerInside = inside => {
-  if (isChromePointerInside === inside) return;
   isChromePointerInside = inside;
-  noteChromeActivity(true);
+};
+
+const flushStuckScrubbingIfNeeded = () => {
+  if (!isScrubbing || partySeekTimer) return;
+  isScrubbing = false;
+  scrubPositionMs = rangePositionMs();
+  send("scrubFinish", scrubPositionMs);
 };
 
 const finishChromePointerInteraction = event => {
   isChromePointerDown = false;
-  if (event && event.type !== "pointercancel") {
-    isChromePointerInside = isChromeInteractionTarget(event.target);
-  } else {
-    isChromePointerInside = false;
-  }
+  isChromePointerInside = event && event.type !== "pointercancel"
+    ? isChromeInteractionTarget(event.target)
+    : false;
   clearPressedButton();
-  noteChromeActivity(true);
+  if (!activeModal && !isTextEntryTarget(document.activeElement)) {
+    focusShortcutRoot();
+  }
+  syncNativeChromeInteraction();
+  window.setTimeout(() => {
+    if (!isChromePointerDown) {
+      flushStuckScrubbingIfNeeded();
+      isChromeFocusInside = isTextEntryTarget(document.activeElement);
+      syncNativeChromeInteraction();
+      if (state.controlsVisible) {
+        noteChromeActivity(true);
+      } else {
+        syncHiddenCursor();
+      }
+    }
+  }, 0);
 };
 
 const renderChrome = () => {
@@ -2863,6 +3024,11 @@ const renderChrome = () => {
   setAttr(backButton, "aria-label", state.closeLabel || "Close player");
   setAttr(submitIntroButton, "aria-label", state.submitIntroLabel || "Submit Intro");
   setAttr(videoSettingsButton, "aria-label", state.videoSettingsLabel || "Video settings");
+  if (shortcutsButton) {
+    const shortcutsText = state.shortcutsLabel || "Keyboard shortcuts";
+    setAttr(shortcutsButton, "aria-label", shortcutsText);
+    setAttr(shortcutsButton, "title", `${shortcutsText} (?)`);
+  }
   setProgress(positionMs, durationMs, bufferedPositionMs);
   if (showError) {
     skipPrompt.classList.remove("visible", "show-progress");
@@ -3153,13 +3319,11 @@ document.addEventListener("pointerdown", event => {
   if (interactingWithChrome) {
     isChromePointerDown = true;
     isChromePointerInside = true;
+    syncNativeChromeInteraction();
     noteChromeActivity(true);
-  }
-  if (!isTextEntryTarget(event.target) && !isInteractiveControlTarget(event.target)) {
+  } else if (!isTextEntryTarget(event.target)) {
     focusShortcutRoot();
-    if (!interactingWithChrome) {
-      noteChromeActivity(true);
-    }
+    noteChromeActivity(true);
   }
   const button = event.target.closest("button");
   if (!button || button.disabled) return;
@@ -3169,22 +3333,35 @@ document.addEventListener("pointerdown", event => {
 }, true);
 
 document.addEventListener("pointermove", event => {
-  noteCursorActivity();
+  const sameCoords =
+    lastPointerMoveX !== null &&
+    event.clientX === lastPointerMoveX &&
+    event.clientY === lastPointerMoveY;
+  lastPointerMoveX = event.clientX;
+  lastPointerMoveY = event.clientY;
+  if (sameCoords) return;
+
   const inside = isChromeInteractionTarget(event.target);
   updateChromePointerInside(inside);
-  if (inside) {
+  if (state.controlsVisible) {
     noteChromeActivity();
+  } else {
+    noteCursorActivity();
   }
 }, true);
 
 document.addEventListener("pointerup", finishChromePointerInteraction, true);
 document.addEventListener("pointercancel", finishChromePointerInteraction, true);
+document.addEventListener("lostpointercapture", finishChromePointerInteraction, true);
 document.addEventListener("dragend", clearPressedButton, true);
-document.addEventListener("pointerleave", () => {
-  updateChromePointerInside(false);
+document.addEventListener("pointerleave", event => {
+  if (event.target === document.documentElement || event.target === document) {
+    isChromePointerInside = false;
+  }
 }, true);
 document.addEventListener("focusin", event => {
-  isChromeFocusInside = isChromeInteractionTarget(event.target);
+  isChromeFocusInside = isTextEntryTarget(event.target);
+  syncNativeChromeInteraction();
   const actionButton = event.target.closest && event.target.closest(".action-pill .action");
   if (actionButton) {
     setFocusedActionButton(actionButton, { focus: false });
@@ -3195,21 +3372,33 @@ document.addEventListener("focusin", event => {
 }, true);
 document.addEventListener("focusout", () => {
   window.setTimeout(() => {
-    isChromeFocusInside = isChromeInteractionTarget(document.activeElement);
-    noteChromeActivity(true);
+    isChromeFocusInside = isTextEntryTarget(document.activeElement);
+    syncNativeChromeInteraction();
+    syncChromeAutoHideTimer(isOpeningOverlayActive());
   }, 0);
 }, true);
-window.addEventListener("blur", () => {
+const resetTransientPointerAndFocusState = () => {
   isChromePointerInside = false;
   isChromePointerDown = false;
   isChromeFocusInside = false;
+  lastPointerMoveX = null;
+  lastPointerMoveY = null;
   clearPressedButton();
+  flushStuckScrubbingIfNeeded();
+  syncNativeChromeInteraction();
   syncChromeAutoHideTimer(isOpeningOverlayActive());
+  syncHiddenCursor();
   clearSpeedBoostTimers();
   releaseFilterRowPointerCaptures();
   if (isHoldSpeedActive || isSpaceBoosting || isSpeedBoosting) {
     suppressNextRootClick = true;
     stopSpeedBoost();
+  }
+};
+window.addEventListener("blur", resetTransientPointerAndFocusState);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    resetTransientPointerAndFocusState();
   }
 });
 
@@ -3543,6 +3732,22 @@ p2pConsentEnableButton.addEventListener("click", event => {
   send("enableP2pForPlayerControls", 0);
 });
 
+if (shortcutsButton) {
+  shortcutsButton.addEventListener("click", event => {
+    event.stopPropagation();
+    if (activeModal === "shortcuts") closePlayerModal(true);
+    else openPlayerModal("shortcuts");
+  });
+}
+
+if (shortcutsCloseButton) {
+  shortcutsCloseButton.addEventListener("click", event => {
+    event.stopPropagation();
+    closePlayerModal(true);
+    focusShortcutRoot();
+  });
+}
+
 skipPrompt.addEventListener("click", event => {
   event.stopPropagation();
   send("skipInterval", 0);
@@ -3595,16 +3800,26 @@ function showHiddenSubtitles() {
   send("subtitleVisibility", 1);
 }
 
-volumeButton.addEventListener("click", () => {
-  noteChromeActivity();
-  if (state.volumeLevel > 0) {
-    preMuteVolumeLevel = state.volumeLevel;
+const currentVolumeOrDefault = () =>
+  typeof state.volumeLevel === "number" && Number.isFinite(state.volumeLevel)
+    ? clampVolumeLevel(state.volumeLevel)
+    : 1.0;
+
+const toggleVolumeMute = () => {
+  const currentLevel = currentVolumeOrDefault();
+  if (currentLevel > 0) {
+    preMuteVolumeLevel = currentLevel;
     state.volumeLevel = 0;
   } else {
     state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
   }
   syncVolumeControl();
   send("volumeChangeTemporary", state.volumeLevel);
+};
+
+volumeButton.addEventListener("click", () => {
+  noteChromeActivity(true);
+  toggleVolumeMute();
 });
 
 timeLabel.addEventListener("click", () => {
@@ -3691,9 +3906,17 @@ window.playerControls = nextState => {
     ? state.isPlaying
     : pendingIsPlaying;
   const currentVolumeLevel = hasReceivedPlayerControls ? state.volumeLevel : undefined;
+  const incomingControlsVisible = Boolean(nextState.controlsVisible);
+  const kotlinControlsVisibleChanged =
+    !hasReceivedPlayerControls || incomingControlsVisible !== lastKotlinControlsVisible;
+  lastKotlinControlsVisible = incomingControlsVisible;
+  const resolvedControlsVisible = kotlinControlsVisibleChanged
+    ? incomingControlsVisible
+    : Boolean(state.controlsVisible);
   state = {
     ...state,
     ...nextState,
+    controlsVisible: resolvedControlsVisible,
     isPlaying: currentPlaybackState,
     volumeLevel: currentVolumeLevel ?? nextState.volumeLevel,
   };
@@ -3791,19 +4014,6 @@ const clearSuppressNextRootClick = () => {
   if (suppressClickTimer) {
     window.clearTimeout(suppressClickTimer);
     suppressClickTimer = null;
-  }
-};
-
-window.nuvioNativeViewportChanged = () => {
-  root.classList.add("native-resizing");
-};
-
-window.nuvioNativeResizeEnded = () => {
-  pipPointerDown = false;
-  clearSuppressNextRootClick();
-  root.classList.remove("native-resizing");
-  if (document.body.style.cursor && document.body.style.cursor.includes("resize")) {
-    document.body.style.cursor = "";
   }
 };
 
@@ -4096,6 +4306,7 @@ document.addEventListener("keyup", event => {
   }
   if (event.code === "Space") {
     if (clearSpaceHoldTimerAndStopSpeedBoost()) return;
+    if (playbackErrorText()) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (activeModal || isTextEntryTarget(event.target)) return;
     event.preventDefault();
@@ -4104,6 +4315,10 @@ document.addEventListener("keyup", event => {
     requestPlaybackState("setPlaybackStateQuiet", false);
   }
 });
+
+const isSkipPromptShown = () =>
+  Boolean(skipPrompt && skipPrompt.classList.contains("visible")) ||
+  Boolean(state.skipPromptVisible && !state.skipPromptDismissed && !skipPromptAutoHidden);
 
 document.addEventListener("keydown", event => {
   if (event.key === "Escape" && isPartyConfirmOpen()) {
@@ -4145,6 +4360,19 @@ document.addEventListener("keydown", event => {
     return;
   }
   if (isTextEntryTarget(event.target)) {
+    return;
+  }
+
+  const isShortcutsToggleKey = event.key === "?" || (event.code === "Slash" && event.shiftKey);
+  if (isShortcutsToggleKey) {
+    clearSpaceHoldTimerAndStopSpeedBoost();
+    event.preventDefault();
+    if (activeModal === "shortcuts") {
+      closePlayerModal(true);
+      focusShortcutRoot();
+    } else {
+      openPlayerModal("shortcuts");
+    }
     return;
   }
 
@@ -4264,7 +4492,7 @@ document.addEventListener("keydown", event => {
     else openPlayerModal("audio");
     return;
   }
-  if (event.code === "KeyS") {
+  if (event.code === "KeyC") {
     event.preventDefault();
     if (activeModal === "subtitles") closePlayerModal(true);
     else openPlayerModal("subtitles");
@@ -4297,7 +4525,15 @@ document.addEventListener("keydown", event => {
     return;
   }
 
-  if (event.code === "Enter" && state.skipPromptVisible) {
+  if (event.code === "KeyS") {
+    if (isSkipPromptShown()) {
+      event.preventDefault();
+      focusShortcutRoot();
+      send("skipInterval", 0);
+    }
+    return;
+  }
+  if (event.code === "Enter" && isSkipPromptShown()) {
     const activeEl = document.activeElement;
     if (!activeEl || activeEl.tagName === "BODY" || activeEl === root) {
       event.preventDefault();
@@ -4305,7 +4541,7 @@ document.addEventListener("keydown", event => {
       return;
     }
   }
-  if (event.shiftKey && event.code === "KeyN") {
+  if (event.code === "KeyN") {
     event.preventDefault();
     send("playNextEpisode", 0);
     return;
@@ -4355,14 +4591,7 @@ document.addEventListener("keydown", event => {
   }
   if (event.code === "KeyM") {
     event.preventDefault();
-    if (state.volumeLevel > 0) {
-      preMuteVolumeLevel = state.volumeLevel;
-      state.volumeLevel = 0;
-    } else {
-      state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
-    }
-    syncVolumeControl();
-    send("volumeChangeTemporary", state.volumeLevel);
+    toggleVolumeMute();
     showPlayerToast(volumeToastLabel(0), { icon: state.volumeLevel > 0 ? "icon-volume" : "icon-volume-muted" });
     return;
   }
@@ -4416,7 +4645,7 @@ document.addEventListener("keydown", event => {
     }
     return;
   }
-  if (event.code === "Slash") {
+  if (!event.shiftKey && event.code === "Slash") {
     event.preventDefault();
     pendingSpeedIndex = speedOptions.findIndex(o => o.value === 1.0);
     window.clearTimeout(pendingSpeedTimer);
@@ -4426,8 +4655,12 @@ document.addEventListener("keydown", event => {
     return;
   }
 
-  if (canSpeedBoostStart() && event.code === "Space") {
+  if (event.code === "Space") {
     event.preventDefault();
+    focusShortcutRoot();
+    if (!canSpeedBoostStart()) {
+      return;
+    }
     if (event.repeat) {
       if (!isSpeedBoosting) {
         isSpaceBoosting = true;

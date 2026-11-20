@@ -539,7 +539,10 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         showParentalGuide,
         errorMessage,
     ) {
+        // Desktop owns its 3s pointer/modal/hover hide timer inside the native player UI
+        // so Compose never fights open HTML panels, cursor drags, or paused auto-hide.
         if (
+            isDesktop ||
             !controlsVisible ||
             isScrubbingTimeline ||
             !playbackSnapshot.isPlaying ||
