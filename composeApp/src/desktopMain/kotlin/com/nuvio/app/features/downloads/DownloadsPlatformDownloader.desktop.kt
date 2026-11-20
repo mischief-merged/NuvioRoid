@@ -107,6 +107,13 @@ internal actual object DownloadsPlatformDownloader {
                 onPaused()
                 return@launch
             }
+            val writerId = request.item.id
+            var writerReleased = false
+            fun releaseWriter() {
+                if (writerReleased) return
+                writerReleased = true
+                WriterTokens.release(writerId)
+            }
             try {
             val location = folders.locations.locationOfRecord(request.item.locationId, null)
             val downloadsDir = File(location.path.also { if (location.id == DownloadLocations.AppId) it.createDirectories() }.toUri())
@@ -141,6 +148,9 @@ internal actual object DownloadsPlatformDownloader {
                     onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
                     return@launch
                 }
+                // The file is closed. Give the token back before success is reported, so a caller that
+                // starts the next transfer inside that report is not told the previous writer still holds it.
+                releaseWriter()
                 onSuccess(uri, request.item.totalBytes ?: recovered.length())
                 return@launch
             }
@@ -330,7 +340,6 @@ internal actual object DownloadsPlatformDownloader {
                     val finalSize = published.length()
                     // Remembered, so that a file found bad right after this can be removed only while it is still this one.
                     DownloadMover.identityOf(published.toPath())?.let { publishedKeys[published.toURI().toString()] = it }
-                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
                     if (request.isCompletionAccepted()) {
                         val retiredKeys = retireKeptPartials(
                             keptPartials = keptPartials,
@@ -344,6 +353,10 @@ internal actual object DownloadsPlatformDownloader {
                             request.onSupersededPartialsRetired(retiredKeys)
                         }
                     }
+                    // Old partials are retired first, while this writer still holds the token. Success is
+                    // reported only after the token is free.
+                    releaseWriter()
+                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
                     return@launch
                 } catch (error: CancellationException) {
                     onPaused()
@@ -413,8 +426,10 @@ internal actual object DownloadsPlatformDownloader {
                 }
             }
             } finally {
-                // Only now, with the file closed, can anything else write or move it.
-                WriterTokens.release(request.item.id)
+                // Pause and failure report before this runs, so a transfer that is still closing is not
+                // overtaken. A second release is skipped: success already gave the token back, and a caller
+                // may have taken it again inside that report.
+                releaseWriter()
                 request.onFinished()
             }
         }
