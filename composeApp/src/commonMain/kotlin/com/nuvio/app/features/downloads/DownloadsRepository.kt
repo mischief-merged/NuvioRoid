@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -181,6 +182,7 @@ object DownloadsRepository {
                 if (indexJob?.isActive == true) return
                 val generation = ++indexGeneration
                 indexJob = indexScope.launch(indexDispatcher) {
+                    if (!isActive) return@launch
                     ensureLoaded()
                     val snapshot = _uiState.value.items
                     val key = completedIndexKey(snapshot)
@@ -256,6 +258,8 @@ object DownloadsRepository {
         }
         val candidates = items.filter { it.isVerifiedCompletedStatus() }
         val job = indexScope.launch(indexDispatcher) {
+            // A newer index, or a cleared list, already took this one's place. Do not look at the files.
+            if (!isActive || synchronized(indexLock) { indexGeneration != generation }) return@launch
             val built = OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
             synchronized(indexLock) {
                 if (indexGeneration == generation) {
