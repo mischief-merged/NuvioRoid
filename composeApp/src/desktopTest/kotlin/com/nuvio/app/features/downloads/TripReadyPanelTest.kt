@@ -10,6 +10,8 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
+import com.nuvio.app.core.network.NetworkCondition
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.debrid.DebridStreamLanguage
 import com.nuvio.app.features.streams.StreamBehaviorHints
@@ -54,6 +56,9 @@ class TripReadyPanelTest {
         backend = FakeDownloadsBackend()
         DownloadsRepository.backend = backend
         DownloadsRepository.clearLocalState()
+        // A probe left running by another test must not hide the time left on an active transfer.
+        NetworkStatusRepository.resetForTest()
+        NetworkStatusRepository.setConditionForTest(NetworkCondition.Online)
         runnerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     }
 
@@ -62,6 +67,7 @@ class TripReadyPanelTest {
         runnerScope.cancel()
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = previousBackend
+        NetworkStatusRepository.resetForTest()
     }
 
     @Test
