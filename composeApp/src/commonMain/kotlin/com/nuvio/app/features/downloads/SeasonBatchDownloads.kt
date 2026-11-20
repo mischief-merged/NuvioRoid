@@ -5,12 +5,14 @@ import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.addons.fetchAddonResponseText
+import com.nuvio.app.features.debrid.DebridStreamLanguage
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.debrid.DirectDebridPlayableResult
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamParser
+import com.nuvio.app.features.streams.WantedContent
 import com.nuvio.app.features.streams.runCatchingUnlessCancelled
 import com.nuvio.app.features.streams.streamAddonInstanceId
 import com.nuvio.app.features.streams.supportsStream
@@ -131,7 +133,33 @@ internal object SeasonBatchDownloads {
         return result
     }
 
-    private suspend fun fetchAddonStreams(episode: SeasonBatchEpisode): List<StreamItem> {
+    internal suspend fun fetchStreamsForEpisode(
+        episode: SeasonBatchEpisode,
+        quality: BatchQuality,
+        maxBitrateMbps: Int?,
+        audioLanguage: DebridStreamLanguage?,
+        wanted: WantedContent?,
+    ): List<StreamItem> {
+        val embedded = rankBatchCandidates(
+            streams = MetaDetailsRepository.findEmbeddedStreams(episode.videoId),
+            quality = quality,
+            maxBitrateMbps = maxBitrateMbps,
+            audioLanguage = audioLanguage,
+            runtimeMinutes = episode.runtimeMinutes,
+            wanted = wanted,
+        )
+        if (embedded.isNotEmpty()) return embedded
+        return rankBatchCandidates(
+            streams = fetchAddonStreams(episode),
+            quality = quality,
+            maxBitrateMbps = maxBitrateMbps,
+            audioLanguage = audioLanguage,
+            runtimeMinutes = episode.runtimeMinutes,
+            wanted = wanted,
+        )
+    }
+
+    internal suspend fun fetchAddonStreams(episode: SeasonBatchEpisode): List<StreamItem> {
         val type = episode.movie?.metaType ?: "series"
         val streamId = if (episode.movie != null) movieStreamId(episode.videoId) else episode.videoId
         return coroutineScope {
@@ -171,7 +199,7 @@ internal object SeasonBatchDownloads {
         return runCatchingUnlessCancelled { TmdbService.tmdbToImdb(tmdbId, "movie") }.getOrNull() ?: videoId
     }
 
-    private suspend fun prepareStream(stream: StreamItem, episode: SeasonBatchEpisode): StreamItem? {
+    internal suspend fun prepareStream(stream: StreamItem, episode: SeasonBatchEpisode): StreamItem? {
         val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
             stream = stream,
             season = episode.seasonNumber.takeIf { episode.movie == null },

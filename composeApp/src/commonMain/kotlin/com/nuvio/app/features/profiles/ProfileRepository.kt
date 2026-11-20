@@ -175,7 +175,7 @@ object ProfileRepository {
     }
 
     private fun selectProfile(profileIndex: Int) {
-        activeProfileIndex = profileIndex
+        DownloadsRepository.selectProfileForDownloads { activeProfileIndex = profileIndex }
         CustomPosterUrlRepository.onProfileChanged()
         val selectedProfile = _state.value.profiles.find { it.profileIndex == profileIndex }
         _state.value = _state.value.copy(

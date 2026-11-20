@@ -307,6 +307,7 @@ internal class DesktopDownloadFolders(
                 totalBytes = members.sumOf { it.moveBytes },
                 usedBytes = used?.usedBytes ?: members.sumOf { it.moveBytes },
                 usedIsLastKnown = used?.lastKnown ?: false,
+                volumeKey = runCatching { Files.getFileStore(location.path).toString() }.getOrDefault(location.id),
                 freeBytes = if (availability == FolderAvailability.Available) {
                     FsGuard.call(3_000L, null) { DownloadFolderValidator.freeBytes(location.path) }
                 } else {
@@ -316,7 +317,7 @@ internal class DesktopDownloadFolders(
         }
         // Each volume counted once, so two folders on one drive do not count its free space twice.
         val freeTotal = infos.filter { it.availability == FolderAvailability.Available && it.freeBytes != null }
-            .distinctBy { info -> runCatching { Files.getFileStore(Paths.get(info.path)).toString() }.getOrDefault(info.id) }
+            .distinctBy { it.volumeKey }
             .sumOf { it.freeBytes ?: 0L }
             .takeIf { infos.any { it.availability == FolderAvailability.Available && it.freeBytes != null } }
         _state.value = DownloadFolderState(

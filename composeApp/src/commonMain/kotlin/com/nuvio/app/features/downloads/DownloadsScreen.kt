@@ -157,6 +157,8 @@ internal fun DownloadsScreenContent(
      * source by itself: a bad source then offers only the user's own choices.
      */
     sourceSearches: kotlinx.coroutines.flow.StateFlow<Map<String, SourceSearchProgress>>? = null,
+    tripDeps: TripReadyDeps = TripReadyDeps(),
+    nowEpochMs: () -> Long = { DownloadsClock.nowEpochMs() },
 ) {
     val uiState by remember {
         DownloadsRepository.ensureLoaded()
@@ -184,11 +186,11 @@ internal fun DownloadsScreenContent(
     val needsClock = anyDownloading || removalByDownload.isNotEmpty()
     // Read again every few seconds while something downloads, so a transfer that went silent shows it,
     // and while a deletion is waiting, so the hours left stay right.
-    val now by produceState(initialValue = DownloadsClock.nowEpochMs(), needsClock) {
-        value = DownloadsClock.nowEpochMs()
+    val now by produceState(initialValue = nowEpochMs(), needsClock) {
+        value = nowEpochMs()
         while (needsClock) {
             delay(StatusRefreshMs)
-            value = DownloadsClock.nowEpochMs()
+            value = nowEpochMs()
         }
     }
     val folderState by folders.state.collectAsStateWithLifecycle()
@@ -259,9 +261,28 @@ internal fun DownloadsScreenContent(
     }
 
     var selectedShowId by rememberSaveable(initialShowId) { mutableStateOf(initialShowId) }
+    var showingTripReady by rememberSaveable { mutableStateOf(false) }
     var downloadPendingDeletionId by rememberSaveable { mutableStateOf<String?>(null) }
     val openDownloadsDirectoryFailedText = stringResource(Res.string.downloads_open_directory_failed)
     val deleteScope = rememberCoroutineScope()
+
+    val tripReadyActive = showingTripReady && selectedShowId == null
+    val tripController = if (showingTripReady) {
+        rememberTripReadyController(
+            active = tripReadyActive,
+            uiState = uiState,
+            folderState = folderStateNow,
+            locationIdOf = if (folders.supported) folders::locationIdOf else { item -> item.locationId.orEmpty() },
+            addressRequired = folders.supported,
+            holdState = holdState,
+            offline = network.isOfflineLike,
+            nowEpochMs = now,
+            rechecks = rechecks,
+            tripDeps = tripDeps,
+        )
+    } else {
+        null
+    }
 
     val completedEpisodes = remember(uiState.items) {
         uiState.completedItems
@@ -278,21 +299,21 @@ internal fun DownloadsScreenContent(
     NuvioScreen {
         stickyHeader {
             NuvioScreenHeader(
-                title = if (selectedShowId == null) {
-                    stringResource(Res.string.compose_settings_root_downloads_title)
-                } else {
-                    selectedShowTitle ?: stringResource(Res.string.downloads_show_downloads)
+                title = when {
+                    selectedShowId != null -> selectedShowTitle ?: stringResource(Res.string.downloads_show_downloads)
+                    showingTripReady -> stringResource(Res.string.downloads_trip_ready_title)
+                    else -> stringResource(Res.string.compose_settings_root_downloads_title)
                 },
                 onBack = {
-                    if (selectedShowId != null) {
-                        onBackFromShow?.invoke() ?: run { selectedShowId = null }
-                    } else {
-                        onBack()
+                    when {
+                        selectedShowId != null -> onBackFromShow?.invoke() ?: run { selectedShowId = null }
+                        showingTripReady -> showingTripReady = false
+                        else -> onBack()
                     }
                 },
                 actions = {
                     val headerColor = MaterialTheme.nuvio.colors.textPrimary
-                    if (selectedShowId == null && canScanDisk) {
+                    if (selectedShowId == null && !showingTripReady && canScanDisk) {
                         TextButton(
                             enabled = !scanningDisk,
                             onClick = {
@@ -321,7 +342,23 @@ internal fun DownloadsScreenContent(
                             )
                         }
                     }
-                    if (extras != null && uiState.completedItems.isNotEmpty()) {
+                    if (selectedShowId == null && !showingTripReady) {
+                        val tripReadyDescription = stringResource(Res.string.downloads_trip_ready_button_description)
+                        TextButton(
+                            onClick = {
+                                selecting = false
+                                selectedIds = emptySet()
+                                showingTripReady = true
+                            },
+                            modifier = Modifier.semantics { contentDescription = tripReadyDescription },
+                        ) {
+                            Text(
+                                text = stringResource(Res.string.downloads_trip_ready_button),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
+                    if (!showingTripReady && extras != null && uiState.completedItems.isNotEmpty()) {
                         TextButton(
                             onClick = {
                                 selecting = !selecting
@@ -397,7 +434,25 @@ internal fun DownloadsScreenContent(
             }
         }
 
-        if (selectedShowId == null) {
+        if (tripController != null && selectedShowId == null) {
+            tripReadyContent(
+                state = tripController,
+                onOpenShow = { showId, title ->
+                    onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId }
+                },
+                onOpenDownload = onOpenDownload,
+                onDownloadAnyway = connectionHold::downloadAnyway,
+                onChooseAnotherSource = onChooseAnotherSource,
+                onRecheckAll = rechecks?.let { checks ->
+                    { checkScope.launch { tripController.runRecheckAll(checks) } }
+                },
+                onFetchMissingCompanions = tripController.runFetchCompanions?.let { action ->
+                    { checkScope.launch { action() } }
+                },
+                onPauseDownload = tripDeps.pauseDownload,
+                onResumeDownload = tripDeps.resumeDownload,
+            )
+        } else if (selectedShowId == null) {
             if (extras != null) {
                 item(key = "storage-summary") {
                     DownloadStorageSummary(
@@ -1321,7 +1376,7 @@ private fun SectionTitle(title: String) {
 }
 
 @Composable
-private fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
+internal fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
     val size = if (item.status == DownloadStatus.Completed) {
         formatBytes(item.totalBytes ?: item.downloadedBytes)
     } else if (item.totalBytes != null && item.totalBytes > 0L) {
@@ -1571,7 +1626,7 @@ private fun SpeedLimitLine(megabytesPerSecond: Int, onChange: (() -> Unit)?) {
  * network (until it changes or the app is closed).
  */
 @Composable
-private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway: () -> Unit) {
+internal fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway: () -> Unit) {
     val anywayDescription = stringResource(Res.string.downloads_held_download_anyway_description)
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
