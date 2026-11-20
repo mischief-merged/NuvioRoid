@@ -90,6 +90,9 @@ internal expect object DownloadsPlatformDownloader {
 
     fun removePartialFile(destinationFileName: String): Boolean
 
+    /** Moves this download's partial files to the Trash when they are still the ones it recorded. */
+    fun retirePartial(item: DownloadItem): Boolean
+
     fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String?
 
     fun openDownloadsDirectory(): Boolean

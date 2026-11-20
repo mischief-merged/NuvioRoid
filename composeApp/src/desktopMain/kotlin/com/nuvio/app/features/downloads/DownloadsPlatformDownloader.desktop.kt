@@ -24,6 +24,8 @@ import java.awt.Desktop
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
 import java.security.MessageDigest
 import nuvio.composeapp.generated.resources.downloads_error_file_checksum
 import java.net.InetAddress
@@ -64,6 +66,12 @@ internal actual object DownloadsPlatformDownloader {
 
     /** Retires a superseded partial file after its replacement finished cleanly. Defaults to the folder's Trash helper. */
     internal var trashPartial: ((java.nio.file.Path) -> Boolean)? = null
+
+    /** Sends a removed partial to the Trash. Tests replace this so nothing reaches the system Trash. */
+    internal var trashPartialFile: ((Path) -> Boolean)? = null
+
+    /** Sends a removed download to the Trash. Tests replace this so nothing reaches the system Trash. */
+    internal var trashRemovedFile: ((String) -> Boolean)? = null
 
     /** Most link refreshes tried in a row without making byte progress. */
     internal var maxLinkRefreshesWithoutProgress: Int = DefaultMaxLinkRefreshesWithoutProgress
@@ -465,17 +473,79 @@ internal actual object DownloadsPlatformDownloader {
 
     actual fun removeFile(localFileUri: String?): Boolean {
         if (localFileUri.isNullOrBlank()) return false
-        val file = localFileUri.toLocalFileOrNull() ?: return false
-        return runCatching { file.delete() }.getOrDefault(false)
+        // A path that cannot be read is not sent anywhere.
+        localFileUri.toLocalFileOrNull() ?: return false
+        val send = trashRemovedFile ?: DownloadsTrash::moveAway
+        return runCatching { send(localFileUri) }.getOrDefault(false)
     }
 
     actual fun removePartialFile(destinationFileName: String): Boolean {
         // Without a record to say where, only the app's own folder: never a file of that name elsewhere.
         // Subtitles saved at the start of a download that never became a file go with it. Never when the file exists.
-        val video = File(appDownloadsDir, destinationFileName)
+        val video = fileInAppDownloads(destinationFileName) ?: return false
         if (!video.exists()) runCatching { DownloadSubtitleStorage(video.toURI().toString()).remove() }
-        val tempFile = File(appDownloadsDir, "$destinationFileName.part")
-        return !tempFile.exists() || runCatching { tempFile.delete() }.getOrDefault(false)
+        val item = DownloadsRepository.loadedProfile()?.let {
+            DownloadsRepository.uiState.value.items.firstOrNull { candidate -> candidate.fileName == destinationFileName }
+        }
+        if (item != null) {
+            DownloadFolders.controller.removePartialOf(item)?.let { return it }
+            return retirePartial(item)
+        }
+        // No record can prove this partial. Leave it where it is.
+        val partial = fileInAppDownloads("$destinationFileName.part") ?: return false
+        return !partial.exists()
+    }
+
+    /**
+     * Moves this download's partial files in the app's own folder to the Trash.
+     * A partial moves only when it is still the file the download recorded and no other download owns it.
+     * Nothing is deleted.
+     */
+    actual fun retirePartial(item: DownloadItem): Boolean {
+        val folder = appDownloadsDir.toPath().toAbsolutePath().normalize()
+        val targets = buildList {
+            add(item.activePartialFileName to item.partialFileKey)
+            item.supersededPartials.forEach { kept ->
+                if (kept.locationId == null || kept.locationId == DownloadLocations.AppId) {
+                    add(kept.fileName to kept.partialFileKey)
+                }
+            }
+        }
+        var allOut = true
+        for ((name, key) in targets) {
+            val partial = pathInFolder(folder, name)
+            if (partial == null || !trashOwnedAppPartial(item, partial, key)) allOut = false
+        }
+        pathInFolder(folder, item.fileName)?.let { video ->
+            if (!Files.exists(video, LinkOption.NOFOLLOW_LINKS)) {
+                runCatching { DownloadSubtitleStorage(video.toUri().toString()).remove() }
+            }
+        }
+        return allOut
+    }
+
+    private fun trashOwnedAppPartial(item: DownloadItem, path: Path, expectedKey: String?): Boolean {
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return true
+        if (Files.isSymbolicLink(path)) return false
+        if (expectedKey == null || DownloadMover.identityOf(path) != expectedKey) return false
+        val records = RepositoryDownloadsHooks.allRecords() ?: return false
+        val ownership = DownloadOwnership(DesktopDownloads.folders.locations, records)
+        val profileId = RepositoryDownloadsHooks.profileId()
+        if (ownership.otherOwner(profileId, item.id, path) != null) return false
+        val sidecar = path.resolveSibling(DownloadSidecarFiles.sidecarFolderName(path.fileName.toString()))
+        if (ownership.otherOwner(profileId, item.id, sidecar) != null) return false
+        val send = trashPartialFile ?: DownloadsTrash::moveToTrash
+        return runCatching { send(path) }.getOrDefault(false) && !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+    }
+
+    private fun fileInAppDownloads(name: String): File? = pathInFolder(appDownloadsDir.toPath(), name)?.toFile()
+
+    private fun pathInFolder(folder: Path, name: String): Path? {
+        if (name.isBlank() || name == "." || name == ".." || '/' in name || '\\' in name) return null
+        val directory = folder.toAbsolutePath().normalize()
+        val path = directory.resolve(name).normalize()
+        if (path.parent != directory) return null
+        return path
     }
 
     /** The recorded address when a file is there. Never a file found by its name instead. */

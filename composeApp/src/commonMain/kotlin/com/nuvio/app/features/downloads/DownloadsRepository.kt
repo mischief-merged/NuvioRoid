@@ -2288,10 +2288,11 @@ private object PlatformDownloadsBackend : DownloadsBackend {
     override fun locationConnected(locationId: String?): Boolean = DownloadFolders.controller.locationConnected(locationId)
 
     override fun removePartialOf(item: DownloadItem): Boolean =
-        DownloadFolders.controller.removePartialOf(item) ?: removePartialFile(item.fileName)
+        DownloadFolders.controller.removePartialOf(item) ?: DownloadsPlatformDownloader.retirePartial(item)
 
     override fun removeActivePartialOf(item: DownloadItem): Boolean =
-        DownloadFolders.controller.removeActivePartialOf(item) ?: removePartialFile(item.fileName)
+        DownloadFolders.controller.removeActivePartialOf(item)
+            ?: DownloadsPlatformDownloader.retirePartial(item.copy(supersededPartials = emptyList()))
 
     override fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? =
         DownloadFolders.controller.placementFor(items, parentMetaId, isEpisode)
