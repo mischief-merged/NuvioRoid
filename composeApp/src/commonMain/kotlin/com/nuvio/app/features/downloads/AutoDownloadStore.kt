@@ -26,7 +26,11 @@ internal object PlatformAutoDownloadPayloads : AutoDownloadPayloads {
 }
 
 @Serializable
+internal enum class DeleteAfterWatchingMode { Off, AutomaticOnly, AllDownloads }
+
+@Serializable
 private data class StoredAutoDownloads(
+    val deleteAfterWatchingMode: DeleteAfterWatchingMode = DeleteAfterWatchingMode.AutomaticOnly,
     val rules: List<AutoDownloadRule> = emptyList(),
     /** Null means no limit. */
     val storageLimitGb: Int? = AutoDownloadStore.DefaultStorageLimitGb,
@@ -46,11 +50,11 @@ internal data class AutoDownloadDeleted(
     val atEpochMs: Long,
 )
 
-/** A watched automatic download that is removed once [dueAtEpochMs] has passed. */
+/** A watched download that is removed once [dueAtEpochMs] has passed. */
 @Serializable
 internal data class AutoDownloadRemoval(
     val downloadId: String,
-    val ruleKey: String,
+    val ruleKey: String? = null,
     val dueAtEpochMs: Long,
 )
 
@@ -79,6 +83,27 @@ internal class AutoDownloadStore(
     private val _rules = MutableStateFlow<List<AutoDownloadRule>>(emptyList())
 
     private val _storageLimitGb = MutableStateFlow<Int?>(DefaultStorageLimitGb)
+
+    private val _deleteAfterWatchingMode = MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
+    private val _keptDownloadIds = MutableStateFlow<Set<String>>(emptySet())
+
+    val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> = _deleteAfterWatchingMode.asStateFlow()
+    val keptDownloadIds: StateFlow<Set<String>> = _keptDownloadIds.asStateFlow()
+
+    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        save(profileId, state.copy(deleteAfterWatchingMode = mode))
+        true
+    }
+
+    fun allowsRemoval(profileId: Int, ruleKey: String?): Boolean = synchronized(lock) {
+        ensureLoaded() == profileId && state.allowsRemoval(ruleKey)
+    }
+
+    private fun StoredAutoDownloads.allowsRemoval(ruleKey: String?): Boolean =
+        deleteAfterWatchingMode != DeleteAfterWatchingMode.Off &&
+            if (ruleKey == null) deleteAfterWatchingMode == DeleteAfterWatchingMode.AllDownloads
+            else rules.any { it.key == ruleKey && it.deleteAfterWatching }
 
     private val _removals = MutableStateFlow<List<AutoDownloadRemoval>>(emptyList())
 
@@ -112,7 +137,7 @@ internal class AutoDownloadStore(
 
     /** Schedules [removal], replacing an earlier one of the same download. Refused for a kept download. */
     fun scheduleRemoval(profileId: Int, removal: AutoDownloadRemoval): Boolean = synchronized(lock) {
-        if (ensureLoaded() != profileId || removal.downloadId in state.keptDownloadIds) return false
+        if (ensureLoaded() != profileId || removal.downloadId in state.keptDownloadIds || !state.allowsRemoval(removal.ruleKey)) return false
         save(profileId, state.copy(removals = state.removals.filterNot { it.downloadId == removal.downloadId } + removal))
         true
     }
@@ -134,6 +159,13 @@ internal class AutoDownloadStore(
                 keptDownloadIds = state.keptDownloadIds + downloadId,
             ),
         )
+        true
+    }
+
+    /** Undoing Keep permits a new schedule the next time the download is finished. */
+    fun undoKeep(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        save(profileId, state.copy(keptDownloadIds = state.keptDownloadIds - downloadId))
         true
     }
 
@@ -202,6 +234,8 @@ internal class AutoDownloadStore(
         // Written first: when that fails, nothing in memory has changed, so what is shown is what is stored.
         payloads.save(profileId, json.encodeToString(updated))
         state = updated
+        _deleteAfterWatchingMode.value = updated.deleteAfterWatchingMode
+        _keptDownloadIds.value = updated.keptDownloadIds
         _rules.value = updated.rules
         _storageLimitGb.value = updated.storageLimitGb
         _removals.value = updated.removals
@@ -213,6 +247,8 @@ internal class AutoDownloadStore(
         if (loadedProfileId != active) {
             state = read(active)
             loadedProfileId = active
+            _deleteAfterWatchingMode.value = state.deleteAfterWatchingMode
+            _keptDownloadIds.value = state.keptDownloadIds
             _rules.value = state.rules
             _storageLimitGb.value = state.storageLimitGb
             _removals.value = state.removals
@@ -235,10 +271,10 @@ internal class AutoDownloadStore(
         rules = rules.map(AutoDownloadRule::normalized).distinctBy { it.key },
         recentlyDeleted = recentlyDeleted.takeLast(MaxRecentlyDeleted),
         storageLimitGb = if (storageLimitGb in storageLimitOptionsGb) storageLimitGb else DefaultStorageLimitGb,
-        // A removal lasts only as long as its rule asks for it.
+        // Changing the setting or a rule drops removals immediately, including before they are due.
         removals = removals
             .distinctBy { it.downloadId }
-            .filter { removal -> rules.any { it.key == removal.ruleKey && it.deleteAfterWatching } },
+            .filter { it.downloadId !in keptDownloadIds && allowsRemoval(it.ruleKey) },
     )
 
     companion object {

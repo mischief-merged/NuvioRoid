@@ -21,6 +21,9 @@ import androidx.compose.ui.test.performClick
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.core.ui.NuvioToastController
 import kotlinx.coroutines.runBlocking
+import nuvio.composeapp.generated.resources.downloads_kept
+import nuvio.composeapp.generated.resources.downloads_undo_keep
+import nuvio.composeapp.generated.resources.downloads_keep_description
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_cancel
 import nuvio.composeapp.generated.resources.downloads_announce_checking
@@ -563,25 +566,31 @@ class DownloadsScreenTest {
         override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
         override var usesSystemTrash = true
         val kept = mutableListOf<String>()
+        override val keptDownloadIds = MutableStateFlow<Set<String>>(emptySet())
 
         override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
         override fun turnOff(profileId: Int, ruleKey: String) = Unit
         override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
         override fun keepDownload(profileId: Int, downloadId: String) {
             kept += downloadId
+            keptDownloadIds.value += downloadId
+            removals.value = removals.value.filterNot { it.downloadId == downloadId }
+        }
+        override fun undoKeepDownload(profileId: Int, downloadId: String) {
+            keptDownloadIds.value -= downloadId
         }
         override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
         override fun checkNow() = Unit
     }
 
-    private fun showShowWith(controller: AutoDownloadController, vararg items: String) {
+    private fun showShowWith(controller: AutoDownloadController, vararg items: String, showId: String? = "tt1") {
         backend.payload = """{"items":[${items.joinToString(",")}]}"""
         compose.setContent {
             NuvioTheme {
                 DownloadsScreenContent(
                     onBack = {},
                     onOpenDownload = {},
-                    initialShowId = "tt1",
+                    initialShowId = showId,
                     showAutoDownloads = false,
                     autoDownloads = controller,
                 )
@@ -600,7 +609,7 @@ class DownloadsScreenTest {
         showShowWith(controller, completedEpisode("a"), completedEpisode("b", episode = 4))
 
         compose.onNodeWithText(text(Res.plurals.downloads_row_deletes_in_hours, 20)).assertIsDisplayed()
-        // Only the episode with a scheduled deletion has the line and the button.
+        // Only the episode with a scheduled deletion has the countdown.
         compose.onAllNodesWithText(text(Res.plurals.downloads_row_deletes_in_hours, 20)).assertCountEquals(1)
         compose.onNodeWithContentDescription(keepDescription())
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
@@ -620,11 +629,29 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun an_episode_with_nothing_scheduled_has_no_deletion_line_or_keep_button() {
+    fun an_episode_with_nothing_scheduled_can_be_kept_and_keep_can_be_undone() {
         showShowWith(SchedulingController(), completedEpisode("a"))
 
-        compose.onNodeWithContentDescription(keepDescription()).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertDoesNotExist()
+        compose.onNodeWithContentDescription(keepDescription()).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_undo_keep)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertDoesNotExist()
+        compose.onNodeWithContentDescription(keepDescription()).assertHasClickAction()
+    }
+
+    @Test
+    fun a_manual_movie_shows_its_countdown_and_lasting_keep_action() {
+        val controller = SchedulingController()
+        controller.removals.value = listOf(AutoDownloadRemoval("movie", null, DownloadsClock.nowEpochMs() + 10 * 60_000L))
+        showShowWith(controller, stored("movie", "Completed", season = null, episode = null), showId = null)
+        compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertIsDisplayed()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_keep_description, "Pantheon")).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertDoesNotExist()
+        compose.onNodeWithText(text(Res.string.downloads_undo_keep)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertDoesNotExist()
+        assertEquals(listOf("movie"), controller.kept)
     }
 
     private fun pressDelete(name: String = "Pantheon S02E03") {

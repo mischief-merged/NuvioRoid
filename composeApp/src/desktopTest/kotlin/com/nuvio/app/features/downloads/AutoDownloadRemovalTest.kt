@@ -18,6 +18,7 @@ class AutoDownloadRemovalTest {
     private inner class FakeBackend : DownloadsBackend {
         var payload: String? = null
         var trashWorks = true
+        override var usesSystemTrash = true
         val trashed = mutableListOf<String>()
 
         override fun loadPayload(): String? = payload
@@ -113,6 +114,34 @@ class AutoDownloadRemovalTest {
 
     private fun heldFiles() = downloadsDir.resolve(DesktopDownloadsTrash.HoldingFolderName).toFile().list().orEmpty()
         .filter { it != DesktopDownloadsTrash.IndexFileName }
+
+    @Test
+    fun a_manual_download_uses_the_same_trash_step_with_no_rule_key() {
+        val file = download(1, automatic = false)
+        val result = DownloadsRepository.removeWatchedAutoDownload(item(1)!!.id, null)
+        assertEquals(AutoDownloadRemovalResult.Removed, result)
+        assertEquals(listOf(file.toUri().toString()), backend.trashed)
+        assertFalse(file.exists())
+        assertEquals(1, heldFiles().size)
+        assertNull(item(1))
+    }
+
+    @Test
+    fun a_manual_removal_is_left_alone_when_the_last_check_says_keep() {
+        val file = download(1, automatic = false)
+        assertEquals(AutoDownloadRemovalResult.Changed, DownloadsRepository.removeWatchedAutoDownload(item(1)!!.id, null) { false })
+        assertTrue(file.exists())
+        assertTrue(backend.trashed.isEmpty())
+    }
+
+    @Test
+    fun watched_downloads_are_left_alone_without_system_trash() {
+        val file = download(1, automatic = false)
+        backend.usesSystemTrash = false
+        assertEquals(AutoDownloadRemovalResult.NotMoved, DownloadsRepository.removeWatchedAutoDownload(item(1)!!.id, null))
+        assertTrue(file.exists())
+        assertTrue(backend.trashed.isEmpty())
+    }
 
     @Test
     fun a_finished_automatic_download_is_moved_out_of_the_downloads_folder_and_dropped() {

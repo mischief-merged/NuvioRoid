@@ -27,6 +27,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import nuvio.composeapp.generated.resources.downloads_delete_setting_save_failed
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast_soon
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_auto_delete_failed_toast
 import nuvio.composeapp.generated.resources.downloads_auto_delete_not_connected_toast
@@ -59,6 +62,9 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
     }
 }
 
+private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
+internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
 /** What the interface needs from automatic downloads. */
@@ -68,6 +74,11 @@ internal interface AutoDownloadController {
 
     /** The storage limit for automatic downloads, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?>
+
+    val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
+    val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
+    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
+    fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
 
     /** The watched episodes that are going to be removed. */
     val removals: StateFlow<List<AutoDownloadRemoval>>
@@ -184,6 +195,9 @@ internal object AutoDownloads : AutoDownloadController {
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
 
+    override val deleteAfterWatchingMode get() = store.deleteAfterWatchingMode
+    override val keptDownloadIds get() = store.keptDownloadIds
+
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
     override val storageLimitGb: StateFlow<Int?> get() = store.storageLimitGb
@@ -295,6 +309,18 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    override fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) {
+        scope.launch {
+            if (!runCatching { store.setDeleteAfterWatchingMode(profileId, mode) }.getOrDefault(false)) {
+                NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
+            }
+        }
+    }
+
+    override fun undoKeepDownload(profileId: Int, downloadId: String) {
+        scope.launch { runCatching { store.undoKeep(profileId, downloadId) } }
+    }
+
     override fun keepDownload(profileId: Int, downloadId: String) {
         scope.launch { runCatching { deleteAfterWatching.keep(profileId, downloadId) } }
     }
@@ -396,7 +422,11 @@ internal object AutoDownloads : AutoDownloadController {
 }
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
-private suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+    if (!item.isEpisode) {
+        return if (hours < 1) getString(Res.string.downloads_movie_scheduled_toast_soon, item.title)
+        else getPluralString(Res.plurals.downloads_movie_scheduled_toast, hours, item.title, hours)
+    }
     val season = item.seasonNumber ?: 0
     val episode = item.episodeNumber ?: 0
     return if (hours < 1) {

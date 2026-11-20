@@ -1393,7 +1393,7 @@ object DownloadsRepository {
     }
 
     /**
-     * Removes a finished automatic download: its file is moved to the trash and its entry dropped.
+     * Removes a finished watched download: its file is moved to the trash and its entry dropped.
      * Everything is looked at again here, under the state lock, so nothing that changed since the
      * caller decided is acted on: the download must still be finished and still belong to [ruleKey],
      * and [stillWanted] must say so.
@@ -1402,7 +1402,7 @@ object DownloadsRepository {
      */
     internal fun removeWatchedAutoDownload(
         downloadId: String,
-        ruleKey: String,
+        ruleKey: String?,
         stillWanted: () -> Boolean = { true },
     ): AutoDownloadRemovalResult {
         ensureLoaded()
@@ -1421,7 +1421,7 @@ object DownloadsRepository {
 
     private fun removeAutoWithLocksHeld(
         downloadId: String,
-        ruleKey: String,
+        ruleKey: String?,
         stillWanted: () -> Boolean,
         lockedUri: String?,
     ): AutoDownloadRemovalResult? = synchronized(stateLock) {
@@ -1432,6 +1432,8 @@ object DownloadsRepository {
         if (item.autoDownloadRuleKey != ruleKey || item.status != DownloadStatus.Completed || item.isPlaceholder) {
             return AutoDownloadRemovalResult.Changed
         }
+        // Scheduled removals must never use a holding folder that is later emptied permanently.
+        if (!backend.usesSystemTrash) return AutoDownloadRemovalResult.NotMoved
         if (!stillWanted()) return AutoDownloadRemovalResult.Changed
         val fileUri = backend.resolveLocalFileUri(item.localFileUri, item.fileName)
         if (fileUri != lockedUri) return null

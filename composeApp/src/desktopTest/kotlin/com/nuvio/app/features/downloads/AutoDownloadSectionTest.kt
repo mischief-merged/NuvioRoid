@@ -502,6 +502,15 @@ class AutoDownloadSectionTest {
     private fun recent(episode: Int, agoMs: Long) = AutoDownloadDeleted("Show", 1, episode, atEpochMs = shownNow - agoMs)
 
     @Test
+    fun a_manual_movie_removed_today_is_shown_without_episode_numbers_or_rules() {
+        controller.recentlyDeleted.value = listOf(AutoDownloadDeleted("Movie", atEpochMs = shownNow))
+        show()
+        compose.onNodeWithText(text(Res.string.downloads_auto_recent_heading)).assertIsDisplayed()
+        compose.onNodeWithText("Movie • " + text(Res.string.downloads_auto_recent_today)).assertIsDisplayed()
+        compose.onNodeWithText("S0 E0", substring = true).assertDoesNotExist()
+    }
+
+    @Test
     fun an_episode_deleted_after_watching_is_listed_under_recently_deleted_for_a_week() {
         controller.rules.value = listOf(rule)
         controller.recentlyDeleted.value = listOf(

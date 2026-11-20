@@ -4,6 +4,7 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.isDesktop
@@ -42,6 +43,9 @@ internal fun LazyListScope.playbackSettingsContent(
                         PoliteDownloadsSetting(isTablet)
                         SettingsGroupDivider(isTablet = isTablet)
                         DownloadFolderSetting(isTablet)
+                        SettingsGroupDivider(isTablet = isTablet)
+                        val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
+                        DeleteAfterWatchingSetting(isTablet, profileId = profileState.activeProfile?.profileIndex ?: ProfileRepository.activeProfileId)
                     }
                 }
             }

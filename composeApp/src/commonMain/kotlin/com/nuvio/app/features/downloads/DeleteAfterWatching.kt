@@ -24,27 +24,10 @@ internal enum class AutoDownloadRemovalOutcome {
 }
 
 /**
- * Removes an automatically downloaded episode some time after it was watched to the end on this
- * device. Off for every show until its rule says otherwise.
- *
- * - Only [onLocalPlaybackCompleted] schedules a removal. Marking an episode watched, or watching it
- *   elsewhere, schedules nothing.
- * - Only a finished download that carries the key of a rule with
- *   [AutoDownloadRule.deleteAfterWatching] is scheduled or removed. A download the user started
- *   carries no rule key and is never touched.
- * - The time a removal is due is stored, so it is the same after the computer slept or the app was
- *   restarted. Watching the episode to the end again sets a new time.
- * - When it is due the download is looked at again. It is left alone while it is open in the
- *   player, and until a later episode of the show is known to be released, so the last episode is
- *   never removed by itself. It is dropped from the schedule when the user chose Keep, when it is
- *   no longer watched to the end, or when its rule no longer asks for removal.
- * - Turning the option or the rule off drops what was scheduled for it at once.
- * - Every episode that was removed is noted in the store, so that the user can see for a week that
- *   it happened.
- * - [deleteNow] is the user's own request: it skips the wait and the last two checks.
- *
- * The schedule is kept in [store] with the rules of the profile, and every call names the profile
- * it is for.
+ * Schedules removal only after local playback finishes, with a stored due time that survives sleep
+ * and restart. The profile setting controls eligibility; automatic downloads also need their rule's
+ * switch. Keep always wins. Rule downloads wait for a later released episode, while manual downloads
+ * do not. Every removal uses the same guarded Trash step and records a note for a week.
  */
 internal class DeleteAfterWatching(
     private val store: AutoDownloadStore,
@@ -58,15 +41,15 @@ internal class DeleteAfterWatching(
      * The step that moves the file away and drops the download. It checks the download once more
      * and asks stillWanted at the last moment before it touches the file.
      */
-    private val removeDownload: (downloadId: String, ruleKey: String, stillWanted: () -> Boolean) -> AutoDownloadRemovalResult,
+    private val removeDownload: (downloadId: String, ruleKey: String?, stillWanted: () -> Boolean) -> AutoDownloadRemovalResult,
     private val nowEpochMs: () -> Long,
     private val holdMs: Long = DefaultHoldMs,
 ) {
     /** True when a removal was scheduled for [item]. */
     fun onLocalPlaybackCompleted(profileId: Int, item: DownloadItem): Boolean {
-        val ruleKey = item.autoDownloadRuleKey ?: return false
-        if (item.status != DownloadStatus.Completed) return false
-        if (store.rule(profileId, ruleKey)?.deleteAfterWatching != true) return false
+        val ruleKey = item.autoDownloadRuleKey
+        if (item.status != DownloadStatus.Completed || item.isPlaceholder) return false
+        if (!store.allowsRemoval(profileId, ruleKey)) return false
         return store.scheduleRemoval(profileId, AutoDownloadRemoval(item.id, ruleKey, nowEpochMs() + holdMs))
     }
 
@@ -90,10 +73,10 @@ internal class DeleteAfterWatching(
 
     private fun process(profileId: Int, removal: AutoDownloadRemoval, askedByUser: Boolean): AutoDownloadRemovalOutcome {
         val item = downloads().firstOrNull { it.id == removal.downloadId }
-        val rule = store.rule(profileId, removal.ruleKey)
+        val rule = removal.ruleKey?.let { store.rule(profileId, it) }
         if (
             item == null ||
-            rule?.deleteAfterWatching != true ||
+            !store.allowsRemoval(profileId, removal.ruleKey) ||
             item.autoDownloadRuleKey != removal.ruleKey ||
             item.status != DownloadStatus.Completed ||
             // A file marked as not the real video is the user's to remove, never removed by this.
@@ -105,7 +88,7 @@ internal class DeleteAfterWatching(
         if (isInPlayer(item)) return AutoDownloadRemovalOutcome.Playing
         if (!askedByUser) {
             if (!isWatchedToTheEnd(item)) return cancel(profileId, removal)
-            if (hasLaterEpisode(rule, item) != true) return AutoDownloadRemovalOutcome.LastEpisode
+            if (rule != null && hasLaterEpisode(rule, item) != true) return AutoDownloadRemovalOutcome.LastEpisode
         }
         // Things may change while this runs: the episode is opened, Keep, a new time after a rewatch,
         // the option turned off, another profile. All of that is asked again right before the file
@@ -114,14 +97,15 @@ internal class DeleteAfterWatching(
             !isInPlayer(item) &&
                 removal in store.removals(profileId) &&
                 !store.isKept(profileId, item.id) &&
-                store.rule(profileId, removal.ruleKey)?.deleteAfterWatching == true
+                store.allowsRemoval(profileId, removal.ruleKey) &&
+                (askedByUser || isWatchedToTheEnd(item))
         }
         return when (removeDownload(item.id, removal.ruleKey, stillWanted)) {
             AutoDownloadRemovalResult.Removed -> {
                 // The rule must know it had this episode, so that it does not fetch it again.
                 val season = item.seasonNumber
                 val episode = item.episodeNumber
-                if (season != null && episode != null) {
+                if (removal.ruleKey != null && season != null && episode != null) {
                     store.update(profileId, removal.ruleKey) {
                         it.copy(ownedEpisodeKeys = it.ownedEpisodeKeys + autoDownloadEpisodeKey(season, episode))
                     }
