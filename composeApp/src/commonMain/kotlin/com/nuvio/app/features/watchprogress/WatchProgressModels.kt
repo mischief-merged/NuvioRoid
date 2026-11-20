@@ -62,6 +62,11 @@ data class WatchProgressEntry(
     val pauseDescription: String? = null,
     val lastSourceUrl: String? = null,
     val isCompleted: Boolean = false,
+    /**
+     * Set when a sleep timer stops playback. The position is kept, but the row stays unfinished
+     * even if it is past the usual watched line.
+     */
+    val completionHeld: Boolean = false,
     val progressPercent: Float? = null,
     val source: String = WatchProgressSourceLocal,
     override val trackingProviderId: String? = null,
@@ -78,9 +83,11 @@ data class WatchProgressEntry(
         get() = progressPercent?.coerceIn(0f, 100f)
 
     val isEffectivelyCompleted: Boolean
-        get() = isCompleted ||
-            (normalizedProgressPercent?.let { it >= WatchProgressCompletionPercentThreshold } == true) ||
-            (durationMs > 0L && isWatchProgressComplete(lastPositionMs, durationMs, false))
+        get() = !completionHeld && (
+            isCompleted ||
+                (normalizedProgressPercent?.let { it >= WatchProgressCompletionPercentThreshold } == true) ||
+                (durationMs > 0L && isWatchProgressComplete(lastPositionMs, durationMs, false))
+            )
 
     val progressFraction: Float
         get() {
@@ -101,6 +108,14 @@ data class WatchProgressEntry(
         get() = !isEffectivelyCompleted
 
     fun normalizedCompletion(): WatchProgressEntry {
+        if (completionHeld) {
+            val position = lastPositionMs.coerceAtLeast(0L)
+            return if (!isCompleted && position == lastPositionMs) {
+                this
+            } else {
+                copy(lastPositionMs = position, isCompleted = false, completionHeld = true)
+            }
+        }
         val completed = isEffectivelyCompleted
         // Preserve the upstream position. Completion is a state derived at the
         // 90% threshold, not evidence that playback reached the exact duration.

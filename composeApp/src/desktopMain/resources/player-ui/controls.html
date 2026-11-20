@@ -87,6 +87,9 @@
     <symbol id="icon-chapters" viewBox="0 0 24 24">
       <path d="M3 9h14V7H3v2Zm0 4h14v-2H3v2Zm0 4h14v-2H3v2Zm16 0h2v-2h-2v2Zm0-10v2h2V7h-2Zm0 6h2v-2h-2v2Z"/>
     </symbol>
+    <symbol id="icon-sleep" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M14.4 3.1a8.4 8.4 0 1 0 6.6 13.4A7.3 7.3 0 1 1 14.4 3.1z"/>
+    </symbol>
     <symbol id="icon-info" viewBox="0 0 24 24">
       <path d="M11 7h2v2h-2V7Zm0 4h2v6h-2v-6Zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2Zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8Z"/>
     </symbol>
@@ -270,6 +273,9 @@
             <button class="action optional" id="episodesButton" data-command="episodes"><svg><use href="#icon-episodes"></use></svg><span id="episodesLabel">Episodes</span></button>
             <button class="action optional" id="chaptersButton" data-command="chapters" hidden><svg><use href="#icon-chapters"></use></svg><span id="chaptersLabel">Chapters</span></button>
             <button class="action optional" id="streamInfoButton" data-command="streamInfo"><svg><use href="#icon-info"></use></svg><span id="streamInfoLabel">Stream info</span></button>
+            <button class="action" id="sleepTimerButton" data-command="sleepTimer" aria-label="Sleep timer" title="Sleep timer (Z)">
+              <svg><use href="#icon-sleep"></use></svg><span id="sleepTimerLabel">Sleep timer</span>
+            </button>
           </div>
           <div class="playback-status">
             <div class="volume-control" id="volumeControl" aria-label="Volume">
@@ -278,6 +284,7 @@
               </button>
               <input id="volumeSlider" class="volume-slider" type="range" min="0" max="200" value="100" aria-label="Volume">
             </div>
+            <div class="sleep-remaining" id="sleepRemaining" hidden></div>
             <div class="time-label" id="timeLabel" aria-label="Toggle between total and remaining time" title="Toggle between total and remaining time">00:00 / 00:00</div>
           </div>
         </div>
@@ -285,6 +292,12 @@
       <section class="player-toast" id="playerToast" aria-live="polite" aria-atomic="true" aria-hidden="true">
         <svg class="player-toast-icon" id="playerToastIcon" aria-hidden="true" hidden><use id="playerToastIconUse" href="#icon-speed"></use></svg>
         <span class="player-toast-text" id="playerToastText"></span>
+      </section>
+      <section class="modal-layer player-rail-modal" id="sleepModal" aria-label="Sleep timer" hidden>
+        <div class="track-panel audio-rail-panel">
+          <div class="track-header" id="sleepPanelTitle">Sleep timer</div>
+          <div class="track-list" id="sleepOptionList"></div>
+        </div>
       </section>
       <section class="modal-layer player-rail-modal" id="speedModal" aria-label="Playback speed" hidden>
         <div class="track-panel audio-rail-panel">

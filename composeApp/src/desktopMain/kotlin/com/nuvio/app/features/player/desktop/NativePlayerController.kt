@@ -689,6 +689,23 @@ internal class NativePlayerController(
         }
     }
 
+    /**
+     * Quietens playback for a sleep-timer fade. Scales the level being heard now,
+     * so a mute stays silent. The slider and the saved volume stay put.
+     * A fraction of 1 puts the heard level back.
+     */
+    @Synchronized
+    override fun setVolumeFade(fraction: Float) {
+        val current = handle
+        if (current == 0L) return
+        val scaled = sleepTimerFadeOutputLevel(
+            audibleLevel = currentVolumeLevel,
+            rememberedLevel = rememberedVolumeLevel,
+            fraction = fraction,
+        )
+        NativePlayerBridge.setVolume(current, scaled)
+    }
+
     @Synchronized
     private fun applyRememberedVolume() {
         val current = handle
@@ -1800,6 +1817,38 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
             }
             append("]}")
         }
+        append(',')
+        appendJsonField("sleepTimerLabel", sleepTimerLabel)
+        append(',')
+        appendJsonField("sleepTimerPanelTitle", sleepTimerPanelTitle)
+        append(',')
+        appendJsonField("sleepTimerOffLabel", sleepTimerOffLabel)
+        append(',')
+        appendJsonField("sleepTimer15Label", sleepTimer15Label)
+        append(',')
+        appendJsonField("sleepTimer30Label", sleepTimer30Label)
+        append(',')
+        appendJsonField("sleepTimer45Label", sleepTimer45Label)
+        append(',')
+        appendJsonField("sleepTimer60Label", sleepTimer60Label)
+        append(',')
+        appendJsonField("sleepTimer90Label", sleepTimer90Label)
+        append(',')
+        appendJsonField("sleepTimerEndLabel", sleepTimerEndLabel)
+        append(',')
+        appendJsonField("sleepTimerStopAfterLabel", sleepTimerStopAfterLabel)
+        append(',')
+        appendJsonField("sleepTimerShortcutLabel", sleepTimerShortcutLabel)
+        append(',')
+        appendJsonField("sleepTimerOption", sleepTimerOption)
+        append(',')
+        appendJsonField("sleepTimerStopAfter", sleepTimerStopAfter)
+        append(',')
+        appendJsonField("sleepTimerRemainingLabel", sleepTimerRemainingLabel)
+        append(',')
+        appendJsonField("sleepTimerFading", sleepTimerFading)
+        append(',')
+        appendJsonField("sleepTimerActive", sleepTimerActive)
         append(",\"party\":")
         append(partyJson.encodeToString(PlayerControlPartyState.serializer(), party.withWebviewImages(onImageReady)))
         append('}')

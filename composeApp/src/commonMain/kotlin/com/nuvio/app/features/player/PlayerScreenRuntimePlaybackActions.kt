@@ -176,6 +176,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         currentTrackingMedia = null
         resetTrackSelectionState()
     }
+    noteSleepTimerEpisode()
 }
 
 private fun PlayerScreenRuntime.resetTrackSelectionState() {
@@ -478,14 +479,43 @@ internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
     emitAddonPlayerEvent(action, forceResend = true)
 }
 
+/**
+ * True when this save is the episode being left, not another source for the same one.
+ * Season and episode come first. Ids are the tie-break when those numbers match.
+ */
+internal fun isLeavingPlaybackEpisode(
+    currentVideoId: String?,
+    currentSeason: Int?,
+    currentEpisode: Int?,
+    nextVideoId: String?,
+    nextSeason: Int?,
+    nextEpisode: Int?,
+): Boolean {
+    if (nextSeason != currentSeason || nextEpisode != currentEpisode) return true
+    val currentId = currentVideoId?.takeIf { it.isNotBlank() } ?: return false
+    val nextId = nextVideoId?.takeIf { it.isNotBlank() } ?: return false
+    return currentId != nextId
+}
+
+/**
+ * The save every minute stays on this computer. Pause, seek, and stop are what reach the server.
+ * [holdIncomplete] only changes the row stored here. It does not send the tick.
+ */
+internal fun playbackProgressTickSyncsRemote(holdIncomplete: Boolean): Boolean = false
+
 internal fun PlayerScreenRuntime.flushWatchProgress(
     scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
+    leavingEpisode: Boolean = false,
+    holdIncomplete: Boolean = playbackHoldIncomplete(leavingEpisode = leavingEpisode),
 ) {
+    val action = scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)
     WatchProgressRepository.flushPlaybackProgress(
         session = playbackSession,
         snapshot = playbackSnapshot,
+        syncRemote = !holdIncomplete,
+        holdIncomplete = holdIncomplete,
     )
-    when (scrobbleAction) {
+    when (action) {
         TrackingScrobbleAction.PAUSE -> emitTrackingScrobblePause()
         TrackingScrobbleAction.STOP -> {
             emitStopScrobbleForCurrentProgress()
@@ -493,7 +523,7 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
         }
         TrackingScrobbleAction.START -> Unit
     }
-    when (scrobbleAction) {
+    when (action) {
         TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
         TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
         TrackingScrobbleAction.START -> Unit
@@ -517,10 +547,15 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
+        // A seek during a sleep stop must not mark the episode watched or scrobble past it.
+        val holdIncomplete = playbackHoldIncomplete()
         WatchProgressRepository.upsertPlaybackProgress(
             session = playbackSession,
             snapshot = playbackSnapshot,
+            syncRemote = !holdIncomplete,
+            holdIncomplete = holdIncomplete,
         )
+        if (holdIncomplete) return@launch
         resendAddonPlayerStateAfterSeek()
 
         val progressPercent = currentPlaybackProgressPercent()
@@ -569,10 +604,12 @@ internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now
+    val holdIncomplete = playbackHoldIncomplete(now)
     WatchProgressRepository.upsertPlaybackProgress(
         session = playbackSession,
         snapshot = playbackSnapshot,
-        syncRemote = false,
+        syncRemote = playbackProgressTickSyncsRemote(holdIncomplete),
+        holdIncomplete = holdIncomplete,
     )
 }
 

@@ -91,6 +91,12 @@ const subtitleModal = document.getElementById("subtitleModal");
 const speedModal = document.getElementById("speedModal");
 const speedOptionList = document.getElementById("speedOptionList");
 const speedPanelTitle = document.getElementById("speedPanelTitle");
+const sleepModal = document.getElementById("sleepModal");
+const sleepOptionList = document.getElementById("sleepOptionList");
+const sleepPanelTitle = document.getElementById("sleepPanelTitle");
+const sleepTimerButton = document.getElementById("sleepTimerButton");
+const sleepTimerLabel = document.getElementById("sleepTimerLabel");
+const sleepRemaining = document.getElementById("sleepRemaining");
 const audioPanelTitle = document.getElementById("audioPanelTitle");
 const audioTrackList = document.getElementById("audioTrackList");
 const subtitleTrackList = document.getElementById("subtitleTrackList");
@@ -1052,6 +1058,7 @@ const rangePositionMs = () => {
 const modalByName = {
   audio: audioModal,
   subtitles: subtitleModal,
+  sleep: sleepModal,
   speed: speedModal,
   sources: sourceModal,
   episodes: episodesModal,
@@ -1203,6 +1210,75 @@ const speedOptions = [
   { value: 1.75, label: "1.75x" },
   { value: 2.0, label: "2x" },
 ];
+
+const sleepTimerChoices = () => [
+  { value: 0, wire: "off", label: state.sleepTimerOffLabel || "Off" },
+  { value: 15, wire: "15", label: state.sleepTimer15Label || "15 minutes" },
+  { value: 30, wire: "30", label: state.sleepTimer30Label || "30 minutes" },
+  { value: 45, wire: "45", label: state.sleepTimer45Label || "45 minutes" },
+  { value: 60, wire: "60", label: state.sleepTimer60Label || "60 minutes" },
+  { value: 90, wire: "90", label: state.sleepTimer90Label || "90 minutes" },
+  { value: -1, wire: "end", label: state.sleepTimerEndLabel || "End of episode" },
+];
+
+let sleepOptionSignature = "";
+
+const sleepOptionSignatureNow = () => [
+  state.sleepTimerPanelTitle || state.sleepTimerLabel || "",
+  state.sleepTimerOption || "off",
+  state.sleepTimerStopAfter ? "1" : "0",
+  state.sleepTimerOffLabel || "",
+  state.sleepTimer15Label || "",
+  state.sleepTimer30Label || "",
+  state.sleepTimer45Label || "",
+  state.sleepTimer60Label || "",
+  state.sleepTimer90Label || "",
+  state.sleepTimerEndLabel || "",
+  state.sleepTimerStopAfterLabel || "",
+].join("|");
+
+const renderSleepOptionList = () => {
+  if (!sleepOptionList) return;
+  const signature = sleepOptionSignatureNow();
+  if (signature === sleepOptionSignature && sleepOptionList.childElementCount > 0) return;
+  sleepOptionSignature = signature;
+  sleepOptionList.textContent = "";
+  if (sleepPanelTitle) {
+    sleepPanelTitle.textContent = state.sleepTimerPanelTitle || state.sleepTimerLabel || "Sleep timer";
+  }
+  const selectedWire = String(state.sleepTimerOption || "off");
+  sleepTimerChoices().forEach(choice => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `track-row${selectedWire === choice.wire ? " selected" : ""}`;
+    row.addEventListener("click", event => {
+      event.stopPropagation();
+      send("sleepTimerOption", choice.value);
+      window.setTimeout(closePlayerModal, 120);
+    });
+    const labelElement = document.createElement("span");
+    labelElement.className = "track-label";
+    labelElement.textContent = choice.label;
+    row.appendChild(labelElement);
+    row.appendChild(buildCheckIcon());
+    sleepOptionList.appendChild(row);
+  });
+
+  const stopAfter = document.createElement("button");
+  stopAfter.type = "button";
+  stopAfter.className = `track-row sleep-stop-after${state.sleepTimerStopAfter ? " selected" : ""}`;
+  stopAfter.addEventListener("click", event => {
+    event.stopPropagation();
+    send("toggleStopAfterEpisode", 0);
+    window.setTimeout(closePlayerModal, 120);
+  });
+  const stopLabel = document.createElement("span");
+  stopLabel.className = "track-label";
+  stopLabel.textContent = state.sleepTimerStopAfterLabel || "Stop after this episode";
+  stopAfter.appendChild(stopLabel);
+  stopAfter.appendChild(buildCheckIcon());
+  sleepOptionList.appendChild(stopAfter);
+};
 
 const renderSpeedOptionList = () => {
   if (!speedOptionList) return;
@@ -2494,6 +2570,7 @@ const renderActiveModal = (modalOpened = false) => {
   captureActiveModalFocus();
   if (activeModal === "audio") renderAudioTrackList();
   if (activeModal === "subtitles") renderSubtitleModal();
+  if (activeModal === "sleep") renderSleepOptionList();
   if (activeModal === "speed") renderSpeedOptionList();
   if (activeModal === "sources") renderSourceModal(modalOpened);
   if (activeModal === "episodes") renderEpisodesModal(modalOpened);
@@ -2895,6 +2972,15 @@ const renderChrome = () => {
   setActionButtonLabel("chapters", state.chaptersLabel || "Chapters");
   setTextContent(streamInfoLabel, state.streamInfoLabel || "Stream info");
   setActionButtonLabel("streamInfo", state.streamInfoLabel || "Stream info");
+  const sleepLabel = state.sleepTimerShortcutLabel || state.sleepTimerLabel || "Sleep timer";
+  setTextContent(sleepTimerLabel, state.sleepTimerLabel || "Sleep timer");
+  setActionButtonLabel("sleepTimer", sleepLabel);
+  if (sleepTimerButton) {
+    setAttr(sleepTimerButton, "aria-label", sleepLabel);
+    setAttr(sleepTimerButton, "title", sleepLabel);
+    sleepTimerButton.classList.toggle("sleep-active", Boolean(state.sleepTimerActive));
+  }
+  setText(sleepRemaining, state.sleepTimerRemainingLabel || "");
   renderChapterMarks();
   if (!hasChapters && activeModal === "chapters") closePlayerModal(false);
   syncActionFocusState();
@@ -3321,6 +3407,10 @@ document.querySelectorAll("[data-command]").forEach(button => {
       openPlayerModal("streamInfo");
       return;
     }
+    if (command === "sleepTimer") {
+      openPlayerModal("sleep");
+      return;
+    }
     if (command === "submitIntro") {
       openPlayerModal("submitIntro");
       return;
@@ -3639,12 +3729,14 @@ volumeSlider.addEventListener("input", event => {
   if (nextLevel > 0) {
     preMuteVolumeLevel = nextLevel;
   }
+  sleepFadeVolumeLatch = false;
   syncVolumeControl();
   showPlayerToast(volumeToastLabel());
   send("volumeChange", nextLevel);
 });
 
 let preMuteVolumeLevel = 1.0;
+let sleepFadeVolumeLatch = false;
 let subtitlesHidden = false;
 
 function showHiddenSubtitles() {
@@ -3676,7 +3768,20 @@ window.playerUpdate = update => {
   const positionMs = Math.round((Number(update.position) || 0) * 1000);
   const bufferedPositionMs = Math.round((Number(update.bufferedPosition) || 0) * 1000);
   const reportedVolumeLevel = Number(update.volumeLevel);
-  const volumeLevel = Number.isFinite(reportedVolumeLevel)
+  const fading = Boolean(state.sleepTimerFading);
+  let acceptReportedVolume = !fading && !sleepFadeVolumeLatch;
+  if (sleepFadeVolumeLatch && !fading && Number.isFinite(reportedVolumeLevel)) {
+    // The fade puts back the level on screen, including a mute. The level from before mute is not this.
+    const listenerLevel = typeof state.volumeLevel === "number" ? state.volumeLevel : null;
+    if (
+      listenerLevel !== null &&
+      Math.abs(clampVolumeLevel(reportedVolumeLevel) - clampVolumeLevel(listenerLevel)) < 0.05
+    ) {
+      sleepFadeVolumeLatch = false;
+      acceptReportedVolume = true;
+    }
+  }
+  const volumeLevel = acceptReportedVolume && Number.isFinite(reportedVolumeLevel)
     ? clampVolumeLevel(reportedVolumeLevel)
     : state.volumeLevel;
   const audioTracks = normalizeTracks(update.audioTracks);
@@ -3715,7 +3820,7 @@ window.playerUpdate = update => {
     appliedRememberedVolume = true;
     syncVolumeControl();
   }
-  if (typeof volumeLevel === "number" && volumeLevel > 0) {
+  if (acceptReportedVolume && typeof volumeLevel === "number" && volumeLevel > 0) {
     preMuteVolumeLevel = volumeLevel;
   }
   if (subtitleTracksChanged && activeModal === "subtitles") {
@@ -3833,7 +3938,50 @@ const handleNativeModalNavigation = action => {
   }
 };
 
+const sleepClockFields = new Set([
+  "sleepTimerRemainingLabel",
+  "isPlaying",
+  "isLoading",
+  "durationMs",
+  "positionMs",
+  "bufferedPositionMs",
+  "volumeLevel",
+]);
+
+const sameControlValue = (left, right) => {
+  if (Object.is(left, right)) return true;
+  if (typeof left === "number" && typeof right === "number") {
+    return left === right || (Number.isNaN(left) && Number.isNaN(right));
+  }
+  if (left == null || right == null || typeof left !== "object" || typeof right !== "object") return false;
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch (error) {
+    return false;
+  }
+};
+
+// The countdown changes every second. Rebuilding the open menus for that tick steals focus.
+const onlySleepClockChanged = (current, next) => {
+  if (!next || typeof next !== "object") return false;
+  const keys = Object.keys(next);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (sleepClockFields.has(key)) continue;
+    if (!sameControlValue(current[key], next[key])) return false;
+  }
+  return !sameControlValue(current.sleepTimerRemainingLabel, next.sleepTimerRemainingLabel);
+};
+
 window.playerControls = nextState => {
+  if (hasReceivedPlayerControls && onlySleepClockChanged(state, nextState)) {
+    state = {
+      ...state,
+      sleepTimerRemainingLabel: nextState.sleepTimerRemainingLabel || "",
+    };
+    setText(sleepRemaining, state.sleepTimerRemainingLabel || "");
+    return;
+  }
   const previousCloseToken = Number(state.closeModalsToken) || 0;
   const previousModalNavToken = Number(state.modalNavigationToken) || 0;
   const previousSubmitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
@@ -3849,13 +3997,17 @@ window.playerControls = nextState => {
     ? state.isPlaying
     : pendingIsPlaying;
   const currentVolumeLevel = hasReceivedPlayerControls ? state.volumeLevel : undefined;
+  const wasFading = Boolean(state.sleepTimerFading);
   state = {
     ...state,
     ...nextState,
     isPlaying: currentPlaybackState,
     volumeLevel: currentVolumeLevel ?? nextState.volumeLevel,
   };
-  if (typeof state.volumeLevel === "number" && state.volumeLevel > 0) {
+  if (wasFading && !state.sleepTimerFading) {
+    sleepFadeVolumeLatch = true;
+  }
+  if (!state.sleepTimerFading && !sleepFadeVolumeLatch && typeof state.volumeLevel === "number" && state.volumeLevel > 0) {
     preMuteVolumeLevel = state.volumeLevel;
   }
   hasReceivedPlayerControls = true;
@@ -4418,6 +4570,12 @@ document.addEventListener("keydown", event => {
     return;
   }
 
+  if (event.code === "KeyZ" && !event.shiftKey) {
+    event.preventDefault();
+    if (activeModal === "sleep") closePlayerModal(true);
+    else openPlayerModal("sleep");
+    return;
+  }
   if (event.code === "KeyA") {
     event.preventDefault();
     if (activeModal === "audio") closePlayerModal(true);

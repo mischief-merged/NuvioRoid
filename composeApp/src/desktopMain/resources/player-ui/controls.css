@@ -1904,6 +1904,30 @@ button:disabled {
   cursor: pointer;
 }
 
+.sleep-remaining {
+  flex: 0 0 auto;
+  color: var(--theme-text-muted, rgba(255, 255, 255, .72));
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, .7);
+}
+
+.sleep-remaining:empty,
+.sleep-remaining[hidden] {
+  display: none;
+}
+
+.action.sleep-active {
+  color: var(--theme-accent);
+}
+
+.track-row.sleep-stop-after {
+  margin-top: 8px;
+}
+
 .action-pill {
   max-width: 100%;
   display: flex;

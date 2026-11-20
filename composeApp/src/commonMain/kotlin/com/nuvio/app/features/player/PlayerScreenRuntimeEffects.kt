@@ -616,6 +616,16 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
             persistPlaybackProgressTick()
         }
     }
+
+    if (isDesktop) {
+        LaunchedEffect(Unit) {
+            while (true) {
+                val fading = sleepTimer.phase == SleepTimerPhase.Fading
+                delay(if (fading) 200L else 1_000L)
+                advanceSleepTimer(System.currentTimeMillis())
+            }
+        }
+    }
 }
 
 @Composable
@@ -937,21 +947,11 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
         playerSettingsUiState.streamAutoPlayNextEpisodeEnabled,
         nextEpisodeCardDismissed,
+        sleepTimer.option,
+        sleepTimer.phase,
+        sleepTimer.stopAfterEpisode,
     ) {
-        val shouldShow = nextEpisodeInfo != null && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
-        if (nextEpisodeAutoPlayAutomatic &&
-            (!shouldShow || !playerSettingsUiState.streamAutoPlayNextEpisodeEnabled)
-        ) {
-            cancelNextEpisodeAutoPlay()
-        }
-        if (shouldShow && !showNextEpisodeCard) {
-            showNextEpisodeCard = true
-            if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true && !isPartyControlLocked) {
-                playNextEpisode(automatic = true)
-            }
-        } else if (!shouldShow) {
-            showNextEpisodeCard = false
-        }
+        onNextEpisodeThresholdChanged()
     }
 }
 
