@@ -260,7 +260,11 @@ internal fun AutoDownloadSection(
     deletionToConfirm?.let { (confirmProfileId, item) ->
         NuvioStatusModal(
             title = stringResource(if (item.isEpisode) Res.string.downloads_auto_delete_now_title else Res.string.downloads_movie_delete_now_title),
-            message = if (!item.isEpisode) stringResource(Res.string.downloads_movie_delete_now_message_trash, item.title) else stringResource(
+            message = if (!item.isEpisode) stringResource(
+                if (controller.usesSystemTrash) Res.string.downloads_movie_delete_now_message_trash
+                else Res.string.downloads_movie_delete_now_message_held,
+                item.title,
+            ) else stringResource(
                 if (controller.usesSystemTrash) {
                     Res.string.downloads_auto_delete_now_message_trash
                 } else {

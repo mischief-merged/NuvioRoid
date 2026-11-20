@@ -185,9 +185,7 @@ internal object AutoDownloads : AutoDownloadController {
                 episodeNumber = item.episodeNumber,
             )?.isCompleted == true
         },
-        isInPlayer = { item ->
-            playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
-        },
+        isInPlayer = ::isPlaying,
         hasLaterEpisode = { rule, item -> engine.knownEpisodes(rule.key)?.let { hasLaterReleasedEpisode(item, it) } },
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
@@ -342,10 +340,14 @@ internal object AutoDownloads : AutoDownloadController {
 
     /** Whether the player has the file of [item] open. A download that is playing is not moved. */
     fun isPlaying(item: DownloadItem): Boolean =
-        playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
+        playingFileUri.value?.let { playing ->
+            // The row can be temporarily absent while its removal is being saved.
+            item.localFileUri?.let { DownloadsRepository.backend.isSameFile(playing, it) } == true ||
+                DownloadsRepository.findCompletedDownloadByLocalFile(playing)?.id == item.id
+        } == true
 
-    /** The player opened or closed a local file. A download that is open is not removed. */
-    fun onLocalFileOpened(localFileUri: String) {
+    /** Signal an opened file before waiting for a removal to finish or roll back. */
+    fun onLocalFileOpened(localFileUri: String) = WatchedRemovalGuard.change {
         playingFileUri.value = localFileUri
     }
 

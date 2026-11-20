@@ -1,6 +1,5 @@
 package com.nuvio.app.features.downloads
 
-import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -71,7 +70,7 @@ internal class AutoDownloadStore(
     private val payloads: AutoDownloadPayloads,
     private val activeProfileId: () -> Int,
 ) {
-    private val lock = SynchronizedObject()
+    private val lock = WatchedRemovalGuard.lock
     // Every field is written, also one that has its default value, so that a rule keeps what it
     // was saved with when a default changes later.
     private val json = Json {
@@ -90,8 +89,8 @@ internal class AutoDownloadStore(
     val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> = _deleteAfterWatchingMode.asStateFlow()
     val keptDownloadIds: StateFlow<Set<String>> = _keptDownloadIds.asStateFlow()
 
-    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode): Boolean = synchronized(lock) {
-        if (ensureLoaded() != profileId) return false
+    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode): Boolean = WatchedRemovalGuard.change {
+        if (ensureLoaded() != profileId) return@change false
         save(profileId, state.copy(deleteAfterWatchingMode = mode))
         true
     }
@@ -150,8 +149,8 @@ internal class AutoDownloadStore(
     }
 
     /** Keeps a download for good: its scheduled removal is dropped and none is scheduled again. */
-    fun keep(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
-        if (ensureLoaded() != profileId) return false
+    fun keep(profileId: Int, downloadId: String): Boolean = WatchedRemovalGuard.change {
+        if (ensureLoaded() != profileId) return@change false
         save(
             profileId,
             state.copy(

@@ -3287,5 +3287,6 @@
     <string name="downloads_movie_removal_row">%1$s • %2$s</string>
     <string name="downloads_movie_delete_now_description">Delete %1$s now</string>
     <string name="downloads_movie_delete_now_title">Delete this movie now?</string>
+    <string name="downloads_movie_delete_now_message_held">The Trash is not available. %1$s will stay where it is.</string>
     <string name="downloads_movie_delete_now_message_trash">%1$s is moved to the Trash.</string>
 </resources>

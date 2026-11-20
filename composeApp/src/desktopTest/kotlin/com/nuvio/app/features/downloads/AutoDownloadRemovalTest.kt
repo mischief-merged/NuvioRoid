@@ -2,6 +2,11 @@ package com.nuvio.app.features.downloads
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
+import kotlin.io.path.readText
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.writeText
@@ -18,13 +23,15 @@ class AutoDownloadRemovalTest {
     private inner class FakeBackend : DownloadsBackend {
         var payload: String? = null
         var trashWorks = true
-        override var usesSystemTrash = true
+        override val usesSystemTrash: Boolean get() = trash.usesSystemTrash
+        var afterSave: () -> Unit = {}
         val trashed = mutableListOf<String>()
 
         override fun loadPayload(): String? = payload
 
         override fun savePayload(payload: String) {
             this.payload = payload
+            afterSave()
         }
 
         override fun restoreItem(item: DownloadItem): DownloadItem = item
@@ -53,6 +60,11 @@ class AutoDownloadRemovalTest {
             return trashWorks && trash.moveAway(localFileUri)
         }
 
+        override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult {
+            trashed += localFileUri
+            return if (trashWorks) trash.moveWatchedAway(localFileUri, stillWanted) else AutoDownloadRemovalResult.NotMoved
+        }
+
         override fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
             trash.isSameFile(firstFileUri, secondFileUri)
     }
@@ -65,12 +77,19 @@ class AutoDownloadRemovalTest {
     private lateinit var folder: Path
     private lateinit var downloadsDir: Path
     private lateinit var trash: DesktopDownloadsTrash
+    private lateinit var systemTrashDir: Path
+    private var afterTrashMove: () -> Unit = {}
 
     @BeforeTest
     fun use_an_empty_in_memory_repository_and_a_temporary_downloads_folder() {
         folder = Files.createTempDirectory("nuvio-removal-test").toRealPath()
         downloadsDir = folder.resolve("downloads").createDirectories()
-        trash = DesktopDownloadsTrash(downloadsDir = { downloadsDir }, systemTrash = null)
+        systemTrashDir = folder.resolve("system-trash").createDirectories()
+        trash = DesktopDownloadsTrash(downloadsDir = { downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), systemTrashDir.resolve(file.name))
+            afterTrashMove()
+            true
+        })
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
         DownloadsRepository.ensureLoaded()
@@ -122,7 +141,8 @@ class AutoDownloadRemovalTest {
         assertEquals(AutoDownloadRemovalResult.Removed, result)
         assertEquals(listOf(file.toUri().toString()), backend.trashed)
         assertFalse(file.exists())
-        assertEquals(1, heldFiles().size)
+        assertTrue(heldFiles().isEmpty())
+        assertTrue(systemTrashDir.resolve(file.fileName).exists())
         assertNull(item(1))
     }
 
@@ -137,10 +157,128 @@ class AutoDownloadRemovalTest {
     @Test
     fun watched_downloads_are_left_alone_without_system_trash() {
         val file = download(1, automatic = false)
-        backend.usesSystemTrash = false
+        trash = DesktopDownloadsTrash(downloadsDir = { downloadsDir }, systemTrash = null)
         assertEquals(AutoDownloadRemovalResult.NotMoved, DownloadsRepository.removeWatchedAutoDownload(item(1)!!.id, null))
         assertTrue(file.exists())
         assertTrue(backend.trashed.isEmpty())
+        assertTrue(heldFiles().isEmpty())
+        assertEquals(DownloadStatus.Completed, item(1)?.status)
+    }
+
+    @Test
+    fun keep_after_the_last_check_during_the_list_save_keeps_the_file_and_record() =
+        cancelDuringRemoval(afterMove = false) { store, id -> store.keep(1, id) }
+
+    @Test
+    fun off_after_the_last_check_during_the_list_save_keeps_the_file_and_record() =
+        cancelDuringRemoval(afterMove = false) { store, _ -> store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.Off) }
+
+    @Test
+    fun automatic_only_after_the_last_check_keeps_a_manual_file_and_record() =
+        cancelDuringRemoval(afterMove = false) { store, _ -> store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AutomaticOnly) }
+
+    @Test
+    fun keep_after_the_trash_move_restores_the_file_and_record() =
+        cancelDuringRemoval(afterMove = true) { store, id -> store.keep(1, id) }
+
+    @Test
+    fun off_after_the_trash_move_restores_the_file_and_record() =
+        cancelDuringRemoval(afterMove = true) { store, _ -> store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.Off) }
+
+    @Test
+    fun automatic_only_after_the_trash_move_restores_a_manual_file_and_record() =
+        cancelDuringRemoval(afterMove = true) { store, _ -> store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AutomaticOnly) }
+
+    private fun cancelDuringRemoval(afterMove: Boolean, change: (AutoDownloadStore, String) -> Unit) {
+        val file = download(1, automatic = false)
+        val original = item(1)!!
+        val store = AutoDownloadStore(MemoryAutoDownloadPayloads()) { 1 }
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        val feature = DeleteAfterWatching(
+            store, { DownloadsRepository.uiState.value.items }, { true }, { false }, { _, _ -> true },
+            DownloadsRepository::removeWatchedAutoDownload, { 0L }, holdMs = 0L,
+        )
+        assertTrue(feature.onLocalPlaybackCompleted(1, original))
+        val failure = AtomicReference<Throwable?>()
+        var worker: Thread? = null
+        var interrupted = false
+        val interrupt = {
+            if (!interrupted) {
+                interrupted = true
+                // The record has already been saved without this item, after stillWanted was true.
+                assertNull(item(1))
+                assertEquals(!afterMove, file.exists())
+                val unchanged = WatchedRemovalGuard.check { true }
+                val started = CountDownLatch(1)
+                worker = thread(isDaemon = true) {
+                    started.countDown()
+                    runCatching { change(store, original.id) }.onFailure { failure.set(it) }
+                }
+                assertTrue(started.await(5, TimeUnit.SECONDS))
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (unchanged() && System.nanoTime() < deadline) Thread.yield()
+                assertFalse(unchanged(), "The change must signal cancellation before waiting for the lock")
+            }
+        }
+        if (afterMove) afterTrashMove = interrupt else backend.afterSave = interrupt
+        assertEquals(AutoDownloadRemovalOutcome.Cancelled, feature.runDue(1).values.single())
+        worker?.join(5_000)
+        assertFalse(worker?.isAlive ?: true)
+        assertNull(failure.get())
+        assertTrue(interrupted)
+        assertEquals(original, item(1))
+        assertEquals("video 1", file.readText())
+        assertTrue(heldFiles().isEmpty())
+        assertTrue(store.removals(1).isEmpty())
+        assertTrue(store.recentlyDeleted.value.isEmpty())
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        assertEquals(original, item(1))
+    }
+
+    @Test
+    fun opening_the_player_during_the_list_save_keeps_the_file_and_record() =
+        playbackChangesDuringRemoval(afterMove = false, progressChanged = false)
+
+    @Test
+    fun opening_the_player_after_the_move_restores_the_file_and_record() =
+        playbackChangesDuringRemoval(afterMove = true, progressChanged = false)
+
+    @Test
+    fun changed_progress_during_the_list_save_keeps_the_file_and_record() =
+        playbackChangesDuringRemoval(afterMove = false, progressChanged = true)
+
+    @Test
+    fun changed_progress_after_the_move_restores_the_file_and_record() =
+        playbackChangesDuringRemoval(afterMove = true, progressChanged = true)
+
+    private fun playbackChangesDuringRemoval(afterMove: Boolean, progressChanged: Boolean) {
+        val file = download(1, automatic = false)
+        val original = item(1)!!
+        val store = AutoDownloadStore(MemoryAutoDownloadPayloads()) { 1 }
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        var watched = true
+        val feature = DeleteAfterWatching(
+            store, { DownloadsRepository.uiState.value.items }, { watched }, AutoDownloads::isPlaying, { _, _ -> true },
+            DownloadsRepository::removeWatchedAutoDownload, { 0L }, holdMs = 0L,
+        )
+        feature.onLocalPlaybackCompleted(1, original)
+        val interrupt = {
+            if (progressChanged) watched = false else {
+                AutoDownloads.onLocalFileOpened(file.toUri().toString())
+                assertTrue(AutoDownloads.isPlaying(original), "Playback must still be found while the row is absent")
+            }
+        }
+        if (afterMove) afterTrashMove = interrupt else backend.afterSave = interrupt
+        try {
+            assertEquals(AutoDownloadRemovalOutcome.Cancelled, feature.runDue(1).values.single())
+        } finally {
+            AutoDownloads.onLocalFileClosed(file.toUri().toString())
+        }
+        assertEquals(original, item(1))
+        assertEquals("video 1", file.readText())
+        assertTrue(heldFiles().isEmpty())
+        assertTrue(store.recentlyDeleted.value.isEmpty())
     }
 
     @Test
@@ -150,7 +288,8 @@ class AutoDownloadRemovalTest {
         assertEquals(AutoDownloadRemovalResult.Removed, remove(1))
 
         assertFalse(file.exists())
-        assertEquals(1, heldFiles().size)
+        assertTrue(heldFiles().isEmpty())
+        assertTrue(systemTrashDir.resolve(file.fileName).exists())
         assertNull(item(1))
         DownloadsRepository.clearLocalState()
         DownloadsRepository.ensureLoaded()

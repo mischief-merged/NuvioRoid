@@ -198,6 +198,11 @@ internal class LocationsBackend(private val world: FolderWorld) : DownloadsBacke
 
     override fun inspectFile(localFileUri: String): DownloadedFileFacts? = inspectDownloadedFile(localFileUri)
 
+    override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult {
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        return if (trashFile(localFileUri)) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.NotMoved
+    }
+
     override fun trashFile(localFileUri: String): Boolean {
         if (trashSucceeds) trashed += localFileUri
         return trashSucceeds
