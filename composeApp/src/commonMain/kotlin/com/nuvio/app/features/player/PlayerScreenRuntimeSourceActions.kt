@@ -613,7 +613,9 @@ internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false): Bo
                 nextEpisodeInfo?.videoId == targetInfo.videoId &&
                 (!automatic || (
                     playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
-                        !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
+                        !nextEpisodeCardDismissed &&
+                        isAtNextEpisodeThreshold() &&
+                        !sleepTimer.blocksAutomaticNextEpisode()
                     ))
         },
     )
