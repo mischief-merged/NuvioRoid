@@ -1,5 +1,6 @@
 package com.nuvio.app.features.cloud
 
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.features.debrid.DebridProviderCapability
 import com.nuvio.app.features.debrid.DebridProviders
 import com.nuvio.app.features.debrid.DebridServiceCredential
@@ -13,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.cloud_library_load_failed
 import nuvio.composeapp.generated.resources.cloud_library_playback_disabled
 import nuvio.composeapp.generated.resources.cloud_library_provider_unavailable
 import org.jetbrains.compose.resources.getString
@@ -48,7 +50,13 @@ internal class CloudLibraryStore(
                     onFailure = { error ->
                         CloudLibraryProviderState(
                             provider = credential.provider,
-                            errorMessage = error.message,
+                            errorMessage = userFacingFailure(
+                                error.message,
+                                getString(
+                                    Res.string.cloud_library_load_failed,
+                                    credential.provider.displayName,
+                                ),
+                            ),
                         )
                     },
                 )

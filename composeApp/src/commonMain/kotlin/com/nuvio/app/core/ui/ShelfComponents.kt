@@ -34,9 +34,13 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -59,6 +63,7 @@ import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.home_view_all
+import nuvio.composeapp.generated.resources.poster_image_retry
 import nuvio.composeapp.generated.resources.poster_logo_content_description
 import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
@@ -287,19 +292,29 @@ fun NuvioPosterCard(
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            if (imageUrl != null) {
+            var imageAttempt by remember(imageUrl, fallbackImageUrl) { mutableIntStateOf(0) }
+            var imageFailed by remember(imageUrl, fallbackImageUrl, imageAttempt) { mutableStateOf(false) }
+            val showTitleOnFace = posterShowsTitleOnFace(imageUrl, imageFailed)
+            if (imageUrl != null && !imageFailed) {
                 val platformContext = coil3.compose.LocalPlatformContext.current
                 val hasFallback = !fallbackImageUrl.isNullOrBlank() && fallbackImageUrl != imageUrl
-                val imageModel = remember(imageUrl, fallbackImageUrl, platformContext) {
-                    if (hasFallback) {
+                val imageModel = remember(imageUrl, fallbackImageUrl, platformContext, imageAttempt) {
+                    if (!hasFallback && imageAttempt == 0) {
+                        imageUrl
+                    } else {
                         coil3.request.ImageRequest.Builder(platformContext)
                             .data(imageUrl)
-                            .memoryCacheKeyExtras(
-                                mapOf(com.nuvio.app.core.poster.CustomPosterFallbackInterceptor.FALLBACK_URL_KEY to fallbackImageUrl!!)
-                            )
+                            .apply {
+                                if (imageAttempt > 0) {
+                                    memoryCacheKey("$imageUrl#$imageAttempt")
+                                }
+                                if (hasFallback) {
+                                    memoryCacheKeyExtras(
+                                        mapOf(com.nuvio.app.core.poster.CustomPosterFallbackInterceptor.FALLBACK_URL_KEY to fallbackImageUrl!!)
+                                    )
+                                }
+                            }
                             .build()
-                    } else {
-                        imageUrl
                     }
                 }
                 NuvioAsyncImage(
@@ -308,17 +323,39 @@ fun NuvioPosterCard(
                     modifier = Modifier.matchParentSize(),
                     contentScale = ContentScale.Crop,
                     desktopAnimation = posterCardStyle.animatedArtworkMode.toDesktopAnimation(),
+                    onError = { imageFailed = true },
                 )
-            } else {
-                Text(
-                    text = title,
+            }
+            if (showTitleOnFace) {
+                Column(
                     modifier = Modifier.padding(horizontal = NuvioTokens.Space.s14),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = tokens.colors.textMuted,
-                    textAlign = TextAlign.Center,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s6),
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = tokens.colors.textMuted,
+                        textAlign = TextAlign.Center,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (!detailLine.isNullOrBlank()) {
+                        Text(
+                            text = detailLine,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = tokens.colors.textMuted,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (!imageUrl.isNullOrBlank() && imageFailed) {
+                        TextButton(onClick = { imageAttempt = nextPosterAttempt(imageAttempt) }) {
+                            Text(text = stringResource(Res.string.poster_image_retry))
+                        }
+                    }
+                }
             }
 
             if (!bottomLeftLogoUrl.isNullOrBlank() || !bottomLeftText.isNullOrBlank()) {

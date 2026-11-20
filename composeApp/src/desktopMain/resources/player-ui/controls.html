@@ -170,7 +170,7 @@
           <button class="header-button" id="partyButton" type="button" aria-label="Watch party" hidden><svg><use href="#icon-party"></use></svg></button>
           <button class="header-button" id="videoSettingsButton" data-command="videoSettings" aria-label="Video settings"><svg><use href="#icon-build"></use></svg></button>
           <button class="header-button pip-lock-button" id="pipLockButton" type="button" aria-pressed="false" aria-label="Lock player controls"><svg><use href="#icon-lock"></use></svg></button>
-          <button class="header-button" id="pipButton" data-command="pictureInPicture" aria-label=""><svg><use href="#icon-pip"></use></svg></button>
+          <button class="header-button" id="pipButton" data-command="pictureInPicture" aria-label="Picture in picture"><svg><use href="#icon-pip"></use></svg></button>
           <button class="header-button" id="fullscreenButton" data-command="toggleFullscreen" aria-label="Enter fullscreen"><svg><use id="fullscreenIcon" href="#icon-fullscreen"></use></svg></button>
           <button class="header-button" id="backButton" data-command="back" aria-label="Close player"><svg><use href="#icon-close"></use></svg></button>
         </nav>
@@ -318,29 +318,29 @@
                     <span class="style-label" id="subtitleDelayLabel">Subtitle Delay</span>
                     <div class="style-control-row">
                       <div class="stepper">
-                        <button class="round-step" id="subtitleDelayMinus" type="button">-</button>
+                        <button class="round-step" id="subtitleDelayMinus" type="button" aria-label="Decrease subtitle delay">-</button>
                         <span class="stepper-value" id="subtitleDelayValue">+0.000s</span>
-                        <button class="round-step" id="subtitleDelayPlus" type="button">+</button>
+                        <button class="round-step" id="subtitleDelayPlus" type="button" aria-label="Increase subtitle delay">+</button>
                       </div>
-                      <button class="panel-button" id="subtitleDelayReset" type="button">Reset</button>
+                      <button class="panel-button" id="subtitleDelayReset" type="button" aria-label="Reset subtitle delay">Reset</button>
                     </div>
                   </div>
                   <div class="custom-subtitle-style-controls" id="customSubtitleStyleControls">
                     <div class="style-section">
                       <span class="style-label" id="subtitleFontLabel">Font</span>
-                      <button class="font-row" id="subtitleFontRow" type="button"><span id="subtitleFontName">Default</span><span class="font-row-chevron">›</span></button>
+                      <button class="font-row" id="subtitleFontRow" type="button" aria-label="Font, Default"><span id="subtitleFontName">Default</span><span class="font-row-chevron">›</span></button>
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="fontSizeLabel">Font Size</span>
                       <div class="stepper">
-                        <button class="round-step" id="fontSizeMinus" type="button">-</button>
+                        <button class="round-step" id="fontSizeMinus" type="button" aria-label="Decrease subtitle font size">-</button>
                         <span class="stepper-value" id="fontSizeValue">18sp</span>
-                        <button class="round-step" id="fontSizePlus" type="button">+</button>
+                        <button class="round-step" id="fontSizePlus" type="button" aria-label="Increase subtitle font size">+</button>
                       </div>
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="boldLabel">Bold</span>
-                      <button class="panel-button" id="boldToggle" type="button">Off</button>
+                      <button class="panel-button" id="boldToggle" type="button" aria-pressed="false" aria-label="Bold subtitles, Off">Off</button>
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="subtitleColorLabel">Color</span>
@@ -349,9 +349,9 @@
                     <div class="style-section">
                       <span class="style-label" id="textOpacityLabel">Text Opacity</span>
                       <div class="stepper">
-                        <button class="round-step" id="textOpacityMinus" type="button">-</button>
+                        <button class="round-step" id="textOpacityMinus" type="button" aria-label="Decrease subtitle text opacity">-</button>
                         <span class="stepper-value" id="textOpacityValue">100%</span>
-                        <button class="round-step" id="textOpacityPlus" type="button">+</button>
+                        <button class="round-step" id="textOpacityPlus" type="button" aria-label="Increase subtitle text opacity">+</button>
                       </div>
                     </div>
                     <div class="style-section">
@@ -361,14 +361,14 @@
                     <div class="style-section">
                       <span class="style-label" id="backgroundOpacityLabel">Background opacity</span>
                       <div class="stepper">
-                        <button class="round-step" id="backgroundOpacityMinus" type="button">-</button>
+                        <button class="round-step" id="backgroundOpacityMinus" type="button" aria-label="Decrease subtitle background opacity">-</button>
                         <span class="stepper-value" id="backgroundOpacityValue">0%</span>
-                        <button class="round-step" id="backgroundOpacityPlus" type="button">+</button>
+                        <button class="round-step" id="backgroundOpacityPlus" type="button" aria-label="Increase subtitle background opacity">+</button>
                       </div>
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="outlineLabel">Outline</span>
-                      <button class="panel-button" id="outlineToggle" type="button">On</button>
+                      <button class="panel-button" id="outlineToggle" type="button" aria-pressed="true" aria-label="Subtitle outline, On">On</button>
                     </div>
                     <div class="style-section" id="outlineColorSection">
                       <span class="style-label" id="outlineColorLabel">Outline Color</span>
@@ -376,44 +376,44 @@
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="shadowLabel">Drop shadow</span>
-                      <button class="panel-button" id="shadowToggle" type="button">Off</button>
+                      <button class="panel-button" id="shadowToggle" type="button" aria-pressed="false" aria-label="Subtitle shadow, Off">Off</button>
                     </div>
                     <div class="style-section" id="shadowOpacitySection">
                       <span class="style-label" id="shadowOpacityLabel">Shadow opacity</span>
                       <div class="stepper">
-                        <button class="round-step" id="shadowOpacityMinus" type="button">-</button>
+                        <button class="round-step" id="shadowOpacityMinus" type="button" aria-label="Decrease subtitle shadow opacity">-</button>
                         <span class="stepper-value" id="shadowOpacityValue">75%</span>
-                        <button class="round-step" id="shadowOpacityPlus" type="button">+</button>
+                        <button class="round-step" id="shadowOpacityPlus" type="button" aria-label="Increase subtitle shadow opacity">+</button>
                       </div>
                     </div>
                     <div class="style-section" id="shadowSizeSection">
                       <span class="style-label" id="shadowSizeLabel">Shadow size</span>
                       <div class="stepper">
-                        <button class="round-step" id="shadowSizeMinus" type="button">-</button>
+                        <button class="round-step" id="shadowSizeMinus" type="button" aria-label="Decrease subtitle shadow size">-</button>
                         <span class="stepper-value" id="shadowSizeValue">2</span>
-                        <button class="round-step" id="shadowSizePlus" type="button">+</button>
+                        <button class="round-step" id="shadowSizePlus" type="button" aria-label="Increase subtitle shadow size">+</button>
                       </div>
                     </div>
                     <div class="style-section">
                       <span class="style-label" id="bottomOffsetLabel">Bottom Offset</span>
                       <div class="stepper">
-                        <button class="round-step" id="bottomOffsetMinus" type="button">-</button>
+                        <button class="round-step" id="bottomOffsetMinus" type="button" aria-label="Move subtitles down">-</button>
                         <span class="stepper-value" id="bottomOffsetValue">20</span>
-                        <button class="round-step" id="bottomOffsetPlus" type="button">+</button>
+                        <button class="round-step" id="bottomOffsetPlus" type="button" aria-label="Move subtitles up">+</button>
                       </div>
                     </div>
                   </div>
                   <div class="style-section">
                     <span class="style-label" id="autoSyncLabel">Auto Sync</span>
                     <div class="style-control-row">
-                      <button class="panel-button" id="autoSyncReload" type="button">Reload</button>
-                      <button class="panel-button" id="autoSyncCapture" type="button">Capture</button>
+                      <button class="panel-button" id="autoSyncReload" type="button" aria-label="Reload subtitle lines">Reload</button>
+                      <button class="panel-button" id="autoSyncCapture" type="button" aria-label="Capture subtitle time">Capture</button>
                     </div>
                     <div class="stream-subtitle" id="autoSyncStatus"></div>
                     <div id="autoSyncCueList"></div>
                   </div>
                   <div class="style-section">
-                    <button class="panel-button" id="subtitleStyleReset" type="button">Reset appearance</button>
+                    <button class="panel-button" id="subtitleStyleReset" type="button" aria-label="Reset subtitle appearance">Reset appearance</button>
                   </div>
                 </div>
               </div>
@@ -426,8 +426,8 @@
           <div class="track-header-row">
             <div class="track-title" id="sourcePanelTitle">Sources</div>
             <div class="panel-actions">
-              <button class="panel-button" id="sourceReloadButton" type="button">Reload</button>
-              <button class="panel-button" id="sourceCloseButton" type="button">Close</button>
+              <button class="panel-button" id="sourceReloadButton" type="button" aria-label="Reload sources">Reload</button>
+              <button class="panel-button" id="sourceCloseButton" type="button" aria-label="Close sources">Close</button>
             </div>
           </div>
           <div class="panel-context" id="sourceContextLabel"></div>
@@ -457,7 +457,7 @@
           <div class="track-header-row">
             <div class="track-title" id="chaptersPanelTitle">Chapters</div>
             <div class="panel-actions">
-              <button class="panel-button" id="chaptersCloseButton" type="button">Close</button>
+              <button class="panel-button" id="chaptersCloseButton" type="button" aria-label="Close chapters">Close</button>
             </div>
           </div>
           <div class="track-list" id="chapterList"></div>
@@ -469,7 +469,7 @@
             <div class="track-header-row">
               <div class="track-title" id="episodesPanelTitle">Episodes</div>
               <div class="panel-actions">
-                <button class="panel-button" id="episodesCloseButton" type="button">Close</button>
+                <button class="panel-button" id="episodesCloseButton" type="button" aria-label="Close episodes">Close</button>
               </div>
             </div>
             <div class="filter-row" id="seasonFilterList"></div>
@@ -479,12 +479,12 @@
             <div class="track-header-row">
               <div class="track-title" id="streamsPanelTitle">Streams</div>
               <div class="panel-actions">
-                <button class="panel-button" id="episodeStreamsCloseButton" type="button">Close</button>
+                <button class="panel-button" id="episodeStreamsCloseButton" type="button" aria-label="Close episode sources">Close</button>
               </div>
             </div>
             <div class="episode-stream-toolbar">
-              <button class="panel-button" id="episodeBackButton" type="button">Back</button>
-              <button class="panel-button" id="episodeReloadButton" type="button">Reload</button>
+              <button class="panel-button" id="episodeBackButton" type="button" aria-label="Back to episodes">Back</button>
+              <button class="panel-button" id="episodeReloadButton" type="button" aria-label="Reload episode sources">Reload</button>
               <div class="panel-context" id="episodeStreamContextLabel"></div>
             </div>
             <div class="filter-row" id="episodeStreamFilterList"></div>
@@ -497,7 +497,7 @@
           <div class="track-header-row">
             <div class="track-title" id="submitIntroPanelTitle">Submit Timestamps</div>
             <div class="panel-actions">
-              <button class="panel-button" id="submitIntroCloseButton" type="button">Close</button>
+              <button class="panel-button" id="submitIntroCloseButton" type="button" aria-label="Close timestamps">Close</button>
             </div>
           </div>
           <div class="intro-form">
@@ -514,14 +514,14 @@
                 <span class="form-label" id="startTimeLabel">START TIME (MM:SS)</span>
                 <input class="time-input" id="submitIntroStartInput" value="00:00" inputmode="decimal">
               </label>
-              <button class="capture-button" id="captureStartButton" type="button">Capture</button>
+              <button class="capture-button" id="captureStartButton" type="button" aria-label="Capture start time">Capture</button>
             </div>
             <div class="time-field-row">
               <label class="time-field-wrap">
                 <span class="form-label" id="endTimeLabel">END TIME (MM:SS)</span>
                 <input class="time-input" id="submitIntroEndInput" value="00:00" inputmode="decimal">
               </label>
-              <button class="capture-button" id="captureEndButton" type="button">Capture</button>
+              <button class="capture-button" id="captureEndButton" type="button" aria-label="Capture end time">Capture</button>
             </div>
             <div class="submit-status" id="submitIntroStatus"></div>
             <div class="modal-actions">
@@ -536,13 +536,13 @@
           <div class="track-header-row">
             <div class="track-title" id="partyPanelTitle">Watch party</div>
             <div class="panel-actions">
-              <button class="panel-button" id="partyCloseButton" type="button">Close</button>
+              <button class="panel-button" id="partyCloseButton" type="button" aria-label="Close watch party">Close</button>
             </div>
           </div>
           <div class="party-tabs" id="partyTabs" hidden>
             <span class="party-tab-indicator" id="partyTabIndicator"></span>
-            <button class="party-tab selected" id="partyTabParty" type="button" data-party-focus="tabParty"><span class="party-tab-label"></span></button>
-            <button class="party-tab" id="partyTabChat" type="button" data-party-focus="tabChat"><span class="party-tab-label"></span><span class="party-unread" id="partyTabBadge" hidden><span class="party-unread-count"></span></span></button>
+            <button class="party-tab selected" id="partyTabParty" type="button" data-party-focus="tabParty" aria-label="Party"><span class="party-tab-label"></span></button>
+            <button class="party-tab" id="partyTabChat" type="button" data-party-focus="tabChat" aria-label="Chat"><span class="party-tab-label"></span><span class="party-unread" id="partyTabBadge" hidden><span class="party-unread-count"></span></span></button>
           </div>
           <div class="party-body" id="partyBody"></div>
           <div class="party-chat" id="partyChat" hidden>
@@ -553,11 +553,11 @@
                 <div class="party-chat-empty-title" id="partyChatEmptyTitle"></div>
                 <div class="party-chat-empty-message" id="partyChatEmptyMessage"></div>
               </div>
-              <button class="party-chat-new" id="partyChatNew" type="button" hidden><svg><use href="#icon-arrow-down"></use></svg><span id="partyChatNewLabel"></span></button>
+              <button class="party-chat-new" id="partyChatNew" type="button" aria-label="New messages" hidden><svg><use href="#icon-arrow-down"></use></svg><span id="partyChatNewLabel"></span></button>
             </div>
             <div class="party-chat-composer">
-              <textarea class="party-chat-input" id="partyChatInput" rows="1" maxlength="500" autocomplete="off" spellcheck="true"></textarea>
-              <button class="party-chat-send" id="partyChatSend" type="button" disabled><svg><use href="#icon-arrow-up"></use></svg></button>
+              <textarea class="party-chat-input" id="partyChatInput" rows="1" maxlength="500" autocomplete="off" spellcheck="true" aria-label="Message"></textarea>
+              <button class="party-chat-send" id="partyChatSend" type="button" aria-label="Send message" disabled><svg><use href="#icon-arrow-up"></use></svg></button>
             </div>
           </div>
         </div>
@@ -567,7 +567,7 @@
             <div class="party-confirm-message" id="partyConfirmMessage"></div>
             <div class="party-confirm-actions">
               <button class="party-button" id="partyConfirmCancel" type="button">Cancel</button>
-              <button class="party-button danger" id="partyConfirmAccept" type="button"></button>
+              <button class="party-button danger" id="partyConfirmAccept" type="button" aria-label="Confirm"></button>
             </div>
           </div>
         </div>

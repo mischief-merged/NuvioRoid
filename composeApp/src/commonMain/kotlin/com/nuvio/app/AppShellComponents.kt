@@ -180,6 +180,9 @@ internal data class AppTabActions(
     val onMetaScreenSettingsClick: () -> Unit = {},
     val onContinueWatchingSettingsClick: () -> Unit = {},
     val onAddonsSettingsClick: () -> Unit = {},
+    val onAddSource: () -> Unit = {},
+    val onConnectServer: () -> Unit = {},
+    val onOpenDownloads: () -> Unit = {},
     val onPluginsSettingsClick: () -> Unit = {},
     val onAccountSettingsClick: () -> Unit = {},
     val onSupportersContributorsSettingsClick: () -> Unit = {},
@@ -253,6 +256,9 @@ internal fun AppTabHost(
                         continueWatchingDisintegrationRequest = state.continueWatchingDisintegrationRequest,
                         onFolderClick = actions.onFolderClick,
                         onFirstCatalogRendered = actions.onInitialHomeContentRendered,
+                        onAddSource = actions.onAddSource,
+                        onConnectServer = actions.onConnectServer,
+                        onOpenDownloads = actions.onOpenDownloads,
                     )
                 }
             }
@@ -266,6 +272,9 @@ internal fun AppTabHost(
                     onPosterLongClick = actions.onPosterLongClick,
                     searchFocusRequestCount = state.searchFocusRequestCount,
                     scrollToTopRequests = requests.searchScrollToTopRequests,
+                    onAddSource = actions.onAddSource,
+                    onConnectServer = actions.onConnectServer,
+                    onOpenDownloads = actions.onOpenDownloads,
                 )
             }
 

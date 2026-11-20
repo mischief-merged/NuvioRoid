@@ -50,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.NuvioTokens
+import com.nuvio.app.core.ui.activeControlContentAlpha
 import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioBackButton
 import com.nuvio.app.core.ui.NuvioSectionLabel
@@ -522,7 +523,7 @@ internal fun HomescreenCatalogRow(
                         Icon(
                             imageVector = Icons.Rounded.Lock,
                             contentDescription = stringResource(Res.string.settings_homescreen_pinned),
-                            tint = tokens.colors.textMuted.copy(alpha = tokens.opacity.medium),
+                            tint = tokens.colors.textPrimary.copy(alpha = activeControlContentAlpha()),
                         )
                     }
                 } else {

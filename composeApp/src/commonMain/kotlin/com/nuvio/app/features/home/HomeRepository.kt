@@ -8,6 +8,7 @@ import com.nuvio.app.features.catalog.CatalogPage
 import com.nuvio.app.features.catalog.fetchCatalogPage
 import com.nuvio.app.features.catalog.mergeCatalogItems
 import com.nuvio.app.core.poster.CustomPosterUrlRepository
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.poster.reapplyCustomPosterUrls
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.features.collection.Collection
@@ -33,6 +34,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.absoluteValue
 import kotlin.random.Random
+import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.catalog_load_failed
+import org.jetbrains.compose.resources.getString
 
 object HomeRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -112,8 +116,11 @@ object HomeRepository {
                     loadedSections[cacheKey] = section
                 }
                 if (firstErrorMessage == null) {
-                    firstErrorMessage = results.firstNotNullOfOrNull { (_, result) ->
+                    val raw = results.firstNotNullOfOrNull { (_, result) ->
                         result.exceptionOrNull()?.message
+                    }
+                    if (raw != null) {
+                        firstErrorMessage = userFacingFailure(raw, getString(Res.string.catalog_load_failed))
                     }
                 }
                 cachedSections = loadedSections.toMap()

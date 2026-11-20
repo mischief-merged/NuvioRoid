@@ -194,7 +194,7 @@ private val NuvioTypeTokens: NuvioTypeScale
     )
 
 private val NuvioRippleConfiguration = RippleConfiguration(
-    color = Color.Black,
+    color = darkSurfaceRippleColor(),
 )
 
 private const val NuvioDesktopFontScale = 1.08f

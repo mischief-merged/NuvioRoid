@@ -30,6 +30,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -83,8 +84,13 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.map
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_retry
+import nuvio.composeapp.generated.resources.catalog_load_more_retry
 import nuvio.composeapp.generated.resources.collections_folder_empty_items
+import nuvio.composeapp.generated.resources.collections_folder_load_failed_message
+import nuvio.composeapp.generated.resources.collections_folder_load_failed_title
 import nuvio.composeapp.generated.resources.collections_folder_not_found
+import nuvio.composeapp.generated.resources.collections_folder_partial_failure
 import nuvio.composeapp.generated.resources.collections_tab_all
 import org.jetbrains.compose.resources.stringResource
 
@@ -162,6 +168,11 @@ fun FolderDetailScreen(
                         topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 32.dp,
                         onBack = onBack,
                     )
+                }
+
+                if (folder == null && uiState.isLoading) {
+                    LoadingIndicator()
+                    return@Column
                 }
 
                 if (folder == null && !uiState.isLoading) {
@@ -280,6 +291,11 @@ private fun MobileFolderDetailContent(
             )
         }
 
+        if (folder == null && uiState.isLoading) {
+            LoadingIndicator()
+            return@Column
+        }
+
         if (folder == null && !uiState.isLoading) {
             Box(
                 modifier = Modifier.fillMaxSize(),
@@ -390,7 +406,10 @@ private fun TabbedGridContent(
         Spacer(modifier = Modifier.height(8.dp))
 
         val selectedTab = uiState.tabs.getOrNull(uiState.selectedTabIndex)
-        if (selectedTab == null) return
+        if (selectedTab == null) {
+            if (uiState.isLoading) LoadingIndicator() else EmptyMessage()
+            return
+        }
 
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val posterCardStyle = rememberPosterCardStyleUiState()
@@ -408,9 +427,19 @@ private fun TabbedGridContent(
                 GridCells.Fixed(columns)
             }
 
+            val bodyKind = folderBodyKind(uiState)
+            val laterPageFailed = selectedTab.error != null &&
+                selectedTab.nextSkip != null &&
+                selectedTab.items.isNotEmpty()
             when {
-                selectedTab.isLoading && selectedTab.items.isEmpty() -> LoadingIndicator()
-                selectedTab.error != null && selectedTab.items.isEmpty() -> ErrorMessage(selectedTab.error)
+                bodyKind == CollectionBodyKind.Loading && selectedTab.items.isEmpty() -> LoadingIndicator()
+                bodyKind == CollectionBodyKind.Failed -> CollectionFailedMessage(
+                    message = collectionFailureMessage(
+                        collectionFailureErrors(uiState.tabs, uiState.selectedTabIndex, rows = false),
+                        stringResource(Res.string.collections_folder_load_failed_message),
+                    ),
+                    onRetry = { FolderDetailRepository.retryFailedSources() },
+                )
                 selectedTab.items.isEmpty() -> EmptyMessage()
                 else -> {
                     Box(modifier = Modifier.fillMaxSize()) {
@@ -427,6 +456,21 @@ private fun TabbedGridContent(
                             horizontalArrangement = Arrangement.spacedBy(if (isDesktop) 12.dp else 10.dp),
                             verticalArrangement = Arrangement.spacedBy(if (isDesktop) 18.dp else 14.dp),
                         ) {
+                            if (bodyKind == CollectionBodyKind.Partial && !laterPageFailed) {
+                                item(span = { GridItemSpan(maxLineSpan) }) {
+                                    CollectionPartialBanner(
+                                        onRetry = { FolderDetailRepository.retryFailedSources() },
+                                    )
+                                }
+                            }
+                            if (laterPageFailed && !selectedTab.isLoadingMore) {
+                                item(span = { GridItemSpan(maxLineSpan) }) {
+                                    CollectionLoadMoreRetry(
+                                        onRetry = { FolderDetailRepository.retryFailedSources() },
+                                    )
+                                }
+                            }
+
                             items(
                                 items = selectedTab.items.withDuplicateSafeLazyKeys { item -> item.stableKey() },
                                 key = { item -> item.lazyKey },
@@ -486,13 +530,25 @@ private fun RowsContent(
 ) {
     val sections = FolderDetailRepository.getCatalogSectionsForRows()
     val listState = rememberLazyListState()
+    val bodyKind = folderRowsBodyKind(uiState)
 
-    if (uiState.isLoading && sections.isEmpty()) {
+    if (bodyKind == CollectionBodyKind.Loading && sections.isEmpty()) {
         LoadingIndicator()
         return
     }
 
-    if (sections.isEmpty() && !uiState.isLoading) {
+    if (bodyKind == CollectionBodyKind.Failed) {
+        CollectionFailedMessage(
+            message = collectionFailureMessage(
+                collectionFailureErrors(uiState.tabs, uiState.selectedTabIndex, rows = true),
+                stringResource(Res.string.collections_folder_load_failed_message),
+            ),
+            onRetry = { FolderDetailRepository.retryFailedSources() },
+        )
+        return
+    }
+
+    if (sections.isEmpty()) {
         EmptyMessage()
         return
     }
@@ -518,6 +574,13 @@ private fun RowsContent(
             ),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            if (bodyKind == CollectionBodyKind.Partial) {
+                item(key = "collection_partial") {
+                    CollectionPartialBanner(
+                        onRetry = { FolderDetailRepository.retryFailedSources() },
+                    )
+                }
+            }
             items(
                 items = sections.withDuplicateSafeLazyKeys { it.key },
                 key = { it.lazyKey },
@@ -589,17 +652,62 @@ private fun LoadingIndicator() {
 }
 
 @Composable
-private fun ErrorMessage(error: String) {
-    Box(
+private fun CollectionFailedMessage(message: String, onRetry: () -> Unit) {
+    Column(
         modifier = Modifier.fillMaxSize().padding(32.dp),
-        contentAlignment = Alignment.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
     ) {
         Text(
-            text = error,
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.error,
+            text = stringResource(Res.string.collections_folder_load_failed_title),
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onSurface,
             textAlign = TextAlign.Center,
         )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        TextButton(onClick = onRetry) {
+            Text(text = stringResource(Res.string.action_retry))
+        }
+    }
+}
+
+@Composable
+private fun CollectionPartialBanner(onRetry: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.Start,
+    ) {
+        Text(
+            text = stringResource(Res.string.collections_folder_partial_failure),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        TextButton(onClick = onRetry) {
+            Text(text = stringResource(Res.string.action_retry))
+        }
+    }
+}
+
+@Composable
+private fun CollectionLoadMoreRetry(onRetry: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        TextButton(onClick = onRetry) {
+            Text(text = stringResource(Res.string.catalog_load_more_retry))
+        }
     }
 }
 

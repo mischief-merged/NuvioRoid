@@ -9,6 +9,7 @@ import com.nuvio.app.features.catalog.fetchCatalogPage
 import com.nuvio.app.features.catalog.mergeCatalogItems
 import com.nuvio.app.features.catalog.nextCatalogPaginationState
 import com.nuvio.app.features.catalog.supportsPagination
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.core.i18n.localizedMediaTypeLabel
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
@@ -18,6 +19,7 @@ import com.nuvio.app.features.home.filterReleasedItems
 import com.nuvio.app.features.home.stableKey
 import com.nuvio.app.features.trakt.TraktPublicListSourceResolver
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -30,6 +32,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.collections_folder_addon_not_found
+import nuvio.composeapp.generated.resources.collections_folder_load_failed_message
 import nuvio.composeapp.generated.resources.collections_folder_trakt_movie_list
 import nuvio.composeapp.generated.resources.collections_folder_trakt_series_list
 import nuvio.composeapp.generated.resources.collections_tab_all
@@ -55,7 +58,7 @@ data class FolderTab(
     val isAllTab: Boolean = false,
 ) {
     val canLoadMore: Boolean
-        get() = supportsPagination && nextSkip != null
+        get() = supportsPagination && nextSkip != null && error == null
 }
 
 data class FolderDetailUiState(
@@ -272,6 +275,50 @@ object FolderDetailRepository {
         _uiState.value = FolderDetailUiState()
     }
 
+    fun retryFailedSources() {
+        val current = _uiState.value
+        val addons = AddonRepository.uiState.value.addons
+        folderRetryTargets(current.tabs, current.selectedTabIndex).forEach { index ->
+            val tab = _uiState.value.tabs.getOrNull(index) ?: return@forEach
+            val catalogSource = tab.source?.addonCatalogSource()
+            val resolved = catalogSource?.let { addons.findCollectionCatalog(it) }
+            val missingMessage = runBlocking {
+                getString(
+                    Res.string.collections_folder_addon_not_found,
+                    catalogSource?.addonId ?: tab.source?.addonId.orEmpty(),
+                )
+            }
+            when (
+                val plan = folderSourceRetry(
+                    tab = tab,
+                    resolvedManifestUrl = resolved?.addon?.manifestUrl,
+                    resolvedSupportsPagination = resolved?.catalog?.supportsPagination() == true,
+                    missingMessage = missingMessage,
+                )
+            ) {
+                FolderSourceRetry.LoadPage ->
+                    loadTabPage(index, reset = folderRetryUsesReset(tab))
+                is FolderSourceRetry.AttachThenLoad -> {
+                    updateTab(index) { currentTab ->
+                        currentTab.copy(
+                            manifestUrl = plan.manifestUrl,
+                            supportsPagination = currentTab.supportsPagination || plan.supportsPagination,
+                        )
+                    }
+                    val updated = _uiState.value.tabs.getOrNull(index) ?: return@forEach
+                    loadTabPage(index, reset = folderRetryUsesReset(updated))
+                }
+                is FolderSourceRetry.StillMissing -> updateTab(index) { currentTab ->
+                    currentTab.copy(
+                        isLoading = false,
+                        isLoadingMore = false,
+                        error = plan.message,
+                    )
+                }
+            }
+        }
+    }
+
     fun loadMoreSelectedTab() {
         val current = _uiState.value
         val selectedTab = current.selectedTab ?: return
@@ -386,14 +433,14 @@ object FolderDetailRepository {
                 }
                 rebuildAllTab()
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 log.e(error) { "Failed to load source ${currentTab.catalogId}" }
+                val message = userFacingFailure(
+                    error.message,
+                    getString(Res.string.collections_folder_load_failed_message),
+                )
                 updateTab(index) { tab ->
-                    tab.copy(
-                        isLoading = false,
-                        isLoadingMore = false,
-                        nextSkip = if (reset) null else tab.nextSkip,
-                        error = error.message,
-                    )
+                    folderTabAfterLoadFailure(tab, reset, message)
                 }
                 rebuildAllTab()
             }

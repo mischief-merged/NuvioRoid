@@ -1455,15 +1455,19 @@ const sameRgb = (left, right) => {
   return a.red === b.red && a.green === b.green && a.blue === b.blue;
 };
 
-const renderSwatches = (container, colors, selectedColor, eventType) => {
+const renderSwatches = (container, colors, selectedColor, eventType, accessibleName) => {
   container.textContent = "";
   const items = Array.isArray(colors) ? colors : [];
+  const name = accessibleName || "Color";
   items.forEach((color, index) => {
     const parsed = parseArgb(color);
+    const selected = sameRgb(color, selectedColor);
     const swatch = document.createElement("button");
     swatch.type = "button";
-    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameRgb(color, selectedColor) ? " selected" : ""}`;
+    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${selected ? " selected" : ""}`;
     swatch.style.setProperty("--swatch", parsed.css);
+    swatch.setAttribute("aria-label", `${name} ${index + 1}`);
+    if (selected) swatch.setAttribute("aria-pressed", "true");
     swatch.addEventListener("click", event => {
       event.stopPropagation();
       send(eventType, index);
@@ -1493,6 +1497,7 @@ const renderAutoSyncCues = () => {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "sync-cue";
+    row.setAttribute("aria-label", `${cue.timeLabel || ""} ${cue.text || ""}`.trim() || "Subtitle line");
     row.addEventListener("click", event => {
       event.stopPropagation();
       send("subtitleAutoSyncCue", Number(cue.index) || 0);
@@ -1522,9 +1527,13 @@ const renderSubtitleStylePanel = () => {
   outlineLabel.textContent = state.outlineLabel || "Outline";
   outlineToggle.textContent = style.outlineEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
   outlineToggle.classList.toggle("primary", Boolean(style.outlineEnabled));
+  outlineToggle.setAttribute("aria-pressed", String(Boolean(style.outlineEnabled)));
+  outlineToggle.setAttribute("aria-label", `${state.outlineLabel || "Outline"}, ${outlineToggle.textContent}`);
   boldLabel.textContent = state.boldLabel || "Bold";
   boldToggle.textContent = style.bold ? (state.onLabel || "On") : (state.offLabel || "Off");
   boldToggle.classList.toggle("primary", Boolean(style.bold));
+  boldToggle.setAttribute("aria-pressed", String(Boolean(style.bold)));
+  boldToggle.setAttribute("aria-label", `${state.boldLabel || "Bold"}, ${boldToggle.textContent}`);
   bottomOffsetLabel.textContent = state.bottomOffsetLabel || "Bottom Offset";
   bottomOffsetValue.textContent = String(Number(style.bottomOffset) || 0);
   subtitleColorLabel.textContent = state.colorLabel || "Color";
@@ -1536,20 +1545,23 @@ const renderSubtitleStylePanel = () => {
   subtitleFontLabel.textContent = state.fontLabel || "Font";
   const activeFont = (state.subtitleFonts || []).find(font => font.id === (style.fontId || "default"));
   subtitleFontName.textContent = activeFont ? activeFont.label : ((state.subtitleFonts || [])[0] || {}).label || "";
+  subtitleFontRow.setAttribute("aria-label", `${state.fontLabel || "Font"}, ${subtitleFontName.textContent}`.replace(/,\s*$/, ""));
   renderFontPicker();
   shadowLabel.textContent = state.shadowLabel || "Drop shadow";
   shadowToggle.textContent = style.shadowEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
   shadowToggle.classList.toggle("primary", Boolean(style.shadowEnabled));
+  shadowToggle.setAttribute("aria-pressed", String(Boolean(style.shadowEnabled)));
+  shadowToggle.setAttribute("aria-label", `${state.shadowLabel || "Drop shadow"}, ${shadowToggle.textContent}`);
   shadowOpacityLabel.textContent = state.shadowOpacityLabel || "Shadow opacity";
   shadowOpacityValue.textContent = `${Number(style.shadowOpacity) || 0}%`;
   shadowSizeLabel.textContent = state.shadowSizeLabel || "Shadow size";
   shadowSizeValue.textContent = String(Number(style.shadowSize) || 1);
-  renderSwatches(subtitleColorSwatches, state.subtitleColorSwatches, style.textColor, "subtitleTextColor");
-  renderSwatches(outlineColorSwatches, state.subtitleColorSwatches, style.outlineColor, "subtitleOutlineColor");
+  renderSwatches(subtitleColorSwatches, state.subtitleColorSwatches, style.textColor, "subtitleTextColor", "Subtitle text color");
+  renderSwatches(outlineColorSwatches, state.subtitleColorSwatches, style.outlineColor, "subtitleOutlineColor", "Subtitle outline color");
   backgroundColorLabel.textContent = state.backgroundColorLabel || "Background Color";
   backgroundOpacityLabel.textContent = state.backgroundOpacityLabel || "Background opacity";
   backgroundOpacityValue.textContent = `${Math.round((parseArgb(style.backgroundColor).alpha / 255) * 100)}%`;
-  renderSwatches(backgroundColorSwatches, state.subtitleColorSwatches, style.backgroundColor, "subtitleBackgroundColor");
+  renderSwatches(backgroundColorSwatches, state.subtitleColorSwatches, style.backgroundColor, "subtitleBackgroundColor", "Subtitle background color");
   outlineColorSection.hidden = !style.outlineEnabled;
   shadowOpacitySection.hidden = !style.shadowEnabled;
   shadowSizeSection.hidden = !style.shadowEnabled;

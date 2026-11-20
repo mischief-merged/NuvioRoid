@@ -672,29 +672,36 @@ internal fun MainAppContent(
     }
 
     LaunchedEffect(
-        initialHomeReady,
+        ownsAppRuntime,
         offlineLaunchRouteHandled,
         networkStatusUiState.condition,
         downloadsUiState.completedItems,
     ) {
         if (!ownsAppRuntime) return@LaunchedEffect
-        if (!initialHomeReady || offlineLaunchRouteHandled) return@LaunchedEffect
-
-        when (networkStatusUiState.condition) {
-            NetworkCondition.Unknown,
-            NetworkCondition.Checking,
-            -> return@LaunchedEffect
-
-            NetworkCondition.Online -> {
+        val condition = networkStatusUiState.condition
+        val networkKnown = condition != NetworkCondition.Unknown && condition != NetworkCondition.Checking
+        val offline = condition == NetworkCondition.NoInternet || condition == NetworkCondition.ServersUnreachable
+        if (revealShellForOffline(offline)) {
+            initialHomeReady = true
+        }
+        val hasPlayableDownload = downloadsUiState.completedItems.any {
+            !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
+        }
+        when (
+            offlineLaunch(
+                alreadyHandled = offlineLaunchRouteHandled,
+                networkKnown = networkKnown,
+                offline = offline,
+                downloadsEnabled = AppFeaturePolicy.downloadsEnabled,
+                hasPlayableDownload = hasPlayableDownload,
+            )
+        ) {
+            OfflineLaunch.Wait -> Unit
+            OfflineLaunch.StayHere -> offlineLaunchRouteHandled = true
+            OfflineLaunch.OpenDownloads -> {
                 offlineLaunchRouteHandled = true
-            }
-
-            NetworkCondition.NoInternet,
-            NetworkCondition.ServersUnreachable,
-            -> {
-                offlineLaunchRouteHandled = true
-                // Offline startup keeps Home active so the "Downloaded" row and local Continue Watching
-                // entries appear immediately instead of jumping straight into the Downloads screen.
+                // Home stays in front so the Downloaded row and local Continue Watching stay visible.
+                // Downloads can still be opened from the empty-state action.
             }
         }
     }
@@ -1133,6 +1140,13 @@ internal fun MainAppContent(
             }
             requestedSettingsPageName = page.name
             activateTab(AppScreenTab.Settings)
+        }
+
+        fun openHome() {
+            repeat(navController.routes.size) {
+                if (navController.currentRoute !is TabsRoute) navController.popBackStack()
+            }
+            activateTab(AppScreenTab.Home)
         }
 
         fun openPartyMedia(media: PartyMedia) {
@@ -1583,6 +1597,9 @@ internal fun MainAppContent(
                                 onMetaScreenSettingsClick = { navController.navigate(MetaScreenSettingsRoute(metaScreenSettingsTitle)) },
                                 onContinueWatchingSettingsClick = { navController.navigate(ContinueWatchingSettingsRoute(continueWatchingSettingsTitle)) },
                                 onAddonsSettingsClick = { navController.navigate(AddonsSettingsRoute(addonsSettingsTitle)) },
+                                onAddSource = { openSettingsPage(SettingsPage.Addons) },
+                                onConnectServer = { openSettingsPage(SettingsPage.MediaServers) },
+                                onOpenDownloads = { navController.navigate(DownloadsRoute(downloadsTitle)) },
                                 onPluginsSettingsClick = {
                                     if (AppFeaturePolicy.pluginsEnabled) {
                                         navController.navigate(PluginsSettingsRoute(pluginsSettingsTitle))
@@ -1801,6 +1818,7 @@ internal fun MainAppContent(
                         useNativeNavigation = useNativeNavigation,
                         onOpenDownload = ::openDownloadedItem,
                         onChooseAnotherSource = ::chooseAnotherSourceForDownload,
+                        onBrowse = ::openHome,
                     )
                 }
                 entry<DownloadShowRoute> { route ->

@@ -246,6 +246,7 @@ const showPartyConfirm = ({ title, message, confirmLabel, danger, onConfirm }) =
   partyConfirmMessage.hidden = !message;
   partyConfirmCancel.textContent = partyLabel("cancel", "Cancel");
   partyConfirmAccept.textContent = confirmLabel || "";
+  partyConfirmAccept.setAttribute("aria-label", confirmLabel || "Confirm");
   partyConfirmAccept.classList.toggle("danger", Boolean(danger));
   partyConfirmAccept.classList.toggle("primary", !danger);
   partyPanel.inert = true;
@@ -647,9 +648,10 @@ const sendPartyChatMessage = () => {
 
 const renderPartyChat = visible => {
   partyChatInput.placeholder = partyLabel("chatPlaceholder", "Message");
-  partyChatSend.setAttribute("aria-label", partyLabel("chatSend", "Send"));
+  partyChatSend.setAttribute("aria-label", partyLabel("chatSend", "Send message"));
   partyChatSend.title = partyLabel("chatSend", "Send");
   partyChatNewLabel.textContent = partyLabel("chatNewMessages", "New messages");
+  partyChatNew.setAttribute("aria-label", partyLabel("chatNewMessages", "New messages"));
   partyChatEmptyTitle.textContent = partyLabel("chatEmptyTitle");
   partyChatEmptyMessage.textContent = partyLabel("chatEmptyMessage");
   const chat = currentPartyChat();
@@ -681,6 +683,8 @@ const renderPartyTabs = () => {
   const chat = partyTab === "chat";
   partyTabParty.firstElementChild.textContent = partyLabel("tabParty", "Party");
   partyTabChat.firstElementChild.textContent = partyLabel("tabChat", "Chat");
+  partyTabParty.setAttribute("aria-label", partyLabel("tabParty", "Party"));
+  partyTabChat.setAttribute("aria-label", partyLabel("tabChat", "Chat"));
   partyTabParty.classList.toggle("selected", !chat);
   partyTabChat.classList.toggle("selected", chat);
   partyTabParty.setAttribute("aria-selected", String(!chat));

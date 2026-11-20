@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import com.nuvio.app.core.ui.NuvioLoadingIndicator
+import com.nuvio.app.core.ui.userFacingErrorText
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -530,7 +531,10 @@ fun MetaDetailsScreen(
                         text = when (networkStatusUiState.condition) {
                             NetworkCondition.NoInternet -> stringResource(Res.string.details_check_connection)
                             NetworkCondition.ServersUnreachable -> stringResource(Res.string.details_servers_unreachable)
-                            else -> uiState.errorMessage.orEmpty()
+                            else -> userFacingErrorText(
+                                uiState.errorMessage,
+                                stringResource(Res.string.details_failed_to_load),
+                            )
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

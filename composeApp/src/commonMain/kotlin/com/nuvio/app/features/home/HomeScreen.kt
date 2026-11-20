@@ -36,7 +36,9 @@ import com.nuvio.app.core.ui.LocalVerticalBarPadding
 import com.nuvio.app.core.ui.nuvioHorizontalScrollBleed
 import com.nuvio.app.core.ui.ScreenActivityEffect
 import com.nuvio.app.core.ui.NuvioScreen
+import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.ui.NuvioNetworkOfflineCard
+import com.nuvio.app.core.ui.userFacingErrorText
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.rememberHeroStretchState
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
@@ -137,6 +139,9 @@ fun HomeScreen(
     continueWatchingDisintegrationRequest: DisintegrationRequest<String>? = null,
     onFolderClick: ((collectionId: String, folderId: String) -> Unit)? = null,
     onFirstCatalogRendered: (() -> Unit)? = null,
+    onAddSource: () -> Unit = {},
+    onConnectServer: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
 ) {
     LaunchedEffect(Unit) {
         withContext(Dispatchers.Default) {
@@ -1129,47 +1134,80 @@ fun HomeScreen(
                         disintegrationRequest = continueWatchingDisintegrationRequest,
                     )
                     if (!hasDownloadedOfflineRow) {
-                        item(key = "home_empty", contentType = "empty") {
-                            when {
-                                networkStatusUiState.isOfflineLike && addonManifestErrorMessage != null -> {
-                                    NuvioNetworkOfflineCard(
-                                        condition = networkStatusUiState.condition,
-                                        modifier = Modifier.padding(
-                                            horizontal = if (isDesktop) homeSectionPadding else 16.dp,
-                                        ),
-                                        onRetry = {
-                                            NetworkStatusRepository.requestRefresh(force = true)
-                                            AddonRepository.refreshAll()
-                                        },
-                                    )
-                                }
+                    item(key = "home_empty", contentType = "empty") {
+                        val offline = networkStatusUiState.isOfflineLike
+                        val refreshSources = {
+                            NetworkStatusRepository.requestRefresh(force = true)
+                            AddonRepository.refreshAll()
+                        }
+                        val openDownloadsLabel = stringResource(Res.string.home_empty_open_downloads)
+                        when {
+                            offline && addonManifestErrorMessage != null -> {
+                                val showDownloads = visibleEmptyActions(
+                                    failedEmptyActions(offline = true),
+                                    AppFeaturePolicy.downloadsEnabled,
+                                ).contains(EmptyScreenAction.OpenDownloads)
+                                NuvioNetworkOfflineCard(
+                                    condition = networkStatusUiState.condition,
+                                    modifier = Modifier.padding(
+                                        horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                    ),
+                                    onRetry = refreshSources,
+                                    secondaryActionLabel = if (showDownloads) openDownloadsLabel else null,
+                                    onSecondaryAction = if (showDownloads) onOpenDownloads else null,
+                                )
+                            }
 
-                                addonManifestErrorMessage != null -> {
-                                    HomeEmptyStateCard(
-                                        modifier = Modifier.padding(
-                                            horizontal = if (isDesktop) homeSectionPadding else 16.dp,
-                                        ),
-                                        title = stringResource(Res.string.home_load_failed_title),
-                                        message = addonManifestErrorMessage,
-                                        actionLabel = stringResource(Res.string.action_retry),
-                                        onActionClick = {
-                                            NetworkStatusRepository.requestRefresh(force = true)
-                                            AddonRepository.refreshAll()
-                                        },
-                                    )
-                                }
+                            addonManifestErrorMessage != null -> {
+                                HomeEmptyStateCard(
+                                    modifier = Modifier.padding(
+                                        horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                    ),
+                                    title = stringResource(Res.string.home_load_failed_title),
+                                    message = userFacingErrorText(
+                                        addonManifestErrorMessage,
+                                        stringResource(Res.string.addon_load_manifest_failed),
+                                    ),
+                                    actions = visibleEmptyActions(
+                                        failedEmptyActions(offline = false),
+                                        AppFeaturePolicy.downloadsEnabled,
+                                    ),
+                                    onEmptyAction = { action ->
+                                        performEmptyAction(
+                                            action = action,
+                                            onAddSource = onAddSource,
+                                            onConnectServer = onConnectServer,
+                                            onOpenDownloads = onOpenDownloads,
+                                            onRetry = refreshSources,
+                                        )
+                                    },
+                                )
+                            }
 
-                                else -> {
-                                    HomeEmptyStateCard(
-                                        modifier = Modifier.padding(
-                                            horizontal = if (isDesktop) homeSectionPadding else 16.dp,
-                                        ),
-                                        title = stringResource(Res.string.home_empty_no_sources_title),
-                                        message = stringResource(Res.string.home_empty_no_sources_message),
-                                    )
-                                }
+                            else -> {
+                                HomeEmptyStateCard(
+                                    modifier = Modifier.padding(
+                                        horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                    ),
+                                    title = stringResource(Res.string.home_empty_no_sources_title),
+                                    message = stringResource(Res.string.home_empty_no_sources_message),
+                                    actions = visibleEmptyActions(
+                                        setupEmptyActions(offline),
+                                        AppFeaturePolicy.downloadsEnabled,
+                                    ),
+                                    onEmptyAction = { action ->
+                                        performEmptyAction(
+                                            action = action,
+                                            onAddSource = onAddSource,
+                                            onConnectServer = onConnectServer,
+                                            onOpenDownloads = onOpenDownloads,
+                                            onRetry = refreshSources,
+                                        )
+                                    },
+                                )
                             }
                         }
+                    }
                     }
                 }
 
@@ -1177,45 +1215,64 @@ fun HomeScreen(
                     (!continueWatchingPreferences.isVisible || !hasContinueWatchingRows) &&
                     !hasRenderableCollectionRows -> {
                     if (!hasDownloadedOfflineRow) {
-                        item(key = "home_empty", contentType = "empty") {
-                            val loadFailed = !homeUiState.errorMessage.isNullOrBlank()
-                            if (networkStatusUiState.isOfflineLike && loadFailed) {
-                                NuvioNetworkOfflineCard(
-                                    condition = networkStatusUiState.condition,
-                                    modifier = Modifier.padding(
-                                        horizontal = if (isDesktop) homeSectionPadding else 16.dp,
-                                    ),
-                                    onRetry = {
-                                        NetworkStatusRepository.requestRefresh(force = true)
-                                        HomeRepository.refresh(addonsUiState.addons.enabledAddons(), force = true)
-                                    },
-                                )
-                            } else {
-                                HomeEmptyStateCard(
-                                    modifier = Modifier.padding(
-                                        horizontal = if (isDesktop) homeSectionPadding else 16.dp,
-                                    ),
-                                    title = stringResource(
-                                        if (loadFailed) {
-                                            Res.string.home_load_failed_title
-                                        } else {
-                                            Res.string.home_empty_no_rows_title
-                                        },
-                                    ),
-                                    message = homeUiState.errorMessage
-                                        ?: stringResource(Res.string.home_empty_no_rows_message),
-                                    actionLabel = if (loadFailed) stringResource(Res.string.action_retry) else null,
-                                    onActionClick = if (loadFailed) {
-                                        {
-                                            NetworkStatusRepository.requestRefresh(force = true)
-                                            HomeRepository.refresh(addonsUiState.addons.enabledAddons(), force = true)
-                                        }
-                                    } else {
-                                        null
-                                    },
-                                )
-                            }
+                    item(key = "home_empty", contentType = "empty") {
+                        val loadFailed = !homeUiState.errorMessage.isNullOrBlank()
+                        val offline = networkStatusUiState.isOfflineLike
+                        val refreshHome = {
+                            NetworkStatusRepository.requestRefresh(force = true)
+                            HomeRepository.refresh(addonsUiState.addons.enabledAddons(), force = true)
                         }
+                        val openDownloadsLabel = stringResource(Res.string.home_empty_open_downloads)
+                        if (offline && loadFailed) {
+                            val showDownloads = visibleEmptyActions(
+                                failedEmptyActions(offline = true),
+                                AppFeaturePolicy.downloadsEnabled,
+                            ).contains(EmptyScreenAction.OpenDownloads)
+                            NuvioNetworkOfflineCard(
+                                condition = networkStatusUiState.condition,
+                                modifier = Modifier.padding(
+                                    horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                ),
+                                onRetry = refreshHome,
+                                secondaryActionLabel = if (showDownloads) openDownloadsLabel else null,
+                                onSecondaryAction = if (showDownloads) onOpenDownloads else null,
+                            )
+                        } else {
+                            HomeEmptyStateCard(
+                                modifier = Modifier.padding(
+                                    horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                ),
+                                title = stringResource(
+                                    if (loadFailed) {
+                                        Res.string.home_load_failed_title
+                                    } else {
+                                        Res.string.home_empty_no_rows_title
+                                    },
+                                ),
+                                message = if (loadFailed) {
+                                    userFacingErrorText(
+                                        homeUiState.errorMessage,
+                                        stringResource(Res.string.catalog_load_failed),
+                                    )
+                                } else {
+                                    stringResource(Res.string.home_empty_no_rows_message)
+                                },
+                                actions = visibleEmptyActions(
+                                    if (loadFailed) failedEmptyActions(offline = false) else setupEmptyActions(offline),
+                                    AppFeaturePolicy.downloadsEnabled,
+                                ),
+                                onEmptyAction = { action ->
+                                    performEmptyAction(
+                                        action = action,
+                                        onAddSource = onAddSource,
+                                        onConnectServer = onConnectServer,
+                                        onOpenDownloads = onOpenDownloads,
+                                        onRetry = refreshHome,
+                                    )
+                                },
+                            )
+                        }
+                    }
                     }
                 }
 
