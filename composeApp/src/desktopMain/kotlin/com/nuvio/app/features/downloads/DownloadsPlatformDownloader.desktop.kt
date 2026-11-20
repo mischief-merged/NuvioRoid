@@ -252,6 +252,7 @@ internal actual object DownloadsPlatformDownloader {
             // periodic disconnects and only fail after repeated attempts that receive nothing while
             // the internet can be reached. Without internet the download waits for it to come back.
             val retries = DownloadRetries(isOffline, waitBeforeRetry)
+            var digestReplacements = 0
             val refreshBudget = LinkRefreshBudget(
                 maxWithoutProgress = maxLinkRefreshesWithoutProgress,
                 maxTotal = maxTotalLinkRefreshes,
@@ -303,12 +304,22 @@ internal actual object DownloadsPlatformDownloader {
                         switchToFreePartialName(keepCurrentPartial = true)
                         refreshBudget.recordPartialSwitched()
                         continue
+                    } catch (_: NeedsReplacementPartial) {
+                        switchToFreePartialName(keepCurrentPartial = true)
+                        refreshBudget.recordPartialSwitched()
+                        continue
                     }
                     val totalBytes = transfer.totalBytes
                     if (transfer.digestMatched == false) {
-                        // Not the body the server said it sent. Nothing of it is worth resuming: removed only while it is ours.
-                        partial.removeIfOurs(tempFile.toPath())
-                        error(runBlocking { getString(Res.string.downloads_error_file_checksum) })
+                        // Not the body the server said it sent. The partial stays, and one fresh partial is tried.
+                        // A second mismatch keeps both files and stops.
+                        if (digestReplacements >= 1) {
+                            error(runBlocking { getString(Res.string.downloads_error_file_checksum) })
+                        }
+                        digestReplacements++
+                        switchToFreePartialName(keepCurrentPartial = true)
+                        refreshBudget.recordPartialSwitched()
+                        continue
                     }
                     if (transfer.digestMatched == true) request.onDigestVerified()
 
@@ -548,10 +559,8 @@ internal actual object DownloadsPlatformDownloader {
         } catch (rangeError: RangeNotSatisfiableException) {
             if (!attemptedRangeRequest) error("Download failed with HTTP 416")
             if (needsIdentityVerification) throw RefreshNeedsNewPartial()
-            if (!partial.removeIfOurs(tempFile.toPath())) throw PartialNotOurs()
-            resumeFromBytes = 0L
-            attemptedRangeRequest = false
-            openValidatedBody(request, rangeStart = null)
+            if (!partial.proven(tempFile.toPath())) throw PartialNotOurs()
+            throw NeedsReplacementPartial()
         }
 
         if (needsIdentityVerification) {
@@ -641,10 +650,13 @@ internal actual object DownloadsPlatformDownloader {
         val isPartialResume = attemptedRangeRequest && statusCode == 206 && resumeFromBytes > 0L
         val appendToTemp = isPartialResume
         val startingBytes = if (appendToTemp) resumeFromBytes else 0L
-        // An earlier partial that cannot be continued is discarded only after the checks below have
-        // passed, so a download that is refused for lack of room keeps what it already has.
-        val discardPartial = !appendToTemp && tempFile.exists()
-        val reclaimedBytes = if (discardPartial) tempFile.partialLength() else 0L
+        // A server that ignores a range request cannot continue this partial. The file stays where it
+        // is; the caller starts a separate replacement and retires this one only after that is accepted.
+        if (!appendToTemp && tempFile.exists()) {
+            body.close()
+            if (!partial.proven(tempFile.toPath())) throw PartialNotOurs()
+            throw NeedsReplacementPartial()
+        }
 
         val totalBytes = resolveTotalBytes(
             startingBytes = startingBytes,
@@ -658,7 +670,7 @@ internal actual object DownloadsPlatformDownloader {
         // Checked before anything of the body is written, for every download: a file announced as
         // larger than the room on the disk fails with a plain message instead of a system error.
         if (totalBytes != null) {
-            val free = freeBytesFor(request.item)?.plus(reclaimedBytes)
+            val free = freeBytesFor(request.item)
             if (free != null && totalBytes - startingBytes > free) {
                 body.close()
                 error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
@@ -667,13 +679,9 @@ internal actual object DownloadsPlatformDownloader {
         // Checked before anything of the body is written: a file that is announced as too large for
         // the limits of an automatic download is not started.
         val limits = request.limits
-        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item)?.plus(reclaimedBytes))?.let { reason ->
+        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item))?.let { reason ->
             body.close()
             throw TransferStoppedByLimit(reason)
-        }
-        if (discardPartial && !partial.removeIfOurs(tempFile.toPath())) {
-            body.close()
-            throw PartialNotOurs()
         }
         onIdentityObserved(SourceFileIdentity(totalBytes = totalBytes, eTag = opened.eTag, lastModified = opened.lastModified))
         onJoinVerified()
@@ -974,6 +982,9 @@ internal data class SourceFileIdentity(
 internal class ExpiredDownloadLinkException(val statusCode: Int) : IOException("Download failed with HTTP $statusCode")
 
 internal class RefreshNeedsNewPartial : IOException("Refreshed link is not provably the same file")
+
+/** The partial file cannot be continued. It is kept, and a separate replacement is started. */
+internal class NeedsReplacementPartial : IOException("The partial file cannot be continued")
 
 private class RangeNotSatisfiableException(val contentRangeHeader: String?) : IOException("Download failed with HTTP 416")
 
@@ -1419,7 +1430,7 @@ private fun removeIfStill(path: java.nio.file.Path, key: String?) {
 
 /**
  * The partial file of a download, opened for writing without following a link: appended to when the
- * download resumes it, created with create-new when it starts it (the old one was removed just before),
+ * download resumes it, created with create-new when it starts a new partial,
  * so a link or another file put at that name is never written through or cut short.
  */
 internal fun openPartial(path: java.nio.file.Path, append: Boolean): java.io.OutputStream {
@@ -1436,7 +1447,7 @@ internal class PartialNotOurs : IOException("The partial file at that name is no
 
 /**
  * Which partial file is a transfer's own: the one whose identity was recorded when this download created it.
- * Nothing that cannot be proven this way is resumed, cut back or removed.
+ * Nothing that cannot be proven this way is resumed or replaced.
  */
 internal class OwnedPartial(
     @Volatile var key: String?,
@@ -1451,13 +1462,6 @@ internal class OwnedPartial(
         val identity = DownloadMover.identityOf(path) ?: return
         key = identity
         onCreated(identity)
-    }
-
-    /** Removes the partial file only while it is proven to be this download's. True when it is gone. */
-    fun removeIfOurs(path: java.nio.file.Path): Boolean {
-        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return true
-        if (!proven(path)) return false
-        return runCatching { Files.delete(path); true }.getOrDefault(false)
     }
 
     companion object {

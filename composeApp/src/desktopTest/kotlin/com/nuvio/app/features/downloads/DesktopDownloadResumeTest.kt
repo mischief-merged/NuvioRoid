@@ -12,6 +12,7 @@ import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -272,7 +273,13 @@ class DesktopDownloadResumeTest : com.nuvio.app.core.network.TrustedLocalServerT
         }
     }
 
-    private class Outcome(val successUri: String?, val failure: String?, val digestVerified: Boolean, val requests: Int)
+    private class Outcome(
+        val successUri: String?,
+        val failure: String?,
+        val digestVerified: Boolean,
+        val requests: Int,
+        val keptPartialBytes: List<ByteArray> = emptyList(),
+    )
 
     /** Serves [body] with [headers] and downloads it, optionally on top of a partial file. */
     private fun downloadWithHeaders(body: ByteArray, headers: Map<String, String>, partialBytes: Int = 0): Outcome {
@@ -315,13 +322,18 @@ class DesktopDownloadResumeTest : com.nuvio.app.core.network.TrustedLocalServerT
             )
             assertTrue(done.await(60, TimeUnit.SECONDS), "download did not finish")
             if (successUri != null) assertContentEquals(body, File(URI(successUri!!)).readBytes())
-            val leftBehind = File(downloadsDir, "$fileName.part").exists() || (failure != null && File(downloadsDir, fileName).exists())
-            assertEquals(false, leftBehind && failure != null, "a failed download left a file behind")
-            return Outcome(successUri, failure, digestVerified, requests.get())
+            val stem = fileName.substringBeforeLast('.')
+            val keptPartialBytes = downloadsDir.listFiles()
+                ?.filter { it.isFile && it.name.startsWith(stem) && it.name.endsWith(".part") }
+                ?.sortedBy { it.name }
+                ?.map { it.readBytes() }
+                .orEmpty()
+            if (failure != null) assertFalse(File(downloadsDir, fileName).exists(), "a failed download published a file")
+            return Outcome(successUri, failure, digestVerified, requests.get(), keptPartialBytes)
         } finally {
             server.stop(0)
-            File(downloadsDir, fileName).delete()
-            File(downloadsDir, "$fileName.part").delete()
+            val stem = fileName.substringBeforeLast('.')
+            downloadsDir.listFiles()?.filter { it.name.startsWith(stem) }?.forEach { it.delete() }
         }
     }
 
@@ -340,7 +352,7 @@ class DesktopDownloadResumeTest : com.nuvio.app.core.network.TrustedLocalServerT
     }
 
     @Test
-    fun a_body_that_does_not_match_the_content_md5_of_its_server_fails_and_leaves_no_file() {
+    fun a_body_that_does_not_match_the_content_md5_of_its_server_fails_and_keeps_the_partial_files() {
         val body = Random(12).nextBytes(300 * 1024)
 
         val outcome = downloadWithHeaders(body, mapOf("Content-MD5" to md5Base64(body + 1)))
@@ -348,7 +360,9 @@ class DesktopDownloadResumeTest : com.nuvio.app.core.network.TrustedLocalServerT
         assertNull(outcome.successUri)
         assertTrue(outcome.failure != null)
         assertEquals(false, outcome.digestVerified)
-        assertEquals(1, outcome.requests)
+        assertEquals(2, outcome.requests)
+        assertEquals(2, outcome.keptPartialBytes.size)
+        assertTrue(outcome.keptPartialBytes.all { it.contentEquals(body) })
     }
 
     @Test
