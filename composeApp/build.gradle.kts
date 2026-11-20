@@ -1698,10 +1698,17 @@ tasks.withType<KotlinNativeSimulatorTest>().configureEach {
     dependsOn(bootIosTestSimulator)
 }
 
-// The desktop test process cannot open the login keychain. The app itself does not set this.
+// The desktop test process cannot open the login keychain, and it must not read or write the app's
+// own data folder. The app itself does not set either of these.
 tasks.withType<Test>().configureEach {
     if (name == "desktopTest") {
+        val storage = layout.buildDirectory.dir("desktop-test-home")
         systemProperty("nuvio.credentialVault", "memory")
+        systemProperty("nuvio.storageDir", storage.map { it.asFile.absolutePath }.get())
+        doFirst {
+            val dir = storage.get().asFile
+            if (dir.exists()) dir.deleteRecursively()
+        }
     }
 }
 

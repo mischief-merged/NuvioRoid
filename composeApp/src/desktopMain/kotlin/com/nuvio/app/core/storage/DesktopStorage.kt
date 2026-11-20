@@ -100,6 +100,10 @@ internal object DesktopStorage {
     }
 
     private fun resolveAppDataDir(): Path {
+        // Tests pass nuvio.storageDir so they do not read or write the app's own data folder.
+        // The app itself does not set this.
+        val override = System.getProperty("nuvio.storageDir")?.takeIf { it.isNotBlank() }
+        if (override != null) return Paths.get(override)
         val osName = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
         val userHome = Paths.get(System.getProperty("user.home").orEmpty())
         return when {
