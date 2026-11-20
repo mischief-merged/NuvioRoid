@@ -36,6 +36,32 @@ enum class DownloadFailureKind {
 }
 
 @Serializable
+data class KeptPartialFile(
+    val fileName: String,
+    val partialFileKey: String,
+    val locationId: String? = null,
+)
+
+@Serializable
+data class DownloadClientResolve(
+    val type: String? = null,
+    val infoHash: String? = null,
+    val fileIdx: Int? = null,
+    val magnetUri: String? = null,
+    val sources: List<String> = emptyList(),
+    val torrentName: String? = null,
+    val filename: String? = null,
+    val season: Int? = null,
+    val episode: Int? = null,
+    val service: String? = null,
+    val isCached: Boolean? = null,
+    val rawFilename: String? = null,
+    val rawSize: Long? = null,
+    val debridProviderId: String? = null,
+    val debridProviderName: String? = null,
+)
+
+@Serializable
 data class DownloadItem(
     val id: String,
     val contentType: String,
@@ -116,7 +142,34 @@ data class DownloadItem(
     val autoSourceAttempts: Int = 0,
     /** The app looked for a working source by itself and found none. Only the user picks one now. */
     val noWorkingSourceFound: Boolean = false,
+    /** Normalized torrent info hash of the chosen source, when present. */
+    val sourceInfoHash: String? = null,
+    /** File index within a multi-file torrent of the chosen source, when present. */
+    val sourceFileIdx: Int? = null,
+    /** Release or file name stated by the source or debrid resolver, when present. */
+    val sourceFilename: String? = null,
+    /** File size in bytes stated by the source or debrid resolver, when present. */
+    val sourceFileSizeBytes: Long? = null,
+    /** Binge group identifier of the chosen source, when present. */
+    val sourceBingeGroup: String? = null,
+    /** Whether the download URL was obtained through Nuvio's local debrid resolver. */
+    val sourceDebridResolved: Boolean = false,
+    /** Metadata needed to re-resolve the same source directly with the debrid resolver. */
+    val sourceClientResolve: DownloadClientResolve? = null,
+    /** Strong ETag returned by the server for the active partial file. */
+    val sourceETag: String? = null,
+    /** Last-Modified header returned by the server for the active partial file. */
+    val sourceLastModified: String? = null,
+    /** Active partial file name inside the download's folder when it differs from `$fileName.part`. */
+    val partialFileName: String? = null,
+    /** Older partials kept untouched while a refreshed link downloads from scratch into a new partial. */
+    val supersededPartials: List<KeptPartialFile> = emptyList(),
+    /** Whether the current [sourceUrl] came from a link refresh and still needs verification before joining the active partial. */
+    val pendingLinkVerification: Boolean = false,
 ) {
+    val activePartialFileName: String
+        get() = partialFileName?.takeIf { it.isNotBlank() } ?: "$fileName.part"
+
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
 

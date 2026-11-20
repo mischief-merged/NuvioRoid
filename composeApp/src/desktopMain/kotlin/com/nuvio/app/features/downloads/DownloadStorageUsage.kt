@@ -74,7 +74,7 @@ internal class DownloadStorageUsage(
                 result[location.id] = LocationUsage(known, lastKnown = true)
                 return@forEach
             }
-            val sizes = FsGuard.call(timeoutMs, null) { sizesIn(location.path, members) }
+            val sizes = FsGuard.call(timeoutMs, null) { sizesIn(location.id, location.path, members) }
             if (sizes == null) {
                 result[location.id] = LocationUsage(lastKnown[location.id] ?: members.sumOf { it.moveBytes }, lastKnown = true)
             } else {
@@ -88,15 +88,21 @@ internal class DownloadStorageUsage(
     }
 
     /** Size on disk of each item of [members] that lives in [root]: one listing of the folder serves all of them. */
-    private fun sizesIn(root: Path, members: List<DownloadItem>): Map<String, Long> {
+    private fun sizesIn(locationId: String, root: Path, members: List<DownloadItem>): Map<String, Long> {
         val listing = runCatching { Files.list(root).use { it.toList() } }.getOrDefault(emptyList())
             .associateBy { it.fileName.toString() }
         return members.associate { item ->
             val video = item.localFileUri?.let(DownloadLocations::fileOfUri)?.name ?: item.fileName
-            val own = if (item.status == DownloadStatus.Completed) video else item.fileName + ".part"
+            val own = if (item.status == DownloadStatus.Completed) video else item.activePartialFileName
             var total = sizeOf(listing[own])
             if (item.status == DownloadStatus.Completed) {
                 total += sizeOf(listing[DownloadSidecarFiles.sidecarFolderName(video)])
+            } else {
+                item.supersededPartials.forEach { kept ->
+                    if (kept.locationId == null || kept.locationId == locationId) {
+                        total += sizeOf(listing[kept.fileName])
+                    }
+                }
             }
             item.id to total
         }

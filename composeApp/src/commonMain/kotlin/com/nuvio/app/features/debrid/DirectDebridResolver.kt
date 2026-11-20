@@ -29,6 +29,12 @@ object DirectDebridPlaybackResolver {
     private val resolvedCache = mutableMapOf<String, CachedDirectDebridResolve>()
     private val inFlightResolves = mutableMapOf<String, Deferred<DirectDebridResolveResult>>()
 
+    internal suspend fun clearCacheForTest() {
+        mutex.withLock {
+            resolvedCache.clear()
+        }
+    }
+
     /** [forceRefresh] drops the in-memory resolved link first, so a new one is requested from the provider. */
     suspend fun resolve(
         stream: StreamItem,
