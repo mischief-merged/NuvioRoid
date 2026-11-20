@@ -55,6 +55,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.home_view_all
@@ -243,6 +244,8 @@ fun NuvioPosterCard(
     bottomLeftLogoUrl: String? = null,
     bottomLeftText: String? = null,
     isWatched: Boolean = false,
+    isAvailableOffline: Boolean = false,
+    isUnavailableOffline: Boolean = false,
     onClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
 ) {
@@ -261,6 +264,7 @@ fun NuvioPosterCard(
         modifier = Modifier
             .desktopPosterHoverScale()
             .then(modifier)
+            .graphicsLayer { alpha = if (isUnavailableOffline) 0.52f else 1f }
             .width(cardWidth),
         verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s6),
     ) {
@@ -361,6 +365,7 @@ fun NuvioPosterCard(
                 }
             }
 
+            PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
             NuvioPosterWatchedOverlay(isWatched = isWatched)
         }
         if (shouldShowTitleBelow) {

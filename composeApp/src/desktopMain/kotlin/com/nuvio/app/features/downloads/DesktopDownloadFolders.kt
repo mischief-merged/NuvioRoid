@@ -23,6 +23,7 @@ internal interface DownloadsHooks {
     fun pauseAndWait(downloadId: String): Boolean
     fun resume(downloadId: String)
     fun resumeHeld()
+    fun refreshOfflineIndex() = Unit
 
     /** The profile whose list [items] is. A move belongs to the one that started it. */
     fun profileId(): Int = 0
@@ -78,6 +79,7 @@ internal object RepositoryDownloadsHooks : DownloadsHooks {
     override fun pauseAndWait(downloadId: String): Boolean = DownloadsRepository.pauseAndWait(downloadId)
     override fun resume(downloadId: String) = DownloadsRepository.resumeDownload(downloadId)
     override fun resumeHeld() = DownloadsRepository.resumeHeldByFolder()
+    override fun refreshOfflineIndex() = DownloadsRepository.refreshOfflineIndex()
     override fun profileId(): Int = ProfileRepository.activeProfileId
 
     override fun <T> withListLock(block: () -> T): T = DownloadsStorage.withListLock(block)
@@ -140,6 +142,8 @@ internal class DesktopDownloadFolders(
     private val cancelRequested = AtomicBoolean(false)
     private val moveRunning = AtomicBoolean(false)
     private val lastAvailability = java.util.concurrent.ConcurrentHashMap<String, FolderAvailability>()
+    private val snapshotLock = Any()
+    private var lastLocationSnapshot: Map<String, Pair<FolderAvailability, String>>? = null
     private var monitor: Thread? = null
 
     override fun pickFolder(): String? = picker()
@@ -280,6 +284,12 @@ internal class DesktopDownloadFolders(
             autoDownloadUsedBytes = measured.autoDownloadBytes, totalFreeBytes = freeTotal, usageMeasured = true,
             leftovers = runCatching { mover.leftovers() }.getOrDefault(emptyList()),
         )
+        val snapshot = infos.associate { it.id to (it.availability to it.path) }
+        val snapshotChanged = synchronized(snapshotLock) {
+            val changed = lastLocationSnapshot != snapshot
+            lastLocationSnapshot = snapshot
+            changed
+        }
         var returned = false
         infos.forEach { info ->
             val before = lastAvailability.put(info.id, info.availability)
@@ -288,6 +298,9 @@ internal class DesktopDownloadFolders(
         if (returned) {
             hooks.resumeHeld()
             onReturned()
+        }
+        if (snapshotChanged) {
+            hooks.refreshOfflineIndex()
         }
     }
 
@@ -588,7 +601,10 @@ internal class DesktopDownloadFolders(
         return reveal(location.path)
     }
 
-    override fun onLocationReturned() = onReturned()
+    override fun onLocationReturned() {
+        hooks.refreshOfflineIndex()
+        onReturned()
+    }
 
     companion object {
         private const val CheckIntervalMs = 3_000L

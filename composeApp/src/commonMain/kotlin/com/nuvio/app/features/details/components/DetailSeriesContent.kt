@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
@@ -63,6 +64,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.network.NetworkStatusRepository
+import com.nuvio.app.features.details.EpisodeAvailability
+import com.nuvio.app.features.details.availability
+import com.nuvio.app.features.downloads.AvailableOfflineBadge
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
@@ -250,6 +257,7 @@ fun DetailSeriesContent(
                             onEpisodeLongPress = onEpisodeLongPress,
                         )
                     } else {
+                        val offlineIndex = rememberOfflineDownloadIndex()
                         Column(
                             verticalArrangement = Arrangement.spacedBy(sizing.cardGap),
                         ) {
@@ -272,6 +280,12 @@ fun DetailSeriesContent(
                                             metaId = meta.id,
                                             episode = episode,
                                         ),
+                                    isAvailableOffline = offlineIndex.hasFor(
+                                        parentMetaId = meta.id,
+                                        seasonNumber = episode.season,
+                                        episodeNumber = episode.episode,
+                                        videoId = episode.id,
+                                    ),
                                     episodeRatingsVisibility = episodeRatingsVisibility,
                                     blurUnwatchedEpisodes = blurUnwatchedEpisodes,
                                     sizing = sizing,
@@ -340,6 +354,7 @@ internal fun DetailSeriesListEpisode(
 ) {
     BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
         val sizing = seriesContentSizing(maxWidth.value)
+        val offlineIndex = rememberOfflineDownloadIndex()
         val episodeVideoId = buildPlaybackVideoId(
             parentMetaId = meta.id,
             seasonNumber = episode.season,
@@ -358,6 +373,12 @@ internal fun DetailSeriesListEpisode(
                     metaId = meta.id,
                     episode = episode,
                 ),
+            isAvailableOffline = offlineIndex.hasFor(
+                parentMetaId = meta.id,
+                seasonNumber = episode.season,
+                episodeNumber = episode.episode,
+                videoId = episode.id,
+            ),
             episodeRatingsVisibility = episodeRatingsVisibility,
             blurUnwatchedEpisodes = blurUnwatchedEpisodes,
             sizing = sizing,
@@ -767,6 +788,7 @@ private fun EpisodeHorizontalRow(
         }
     }
 
+    val offlineIndex = rememberOfflineDownloadIndex()
     LazyRow(
         state = listState,
         modifier = Modifier
@@ -801,6 +823,12 @@ private fun EpisodeHorizontalRow(
                         metaId = parentMetaId,
                         episode = episode,
                     ),
+                isAvailableOffline = offlineIndex.hasFor(
+                    parentMetaId = parentMetaId,
+                    seasonNumber = episode.season,
+                    episodeNumber = episode.episode,
+                    videoId = episode.id,
+                ),
                 episodeRatingsVisibility = episodeRatingsVisibility,
                 blurUnwatchedEpisodes = blurUnwatchedEpisodes,
                 metrics = rowMetrics,
@@ -819,6 +847,7 @@ private fun EpisodeHorizontalCard(
     progressEntry: WatchProgressEntry?,
     imdbRating: Double?,
     isWatched: Boolean,
+    isAvailableOffline: Boolean = false,
     episodeRatingsVisibility: EpisodeRatingsVisibility,
     blurUnwatchedEpisodes: Boolean,
     metrics: EpisodeHorizontalCardMetrics,
@@ -846,11 +875,21 @@ private fun EpisodeHorizontalCard(
     } else {
         metrics.contentBottomPadding
     }
+    val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+    val isOffline = networkStatus.isNoInternet
+    val unavailableDimAlpha = if (
+        video.availability(offline = isOffline, hasLocalDownload = isAvailableOffline) == EpisodeAvailability.Unavailable
+    ) {
+        0.52f
+    } else {
+        1f
+    }
     Box(
         modifier = Modifier
             .width(metrics.cardWidth)
             .height(metrics.cardHeight)
             .bringIntoViewRequester(bringIntoView)
+            .graphicsLayer { alpha = unavailableDimAlpha }
             .clip(cardShape)
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
             .nuvioCardDepth(
@@ -904,6 +943,8 @@ private fun EpisodeHorizontalCard(
 
         EpisodeAvailabilityBadge(
             video = video,
+            isOffline = isOffline,
+            isAvailableOffline = isAvailableOffline,
             modifier = Modifier
                 .align(if (isWatched) Alignment.TopStart else Alignment.TopEnd)
                 .padding(metrics.contentPadding),
@@ -931,14 +972,22 @@ private fun EpisodeHorizontalCard(
                 ),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            EpisodeCodeBadge(
-                text = video.episodeBadge(),
-                textSize = metrics.badgeTextSize,
-                radius = metrics.badgeRadius,
-                horizontalPadding = metrics.badgeHorizontalPadding,
-                verticalPadding = metrics.badgeVerticalPadding,
-                backgroundAlpha = 0.42f,
-            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                EpisodeCodeBadge(
+                    text = video.episodeBadge(),
+                    textSize = metrics.badgeTextSize,
+                    radius = metrics.badgeRadius,
+                    horizontalPadding = metrics.badgeHorizontalPadding,
+                    verticalPadding = metrics.badgeVerticalPadding,
+                    backgroundAlpha = 0.42f,
+                )
+                if (isAvailableOffline) {
+                    AvailableOfflineBadge(compact = true)
+                }
+            }
 
             Text(
                 text = localizedEpisodeTitle(video.title, video.episode) ?: video.title,
@@ -1259,6 +1308,7 @@ private fun EpisodeListCard(
     progressEntry: WatchProgressEntry?,
     imdbRating: Double?,
     isWatched: Boolean,
+    isAvailableOffline: Boolean = false,
     episodeRatingsVisibility: EpisodeRatingsVisibility,
     blurUnwatchedEpisodes: Boolean,
     sizing: SeriesContentSizing,
@@ -1277,11 +1327,21 @@ private fun EpisodeListCard(
             ?.let(::formatEpisodeRating)
     }
     val formattedDate = remember(video.released) { video.released?.let { formatReleaseDateForDisplay(it) } }
+    val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+    val isOffline = networkStatus.isNoInternet
+    val unavailableDimAlpha = if (
+        video.availability(offline = isOffline, hasLocalDownload = isAvailableOffline) == EpisodeAvailability.Unavailable
+    ) {
+        0.52f
+    } else {
+        1f
+    }
     Box(
         modifier = modifier
             .fillMaxWidth()
             .height(sizing.cardHeight)
             .bringIntoViewRequester(bringIntoView)
+            .graphicsLayer { alpha = unavailableDimAlpha }
             .clip(cardShape)
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
             .border(
@@ -1357,6 +1417,8 @@ private fun EpisodeListCard(
 
                 EpisodeAvailabilityBadge(
                     video = video,
+                    isOffline = isOffline,
+                    isAvailableOffline = isAvailableOffline,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .padding(
@@ -1396,11 +1458,14 @@ private fun EpisodeListCard(
                     overflow = TextOverflow.Ellipsis,
                 )
 
-                if (formattedDate != null || ratingLabel != null) {
+                if (formattedDate != null || ratingLabel != null || isAvailableOffline) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        if (isAvailableOffline) {
+                            AvailableOfflineBadge(compact = true)
+                        }
                         formattedDate?.let { date ->
                             Text(
                                 text = date,

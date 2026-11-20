@@ -34,17 +34,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.nuvio.app.core.format.formatReleaseDateForDisplay
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioAnimatedWatchedBadge
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.AvailableOfflineBadge
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamsUiState
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
@@ -250,6 +255,9 @@ private fun EpisodesListPanelContent(
                 )
             }
         } else {
+            val offlineIndex = rememberOfflineDownloadIndex()
+            val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+            val isOffline = networkStatus.isNoInternet
             LazyColumn(
                 state = episodeListState,
                 modifier = Modifier.weight(1f),
@@ -274,10 +282,18 @@ private fun EpisodesListPanelContent(
                             metaId = parentMetaId,
                             episode = episode,
                         )
+                    val isAvailableOffline = offlineIndex.hasFor(
+                        parentMetaId = parentMetaId,
+                        seasonNumber = episode.season,
+                        episodeNumber = episode.episode,
+                        videoId = episode.id,
+                    )
                     EpisodeRow(
                         episode = episode,
                         isCurrent = isCurrent,
                         isWatched = isWatched,
+                        isAvailableOffline = isAvailableOffline,
+                        isEnabled = !isOffline || isAvailableOffline,
                         blurUnwatchedEpisodes = blurUnwatchedEpisodes,
                         onClick = { onEpisodeSelected(episode) },
                     )
@@ -321,6 +337,8 @@ private fun EpisodeRow(
     episode: MetaVideo,
     isCurrent: Boolean,
     isWatched: Boolean,
+    isAvailableOffline: Boolean,
+    isEnabled: Boolean,
     blurUnwatchedEpisodes: Boolean,
     onClick: () -> Unit,
 ) {
@@ -344,6 +362,7 @@ private fun EpisodeRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .graphicsLayer { alpha = if (isEnabled) 1f else 0.45f }
             .clip(cardShape)
             .background(tokens.colors.surfaceCard)
             .then(
@@ -356,7 +375,7 @@ private fun EpisodeRow(
             .semantics {
                 if (isCurrent) stateDescription = playingDescription
             }
-            .clickable(onClick = onClick)
+            .clickable(enabled = isEnabled, onClick = onClick)
             .padding(10.dp),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -416,6 +435,9 @@ private fun EpisodeRow(
                     color = tokens.colors.textMuted,
                     style = MaterialTheme.typography.bodySmall,
                 )
+            }
+            if (isAvailableOffline) {
+                AvailableOfflineBadge(compact = true)
             }
             episode.overview?.takeIf { it.isNotBlank() }?.let { overview ->
                 Text(

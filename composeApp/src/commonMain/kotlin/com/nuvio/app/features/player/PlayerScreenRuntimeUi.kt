@@ -20,6 +20,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.format.formatReleaseDateForDisplay
 import com.nuvio.app.core.i18n.localizedByteUnit
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.AppPresenceState
 import com.nuvio.app.core.ui.PresenceSnapshot
 import com.nuvio.app.core.ui.nuvio
@@ -28,6 +29,8 @@ import com.nuvio.app.features.debrid.DebridSettingsRepository
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.OfflineDownloadIndex
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -221,12 +224,25 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     }
     val allFilterLabel = stringResource(Res.string.collections_tab_all)
     val playingLabel = stringResource(Res.string.compose_player_playing)
+    val offlineIndex = rememberOfflineDownloadIndex()
+    val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+    val isOffline = networkStatus.isNoInternet
+    val isPlayingLocalDownload = activeSourceUrl.startsWith("file:")
+    val canStreamSources = !isOffline && activeVideoId != null
+    val effectiveSourcesLabel = stringResource(
+        if (isPlayingLocalDownload && canStreamSources) Res.string.stream_instead else Res.string.compose_player_sources,
+    )
+    val availableOfflineLabel = stringResource(Res.string.available_offline)
+    val isNextEpisodeAvailableOffline = nextEpisodeInfo?.let { info ->
+        offlineIndex.hasFor(parentMetaId, info.season, info.episode, info.videoId)
+    } == true
+    val canPlayNextEpisode = nextEpisodeInfo?.hasAired == true && (!isOffline || isNextEpisodeAvailableOffline)
     val sourceFilters = buildPlayerControlFilters(
         allLabel = allFilterLabel,
         selectedFilter = null,
     )
     val sourceItems = buildPlayerControlSourceItems()
-    val episodeItems = buildPlayerControlEpisodeItems()
+    val episodeItems = buildPlayerControlEpisodeItems(offlineIndex = offlineIndex, isOffline = isOffline)
     val episodeSeasons = buildPlayerControlSeasonItems(episodeItems)
     val episodeStreamFilters = buildPlayerControlEpisodeStreamFilters(
         allLabel = allFilterLabel,
@@ -334,7 +350,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         holdToSpeedValue = playerSettingsUiState.holdToSpeedValue,
         subtitlesLabel = stringResource(Res.string.compose_player_subs),
         audioLabel = stringResource(Res.string.compose_player_audio),
-        sourcesLabel = stringResource(Res.string.compose_player_sources),
+        sourcesLabel = effectiveSourcesLabel,
+        availableOfflineLabel = availableOfflineLabel,
         episodesLabel = stringResource(Res.string.compose_player_episodes),
         externalPlayerLabel = stringResource(Res.string.streams_open_external_player),
         playLabel = stringResource(Res.string.detail_btn_play),
@@ -354,7 +371,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         playbackErrorTitle = stringResource(Res.string.compose_player_playback_error),
         playbackErrorMessage = errorMessage.orEmpty(),
         playbackErrorActionLabel = stringResource(Res.string.compose_player_go_back),
-        sourcesPanelTitle = stringResource(Res.string.compose_player_panel_sources),
+        sourcesPanelTitle = stringResource(
+            if (isPlayingLocalDownload && canStreamSources) Res.string.stream_instead else Res.string.compose_player_panel_sources,
+        ),
         episodesPanelTitle = stringResource(Res.string.compose_player_panel_episodes),
         streamsPanelTitle = stringResource(Res.string.compose_player_panel_streams),
         allFilterLabel = allFilterLabel,
@@ -456,7 +475,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             playerSettingsUiState.introDbApiKey.isNotBlank() &&
             !activeSubmitIntroImdbId().isNullOrBlank(),
         showVideoSettings = isIos,
-        showSources = activeVideoId != null,
+        showSources = canStreamSources,
         showEpisodes = isSeries,
         showExternalPlayer = args.onOpenInExternalPlayer != null,
         durationMs = playbackSnapshot.durationMs,
@@ -523,7 +542,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         skipPromptStartMs = ((nativeSkipInterval?.startTime ?: 0.0) * 1000).toLong().coerceAtLeast(0L),
         skipPromptEndMs = nativeSkipAction?.targetMs?.coerceAtLeast(0L) ?: 0L,
         skipPromptDismissed = skipIntervalDismissed,
-        nextEpisodeVisible = nextEpisodeForControls != null && !playerControlsLocked,
+        nextEpisodeVisible = nextEpisodeForControls != null && !playerControlsLocked && (!isOffline || isNextEpisodeAvailableOffline),
         nextEpisodeHeaderLabel = stringResource(Res.string.player_next_episode),
         nextEpisodeTitle = nextEpisodeForControls?.let {
             stringResource(
@@ -541,7 +560,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         } else {
             stringResource(Res.string.player_next_episode_unaired)
         },
-        nextEpisodePlayable = nextEpisodeInfo?.hasAired == true,
+        nextEpisodePlayable = canPlayNextEpisode,
     )
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
     val fold = LocalFold.current?.takeIf { !isInPip }
@@ -777,6 +796,17 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
     val partyState by PartyRepository.state.collectAsStateWithLifecycle()
     val partyActive = partyState.party != null
     val playerBadges = if (isDesktop) emptyList() else rememberPlayerBadges()
+    val offlineIndex = rememberOfflineDownloadIndex()
+    val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+    val isOffline = networkStatus.isNoInternet
+    val canStreamSources = !isOffline && activeVideoId != null
+    val effectiveSourcesLabel = stringResource(
+        if (activeSourceUrl.startsWith("file:") && canStreamSources) Res.string.stream_instead else Res.string.compose_player_sources,
+    )
+    val isNextEpisodeAvailableOffline = nextEpisodeInfo?.let { info ->
+        offlineIndex.hasFor(parentMetaId, info.season, info.episode, info.videoId)
+    } == true
+    val canPlayNextEpisode = nextEpisodeInfo?.hasAired == true && (!isOffline || isNextEpisodeAvailableOffline)
     LaunchedEffect(folded) {
         if (folded) {
             controlsVisible = true
@@ -807,7 +837,7 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
             releaseInfo = metaUiState.meta?.takeIf { it.id == parentMetaId }?.releaseInfo,
             badges = playerBadges,
             hideDetails = activeSkipInterval != null && !skipIntervalDismissed,
-            onNextEpisodeClick = if (nextEpisodeInfo?.hasAired == true && !nextEpisodeAutoPlaySearching && nextEpisodeAutoPlayCountdown == null) {
+            onNextEpisodeClick = if (canPlayNextEpisode && !nextEpisodeAutoPlaySearching && nextEpisodeAutoPlayCountdown == null) {
                 {
                     if (!partyBlocksControl()) playNextEpisode()
                 }
@@ -866,7 +896,8 @@ private fun PlayerScreenRuntime.RenderPlayerControls(
             } else {
                 null
             },
-            onSourcesClick = if (activeVideoId != null) { { openSourcesPanel() } } else null,
+            onSourcesClick = if (canStreamSources) { { openSourcesPanel() } } else null,
+            sourcesLabel = effectiveSourcesLabel,
             onEpisodesClick = if (isSeries) { { openEpisodesPanel() } } else null,
             chapters = chapters,
             onChaptersClick = if (chapters.isNotEmpty()) { { openChaptersPanel() } } else null,
@@ -1129,7 +1160,7 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
                 )
             ) {
                 playerControlsCloseModalsToken += 1
-            } else {
+            } else if (!NetworkStatusRepository.uiState.value.isNoInternet) {
                 requestEpisodeStreamsForPlayerControls(episode)
             }
         }
@@ -1400,7 +1431,7 @@ private fun PlayerScreenRuntime.prepareEpisodesForPlayerControls() {
     if (!isSeries) return
     if (playerMetaVideos.isEmpty()) {
         scope.launch {
-            playerMetaVideos = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.videos ?: emptyList()
+            playerMetaVideos = loadPlayerMetaVideos(parentMetaType, parentMetaId)
         }
     }
 }
@@ -1808,7 +1839,10 @@ private fun formatPlayerControlsCueTimestamp(timeMs: Long): String {
 }
 
 @Composable
-private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(): List<PlayerControlEpisodeItem> {
+private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(
+    offlineIndex: OfflineDownloadIndex,
+    isOffline: Boolean,
+): List<PlayerControlEpisodeItem> {
     val items = mutableListOf<PlayerControlEpisodeItem>()
     for ((index, video) in playerMetaVideos.withIndex()) {
         if (video.season == null && video.episode == null) continue
@@ -1825,6 +1859,12 @@ private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(): List<PlayerCon
                 metaId = parentMetaId,
                 episode = video,
             )
+        val isAvailableOffline = offlineIndex.hasFor(
+            parentMetaId = parentMetaId,
+            seasonNumber = video.season,
+            episodeNumber = video.episode,
+            videoId = video.id,
+        )
         items.add(
             PlayerControlEpisodeItem(
                 index = index,
@@ -1841,6 +1881,8 @@ private fun PlayerScreenRuntime.buildPlayerControlEpisodeItems(): List<PlayerCon
                 episode = video.episode ?: 0,
                 isCurrent = video.season == activeSeasonNumber && video.episode == activeEpisodeNumber,
                 isWatched = isWatched,
+                isAvailableOffline = isAvailableOffline,
+                isEnabled = !isOffline || isAvailableOffline,
             ),
         )
     }

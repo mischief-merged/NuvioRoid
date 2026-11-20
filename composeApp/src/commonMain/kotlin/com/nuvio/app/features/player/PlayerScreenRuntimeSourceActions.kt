@@ -1,11 +1,13 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.debrid.DirectDebridPlayableResult
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.debrid.toastMessage
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.details.SavedDetails
 import com.nuvio.app.features.downloads.DownloadItem
 import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
@@ -548,10 +550,22 @@ internal fun PlayerScreenRuntime.openSourcesPanel() {
     controlsVisible = false
 }
 
+internal suspend fun loadPlayerMetaVideos(
+    type: String,
+    id: String,
+    isOffline: Boolean = NetworkStatusRepository.uiState.value.isNoInternet,
+): List<MetaVideo> = if (isOffline) {
+    SavedDetails.metaFor(type, id)?.videos ?: emptyList()
+} else {
+    MetaDetailsRepository.fetch(type, id)?.videos
+        ?: SavedDetails.metaFor(type, id)?.videos
+        ?: emptyList()
+}
+
 internal fun PlayerScreenRuntime.openEpisodesPanel() {
     if (playerMetaVideos.isEmpty()) {
         scope.launch {
-            playerMetaVideos = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.videos ?: emptyList()
+            playerMetaVideos = loadPlayerMetaVideos(parentMetaType, parentMetaId)
         }
     }
     showEpisodesPanel = true

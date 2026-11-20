@@ -78,6 +78,8 @@ import com.nuvio.app.core.ui.PosterZoomOverlayCoordinator
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
 import com.nuvio.app.core.ui.secondaryClick
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.details.components.DetailIconAction
 import com.nuvio.app.features.library.LibraryRepository
@@ -455,6 +457,10 @@ private fun HomePosterPreviewCard(
                 )
             }
 
+            PosterAvailableOfflineOverlay(
+                isAvailableOffline = rememberOfflineDownloadIndex().hasMeta(item.id),
+                padding = NuvioTokens.Space.s10,
+            )
             NuvioPosterWatchedOverlay(
                 isWatched = isWatched,
                 padding = NuvioTokens.Space.s10,

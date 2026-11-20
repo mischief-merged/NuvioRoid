@@ -7,6 +7,12 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.sourceLabelSaysNotCached
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,6 +42,28 @@ object DownloadsRepository {
 
     private val _hasUnseenCompleted = MutableStateFlow(false)
     val hasUnseenCompleted: StateFlow<Boolean> = _hasUnseenCompleted.asStateFlow()
+
+    private val _offlineIndex = MutableStateFlow(OfflineDownloadIndex.Empty)
+    internal val offlineIndex: StateFlow<OfflineDownloadIndex> = _offlineIndex.asStateFlow()
+
+    private val indexLock = SynchronizedObject()
+    private val indexScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    internal var indexDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private var indexJob: Job? = null
+    private var indexGeneration: Long = 0L
+    private var lastCompletedIndexKey: List<CompletedIndexKey>? = null
+
+    private data class CompletedIndexKey(
+        val id: String,
+        val localFileUri: String?,
+        val fileName: String,
+        val parentMetaId: String,
+        val videoId: String,
+        val seasonNumber: Int?,
+        val episodeNumber: Int?,
+        val updatedAtEpochMs: Long,
+        val locationId: String?,
+    )
 
     // The UI, downloader callbacks and background workers reach this object from different threads.
     // Every read-modify-write of the item list, and every use of activeTransfers, holds this lock.
@@ -128,7 +156,105 @@ object DownloadsRepository {
         baseRevision = 0L
         _hasUnseenCompleted.value = false
         _uiState.value = DownloadsUiState()
+        resetOfflineIndex()
         notifyLiveStatusPlatform()
+    }
+
+    internal fun ensureOfflineIndexStarted() {
+        if (!hasLoaded) {
+            synchronized(indexLock) {
+                if (indexJob?.isActive == true) return
+                val generation = ++indexGeneration
+                indexJob = indexScope.launch(indexDispatcher) {
+                    ensureLoaded()
+                    val snapshot = _uiState.value.items
+                    val key = completedIndexKey(snapshot)
+                    val shouldBuild = synchronized(indexLock) {
+                        if (indexGeneration != generation) return@launch
+                        lastCompletedIndexKey = key
+                        key.isNotEmpty()
+                    }
+                    val built = if (shouldBuild) {
+                        OfflineDownloadIndex(snapshot, ::resolveLocalUriWithoutMutation)
+                    } else {
+                        OfflineDownloadIndex.Empty
+                    }
+                    synchronized(indexLock) {
+                        if (indexGeneration == generation) {
+                            _offlineIndex.value = built
+                        }
+                    }
+                }
+            }
+            return
+        }
+        scheduleOfflineIndexRefresh(_uiState.value.items)
+    }
+
+    internal fun refreshOfflineIndex() {
+        if (!hasLoaded) {
+            ensureOfflineIndexStarted()
+            return
+        }
+        scheduleOfflineIndexRefresh(_uiState.value.items, force = true)
+    }
+
+    private fun resetOfflineIndex() {
+        synchronized(indexLock) {
+            indexGeneration++
+            indexJob?.cancel()
+            indexJob = null
+            lastCompletedIndexKey = null
+            _offlineIndex.value = OfflineDownloadIndex.Empty
+        }
+    }
+
+    private fun completedIndexKey(items: List<DownloadItem>): List<CompletedIndexKey> =
+        items.mapNotNull { item ->
+            if (!item.isVerifiedCompletedStatus()) return@mapNotNull null
+            CompletedIndexKey(
+                id = item.id,
+                localFileUri = item.localFileUri,
+                fileName = item.fileName,
+                parentMetaId = item.parentMetaId,
+                videoId = item.videoId,
+                seasonNumber = item.seasonNumber,
+                episodeNumber = item.episodeNumber,
+                updatedAtEpochMs = item.updatedAtEpochMs,
+                locationId = item.locationId,
+            )
+        }
+
+    private fun scheduleOfflineIndexRefresh(items: List<DownloadItem>, force: Boolean = false) {
+        val key = completedIndexKey(items)
+        val generation = synchronized(indexLock) {
+            if (!force && key == lastCompletedIndexKey) return
+            lastCompletedIndexKey = key
+            indexJob?.cancel()
+            if (key.isEmpty()) {
+                indexGeneration++
+                indexJob = null
+                _offlineIndex.value = OfflineDownloadIndex.Empty
+                return
+            }
+            ++indexGeneration
+        }
+        val candidates = items.filter { it.isVerifiedCompletedStatus() }
+        val job = indexScope.launch(indexDispatcher) {
+            val built = OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
+            synchronized(indexLock) {
+                if (indexGeneration == generation) {
+                    _offlineIndex.value = built
+                }
+            }
+        }
+        synchronized(indexLock) {
+            if (indexGeneration == generation) {
+                indexJob = job
+            } else {
+                job.cancel()
+            }
+        }
     }
 
     fun findPlayableDownloadByVideoId(videoId: String?): DownloadItem? {
@@ -136,7 +262,7 @@ object DownloadsRepository {
         val normalizedVideoId = videoId?.trim().orEmpty()
         if (normalizedVideoId.isBlank()) return null
         return _uiState.value.items.firstOrNull { item ->
-            item.videoId == normalizedVideoId && item.hasPlayableLocalFile()
+            item.videoId.trim() == normalizedVideoId && item.hasPlayableLocalFile()
         }
     }
 
@@ -147,26 +273,49 @@ object DownloadsRepository {
         videoId: String? = null,
     ): DownloadItem? {
         ensureLoaded()
-        val items = _uiState.value.items
-        val normalizedParentMetaId = parentMetaId.trim()
-
-        findPlayableDownloadByVideoId(videoId)?.let { return it }
-
-        return if (seasonNumber != null && episodeNumber != null) {
-            items.firstOrNull { item ->
-                item.parentMetaId == normalizedParentMetaId &&
-                    item.seasonNumber == seasonNumber &&
-                    item.episodeNumber == episodeNumber &&
-                    item.hasPlayableLocalFile()
-            }
-        } else {
-            items.firstOrNull { item ->
-                item.parentMetaId == normalizedParentMetaId &&
-                    item.seasonNumber == null &&
-                    item.episodeNumber == null &&
-                    item.hasPlayableLocalFile()
-            }
+        val normalizedParent = parentMetaId.trim()
+        val normalizedVideo = videoId?.trim().orEmpty()
+        val videoMatchesParent = normalizedVideo == normalizedParent && seasonNumber != null && episodeNumber != null
+        val candidates = _uiState.value.items.filter { item ->
+            if (!item.isVerifiedCompletedStatus()) return@filter false
+            val matchesVideo = normalizedVideo.isNotBlank() &&
+                !videoMatchesParent &&
+                item.videoId.trim() == normalizedVideo
+            val matchesCoordinates = normalizedParent.isNotBlank() &&
+                item.parentMetaId.trim() == normalizedParent &&
+                if (seasonNumber != null && episodeNumber != null) {
+                    item.seasonNumber == seasonNumber && item.episodeNumber == episodeNumber
+                } else {
+                    item.seasonNumber == null && item.episodeNumber == null
+                }
+            matchesVideo || matchesCoordinates
         }
+        if (candidates.isEmpty()) return null
+        return OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
+            .findFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+            )
+    }
+
+    fun hasPlayableDownloadForMeta(parentMetaId: String): Boolean {
+        ensureLoaded()
+        val normalized = parentMetaId.trim()
+        if (normalized.isBlank()) return false
+        val candidates = _uiState.value.items.filter { item ->
+            item.isVerifiedCompletedStatus() &&
+                (item.parentMetaId.trim() == normalized || item.videoId.trim() == normalized)
+        }
+        if (candidates.isEmpty()) return false
+        return OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
+            .hasMeta(normalized)
+    }
+
+    internal fun resolveLocalUriWithoutMutation(item: DownloadItem): String? {
+        if (!item.isVerifiedCompletedStatus()) return null
+        return (backend.locate(item) as? FileLookup.Found)?.uri
     }
 
     /** The finished download whose file is [localFileUri], in either spelling of a file address. */
@@ -213,11 +362,8 @@ object DownloadsRepository {
 
     fun playableLocalFileUri(item: DownloadItem): String? {
         ensureLoaded()
-        if (item.status != DownloadStatus.Completed) return null
-        val resolvedUri = backend.resolveLocalFileUri(
-            localFileUri = item.localFileUri,
-            destinationFileName = item.fileName,
-        ) ?: return null
+        if (!item.isVerifiedCompletedStatus()) return null
+        val resolvedUri = (backend.locate(item) as? FileLookup.Found)?.uri ?: return null
 
         if (resolvedUri != item.localFileUri) {
             mutateItem(item.id) { current ->
@@ -644,6 +790,7 @@ object DownloadsRepository {
         }
         if (decoded == null) {
             _uiState.value = DownloadsUiState(storeProblem = storeProblem)
+            scheduleOfflineIndexRefresh(emptyList(), force = true)
             notifyLiveStatusPlatform()
             return
         }
@@ -664,6 +811,7 @@ object DownloadsRepository {
             }
 
         _uiState.value = DownloadsUiState(normalized, storeProblem)
+        scheduleOfflineIndexRefresh(normalized, force = true)
         notifyLiveStatusPlatform()
         if (shouldPersistNormalized) {
             persist()
@@ -1047,16 +1195,32 @@ object DownloadsRepository {
      * download was, becomes a failed download, which can be tried again, and is not counted as
      * downloaded. True for a platform that cannot look at the file.
      */
-    internal fun verifyCompletedDownload(downloadId: String): Boolean = synchronized(stateLock) {
-        ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
-        if (item.status != DownloadStatus.Completed) return false
+    internal fun verifyCompletedDownload(downloadId: String): Boolean {
+        val initial = synchronized(stateLock) {
+            ensureLoaded()
+            _uiState.value.items.firstOrNull { it.id == downloadId }
+        } ?: return false
+        if (!initial.isVerifiedCompletedStatus()) return false
         // A move has the item: its file is in the middle of changing places, which is not a file that is lost.
         if (!ItemLocks.tryAcquire(downloadId)) return true
         try {
-            val checked = item.withoutLostFile()
-            if (checked.status == DownloadStatus.Completed) return true
-            mutateItem(downloadId) { checked }
+            var snapshot = initial
+            for (attempt in 0..2) {
+                val checked = snapshot.withoutLostFile()
+                synchronized(stateLock) {
+                    val latest = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
+                    if (!latest.isVerifiedCompletedStatus()) return false
+                    if (latest != snapshot && attempt < 2) {
+                        snapshot = latest
+                    } else if (checked.status == DownloadStatus.Completed) {
+                        scheduleOfflineIndexRefresh(_uiState.value.items, force = true)
+                        return true
+                    } else {
+                        mutateItem(downloadId) { checked }
+                        return false
+                    }
+                }
+            }
             return false
         } finally {
             ItemLocks.release(downloadId)
@@ -1317,6 +1481,7 @@ object DownloadsRepository {
             _hasUnseenCompleted.value = true
         }
         _uiState.value = _uiState.value.copy(items = items)
+        scheduleOfflineIndexRefresh(items)
         notifyLiveStatusPlatform()
     }
 
@@ -1486,13 +1651,12 @@ object DownloadsRepository {
         }
     }
 
+    private fun DownloadItem.isVerifiedCompletedStatus(): Boolean =
+        status == DownloadStatus.Completed && !isPlaceholder
+
     private fun DownloadItem.hasPlayableLocalFile(): Boolean =
-        status == DownloadStatus.Completed &&
-            !isPlaceholder &&
-            backend.resolveLocalFileUri(
-                localFileUri = localFileUri,
-                destinationFileName = fileName,
-            ) != null
+        isVerifiedCompletedStatus() &&
+            (backend.locate(this) as? FileLookup.Found)?.uri != null
 }
 
 private class ActiveTransfer {

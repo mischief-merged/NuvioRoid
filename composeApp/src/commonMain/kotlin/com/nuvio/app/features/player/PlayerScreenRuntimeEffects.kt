@@ -21,7 +21,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.downloads.AutoDownloads
+import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.downloads.SidecarIo
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.downloads.savedEpisodeVideosFor
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamRequest
@@ -78,7 +80,7 @@ private data class PlayerSnapshotSignals(
  * treated as "not offline" so we never suppress work we are not sure about.
  */
 internal fun isNetworkOffline(): Boolean =
-    NetworkStatusRepository.uiState.value.isOfflineLike
+    NetworkStatusRepository.uiState.value.isNoInternet
 
 @Composable
 private fun rememberNetworkCondition(): NetworkCondition {
@@ -926,6 +928,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         }
     }
 
+    val offlineIndex = rememberOfflineDownloadIndex()
+
     LaunchedEffect(
         activePlaybackKey,
         playbackSnapshot,
@@ -940,8 +944,17 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
         playerSettingsUiState.streamAutoPlayNextEpisodeEnabled,
         nextEpisodeCardDismissed,
+        offlineIndex,
     ) {
-        val shouldShow = nextEpisodeInfo != null && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
+        val canPlayNextOffline = nextEpisodeInfo?.let { info ->
+            !isNetworkOffline() || offlineIndex.hasFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = info.season,
+                episodeNumber = info.episode,
+                videoId = info.videoId,
+            )
+        } == true
+        val shouldShow = nextEpisodeInfo != null && canPlayNextOffline && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
         if (nextEpisodeAutoPlayAutomatic &&
             (!shouldShow || !playerSettingsUiState.streamAutoPlayNextEpisodeEnabled)
         ) {

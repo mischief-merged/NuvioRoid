@@ -38,6 +38,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
@@ -54,6 +55,8 @@ import com.nuvio.app.core.format.formatReleaseDateForDisplay
 import com.nuvio.app.core.ui.NuvioDesktopVerticalScrollbar
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
 import com.nuvio.app.core.ui.NuvioPosterWatchedOverlay
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.core.ui.PosterLandscapeAspectRatio
 import com.nuvio.app.core.ui.catalogPosterBaseWidthDp
 import com.nuvio.app.core.ui.desktopPageHorizontalPaddingForWidth
@@ -378,10 +381,15 @@ private fun CatalogPosterTile(
         onLongClick = onLongClick,
         modifier = Modifier.fillMaxWidth(),
     ) {
+        val offlineIndex = rememberOfflineDownloadIndex()
+        val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+        val isAvailableOffline = offlineIndex.hasMeta(item.id)
+        val isUnavailableOffline = networkStatus.isNoInternet && !isAvailableOffline
         Column(
             modifier = Modifier
                 .desktopPosterHoverScale()
-                .then(it),
+                .then(it)
+                .graphicsLayer { alpha = if (isUnavailableOffline) 0.52f else 1f },
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Box(
@@ -425,6 +433,7 @@ private fun CatalogPosterTile(
                         desktopAnimation = rememberAnimatedArtworkAnimation(),
                     )
                 }
+                PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
                 NuvioPosterWatchedOverlay(isWatched = isWatched)
             }
             if (!hideLabels) {

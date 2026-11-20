@@ -214,6 +214,7 @@ fun DesktopDetailHero(
     onHeroTrailerMuteToggle: () -> Unit,
     onPlayClick: () -> Unit,
     onPlayLongClick: (() -> Unit)?,
+    streamInsteadAction: DetailSecondaryAction? = null,
     onShuffleClick: (() -> Unit)?,
     shuffleEnabled: Boolean,
     onWatchedClick: () -> Unit,
@@ -321,11 +322,12 @@ fun DesktopDetailHero(
             }
             val downloadAction = rememberMovieDownloadAction(meta)
             DetailActionButtons(
-                modifier = Modifier.widthIn(max = 520.dp),
+                modifier = Modifier.widthIn(max = if (streamInsteadAction != null) 640.dp else 520.dp),
                 playLabel = if (isPrimaryPlayEnabled) playButtonLabel else stringResource(Res.string.playback_unavailable),
                 playEnabled = isPrimaryPlayEnabled,
                 // The download action is one click away, beside Play, unless shuffle holds that place.
                 pinnedAction = shuffleAction?.takeIf { shuffleEnabled } ?: downloadAction,
+                streamInsteadAction = streamInsteadAction,
                 secondaryActions = buildList {
                     if (!shuffleEnabled) shuffleAction?.let(::add)
                     if (shuffleEnabled && shuffleAction != null) downloadAction?.let(::add)

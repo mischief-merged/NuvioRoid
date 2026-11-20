@@ -1,6 +1,9 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.features.downloads.DownloadSubtitles
+import com.nuvio.app.features.downloads.OfflineSkipTimes
+import com.nuvio.app.features.downloads.SidecarIo
 import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.player.skip.SkipIntroRepository
 import kotlinx.coroutines.CoroutineScope
@@ -55,8 +58,10 @@ suspend fun prepareExternalPlayerLaunch(
                         languageMatchesPreference(it.language, preferredLanguage) ||
                             (secondaryLanguage != null && languageMatchesPreference(it.language, secondaryLanguage))
                     }
+                    .ifEmpty { downloadedSubtitles }
                     .map { SubtitleInput(it.url, it.name ?: it.language, it.language) }
-                    .ifEmpty { null }
+            } else if (NetworkStatusRepository.uiState.value.isNoInternet) {
+                null
             } else {
                 SubtitleForwarder.fetchForExternalPlayer(
                     type = type,
@@ -81,7 +86,16 @@ suspend fun prepareExternalPlayerLaunch(
     }
 
     val skipSegmentsDeferred = if (sendSkipSegments) {
-        async { resolveSkipSegmentsJson(type, videoId, request.season, request.episode, contentId) }
+        async {
+            resolveSkipSegmentsJson(
+                type = type,
+                videoId = videoId,
+                season = request.season,
+                episode = request.episode,
+                contentId = contentId,
+                localSourceUrl = request.sourceUrl,
+            )
+        }
     } else {
         null
     }
@@ -105,13 +119,21 @@ suspend fun prepareExternalPlayerLaunch(
  * intentionally independent of the in-app skip-intro toggle (requireSkipIntroEnabled = false):
  * this is its own opt-in setting.
  */
-private suspend fun resolveSkipSegmentsJson(
+internal suspend fun resolveSkipSegmentsJson(
     type: String,
     videoId: String,
     season: Int?,
     episode: Int?,
     contentId: String?,
+    localSourceUrl: String? = null,
+    isOffline: Boolean = NetworkStatusRepository.uiState.value.isNoInternet,
+    readSavedSkipIntervals: (String) -> List<SkipInterval> = { OfflineSkipTimes.app.saved(it) },
 ): String? {
+    if (!localSourceUrl.isNullOrBlank() && localSourceUrl.startsWith("file:")) {
+        val saved = SidecarIo.read { readSavedSkipIntervals(localSourceUrl) }.orEmpty()
+        if (saved.isNotEmpty()) return saved.toSkipSegmentsJson()
+    }
+    if (isOffline) return null
     val imdbFromContent = contentId?.takeIf { it.startsWith("tt") }
     val intervals = skipResolveScope.async {
         withTimeoutOrNull(SkipSegmentResolveTimeoutMs) {

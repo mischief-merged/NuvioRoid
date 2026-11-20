@@ -35,6 +35,12 @@ data class NetworkStatusUiState(
     val isOnline: Boolean
         get() = condition == NetworkCondition.Online
 
+    val isNoInternet: Boolean
+        get() = condition == NetworkCondition.NoInternet
+
+    val hasInternet: Boolean
+        get() = condition != NetworkCondition.NoInternet
+
     val isOfflineLike: Boolean
         get() = condition == NetworkCondition.NoInternet || condition == NetworkCondition.ServersUnreachable
 }
@@ -151,6 +157,20 @@ object NetworkStatusRepository {
 
     /** Asks the public internet now, whatever [uiState] last said. */
     suspend fun isInternetReachable(): Boolean = probePublicInternet()
+
+    internal fun setConditionForTest(condition: NetworkCondition) {
+        _uiState.value = NetworkStatusUiState(condition = condition)
+    }
+
+    internal fun resetForTest() {
+        started = false
+        probeInFlight = false
+        pendingProbeAfterCurrent = false
+        pendingProbeConfirmFailures = false
+        foregroundRefreshJob?.cancel()
+        foregroundRefreshJob = null
+        _uiState.value = NetworkStatusUiState()
+    }
 
     private suspend fun probePublicInternet(): Boolean =
         probeReachable(PUBLIC_PROBE_PRIMARY) || probeReachable(PUBLIC_PROBE_FALLBACK)

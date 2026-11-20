@@ -3261,4 +3261,8 @@
     <string name="downloads_held_detail">They carry on by themselves when the connection is better.</string>
     <string name="downloads_held_download_anyway">Download anyway</string>
     <string name="downloads_held_download_anyway_description">Download anyway on this network until it changes or the app is closed</string>
+    <string name="stream_instead">Stream instead</string>
+    <string name="available_offline">Available offline</string>
+    <string name="home_section_downloaded">Downloaded</string>
+    <string name="offline_connect_to_play">Connect to the internet to play this</string>
 </resources>

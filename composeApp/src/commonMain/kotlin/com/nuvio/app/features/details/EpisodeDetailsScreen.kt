@@ -50,6 +50,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -81,9 +82,13 @@ import com.nuvio.app.core.ui.desktopPageHorizontalPaddingForWidth
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.features.details.components.formatRating
+import com.nuvio.app.features.downloads.AvailableOfflineBadge
+import com.nuvio.app.features.downloads.OfflineDownloadIndex
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.formatPlaybackTime
 import com.nuvio.app.features.streams.StreamAutoPlayPolicy
+import com.nuvio.app.features.streams.rememberPlaybackAvailability
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watching.application.WatchingActions
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
@@ -127,11 +132,23 @@ internal fun EpisodeDetailsScreen(
     )
     val meta = loadedMeta ?: savedLookup.meta
     var autoLoadAttempted by remember(type, id) { mutableStateOf(false) }
+    var observedOfflineState by remember(type, id) { mutableStateOf(false) }
 
     LaunchedEffect(type, id, loadedMeta, uiState.isLoading, autoLoadAttempted) {
         if (!autoLoadAttempted && loadedMeta == null && !uiState.isLoading) {
             autoLoadAttempted = true
             MetaDetailsRepository.load(type, id)
+        }
+    }
+
+    LaunchedEffect(networkStatus.condition, loadedMeta, uiState.isLoading, type, id) {
+        if (networkStatus.condition == NetworkCondition.NoInternet) {
+            observedOfflineState = true
+        } else if (networkStatus.hasInternet && observedOfflineState) {
+            observedOfflineState = false
+            if (loadedMeta == null && !uiState.isLoading) {
+                MetaDetailsRepository.load(type, id)
+            }
         }
     }
 
@@ -173,7 +190,7 @@ internal fun EpisodeDetailsScreen(
                             actionLabel = stringResource(Res.string.action_retry),
                             onAction = {
                                 NetworkStatusRepository.requestRefresh(force = true)
-                                MetaDetailsRepository.load(type, id)
+                                MetaDetailsRepository.load(type, id, forceNetwork = true)
                             },
                         )
                     }
@@ -195,6 +212,7 @@ internal fun EpisodeDetailsScreen(
                         EpisodePageContent(
                             meta = meta,
                             video = video,
+                            isOffline = networkStatus.isNoInternet,
                             horizontalPadding = pageHorizontalPadding,
                             onOpenEpisode = onOpenEpisode,
                             onPlay = onPlay,
@@ -369,11 +387,14 @@ private fun EpisodePageMessage(
 private fun EpisodePageContent(
     meta: MetaDetails,
     video: MetaVideo,
+    isOffline: Boolean,
     horizontalPadding: Dp,
     onOpenEpisode: (MetaVideo) -> Unit,
     onPlay: ContentPlayAction,
     onPlayManually: ContentPlayAction,
 ) {
+    val offlineIndex = rememberOfflineDownloadIndex()
+    val playbackAvailability = rememberPlaybackAvailability()
     val watchedUiState by remember {
         WatchedRepository.ensureLoaded()
         WatchedRepository.uiState
@@ -412,9 +433,17 @@ private fun EpisodePageContent(
         episodeNumber = video.episode,
     )?.takeUnless { it.isCompleted }
     val resumeMs = savedProgress?.lastPositionMs?.takeIf { it > 0L }
-    val availability = video.availability()
+    val isDownloaded = offlineIndex.hasFor(
+        parentMetaId = meta.id,
+        seasonNumber = video.season,
+        episodeNumber = video.episode,
+        videoId = video.id,
+    )
+    val availability = video.availability(offline = isOffline, hasLocalDownload = isDownloaded)
     val playable = availability == EpisodeAvailability.Playable
-    val showManualPlay = playable && StreamAutoPlayPolicy.isEffectivelyEnabled(playerSettings)
+    val canStream = playbackAvailability.canStream(meta.type, streamVideoId)
+    val showStreamInstead = playable && isDownloaded && canStream
+    val showManualPlay = playable && !isDownloaded && canStream && StreamAutoPlayPolicy.isEffectivelyEnabled(playerSettings)
 
     val startPlayback: (ContentPlayAction) -> Unit = { action ->
         action(
@@ -472,6 +501,7 @@ private fun EpisodePageContent(
                         EpisodeSummary(
                             video = video,
                             isWatched = isWatched,
+                            isAvailableOffline = isDownloaded,
                             showRating = metaScreenSettings.episodeRatingsVisibility.showRating(isWatched),
                             availability = availability,
                         )
@@ -479,6 +509,7 @@ private fun EpisodePageContent(
                             video = video,
                             availability = availability,
                             resumeMs = resumeMs,
+                            showStreamInstead = showStreamInstead,
                             showManualPlay = showManualPlay,
                             isWatched = isWatched,
                             onPlay = { startPlayback(onPlay) },
@@ -516,6 +547,8 @@ private fun EpisodePageContent(
                         watchedKeys = watchedUiState.watchedKeys,
                         progressByVideoId = progressByVideoId,
                         blurUnwatched = metaScreenSettings.blurUnwatchedEpisodes,
+                        offlineIndex = offlineIndex,
+                        isOffline = isOffline,
                         onOpenEpisode = onOpenEpisode,
                     )
                 }
@@ -574,6 +607,7 @@ private fun EpisodeStill(
 private fun EpisodeSummary(
     video: MetaVideo,
     isWatched: Boolean,
+    isAvailableOffline: Boolean,
     showRating: Boolean,
     availability: EpisodeAvailability,
 ) {
@@ -606,6 +640,9 @@ private fun EpisodeSummary(
                 color = MaterialTheme.nuvio.colors.textSecondary,
             )
         }
+        if (isAvailableOffline) {
+            AvailableOfflineBadge()
+        }
         Text(
             text = video.overview?.takeIf { it.isNotBlank() }
                 ?: stringResource(Res.string.episode_page_overview_missing),
@@ -625,6 +662,7 @@ private fun EpisodeActions(
     video: MetaVideo,
     availability: EpisodeAvailability,
     resumeMs: Long?,
+    showStreamInstead: Boolean,
     showManualPlay: Boolean,
     isWatched: Boolean,
     onPlay: () -> Unit,
@@ -658,7 +696,17 @@ private fun EpisodeActions(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (showManualPlay) {
+            if (showStreamInstead) {
+                OutlinedButton(
+                    onClick = onPlayManually,
+                    modifier = Modifier.heightIn(min = EpisodePageButtonMinHeight),
+                    shape = MaterialTheme.nuvio.shapes.button,
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(stringResource(Res.string.stream_instead))
+                }
+            } else if (showManualPlay) {
                 OutlinedButton(
                     onClick = onPlayManually,
                     modifier = Modifier.heightIn(min = EpisodePageButtonMinHeight),
@@ -771,6 +819,8 @@ private fun SeasonStrip(
     watchedKeys: Set<String>,
     progressByVideoId: Map<String, WatchProgressEntry>,
     blurUnwatched: Boolean,
+    offlineIndex: OfflineDownloadIndex,
+    isOffline: Boolean,
     onOpenEpisode: (MetaVideo) -> Unit,
 ) {
     val seasonLabel = seasonLabelFor(normalizeSeasonNumber(currentVideo.season))
@@ -790,11 +840,19 @@ private fun SeasonStrip(
         ) {
             itemsIndexed(episodes, key = { index, item -> "${item.id}#$index" }) { _, item ->
                 val watched = isEpisodeWatchedForActions(meta, item, watchedKeys, progressByVideoId)
+                val availableOffline = offlineIndex.hasFor(
+                    parentMetaId = meta.id,
+                    seasonNumber = item.season,
+                    episodeNumber = item.episode,
+                    videoId = item.id,
+                )
                 SeasonStripItem(
                     video = item,
                     imageUrl = item.thumbnail ?: meta.background ?: meta.poster,
                     isCurrent = item.id == currentVideo.id,
                     isWatched = watched,
+                    isAvailableOffline = availableOffline,
+                    isOffline = isOffline,
                     blurred = blurUnwatched && !watched,
                     onClick = { onOpenEpisode(item) },
                 )
@@ -809,6 +867,8 @@ private fun SeasonStripItem(
     imageUrl: String?,
     isCurrent: Boolean,
     isWatched: Boolean,
+    isAvailableOffline: Boolean,
+    isOffline: Boolean,
     blurred: Boolean,
     onClick: () -> Unit,
 ) {
@@ -819,7 +879,7 @@ private fun SeasonStripItem(
     val watchedText = stringResource(Res.string.episodes_cd_watched)
     val notReleasedText = stringResource(Res.string.episode_page_play_not_released)
     val unavailableText = stringResource(Res.string.episodes_unavailable)
-    val availability = video.availability()
+    val availability = video.availability(offline = isOffline, hasLocalDownload = isAvailableOffline)
     val status = listOfNotNull(
         currentText.takeIf { isCurrent },
         watchedText.takeIf { isWatched },
@@ -828,10 +888,12 @@ private fun SeasonStripItem(
     ).joinToString(separator = "  •  ")
     val openLabel = stringResource(Res.string.episode_page_open_episode, title)
     val colors = MaterialTheme.nuvio.colors
+    val cardAlpha = if (availability == EpisodeAvailability.Unavailable) 0.52f else 1f
 
     Column(
         modifier = Modifier
             .width(240.dp)
+            .graphicsLayer { alpha = cardAlpha }
             .clip(shape)
             .border(
                 width = if (isCurrent) 2.dp else 1.dp,
@@ -855,6 +917,14 @@ private fun SeasonStripItem(
                         .fillMaxSize()
                         .then(if (blurred) Modifier.blur(14.dp) else Modifier),
                     contentScale = ContentScale.Crop,
+                )
+            }
+            if (isAvailableOffline) {
+                AvailableOfflineBadge(
+                    compact = true,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(8.dp),
                 )
             }
         }

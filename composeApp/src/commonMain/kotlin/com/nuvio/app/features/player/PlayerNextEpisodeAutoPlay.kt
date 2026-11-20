@@ -21,10 +21,12 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.watching.domain.isShortPlaceholderDuration
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
@@ -90,25 +92,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
     if (nextEpisodeInfo.hasAired != true) return null
 
-    val downloadedNextEpisode = DownloadsRepository.findPlayableDownload(
-        parentMetaId = parentMetaId,
-        seasonNumber = nextVideo.season,
-        episodeNumber = nextVideo.episode,
-        videoId = nextVideo.id,
-    )
-    if (downloadedNextEpisode != null) {
-        onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
-        return null
-    }
-
-    // Offline: the auto-play fan-out is a network search, so skip it entirely.
-    if (isNetworkOffline()) return null
-
     previousJob?.cancel()
-    onSearchingChanged(true)
-    onSourceNameChanged(null)
-    onCountdownChanged(null)
-
     val type = contentType ?: parentMetaType
     val shouldAutoSelectInManualMode =
         settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
@@ -155,6 +139,26 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     }
 
     return launch {
+        val downloadedNextEpisode = withContext(Dispatchers.IO) {
+            DownloadsRepository.findPlayableDownload(
+                parentMetaId = parentMetaId,
+                seasonNumber = nextVideo.season,
+                episodeNumber = nextVideo.episode,
+                videoId = nextVideo.id,
+            )?.takeIf { DownloadsRepository.verifyCompletedDownload(it.id) }
+        }
+        if (downloadedNextEpisode != null) {
+            onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
+            return@launch
+        }
+
+        // Offline: the auto-play fan-out is a network search, so skip it entirely.
+        if (isNetworkOffline()) return@launch
+
+        onSearchingChanged(true)
+        onSourceNameChanged(null)
+        onCountdownChanged(null)
+
         // Connectivity may have dropped between the request and the actual search.
         if (isNetworkOffline()) {
             onSearchingChanged(false)

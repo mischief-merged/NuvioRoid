@@ -230,6 +230,7 @@ let state = {
   subtitlesLabel: "Subs",
   audioLabel: "Audio",
   sourcesLabel: "Sources",
+  availableOfflineLabel: "Available offline",
   episodesLabel: "Episodes",
   externalPlayerLabel: "External",
   playLabel: "Play",
@@ -2000,10 +2001,13 @@ const renderSourceModal = (modalOpened = false) => {
 const appendEpisodeRow = (container, item) => {
   const row = document.createElement("button");
   row.type = "button";
-  row.className = `track-row episode-row${item.isCurrent ? " selected" : ""}`;
+  const isDisabled = item.isEnabled === false;
+  row.disabled = isDisabled;
+  row.className = `track-row episode-row${item.isCurrent ? " selected" : ""}${isDisabled ? " disabled" : ""}`;
   if (item.isCurrent) row.setAttribute("aria-current", "true");
   row.addEventListener("click", event => {
     event.stopPropagation();
+    if (isDisabled) return;
     send("selectEpisode", Number(item.index) || 0);
   });
 
@@ -2041,6 +2045,12 @@ const appendEpisodeRow = (container, item) => {
     released.className = "episode-release";
     released.textContent = item.released;
     copy.appendChild(released);
+  }
+  if (item.isAvailableOffline) {
+    const offline = document.createElement("span");
+    offline.className = "episode-offline-badge";
+    offline.textContent = state.availableOfflineLabel || "Available offline";
+    copy.appendChild(offline);
   }
   if (item.overview) {
     const overview = document.createElement("span");

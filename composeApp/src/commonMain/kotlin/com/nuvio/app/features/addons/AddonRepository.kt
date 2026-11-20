@@ -109,6 +109,11 @@ object AddonRepository {
         _uiState.value = AddonsUiState()
     }
 
+    internal fun setAddonsForTest(addons: List<ManagedAddon>) {
+        initialized = true
+        _uiState.value = AddonsUiState(addons = addons)
+    }
+
     suspend fun pullFromServer(profileId: Int) {
         currentProfileId = resolveEffectiveProfileId(profileId)
         log.i { "pullFromServer() — profileId=$profileId, initialized=$initialized" }
