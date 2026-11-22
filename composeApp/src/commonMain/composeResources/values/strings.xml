@@ -443,6 +443,11 @@
     <string name="compose_player_close">Close player</string>
     <string name="compose_player_minimize">Minimize player</string>
     <string name="compose_player_reopen">Open full player</string>
+    <string name="player_replace_playback_title">Replace what is playing?</string>
+    <string name="player_replace_playback_message">%1$s is currently playing. Start %2$s instead?</string>
+    <string name="player_replace_playback_message_generic">Something is currently playing. Start %1$s instead?</string>
+    <string name="player_replace_playback_confirm">Play instead</string>
+    <string name="player_replace_playback_keep">Keep playing</string>
     <string name="compose_player_color">Color</string>
     <string name="compose_player_currently_playing">Currently playing</string>
     <string name="compose_player_episode_code_episode_only">E%1$d</string>

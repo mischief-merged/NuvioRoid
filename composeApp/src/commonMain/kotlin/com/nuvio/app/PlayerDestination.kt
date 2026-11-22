@@ -35,6 +35,7 @@ import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerPresentationMode
 import com.nuvio.app.features.player.PlayerScreen
 import com.nuvio.app.features.player.PlayerSessionController
+import com.nuvio.app.features.player.ReplacePlaybackDialog
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import com.nuvio.app.navigation.EpisodeDetailRoute
 import com.nuvio.app.navigation.NuvioNavigator
@@ -280,6 +281,11 @@ internal fun BoxScope.PlayerSessionHost(
             modifier = playerSurfaceModifier,
         )
     }
+    ReplacePlaybackDialog(
+        pending = controller.pendingReplacement,
+        onConfirm = controller::confirmPendingReplacement,
+        onDismiss = controller::cancelPendingReplacement,
+    )
 }
 
 @Composable

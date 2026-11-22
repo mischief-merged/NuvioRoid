@@ -944,11 +944,15 @@ internal fun MainAppContent(
         }
 
         fun openPlayerSession(playerLaunch: PlayerLaunch) {
-            if (playerSessionController.hasActiveSession) {
-                playerSessionController.closeActiveSession {
-                    startPlayerSessionNow(playerLaunch)
-                }
-            } else {
+            playerSessionController.launchOrAskToReplace(
+                incomingTitle = playerLaunch.title,
+                videoId = playerLaunch.videoId,
+                parentMetaId = playerLaunch.parentMetaId,
+                seasonNumber = playerLaunch.seasonNumber,
+                episodeNumber = playerLaunch.episodeNumber,
+                sourceUrl = playerLaunch.sourceUrl,
+                allowSameTargetReopen = false,
+            ) {
                 startPlayerSessionNow(playerLaunch)
             }
         }
@@ -1015,26 +1019,14 @@ internal fun MainAppContent(
             return opened
         }
 
-        suspend fun launchCloudLibraryFile(
+        suspend fun resolveAndOpenCloudLibraryFile(
             item: CloudLibraryItem,
             file: CloudLibraryFile,
-            resumePositionMs: Long? = null,
-            resumeProgressFraction: Float? = null,
-            startFromBeginning: Boolean = false,
-        ): Boolean {
-            if (
-                !startFromBeginning &&
-                !(externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) &&
-                playerSessionController.reopenIfMatching(
-                    videoId = item.playbackVideoId(file),
-                    parentMetaId = item.stableKey,
-                    seasonNumber = null,
-                    episodeNumber = null,
-                )
-            ) {
-                return true
-            }
-            return when (
+            resumePositionMs: Long?,
+            resumeProgressFraction: Float?,
+            startFromBeginning: Boolean,
+        ): Boolean =
+            when (
                 val resolved = CloudLibraryRepository.resolvePlayback(
                     item = item,
                     file = file,
@@ -1071,6 +1063,60 @@ internal fun MainAppContent(
 
                 else -> false
             }
+
+        suspend fun launchCloudLibraryFile(
+            item: CloudLibraryItem,
+            file: CloudLibraryFile,
+            resumePositionMs: Long? = null,
+            resumeProgressFraction: Float? = null,
+            startFromBeginning: Boolean = false,
+        ): Boolean {
+            val useExternalPlayer = externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled
+            val cloudVideoId = item.playbackVideoId(file)
+            if (
+                !startFromBeginning &&
+                !useExternalPlayer &&
+                playerSessionController.reopenIfMatching(
+                    videoId = cloudVideoId,
+                    parentMetaId = item.stableKey,
+                    seasonNumber = null,
+                    episodeNumber = null,
+                )
+            ) {
+                return true
+            }
+            if (!useExternalPlayer && playerSessionController.hasActiveSession) {
+                playerSessionController.launchOrAskToReplace(
+                    incomingTitle = file.name.ifBlank { item.name },
+                    videoId = cloudVideoId,
+                    parentMetaId = item.stableKey,
+                    seasonNumber = null,
+                    episodeNumber = null,
+                    allowSameTargetReopen = false,
+                ) {
+                    coroutineScope.launch {
+                        if (
+                            !resolveAndOpenCloudLibraryFile(
+                                item = item,
+                                file = file,
+                                resumePositionMs = resumePositionMs,
+                                resumeProgressFraction = resumeProgressFraction,
+                                startFromBeginning = startFromBeginning,
+                            )
+                        ) {
+                            NuvioToastController.show(cloudLibraryPlayFailedText)
+                        }
+                    }
+                }
+                return true
+            }
+            return resolveAndOpenCloudLibraryFile(
+                item = item,
+                file = file,
+                resumePositionMs = resumePositionMs,
+                resumeProgressFraction = resumeProgressFraction,
+                startFromBeginning = startFromBeginning,
+            )
         }
 
         fun launchPlaybackWithDownloadPreference(
@@ -1092,11 +1138,13 @@ internal fun MainAppContent(
             manualSelection: Boolean,
             startFromBeginning: Boolean,
             pickPurpose: StreamPickPurpose = StreamPickPurpose.Play,
+            promptBeforeStreamRoute: Boolean = true,
         ) {
+            val useExternalPlayer = externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled
             if (
                 !manualSelection &&
                 !startFromBeginning &&
-                !(externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) &&
+                !useExternalPlayer &&
                 playerSessionController.reopenIfMatching(
                     videoId = videoId,
                     parentMetaId = parentMetaId,
@@ -1144,7 +1192,7 @@ internal fun MainAppContent(
                         initialPositionMs = targetResumePositionMs,
                         initialProgressFraction = targetResumeProgressFraction,
                     )
-                    if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
+                    if (useExternalPlayer) {
                         coroutineScope.launch { openExternalPlayback(playerLaunch) }
                         return
                     }
@@ -1158,32 +1206,50 @@ internal fun MainAppContent(
                 return
             }
 
-            val streamLaunchId = StreamLaunchStore.put(
-                StreamLaunch(
-                    profileId = activePlaybackProfileId,
-                    type = type,
+            val navigateToStreamRoute = {
+                val streamLaunchId = StreamLaunchStore.put(
+                    StreamLaunch(
+                        profileId = activePlaybackProfileId,
+                        type = type,
+                        videoId = videoId,
+                        parentMetaId = parentMetaId,
+                        parentMetaType = parentMetaType,
+                        title = title,
+                        logo = logo,
+                        poster = poster,
+                        background = background,
+                        seasonNumber = seasonNumber,
+                        episodeNumber = episodeNumber,
+                        episodeTitle = episodeTitle,
+                        episodeThumbnail = episodeThumbnail,
+                        pauseDescription = pauseDescription,
+                        resumePositionMs = if (startFromBeginning) 0L else resumePositionMs,
+                        resumeProgressFraction = targetResumeProgressFraction,
+                        manualSelection = manualSelection,
+                        startFromBeginning = startFromBeginning,
+                        pickPurpose = pickPurpose,
+                    ),
+                )
+                navController.navigate(
+                    StreamRoute(launchId = streamLaunchId, title = title),
+                )
+            }
+
+            if (promptBeforeStreamRoute && !useExternalPlayer && playerSessionController.hasActiveSession) {
+                playerSessionController.launchOrAskToReplace(
+                    incomingTitle = title,
                     videoId = videoId,
                     parentMetaId = parentMetaId,
-                    parentMetaType = parentMetaType,
-                    title = title,
-                    logo = logo,
-                    poster = poster,
-                    background = background,
                     seasonNumber = seasonNumber,
                     episodeNumber = episodeNumber,
-                    episodeTitle = episodeTitle,
-                    episodeThumbnail = episodeThumbnail,
-                    pauseDescription = pauseDescription,
-                    resumePositionMs = if (startFromBeginning) 0L else resumePositionMs,
-                    resumeProgressFraction = targetResumeProgressFraction,
-                    manualSelection = manualSelection,
-                    startFromBeginning = startFromBeginning,
-                    pickPurpose = pickPurpose,
-                ),
-            )
-            navController.navigate(
-                StreamRoute(launchId = streamLaunchId, title = title),
-            )
+                    allowSameTargetReopen = false,
+                ) {
+                    navigateToStreamRoute()
+                }
+                return
+            }
+
+            navigateToStreamRoute()
         }
 
         // Opens the list of sources of the title of a download that needs another source, in download
@@ -1208,6 +1274,7 @@ internal fun MainAppContent(
                 manualSelection = true,
                 startFromBeginning = true,
                 pickPurpose = StreamPickPurpose.Download,
+                promptBeforeStreamRoute = false,
             )
         }
 

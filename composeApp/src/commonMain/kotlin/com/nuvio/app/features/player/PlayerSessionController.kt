@@ -131,6 +131,9 @@ internal class PlayerSessionController {
     var playbackState by mutableStateOf<MiniPlayerPlaybackState?>(null)
         private set
 
+    var pendingReplacement by mutableStateOf<PendingPlaybackReplacement?>(null)
+        private set
+
     private var boundLaunchId: Long? = null
     private var boundControls by mutableStateOf<PlayerSessionControls?>(null)
 
@@ -232,6 +235,62 @@ internal class PlayerSessionController {
         return true
     }
 
+    fun launchOrAskToReplace(
+        incomingTitle: String,
+        videoId: String?,
+        parentMetaId: String?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        sourceUrl: String? = null,
+        allowSameTargetReopen: Boolean = true,
+        onProceed: () -> Unit,
+    ) {
+        val current = activeSession
+        when (
+            val decision = decidePlaybackLaunch(
+                activeState = playbackState,
+                activeLaunch = current?.launch,
+                incomingTitle = incomingTitle,
+                videoId = videoId,
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                sourceUrl = sourceUrl,
+                allowSameTargetReopen = allowSameTargetReopen,
+            )
+        ) {
+            ReplacePlaybackDecision.ProceedNow -> onProceed()
+            ReplacePlaybackDecision.ReopenActive -> {
+                reopenIfMatching(
+                    videoId = videoId,
+                    parentMetaId = parentMetaId,
+                    seasonNumber = seasonNumber,
+                    episodeNumber = episodeNumber,
+                    sourceUrl = sourceUrl,
+                )
+            }
+            is ReplacePlaybackDecision.AskFirst -> {
+                pendingReplacement = PendingPlaybackReplacement(
+                    currentTitle = decision.currentTitle,
+                    incomingTitle = decision.incomingTitle,
+                    onConfirm = onProceed,
+                )
+            }
+        }
+    }
+
+    fun confirmPendingReplacement() {
+        val pending = pendingReplacement ?: return
+        pendingReplacement = null
+        closeActiveSession {
+            pending.onConfirm()
+        }
+    }
+
+    fun cancelPendingReplacement() {
+        pendingReplacement = null
+    }
+
     fun updatePlaybackState(launchId: Long, state: MiniPlayerPlaybackState) {
         if (activeSession?.launchId != launchId) return
         playbackState = state
@@ -298,6 +357,7 @@ internal class PlayerSessionController {
         if (activeSession?.launchId != launchId) return false
         activeSession = null
         playbackState = null
+        pendingReplacement = null
         if (boundLaunchId == launchId) {
             boundLaunchId = null
             boundControls = null
