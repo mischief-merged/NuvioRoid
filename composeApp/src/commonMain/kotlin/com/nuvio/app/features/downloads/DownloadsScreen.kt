@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.foundation.selection.toggleable
@@ -50,7 +51,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.network.NetworkStatusRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -59,13 +59,17 @@ import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioScreen
 import com.nuvio.app.core.ui.NuvioScreenHeader
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.core.ui.PlatformBackHandler
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.LocalOpenSettingsPage
 import com.nuvio.app.features.settings.SettingsPage
+import com.nuvio.app.features.watched.WatchedRepository
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.pluralStringResource
@@ -75,6 +79,7 @@ import org.jetbrains.compose.resources.stringResource
 fun DownloadsScreen(
     onBack: () -> Unit,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     initialShowId: String? = null,
     onNavigateToShow: ((showId: String, title: String) -> Unit)? = null,
     onBackFromShow: (() -> Unit)? = null,
@@ -99,6 +104,7 @@ fun DownloadsScreen(
     DownloadsScreenContent(
         onBack = onBack,
         onOpenDownload = onOpenDownload,
+        onOpenDetails = onOpenDetails,
         initialShowId = initialShowId,
         onNavigateToShow = onNavigateToShow,
         onBackFromShow = onBackFromShow,
@@ -118,6 +124,7 @@ fun DownloadsScreen(
 internal fun DownloadsScreenContent(
     onBack: () -> Unit,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     initialShowId: String? = null,
     onNavigateToShow: ((showId: String, title: String) -> Unit)? = null,
     onBackFromShow: (() -> Unit)? = null,
@@ -149,6 +156,18 @@ internal fun DownloadsScreenContent(
         DownloadsRepository.ensureLoaded()
         DownloadsRepository.uiState
     }.collectAsStateWithLifecycle()
+    val watchProgressState by remember {
+        WatchProgressRepository.ensureLoaded()
+        WatchProgressRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val watchedState by remember {
+        WatchedRepository.ensureLoaded()
+        WatchedRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val speeds = rememberDownloadSpeeds(uiState.items)
+    val watchStatusOf = remember(watchProgressState, watchedState) {
+        { item: DownloadItem -> item.watchStatus(watchProgressState) }
+    }
     val checkScope = rememberCoroutineScope()
     val checkClearText = stringResource(Res.string.downloads_check_all_clear)
     val checkNothingText = stringResource(Res.string.downloads_check_all_nothing)
@@ -248,6 +267,10 @@ internal fun DownloadsScreenContent(
         selectedShowId?.let { showId ->
             completedEpisodes.firstOrNull { it.parentMetaId == showId }?.title
         }
+    }
+
+    PlatformBackHandler(enabled = selectedShowId != null && onBackFromShow == null) {
+        selectedShowId = null
     }
 
     NuvioScreen {
@@ -366,7 +389,10 @@ internal fun DownloadsScreenContent(
             downloadsRootContent(
                 uiState = uiState,
                 clock = clock,
+                speeds = speeds,
+                watchStatusOf = watchStatusOf,
                 onChooseAnotherSource = onChooseAnotherSource,
+                onOpenDetails = onOpenDetails,
                 onOpenDownloadsFolder = {
                     if (!openDownloadsFolder()) NuvioToastController.show(openDownloadsDirectoryFailedText)
                 },
@@ -386,7 +412,9 @@ internal fun DownloadsScreenContent(
                 showId = selectedShowId.orEmpty(),
                 episodes = completedEpisodes,
                 clock = clock,
+                watchStatusOf = watchStatusOf,
                 onOpenDownload = onOpenDownload,
+                onOpenDetails = onOpenDetails,
                 onDeleteDownload = { downloadPendingDeletionId = it },
                 scheduledDeletions = removalByDownload,
                 onKeepScheduled = { autoDownloads?.keepDownload(activeProfileId, it) },
@@ -591,7 +619,10 @@ private fun LocationBanner(unreachable: List<DownloadLocationInfo>) {
 private fun LazyListScope.downloadsRootContent(
     uiState: DownloadsUiState,
     clock: RowClock,
+    speeds: Map<String, Long>,
+    watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
     onOpenDownloadsFolder: () -> Unit,
     showSeasonHint: Boolean,
     onBrowse: (() -> Unit)?,
@@ -627,7 +658,26 @@ private fun LazyListScope.downloadsRootContent(
 
     if (activeItems.isNotEmpty()) {
         item {
-            SectionTitle(stringResource(Res.string.downloads_section_active))
+            val hasDownloading = activeItems.any { it.status == DownloadStatus.Downloading }
+            val hasResumablePaused = activeItems.any {
+                it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection
+            }
+            SectionTitle(
+                title = stringResource(Res.string.downloads_section_active),
+                actionText = when {
+                    activeItems.size < 2 -> null
+                    hasDownloading -> stringResource(Res.string.downloads_pause_all)
+                    hasResumablePaused -> stringResource(Res.string.downloads_resume_all)
+                    else -> null
+                },
+                onAction = {
+                    if (hasDownloading) {
+                        DownloadsRepository.pauseActiveDownloads()
+                    } else {
+                        DownloadsRepository.resumePausedDownloads()
+                    }
+                },
+            )
         }
         val failedCount = activeItems.count { it.status == DownloadStatus.Failed }
         if (failedCount > 0) {
@@ -645,7 +695,10 @@ private fun LazyListScope.downloadsRootContent(
             DownloadRow(
                 item = item,
                 clock = clock,
+                speedBytesPerSecond = speeds[item.id],
+                watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
+                onOpenDetails = onOpenDetails,
                 onOpen = { onOpenDownload(item) },
                 onPause = { DownloadsRepository.pauseDownload(item.id) },
                 onResume = { DownloadsRepository.resumeDownload(item.id) },
@@ -669,7 +722,9 @@ private fun LazyListScope.downloadsRootContent(
             DownloadRow(
                 item = item,
                 clock = clock,
+                watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
+                onOpenDetails = onOpenDetails,
                 onOpen = { onOpenDownload(item) },
                 onPause = { DownloadsRepository.pauseDownload(item.id) },
                 onResume = { DownloadsRepository.resumeDownload(item.id) },
@@ -714,8 +769,11 @@ private fun LazyListScope.downloadsRootContent(
                         .fillMaxWidth()
                         .padding(horizontal = 14.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    if (item.posterArtwork() != null) {
+                        DownloadPoster(item = item)
+                    }
                     Column(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -768,7 +826,9 @@ private fun LazyListScope.downloadsShowContent(
     showId: String,
     episodes: List<DownloadItem>,
     clock: RowClock,
+    watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
     onDeleteDownload: (String) -> Unit,
     scheduledDeletions: Map<String, AutoDownloadRemoval>,
     onKeepScheduled: (downloadId: String) -> Unit,
@@ -806,6 +866,22 @@ private fun LazyListScope.downloadsShowContent(
         return
     }
 
+    val watchedCount = showEpisodes.count { watchStatusOf(it).isWatched }
+    if (watchedCount > 0) {
+        item(key = "show-watched-summary") {
+            Text(
+                text = listOf(
+                    pluralStringResource(Res.plurals.downloads_episodes, showEpisodes.size, showEpisodes.size),
+                    formatBytes(showEpisodes.sumOf { it.sizeOnDiskBytes }),
+                    stringResource(Res.string.downloads_watched_count, watchedCount),
+                ).joinToString(DownloadTextSeparator),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
     seasons.forEach { (seasonNumber, entries) ->
         item {
             SectionTitle(
@@ -826,7 +902,9 @@ private fun LazyListScope.downloadsShowContent(
             DownloadRow(
                 item = item,
                 clock = clock,
+                watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = null,
+                onOpenDetails = onOpenDetails,
                 onOpen = { onOpenDownload(item) },
                 onPause = { DownloadsRepository.pauseDownload(item.id) },
                 onResume = { DownloadsRepository.resumeDownload(item.id) },
@@ -845,7 +923,10 @@ private fun LazyListScope.downloadsShowContent(
 private fun DownloadRow(
     item: DownloadItem,
     clock: RowClock,
+    speedBytesPerSecond: Long? = null,
+    watchStatus: DownloadWatchStatus = DownloadWatchStatus(),
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     onOpen: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -940,9 +1021,17 @@ private fun DownloadRow(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.Top,
             ) {
+                if (!item.isEpisode && item.posterArtwork() != null) {
+                    DownloadPoster(item = item)
+                } else if (item.isEpisode && item.landscapeArtwork() != null) {
+                    DownloadThumbnail(
+                        imageUrl = item.landscapeArtwork(),
+                        watchProgress = if (item.status == DownloadStatus.Completed) watchStatus.progress else 0f,
+                    )
+                }
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -963,7 +1052,7 @@ private fun DownloadRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = statusText(item, rowStatus),
+                        text = statusText(item, rowStatus, speedBytesPerSecond),
                         // Announced when the phase changes. The description has no sizes, so the
                         // bytes arriving do not make it speak again.
                         modifier = Modifier.semantics {
@@ -979,6 +1068,24 @@ private fun DownloadRow(
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
                     )
+                    if (item.status == DownloadStatus.Completed) {
+                        val watchNote = when {
+                            watchStatus.isWatched -> stringResource(Res.string.episodes_cd_watched)
+                            watchStatus.remainingMs > 0L -> formatTimeLeft(watchStatus.remainingMs)
+                            watchStatus.progress > 0f -> stringResource(
+                                Res.string.home_continue_watching_watched,
+                                "${(watchStatus.progress * 100f).toInt()}%",
+                            )
+                            else -> null
+                        }
+                        if (watchNote != null) {
+                            Text(
+                                text = watchNote,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                     if (extras != null && extras.folderState.hasSeveralLocations && location != null) {
                         Text(
                             text = stringResource(Res.string.downloads_row_location, location.name),
@@ -1097,6 +1204,14 @@ private fun DownloadRow(
                             Text(stringResource(Res.string.downloads_choose_location), style = MaterialTheme.typography.labelLarge)
                         }
                     }
+                    if (onOpenDetails != null && !selectable && (episodeLinks == null || !item.isEpisode)) {
+                        IconButton(onClick = { onOpenDetails(item) }) {
+                            Icon(
+                                imageVector = Icons.Rounded.Info,
+                                contentDescription = stringResource(Res.string.cw_action_go_to_details),
+                            )
+                        }
+                    }
                     // While a move has the item it cannot be deleted; the status line says why.
                     IconButton(onClick = onDelete, enabled = !isMoving) {
                         Icon(
@@ -1175,20 +1290,37 @@ private fun downloadDisplaySubtitle(
 }
 
 @Composable
-private fun SectionTitle(title: String) {
-    Text(
-        text = title,
+private fun SectionTitle(
+    title: String,
+    actionText: String? = null,
+    onAction: () -> Unit = {},
+) {
+    Row(
         modifier = Modifier
-            .padding(horizontal = 14.dp, vertical = 8.dp)
-            .semantics { heading() },
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        fontWeight = FontWeight.SemiBold,
-    )
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            modifier = Modifier.semantics { heading() },
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (actionText != null) {
+            NuvioActionLabel(text = actionText, onClick = onAction)
+        }
+    }
 }
 
 @Composable
-private fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
+private fun statusText(
+    item: DownloadItem,
+    status: DownloadRowStatus,
+    speedBytesPerSecond: Long? = null,
+): String {
     val size = if (item.status == DownloadStatus.Completed) {
         formatBytes(item.totalBytes ?: item.downloadedBytes)
     } else if (item.totalBytes != null && item.totalBytes > 0L) {
@@ -1197,7 +1329,7 @@ private fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
         formatBytes(item.downloadedBytes)
     }
 
-    val line = when (status.phase) {
+    val baseLine = when (status.phase) {
         DownloadPhase.Failed -> stringResource(Res.string.downloads_status_failed_reason, failureReasonText(item))
         DownloadPhase.NotTheRealVideo -> placeholderRowReason(item)
         else -> if (status.phase.showsSize) {
@@ -1205,6 +1337,12 @@ private fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
         } else {
             stringResource(status.phase.message)
         }
+    }
+    val speed = speedBytesPerSecond?.takeIf { it > 0L && status.phase == DownloadPhase.Downloading }
+    val line = if (speed != null) {
+        baseLine + DownloadTextSeparator + stringResource(Res.string.downloads_speed, formatBytes(speed))
+    } else {
+        baseLine
     }
     return if (status.isAuto) {
         stringResource(Res.string.downloads_status_auto) + " • " + line
@@ -1565,18 +1703,4 @@ private fun resultText(status: DownloadRowStatus, saved: DownloadCompanionsNote?
         null -> Unit
     }
     return message
-}
-
-internal fun formatBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 ${localizedByteUnit("B")}"
-    val kib = 1024.0
-    val mib = kib * 1024.0
-    val gib = mib * 1024.0
-    val value = bytes.toDouble()
-    return when {
-        value >= gib -> "${((value / gib) * 10.0).toInt() / 10.0} ${localizedByteUnit("GB")}"
-        value >= mib -> "${((value / mib) * 10.0).toInt() / 10.0} ${localizedByteUnit("MB")}"
-        value >= kib -> "${((value / kib) * 10.0).toInt() / 10.0} ${localizedByteUnit("KB")}"
-        else -> "$bytes ${localizedByteUnit("B")}"
-    }
 }

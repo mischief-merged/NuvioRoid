@@ -396,6 +396,14 @@ object DownloadsRepository {
             .forEach(::pauseDownload)
     }
 
+    fun resumePausedDownloads(): Unit = synchronized(stateLock) {
+        ensureLoaded()
+        _uiState.value.items
+            .filter { it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection }
+            .map { it.id }
+            .forEach(::resumeDownload)
+    }
+
     /**
      * Pauses a running download and waits until its transfer has stopped writing, so that its file can
      * be looked at or moved. False when it did not stop in time. Never holds the state lock while waiting.
