@@ -139,7 +139,8 @@ internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
         val sessionState by remember(runtime) {
             derivedStateOf {
                 val positionMs = runtime.scrubbingPositionMs ?: runtime.playbackSnapshot.positionMs
-                val quantizedPositionMs = (positionMs / 250L) * 250L
+                val quantizationStepMs = if (runtime.args.isMinimized) 1_000L else 250L
+                val quantizedPositionMs = (positionMs / quantizationStepMs) * quantizationStepMs
                 MiniPlayerPlaybackState(
                     title = runtime.title,
                     seasonNumber = runtime.activeSeasonNumber,

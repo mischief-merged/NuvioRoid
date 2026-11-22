@@ -1194,6 +1194,9 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     std::atomic<double> _requestedVolumePercent;
     BOOL _didFocusControlsWebView;
     BOOL _isInMiniPlayer;
+    BOOL _pendingMiniPlayerResize;
+    NSTimeInterval _pendingMiniPlayerResizeUntil;
+    NSTimeInterval _activeSyncTimerInterval;
     BOOL _controlsWebReady;
     BOOL _fullscreenTransitionActive;
     NSString *_pendingControlsJson;
@@ -1347,11 +1350,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
                 playWhenReady:playWhenReady
              initialPositionMs:initialPositionMs
               decoderPriority:decoderPriority];
-    _timer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                             target:self
-                                           selector:@selector(syncControls)
-                                           userInfo:nil
-                                            repeats:YES];
+    [self updatePeriodicTimers];
     return self;
     } @catch (NSException *exception) {
         // The JNI caller still owns this reference until initialization returns successfully.
@@ -1614,6 +1613,23 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
 
     NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
     BOOL nativeLiveResize = [self isNativeLiveResize];
+    BOOL completingMiniPlayerResize = NO;
+    if (_pendingMiniPlayerResize) {
+        if (nativeLiveResize || now > _pendingMiniPlayerResizeUntil) {
+            _pendingMiniPlayerResize = NO;
+            _pendingMiniPlayerResizeUntil = 0.0;
+        } else if (!NSEqualSizes(bounds.size, _lastAppliedNativeLayoutBounds.size)) {
+            _pendingMiniPlayerResize = NO;
+            _pendingMiniPlayerResizeUntil = 0.0;
+            _lastAppliedNativeLayoutBounds = NSZeroRect;
+            _lastAppliedNativeLayoutWasLiveResize = NO;
+            _lightweightResizeSettleUntil = 0.0;
+            if (!_fullscreenTransitionActive) {
+                [_videoView setFullscreenTransitionActive:NO];
+            }
+            completingMiniPlayerResize = YES;
+        }
+    }
     BOOL wasResizeLikeLayout = _lastAppliedNativeLayoutWasLiveResize
         || _fullscreenTransitionActive
         || (_lightweightResizeSettleUntil > now);
@@ -1663,6 +1679,13 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
         [self layoutControlsWebViewToBounds:bounds immediate:immediateControlsLayout];
     }
     [CATransaction commit];
+
+    if (completingMiniPlayerResize) {
+        [_videoView scheduleRenderUpdate];
+        if (!_isInMiniPlayer) {
+            [self focusControlsWebViewIfNeeded];
+        }
+    }
 
     if (liveResize || settlingFromResize) {
         // The resize-mode layer only draws when asked. A paused player gets no
@@ -1902,17 +1925,52 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self setPaused:!playWhenReady];
 }
 
+- (NSTimeInterval)desiredSyncTimerInterval {
+    if (!_mpv || !_webView) {
+        return 0.0;
+    }
+    if (_isInMiniPlayer) {
+        if (_cachedPaused.load() && !_cachedLoading.load()) {
+            return 0.0;
+        }
+        return 1.0;
+    }
+    return 0.5;
+}
+
+- (void)updatePeriodicTimers {
+    NSTimeInterval desired = [self desiredSyncTimerInterval];
+    if (fabs(desired - _activeSyncTimerInterval) < 0.01) {
+        return;
+    }
+    [_timer invalidate];
+    _timer = nil;
+    _activeSyncTimerInterval = desired;
+    if (desired > 0.0) {
+        _timer = [NSTimer scheduledTimerWithTimeInterval:desired
+                                                  target:self
+                                                selector:@selector(syncControls)
+                                                userInfo:nil
+                                                 repeats:YES];
+    }
+}
+
 - (void)syncControls {
     if (!_webView || !_mpv) {
         return;
     }
-    [self layoutNativeSubviews];
-    [self focusControlsWebViewIfNeeded];
+    if (!_isInMiniPlayer) {
+        [self layoutNativeSubviews];
+        [self focusControlsWebViewIfNeeded];
+    }
     if (_controlsSyncInFlight || !_mpvEventQueue) {
         return;
     }
     _controlsSyncInFlight = YES;
 
+    BOOL miniMode = _isInMiniPlayer;
+    BOOL needHdrInit = (_lastConfiguredHdrKey == nil);
+    BOOL needMediaTitle = !miniMode || (_remoteCommandsActive && _nowPlayingTitleOverride.length == 0);
     mpv_handle *mpv = _mpv;
     dispatch_async(_mpvEventQueue, ^{
         @autoreleasepool {
@@ -1927,18 +1985,22 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
             double duration = [self doubleProperty:"duration" fallback:0.0];
             double position = [self doubleProperty:"time-pos" fallback:0.0];
             double positionReadAt = CACurrentMediaTime();
-            double volumeLevel = [self volume];
+            double volumeLevel = miniMode ? 1.0 : [self volume];
             double cacheAhead = [self cacheAheadSecondsForPosition:position];
-            double bufferedPosition = (double)([self bufferedPositionMs] / 1000.0);
+            double bufferedPosition = miniMode ? 0.0 : (double)([self bufferedPositionMs] / 1000.0);
             BOOL paused = [self rawIsPaused];
             BOOL ended = [self rawIsEnded];
             BOOL loading = [self rawLoadingWithPaused:paused ended:ended duration:duration];
             double speed = [self rawSpeed];
-            NSString *audioTracks = [self audioTracksJson] ?: @"[]";
-            NSString *subtitleTracks = [self subtitleTracksJson] ?: @"[]";
-            NSString *mediaTitle = [self stringProperty:"media-title" fallback:@""];
-            NSString *gamma = [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString];
-            NSString *primaries = [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString];
+            NSString *audioTracks = miniMode ? nil : ([self audioTracksJson] ?: @"[]");
+            NSString *subtitleTracks = miniMode ? nil : ([self subtitleTracksJson] ?: @"[]");
+            NSString *mediaTitle = needMediaTitle ? [self stringProperty:"media-title" fallback:@""] : @"";
+            NSString *gamma = (!miniMode || needHdrInit)
+                ? [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString]
+                : @"";
+            NSString *primaries = (!miniMode || needHdrInit)
+                ? [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString]
+                : @"";
             [self updateCachedDuration:duration
                               position:position
                         positionReadAt:positionReadAt
@@ -1954,12 +2016,18 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
                 if (!self->_webView || self->_mpv != mpv) {
                     return;
                 }
-                [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
+                [self updatePeriodicTimers];
+                if (!miniMode || needHdrInit) {
+                    [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
+                }
                 [self updateNowPlayingWithTitle:mediaTitle
                                        duration:duration
                                        position:position
                                          paused:paused
                                           speed:speed];
+                if (miniMode || self->_isInMiniPlayer) {
+                    return;
+                }
                 NSString *script = [NSString stringWithFormat:
                     @"window.playerUpdate({duration:%0.3f,position:%0.3f,bufferedPosition:%0.3f,volumeLevel:%0.3f,paused:%@,loading:%@,audioTracks:%@,subtitleTracks:%@})",
                     duration,
@@ -1968,8 +2036,8 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
                     volumeLevel,
                     paused ? @"true" : @"false",
                     loading ? @"true" : @"false",
-                    audioTracks,
-                    subtitleTracks];
+                    audioTracks ?: @"[]",
+                    subtitleTracks ?: @"[]"];
                 [self->_webView evaluateJavaScript:script completionHandler:nil];
             });
         }
@@ -2136,15 +2204,6 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
         return;
     }
     _isInMiniPlayer = nextMiniPlayer;
-    _lastAppliedNativeLayoutBounds = NSZeroRect;
-    _lastAppliedNativeLayoutWasLiveResize = NO;
-    _lightweightResizeSettleUntil = 0.0;
-    if (!_fullscreenTransitionActive) {
-        [_videoView setFullscreenTransitionActive:NO];
-    }
-    [self layoutNativeSubviews];
-    [_videoView updateMetalLayerLayout];
-    [_videoView scheduleRenderUpdate];
     if (nextMiniPlayer) {
         _didFocusControlsWebView = NO;
         NSWindow *window = _hostView.window;
@@ -2153,6 +2212,51 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
             [(NSView *)window.firstResponder isDescendantOf:_hostView]) {
             [window makeFirstResponder:contentView];
         }
+    }
+
+    NSRect currentBounds = _hostView ? _hostView.bounds : NSZeroRect;
+    BOOL hasValidHostBounds = currentBounds.size.width > 1.0 && currentBounds.size.height > 1.0;
+    BOOL hostAlreadyResized = hasValidHostBounds &&
+        _lastAppliedNativeLayoutBounds.size.width > 1.0 &&
+        _lastAppliedNativeLayoutBounds.size.height > 1.0 &&
+        !NSEqualSizes(currentBounds.size, _lastAppliedNativeLayoutBounds.size);
+    BOOL layoutJumpTransitionActive = _fullscreenTransitionActive &&
+        _fullscreenTransitionTimer &&
+        [@"layout-jump" isEqual:_fullscreenTransitionTimer.userInfo];
+
+    if (hostAlreadyResized || layoutJumpTransitionActive) {
+        if (layoutJumpTransitionActive) {
+            [_fullscreenTransitionTimer invalidate];
+            _fullscreenTransitionTimer = nil;
+            _fullscreenTransitionActive = NO;
+            [_resizeSettleTimer invalidate];
+            _resizeSettleTimer = nil;
+        }
+        _pendingMiniPlayerResize = NO;
+        _pendingMiniPlayerResizeUntil = 0.0;
+        _lastAppliedNativeLayoutBounds = NSZeroRect;
+        _lastAppliedNativeLayoutWasLiveResize = NO;
+        _lightweightResizeSettleUntil = 0.0;
+        if (!_fullscreenTransitionActive) {
+            [_videoView setFullscreenTransitionActive:NO];
+        }
+        [self layoutNativeSubviews];
+        [_videoView updateMetalLayerLayout];
+        [_videoView scheduleRenderUpdate];
+        if (!nextMiniPlayer) {
+            [self focusControlsWebViewIfNeeded];
+        }
+    } else {
+        // Wait until SwingPanel updates _hostView to its docked or full bounds before
+        // resetting and laying out, matching picture in picture so layoutNativeSubviews
+        // never records the old bounds and arms the 1.6 s layout-jump hold.
+        _pendingMiniPlayerResize = YES;
+        _pendingMiniPlayerResizeUntil = NSDate.timeIntervalSinceReferenceDate + 1.5;
+    }
+
+    [self updatePeriodicTimers];
+    if (!nextMiniPlayer) {
+        [self syncControls];
     }
 }
 
@@ -2200,6 +2304,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_timer invalidate];
     _timer = nil;
+    _activeSyncTimerInterval = 0.0;
     [_resizeSettleTimer invalidate];
     _resizeSettleTimer = nil;
     [_fullscreenTransitionTimer invalidate];
@@ -2251,8 +2356,12 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     mpv_set_property(_mpv, "pause", MPV_FORMAT_FLAG, &flag);
     [self storeCachedPosition:[self estimatedPositionSeconds] at:CACurrentMediaTime()];
     _cachedPaused.store(paused);
+    [self updatePeriodicTimers];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
+    if (_isInMiniPlayer && paused) {
+        [self syncControls];
+    }
 }
 
 - (BOOL)isPaused {
@@ -2274,6 +2383,9 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self storeCachedPosition:(double)positionMs / 1000.0 at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
+    if (_isInMiniPlayer && !_timer) {
+        [self syncControls];
+    }
 }
 
 - (void)seekByMilliseconds:(long long)offsetMs {
@@ -2284,6 +2396,9 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self storeCachedPosition:fmax(0.0, [self estimatedPositionSeconds] + ((double)offsetMs / 1000.0)) at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
+    if (_isInMiniPlayer && !_timer) {
+        [self syncControls];
+    }
 }
 
 - (void)setSpeed:(double)speed {

@@ -51,6 +51,12 @@ internal data class DesktopNativePlayerHooks(
     val attachDelayMs: Long = 16L,
 )
 
+internal const val FULL_PLAYER_SNAPSHOT_POLL_MS = 250L
+internal const val MINI_PLAYER_SNAPSHOT_POLL_MS = 1_000L
+
+internal fun desktopSnapshotPollIntervalMs(isInMiniPlayer: Boolean): Long =
+    if (isInMiniPlayer) MINI_PLAYER_SNAPSHOT_POLL_MS else FULL_PLAYER_SNAPSHOT_POLL_MS
+
 internal val LocalDesktopNativePlayerHooks = staticCompositionLocalOf { DesktopNativePlayerHooks() }
 
 @Composable
@@ -335,10 +341,15 @@ private fun NativePlayerSurface(
         }
     }
 
-    LaunchedEffect(controller) {
+    val isInMiniPlayer = controlsState.isInMiniPlayer
+    LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
+        val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
+        val includeVideoSize = !isInMiniPlayer
         while (true) {
-            if (!controller.isReleasing) onSnapshot(controller.snapshot())
-            delay(250L)
+            if (!controller.isReleasing) {
+                onSnapshot(controller.snapshot(includeVideoSize = includeVideoSize))
+            }
+            delay(pollIntervalMs)
         }
     }
 
