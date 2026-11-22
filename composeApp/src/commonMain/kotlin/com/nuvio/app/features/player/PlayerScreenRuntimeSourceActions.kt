@@ -581,6 +581,7 @@ private fun PlayerScreenRuntime.playTargetEpisode(
         currentStreamBingeGroup = currentStreamBingeGroup,
         isOffline = episodePlaybackOffline,
         findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
+        verifyDownloadedEpisode = verifyEpisodeDownload,
         onDownloadedEpisodeSelected = { item, episode ->
             if (isCurrentRequest()) {
                 switchToDownloadedEpisode(item, episode)

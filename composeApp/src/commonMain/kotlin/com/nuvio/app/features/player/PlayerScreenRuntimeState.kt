@@ -131,6 +131,11 @@ internal class PlayerScreenRuntime(
     lateinit var hapticFeedback: HapticFeedback
 
     var playerSettingsUiState by mutableStateOf(PlayerSettingsUiState())
+
+    /** Fresh check that a finished download is still playable. Runs off the UI thread. */
+    var verifyEpisodeDownload: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    }
     var p2pSettingsUiState by mutableStateOf(P2pSettingsUiState())
     var p2pStreamingState by mutableStateOf<P2pStreamingState>(P2pStreamingState.Idle)
     var metaScreenSettingsUiState: MetaScreenSettingsUiState = MetaScreenSettingsUiState()
