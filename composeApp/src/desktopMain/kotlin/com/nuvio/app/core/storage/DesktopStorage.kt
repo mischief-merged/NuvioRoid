@@ -143,6 +143,20 @@ internal object DesktopStorage {
             if (value == null) properties.remove(key) != null else properties.setProperty(key, value) != value
         }
 
+        /** Writes every entry in one save. A null value removes that key. Nothing is written when nothing changed. */
+        fun putAll(entries: Map<String, String?>) = change {
+            var changed = false
+            entries.forEach { (key, value) ->
+                val updated = if (value == null) {
+                    properties.remove(key) != null
+                } else {
+                    properties.setProperty(key, value) != value
+                }
+                if (updated) changed = true
+            }
+            changed
+        }
+
         /** Every key the store holds. */
         fun keys(): Set<String> = local {
             ensureLoaded()

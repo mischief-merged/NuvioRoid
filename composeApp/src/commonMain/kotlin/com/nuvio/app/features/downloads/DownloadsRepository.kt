@@ -37,6 +37,26 @@ object DownloadsRepository {
     private val _hasUnseenCompleted = MutableStateFlow(false)
     val hasUnseenCompleted: StateFlow<Boolean> = _hasUnseenCompleted.asStateFlow()
 
+    private val _catalogReady = MutableStateFlow(false)
+
+    /** True once the stored list has been read. An offline launch waits for this, so it does not decide before the list exists. */
+    internal val catalogReady: StateFlow<Boolean> = _catalogReady.asStateFlow()
+
+    /**
+     * When this returns true, [ensureLoaded] leaves the list for the warm-up instead of reading it here.
+     * The desktop sets it for the interface thread, so the first screen is not held up by the decode.
+     */
+    @Volatile
+    internal var deferLoadOnThisThread: () -> Boolean = { false }
+
+    /** Runs before the list is read. The desktop waits here until a cut-short folder move has been settled. */
+    @Volatile
+    internal var beforeCatalogLoad: () -> Unit = {}
+
+    /** Runs on the thread that is about to read the list. */
+    @Volatile
+    internal var onCatalogLoad: () -> Unit = {}
+
     // The UI, downloader callbacks and background workers reach this object from different threads.
     // Every read-modify-write of the item list, and every use of activeTransfers, holds this lock.
     //
@@ -98,13 +118,25 @@ object DownloadsRepository {
     /** Runs [block] inside the state lock. Tests only: proves what must not need it. */
     internal fun holdStateLockForTest(block: () -> Unit) = synchronized(stateLock) { block() }
 
-    fun ensureLoaded(): Unit = synchronized(stateLock) {
+    fun ensureLoaded() {
         if (hasLoaded) return
-        loadFromDisk()
+        // The first screen calls this while it is being drawn. Reading the list there blocks that
+        // frame, so the warm-up reads it instead.
+        if (deferLoadOnThisThread()) return
+        loadAfterRecovery()
     }
 
     fun onProfileChanged() {
+        beforeCatalogLoad()
         loadFromDisk()
+    }
+
+    private fun loadAfterRecovery() {
+        beforeCatalogLoad()
+        synchronized(stateLock) {
+            if (hasLoaded) return
+            loadFromDisk()
+        }
     }
 
     fun markCompletedSeen() {
@@ -120,6 +152,7 @@ object DownloadsRepository {
         baseline = emptyList()
         baseRevision = 0L
         _hasUnseenCompleted.value = false
+        _catalogReady.value = false
         _uiState.value = DownloadsUiState()
         notifyLiveStatusPlatform()
     }
@@ -595,6 +628,7 @@ object DownloadsRepository {
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
 
     private fun loadFromDisk(): Unit = synchronized(stateLock) {
+        onCatalogLoad()
         _hasUnseenCompleted.value = false
         hasLoaded = true
         loadedProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
@@ -625,6 +659,7 @@ object DownloadsRepository {
         if (decoded == null) {
             _uiState.value = DownloadsUiState(storeProblem = storeProblem)
             notifyLiveStatusPlatform()
+            _catalogReady.value = true
             return
         }
         loadedPayload = decoded
@@ -653,6 +688,7 @@ object DownloadsRepository {
         resumed.forEach(::startDownload)
         // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
         applyConnectionHold()
+        _catalogReady.value = true
     }
 
     /**

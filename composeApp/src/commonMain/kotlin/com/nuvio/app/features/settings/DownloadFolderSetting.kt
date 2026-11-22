@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,6 +52,10 @@ internal fun DownloadFolderSetting(
 ) {
     if (!controller.supported) return
     val folderState by controller.state.collectAsStateWithLifecycle()
+    DisposableEffect(controller) {
+        controller.setUsageWatched(true)
+        onDispose { controller.setUsageWatched(false) }
+    }
     androidx.compose.runtime.LaunchedEffect(controller) {
         withContext(Dispatchers.Default) {
             DownloadsRepository.ensureLoaded()

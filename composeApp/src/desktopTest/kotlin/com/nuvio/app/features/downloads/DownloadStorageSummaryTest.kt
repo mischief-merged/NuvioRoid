@@ -116,11 +116,11 @@ class DownloadStorageSummaryTest {
         usage.current(listOf(running), avail)
         val afterRunning = usage.measurements
         now += 2_000
-        usage.current(listOf(running.copy(downloadedBytes = 10)), avail) // progress alone is not a change
+        usage.current(listOf(running.copy(downloadedBytes = 10)), avail, watching = true) // progress alone is not a change
         assertEquals(afterRunning, usage.measurements, "measured on every progress step")
         now += 4_000
-        usage.current(listOf(running.copy(downloadedBytes = 20)), avail)
-        assertEquals(afterRunning + 1, usage.measurements, "not refreshed while a transfer runs")
+        usage.current(listOf(running.copy(downloadedBytes = 20)), avail, watching = true)
+        assertEquals(afterRunning + 1, usage.measurements, "not refreshed while a transfer runs and sizes are on screen")
 
         usage.invalidate()
         usage.current(listOf(running), avail)
