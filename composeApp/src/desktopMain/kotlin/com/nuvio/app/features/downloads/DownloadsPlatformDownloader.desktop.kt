@@ -175,8 +175,8 @@ internal actual object DownloadsPlatformDownloader {
                     // a file this download did not create (a taken name gets " (2)", " (3)", ...).
                     val published = try {
                         publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
-                            rememberPublishedFile(path)
-                            request.onPublished(path.toFile().toURI().toString(), Files.size(path))
+                            val key = rememberPublishedFile(path)
+                            request.onPublished(path.toFile().toURI().toString(), Files.size(path), key)
                         }).toFile()
                     } catch (_: DownloadNotDurable) {
                         // The partial file keeps its name: the download is not finished and goes on from it.
@@ -222,17 +222,23 @@ internal actual object DownloadsPlatformDownloader {
     /** The identity of each file this downloader published in this run, by address. */
     private val publishedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    internal fun rememberPublishedFile(path: java.nio.file.Path) {
-        DownloadMover.identityOf(path)?.let { publishedKeys[path.toFile().toURI().toString()] = it }
-    }
+    internal fun rememberPublishedFile(path: java.nio.file.Path): String? =
+        DownloadMover.identityOf(path)?.also { publishedKeys[path.toFile().toURI().toString()] = it }
 
-    /** Trashes a file this downloader just published, only while it still has the identity it had then. */
-    fun removeJustPublished(localFileUri: String): Boolean = removeJustPublished(localFileUri, DownloadsTrash::moveToTrash)
+    /** Uses the saved identity after a restart, or this run's publication identity for older records. */
+    fun removeJustPublished(localFileUri: String, fileKey: String? = null): Boolean =
+        removeJustPublished(localFileUri, fileKey, DownloadsTrash::moveToTrash)
 
-    internal fun removeJustPublished(localFileUri: String, move: (java.nio.file.Path) -> Boolean): Boolean {
-        val key = publishedKeys.remove(localFileUri) ?: return false
+    internal fun removeJustPublished(localFileUri: String, move: (java.nio.file.Path) -> Boolean): Boolean =
+        removeJustPublished(localFileUri, null, move)
+
+    internal fun removeJustPublished(localFileUri: String, fileKey: String?, move: (java.nio.file.Path) -> Boolean): Boolean {
         val path = localFileUri.toLocalFileOrNull()?.toPath() ?: return false
-        return trashPublishedFile(path, key, move)
+        val uri = path.toFile().toURI().toString()
+        val key = fileKey ?: publishedKeys[uri] ?: return false
+        val moved = trashPublishedFile(path, key, move)
+        if (moved) publishedKeys.remove(uri, key)
+        return moved
     }
 
     actual fun removeFile(localFileUri: String?): Boolean {

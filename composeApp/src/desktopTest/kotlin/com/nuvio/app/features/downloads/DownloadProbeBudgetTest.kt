@@ -269,6 +269,21 @@ class DownloadProbeBudgetTest {
         assertEquals(0, backend.sampled.size)
     }
 
+    @Test fun publication_saves_its_identity_before_the_finish_check() {
+        enqueue(1); backend.facts[uri(1)] = video
+        val writesBefore = backend.writes.get()
+        assertTrue(backend.requests.single().onPublished(uri(1), video.sizeBytes, "published identity"))
+        val stored = DownloadsCodec.decode(backend.payload!!)!!.items.single()
+        assertEquals("published identity", stored.publishedFileKey)
+        assertEquals(uri(1), stored.localFileUri)
+        assertTrue(stored.awaitingCheck)
+        finish(1)
+        assertEquals(2, backend.writes.get() - writesBefore)
+        assertEquals(DownloadStatus.Completed, item(1).status)
+        assertEquals(null, item(1).publishedFileKey)
+        assertEquals(0, backend.sampled.size)
+    }
+
     @Test fun a_normal_episode_finishes_with_zero_frame_probes() {
         enqueue(1); backend.facts[uri(1)] = video
         val writesBefore = backend.writes.get()
@@ -402,11 +417,12 @@ class DownloadProbeBudgetTest {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val entered = CountDownLatch(1)
         val nextStarted = CountDownLatch(1)
+        val streamLookups = AtomicInteger()
         val summary = CompletableDeferred<SeasonBatchSummary>()
         backend.duringSample = { entered.countDown(); await(release) }
         val downloader = SeasonBatchDownloader(
             scope = scope, downloads = DownloadsRepository.uiState, maxConcurrent = 1,
-            fetchStreams = { if (it.episodeNumber == 2) nextStarted.countDown(); listOf(stream(it.episodeNumber)) },
+            fetchStreams = { if (streamLookups.incrementAndGet() == 2) nextStarted.countDown(); listOf(stream(it.episodeNumber)) },
             prepareStream = { stream, _ -> stream }, enqueue = { _, ep, _ -> enqueue(ep.episodeNumber) },
             minVideoBytes = { 1 }, onFinished = { _, result -> summary.complete(result) },
         )
@@ -415,18 +431,21 @@ class DownloadProbeBudgetTest {
                 logo = null, poster = null, background = null, seasonNumber = 1,
                 episodes = (1..2).map { SeasonBatchEpisode("show:1:$it", 1, it, "Episode $it", null) }, quality = BatchQuality.BestAvailable))
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-            while (notPresent(1) && System.nanoTime() < deadline) Thread.yield()
-           backend.facts[uri(1)] = video.copy(durationMs = null)
-            worker { finish(1) }
+            while (backend.requests.isEmpty() && System.nanoTime() < deadline) Thread.yield()
+            val firstEpisode = backend.requests.first().item.episodeNumber!!
+            val secondEpisode = 3 - firstEpisode
+            while (notPresent(firstEpisode) && System.nanoTime() < deadline) Thread.yield()
+            backend.facts[uri(firstEpisode)] = video.copy(durationMs = null)
+            worker { finish(firstEpisode) }
             await(entered)
             await(nextStarted)
-            assertEquals(DownloadStatus.Downloading, item(1).status)
-            assertFalse(item(1).isPlayable)
+            assertEquals(DownloadStatus.Downloading, item(firstEpisode).status)
+            assertFalse(item(firstEpisode).isPlayable)
             assertFalse(summary.isCompleted)
             release.countDown()
             val queued = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-            while (notPresent(2) && System.nanoTime() < queued) Thread.yield()
-            backend.facts[uri(2)] = video; finish(2)
+            while (notPresent(secondEpisode) && System.nanoTime() < queued) Thread.yield()
+            backend.facts[uri(secondEpisode)] = video; finish(secondEpisode)
             val result = withTimeout(10_000) { summary.await() }
             assertEquals(2, result.count(SeasonBatchEpisodeResult.Completed))
             assertEquals(2, backend.requests.size)

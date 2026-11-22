@@ -48,7 +48,12 @@ internal class DownloadOwnership(private val locations: DownloadLocations, recor
             ).distinct()
         } else {
             val owner = locations.locationOfRecord(record.locationId, null).path
-            if (record.fileName.isBlank()) emptyList() else listOf(owner.resolve(record.fileName + ".part"), owner.resolve(record.fileName))
+            val reserved = if (record.fileName.isBlank()) emptyList() else listOf(owner.resolve(record.fileName + ".part"), owner.resolve(record.fileName))
+            // A published file can have taken a free name while its record still awaits checks.
+            (reserved + listOfNotNull(
+                record.localFileUri?.let(DownloadLocations::fileOfUri)?.toPath(),
+                locations.recordedPath(record.locationId, record.localFileUri),
+            )).distinct()
         }
         val videos = files.filterNot { it.fileName.toString().endsWith(".part") }
         return files.map { Claim(record, keyOf(it)) } +

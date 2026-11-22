@@ -1217,7 +1217,7 @@ private fun DownloadRow(
                             Text(stringResource(Res.string.downloads_locate_file), style = MaterialTheme.typography.labelLarge)
                         }
                     }
-                    if (extras != null && item.status == DownloadStatus.Paused && item.pausedByFolder) {
+                    if (extras != null && item.status == DownloadStatus.Paused && item.pausedByFolder && !item.awaitingCheck && item.localFileUri == null) {
                         TextButton(
                             onClick = { extras.onChooseLocation(item) },
                             modifier = Modifier.semantics { contentDescription = chooseLocationDescription },

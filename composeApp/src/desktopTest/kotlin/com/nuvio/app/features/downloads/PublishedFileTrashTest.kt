@@ -28,6 +28,19 @@ class PublishedFileTrashTest {
         assertFalse(DownloadsPlatformDownloader.removeJustPublished(uri) { error("already moved") })
     }
 
+    @Test fun an_old_saved_identity_never_uses_a_newer_publications_identity() {
+        val file = folder.newFile("again.mkv").toPath()
+        Files.writeString(file, "the original bytes")
+        val key = assertNotNull(DownloadMover.identityOf(file))
+        Files.move(file, folder.root.toPath().resolve("original.mkv"))
+        Files.writeString(file, "the newer bytes")
+        DownloadsPlatformDownloader.rememberPublishedFile(file)
+        var moves = 0
+        assertFalse(DownloadsPlatformDownloader.removeJustPublished(file.toFile().toURI().toString(), key) { moves++; true })
+        assertEquals(0, moves)
+        assertEquals("the newer bytes", Files.readString(file))
+    }
+
     @Test fun a_rejected_file_is_moved_with_its_bytes_kept() {
         val file = folder.newFile("video.mkv").toPath()
         Files.writeString(file, "the downloaded bytes")

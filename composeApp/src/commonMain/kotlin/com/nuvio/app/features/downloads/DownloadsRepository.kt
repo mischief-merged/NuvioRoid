@@ -297,7 +297,7 @@ object DownloadsRepository {
     /** The address of a finished download's file now, from the published list: no lock is taken. */
     private fun finishedFileUriOf(downloadId: String): String? {
         val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return null
-        return if (item.status == DownloadStatus.Completed) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
+        return if (item.status == DownloadStatus.Completed || item.localFileUri != null) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
     }
 
     fun playableLocalFileUri(item: DownloadItem): String? {
@@ -373,7 +373,8 @@ object DownloadsRepository {
         // leaves it and its record where they are and fetches the new copy beside it, under a name
         // and a record of its own.
         val replaced = currentItems.filter { item ->
-            item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed)
+            item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed) &&
+                !(item.awaitingCheck && item.localFileUri != null)
         }
         replaced.forEach { existing ->
             replacedExisting = true
@@ -526,7 +527,7 @@ object DownloadsRepository {
 
     fun resumeDownload(downloadId: String): Unit = synchronized(stateLock) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+        val item = _uiState.value.items.firstOrNull { it.id == downloadId }?.let(::normalizeCompletedLocalFileUri) ?: return
         if (item.status != DownloadStatus.Paused && item.status != DownloadStatus.Failed) return
 
         val reset = item.copy(
@@ -567,7 +568,7 @@ object DownloadsRepository {
     fun clearFailed(): Int = synchronized(stateLock) {
         ensureLoaded()
         // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
-        val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && backend.isConnected(it) }
+        val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && it.localFileUri == null && backend.isConnected(it) }
             .filter { ItemLocks.tryAcquire(it.id) }
         if (failed.isEmpty()) return 0
         try {
@@ -646,7 +647,7 @@ object DownloadsRepository {
         ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return DownloadDeleteResult.Gone
-        val current = if (item.status == DownloadStatus.Completed) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
+        val current = if (item.status == DownloadStatus.Completed || item.localFileUri != null) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
         if (current != lockedUri) return null
         // Whatever the status, an item whose location is away is not touched: not its partial file, not its record.
         if (!backend.isConnected(item)) return DownloadDeleteResult.NotReachable
@@ -662,7 +663,7 @@ object DownloadsRepository {
 
     private fun deleteLocked(item: DownloadItem, items: List<DownloadItem>): DownloadDeleteResult {
         val downloadId = item.id
-        val lookup = if (item.status == DownloadStatus.Completed) backend.locate(item) else FileLookup.Missing
+        val lookup = if (item.status == DownloadStatus.Completed || item.localFileUri != null) backend.locate(item) else FileLookup.Missing
         // A file whose location is away is not gone. Nothing is touched, and the entry stays.
         if (lookup is FileLookup.Unreachable) return DownloadDeleteResult.NotReachable
         val fileUri = (lookup as? FileLookup.Found)?.uri
@@ -670,20 +671,23 @@ object DownloadsRepository {
             val usedByAnother = usedByAnother(item, items, fileUri) ?: return DownloadDeleteResult.NotMoved
             removeTransfer(downloadId)?.cancel()
             // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
-            if (!removeRecordDurably(item)) return DownloadDeleteResult.NotMoved
+            val retained = if (item.awaitingCheck && item.status == DownloadStatus.Downloading) {
+                item.copy(status = DownloadStatus.Paused, pausedByFolder = false, pausedByConnection = false)
+            } else item
+            if (!removeRecordDurably(retained)) return DownloadDeleteResult.NotMoved
             if (!usedByAnother) {
                 val gone = backend.trashFile(fileUri)
                 if (!gone) {
-                    restoreRecord(item)
+                    restoreRecord(retained)
                     return DownloadDeleteResult.NotMoved
                 }
             }
-            backend.removePartialOf(item)
+            if (!item.awaitingCheck) backend.removePartialOf(item)
             return DownloadDeleteResult.Removed
         }
         removeTransfer(downloadId)?.cancel()
         if (!removeRecordDurably(item)) return DownloadDeleteResult.NotMoved
-        backend.removePartialOf(item)
+        if (!item.awaitingCheck) backend.removePartialOf(item)
         return DownloadDeleteResult.Removed
     }
 
@@ -874,7 +878,7 @@ object DownloadsRepository {
                 limits = autoTransferLimits(item, transfer),
                 onPartialCreated = { key -> ifCurrent(item.id, transfer) { mutateItem(item.id) { it.copy(partialFileKey = key) } } },
                 onFileNameChanged = { name -> ifCurrent(item.id, transfer) { mutateItem(item.id) { it.copy(fileName = name, partialFileKey = null) } } },
-                onPublished = { uri, size -> rememberPublished(item.id, transfer, uri, size) },
+                onPublished = { uri, size, key -> rememberPublished(item.id, transfer, uri, size, key) },
                 // Decided under the state lock, so a connection hold either came first (the transfer
                 // ends as paused, its partial file intact) or sees the transfer finishing and leaves it.
                 mayPublish = {
@@ -941,13 +945,13 @@ object DownloadsRepository {
         transfer.attach(handle)
     }
 
-    private fun rememberPublished(downloadId: String, transfer: ActiveTransfer, uri: String, size: Long?): Boolean =
+    private fun rememberPublished(downloadId: String, transfer: ActiveTransfer, uri: String, size: Long?, fileKey: String? = null): Boolean =
         synchronized(stateLock) {
             if (activeTransfers[downloadId] !== transfer) return false
             val current = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
             if (!current.awaitingCheck || current.localFileUri != uri) {
                 replaceItem(current.copy(
-                    localFileUri = uri, awaitingCheck = true, publishedDigestVerified = transfer.digestVerified,
+                    localFileUri = uri, awaitingCheck = true, publishedDigestVerified = transfer.digestVerified, publishedFileKey = fileKey,
                     downloadedBytes = size?.takeIf { it > 0L } ?: current.downloadedBytes,
                 ))
             }
@@ -1025,17 +1029,31 @@ object DownloadsRepository {
             null
         }
 
-        var rejected = false
+        var rejected: DownloadItem? = null
         var completed = false
         ifCurrent(item.id, transfer) {
+            val current = _uiState.value.items.firstOrNull { it.id == item.id } ?: return@ifCurrent
+            if (current.status != DownloadStatus.Downloading) return@ifCurrent
             removeTransfer(item.id)
-            rejected = problem != null || framesProblem != null || placeholder != null
-            completed = !rejected
+            val failed = when {
+                problem != null -> current.failedBecauseOf(problem)
+                framesProblem != null -> current.failedBecauseOf(framesProblem)
+                placeholder != null -> current.failedAsPlaceholder(placeholder)
+                else -> null
+            }
+            if (failed != null) {
+                // Keep the final address durably until its file is confirmed out of the downloads folder.
+                val retained = failed.copy(
+                    localFileUri = localFileUri, awaitingCheck = true,
+                    publishedFileKey = current.publishedFileKey,
+                    publishedDigestVerified = current.publishedDigestVerified,
+                )
+                replaceItem(retained)
+                if (persist(durably = true)) rejected = retained
+                return@ifCurrent
+            }
+            completed = true
             mutateItem(item.id) { current ->
-                if (current.status != DownloadStatus.Downloading) return@mutateItem current
-                if (problem != null) return@mutateItem current.failedBecauseOf(problem)
-                if (framesProblem != null) return@mutateItem current.failedBecauseOf(framesProblem)
-                if (placeholder != null) return@mutateItem current.failedAsPlaceholder(placeholder)
                 current.copy(
                     verifiedBy = facts?.verification(
                         // Only a size the server announced while the transfer ran counts.
@@ -1047,6 +1065,7 @@ object DownloadsRepository {
                     framesCheck = framesCheck,
                     awaitingCheck = false,
                     publishedDigestVerified = false,
+                    publishedFileKey = null,
                     status = DownloadStatus.Completed,
                     localFileUri = localFileUri,
                     downloadedBytes = if (totalBytes != null && totalBytes > 0L) {
@@ -1061,8 +1080,36 @@ object DownloadsRepository {
             }
         }
         // File moves and companion writes can wait on the file system, so they never hold the state lock.
-        if (rejected) backend.removeJustPublished(localFileUri)
+        rejected?.let(::trashRejectedFile)
         if (completed) companions().saveAfterDownload(item, localFileUri)
+    }
+
+    /** No state lock while waiting for the Trash; keep the failed record if any guard or move refuses. */
+    private fun trashRejectedFile(item: DownloadItem) {
+        val uri = item.localFileUri ?: return
+        SidecarLocks.withLock(uri) {
+            if (!ItemLocks.tryAcquire(item.id)) return@withLock
+            try {
+                val mayMove = backend.withListLock {
+                    val current = _uiState.value.items.firstOrNull { it.id == item.id } ?: return@withListLock false
+                    if (current.localFileUri != uri || current.publishedFileKey != item.publishedFileKey || !current.awaitingCheck) return@withListLock false
+                    if (!backend.isConnected(current) || usedByAnother(current, _uiState.value.items, uri) != false) return@withListLock false
+                    true
+                }
+                // The saved record keeps its ownership claim during the move; UI saves need neither lock.
+                val moved = mayMove && backend.removeJustPublished(uri, item.publishedFileKey)
+                if (moved) mutateItem(item.id) { current ->
+                    if (current.localFileUri != uri || current.publishedFileKey != item.publishedFileKey || !current.awaitingCheck) current
+                    else current.copy(
+                        status = DownloadStatus.Failed, localFileUri = null, awaitingCheck = false,
+                        publishedFileKey = null, publishedDigestVerified = false,
+                        pausedByFolder = false, pausedByConnection = false,
+                    )
+                }
+            } finally {
+                ItemLocks.release(item.id)
+            }
+        }
     }
 
     private class FileInspection(val facts: DownloadedFileFacts?, val problem: DownloadedFileProblem?)
@@ -1608,7 +1655,7 @@ object DownloadsRepository {
     internal fun chooseLocationForWaiting(downloadId: String, locationId: String): Unit = synchronized(stateLock) {
         ensureLoaded()
         val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        if (item.status != DownloadStatus.Paused || !item.pausedByFolder) return
+        if (item.status != DownloadStatus.Paused || !item.pausedByFolder || item.awaitingCheck || item.localFileUri != null) return
         backend.removePartialOf(item)
         mutateItem(downloadId) { it.copy(locationId = locationId) }
         resumeDownload(downloadId)
@@ -1642,7 +1689,7 @@ object DownloadsRepository {
     }
 
     private fun normalizeCompletedLocalFileUri(item: DownloadItem): DownloadItem {
-        if (item.status != DownloadStatus.Completed) return item
+        if (item.status != DownloadStatus.Completed && !item.awaitingCheck) return item
         val found = backend.locate(item) as? FileLookup.Found ?: return item
         // The file may be where the record says it is not, after a move that was cut short: the record follows the file.
         val locationId = found.locationId ?: item.locationId
@@ -1706,7 +1753,7 @@ internal interface DownloadsBackend {
     fun saveUnreadablePayload(payload: String, atEpochMs: Long) = Unit
 
     /** Removes a file the downloader just published that turned out bad. Only that file, where that can be proven. */
-    fun removeJustPublished(localFileUri: String): Boolean = removeFile(localFileUri)
+    fun removeJustPublished(localFileUri: String, fileKey: String? = null): Boolean = removeFile(localFileUri)
 
     /** Flushes the saved list (file and folder) to disk. True where there is nothing more to do. */
     fun syncPayload(): Boolean = true
@@ -1845,8 +1892,8 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override fun syncPayload(): Boolean = DownloadsStorage.syncPayload()
 
-    override fun removeJustPublished(localFileUri: String): Boolean =
-        DownloadFolders.controller.removeJustPublished(localFileUri) ?: removeFile(localFileUri)
+    override fun removeJustPublished(localFileUri: String, fileKey: String?): Boolean =
+        DownloadFolders.controller.removeJustPublished(localFileUri, fileKey) ?: false
 
     override fun ownershipOf(item: DownloadItem, fileUri: String): FileOwnership? =
         DownloadFolders.controller.ownershipOf(item, fileUri)

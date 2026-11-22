@@ -111,6 +111,8 @@ data class DownloadItem(
     val awaitingCheck: Boolean = false,
     /** A verified body digest kept across a restart while its published file awaits checks. */
     val publishedDigestVerified: Boolean = false,
+    /** The identity of the published file, saved before its partial name is removed. */
+    val publishedFileKey: String? = null,
 ) {
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
