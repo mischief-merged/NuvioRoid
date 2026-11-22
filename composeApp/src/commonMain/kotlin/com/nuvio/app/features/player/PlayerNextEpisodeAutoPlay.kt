@@ -118,11 +118,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                     settings.streamAutoPlayPreferBingeGroup
                 )
 
-    val bingeGroupOnlyManualMode =
-        shouldAutoSelectInManualMode &&
-            (!settings.streamAutoPlayNextEpisodeEnabled ||
-                !settings.streamAutoPlayNextEpisodeFallbackEnabled) &&
-            settings.streamAutoPlayPreferBingeGroup
+    val bingeGroupOnlyManualMode = isNextEpisodeBingeGroupOnly(settings)
 
     val effectiveMode = if (shouldAutoSelectInManualMode) {
         StreamAutoPlayMode.FIRST_STREAM
@@ -305,15 +301,20 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                     }
                 },
                 nextCandidate = { failed, triedKeys ->
-                    nextSourceFallbackCandidate(
+                    nextEpisodeFallbackCandidate(
                         streams = PlayerStreamsRepository.episodeStreamsState.value.groups.flatMap { it.streams },
                         settings = settings,
                         triedKeys = triedKeys,
                         failedAddonId = failed.addonId,
                         failedInfoHash = failed.p2pInfoHash,
+                        preferredBingeGroup = preferredBingeGroup,
+                        bingeGroupOnly = bingeGroupOnlyManualMode,
                         preferences = autoPlayPreferences,
                         runtimeMinutes = autoPlayRuntimeMinutes,
                         wanted = autoPlayWanted,
+                        installedAddonNames = installedAddonNames,
+                        debridEnabled = debridSettings.canResolvePlayableLinks,
+                        activeResolverProviderId = debridSettings.activeResolverProviderId,
                     )
                 },
             )
@@ -345,6 +346,87 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             onNextEpisodeCardVisibleChanged(false)
         }
     }
+}
+
+internal fun isNextEpisodeBingeGroupOnly(settings: PlayerSettingsUiState): Boolean {
+    val shouldAutoSelectInManualMode =
+        settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
+            (settings.streamAutoPlayNextEpisodeEnabled || settings.streamAutoPlayPreferBingeGroup)
+    return shouldAutoSelectInManualMode &&
+        (!settings.streamAutoPlayNextEpisodeEnabled || !settings.streamAutoPlayNextEpisodeFallbackEnabled) &&
+        settings.streamAutoPlayPreferBingeGroup
+}
+
+/**
+ * Picks the next fallback source when resolving the next episode's selected stream fails.
+ * When [bingeGroupOnly] is true (Manual mode with binge-group preference and fallback off),
+ * only untried streams in [preferredBingeGroup] are eligible so fallback never escapes to another group.
+ */
+internal fun nextEpisodeFallbackCandidate(
+    streams: List<StreamItem>,
+    settings: PlayerSettingsUiState,
+    triedKeys: Set<String>,
+    failedAddonId: String? = null,
+    failedInfoHash: String? = null,
+    preferredBingeGroup: String? = null,
+    bingeGroupOnly: Boolean = false,
+    preferences: com.nuvio.app.features.downloads.SeasonDownloadDefaults = StreamAutoPlayPolicy.preferencesFor(settings.streamAutoPlayMode),
+    runtimeMinutes: Int? = null,
+    wanted: com.nuvio.app.features.streams.WantedContent? = null,
+    installedAddonNames: Set<String> = AddonRepository.uiState.value.addons.enabledAddons().map { it.displayTitle }.toSet(),
+    debridEnabled: Boolean = DebridSettingsRepository.snapshot().canResolvePlayableLinks,
+    activeResolverProviderId: String? = DebridSettingsRepository.snapshot().activeResolverProviderId,
+): StreamItem? {
+    val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
+    if (bingeGroupOnly) {
+        if (targetBingeGroup.isEmpty()) return null
+        val bingeGroupStreams = streams.filter { it.behaviorHints.bingeGroup == targetBingeGroup }
+        if (bingeGroupStreams.isEmpty()) return null
+        return nextSourceFallbackCandidate(
+            streams = bingeGroupStreams,
+            settings = settings,
+            triedKeys = triedKeys,
+            failedAddonId = failedAddonId,
+            failedInfoHash = failedInfoHash,
+            preferences = preferences,
+            runtimeMinutes = runtimeMinutes,
+            wanted = wanted,
+            installedAddonNames = installedAddonNames,
+            debridEnabled = debridEnabled,
+            activeResolverProviderId = activeResolverProviderId,
+        )
+    }
+    if (settings.streamAutoPlayPreferBingeGroup && targetBingeGroup.isNotEmpty()) {
+        val bingeGroupStreams = streams.filter { it.behaviorHints.bingeGroup == targetBingeGroup }
+        if (bingeGroupStreams.isNotEmpty()) {
+            nextSourceFallbackCandidate(
+                streams = bingeGroupStreams,
+                settings = settings,
+                triedKeys = triedKeys,
+                failedAddonId = failedAddonId,
+                failedInfoHash = failedInfoHash,
+                preferences = preferences,
+                runtimeMinutes = runtimeMinutes,
+                wanted = wanted,
+                installedAddonNames = installedAddonNames,
+                debridEnabled = debridEnabled,
+                activeResolverProviderId = activeResolverProviderId,
+            )?.let { return it }
+        }
+    }
+    return nextSourceFallbackCandidate(
+        streams = streams,
+        settings = settings,
+        triedKeys = triedKeys,
+        failedAddonId = failedAddonId,
+        failedInfoHash = failedInfoHash,
+        preferences = preferences,
+        runtimeMinutes = runtimeMinutes,
+        wanted = wanted,
+        installedAddonNames = installedAddonNames,
+        debridEnabled = debridEnabled,
+        activeResolverProviderId = activeResolverProviderId,
+    )
 }
 
 internal fun PlayerScreenRuntime.preloadNextEpisodeSources() {
