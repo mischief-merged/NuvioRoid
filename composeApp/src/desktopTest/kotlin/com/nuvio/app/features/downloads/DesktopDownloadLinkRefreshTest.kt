@@ -1421,7 +1421,14 @@ class DesktopDownloadLinkRefreshTest {
         assertEquals(null, resumed.failure)
         assertContentEquals(payload, Files.readAllBytes(drive.path.resolve(item.fileName)))
         assertFalse(Files.exists(original), "Original in the app folder was orphaned after the move")
-        assertEquals(setOf(item.supersededPartials.single().partialFileKey), retired.get())
+        // The moved partial was already complete, so the server answered 416. It is kept and replaced,
+        // then both it and the original partial are retired once the replacement is accepted.
+        val replacedKey = checkNotNull(item.partialFileKey)
+        assertEquals(
+            setOf(item.supersededPartials.single().partialFileKey, replacedKey),
+            retired.get(),
+        )
+        assertFalse(Files.exists(drive.path.resolve(item.activePartialFileName)))
         assertEquals(DownloadLocations.AppId, item.supersededPartials.single().locationId)
     }
 
