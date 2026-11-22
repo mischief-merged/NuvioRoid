@@ -1,11 +1,14 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.ui.Modifier
+import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.resolvePlaybackCompletion
 import com.nuvio.app.features.watchprogress.shouldCascadeCompletedProgressToWatchedHistory
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -608,6 +611,27 @@ class SleepTimerTest {
         assertFalse(
             SleepTimerState().selectOption(SleepTimerOption.Minutes60, 0L).blocksAutomaticNextEpisode(),
         )
+    }
+
+    @Test
+    fun `a sleep timer set while an automatic next episode lookup is running rejects the switch`() = runTest {
+        val runtime = episodeNearTheEnd().apply {
+            scope = this@runTest
+            playerMetaVideos = listOf(
+                MetaVideo(id = "tt123:1:2", title = "Current", season = 1, episode = 2, thumbnail = null),
+                MetaVideo(id = "tt123:1:3", title = "Next", season = 1, episode = 3, thumbnail = null),
+            )
+            playerSettingsUiState = playerSettingsUiState.copy(
+                streamAutoPlayTimeoutSeconds = 1,
+            )
+        }
+        runtime.playNextEpisode(automatic = true)
+        assertTrue(runtime.nextEpisodeAutoPlayJob?.isActive == true)
+        runtime.sleepTimer = SleepTimerState(stopAfterEpisode = true)
+        advanceUntilIdle()
+        assertEquals("https://example.com/video.mp4", runtime.activeSourceUrl)
+        assertEquals("tt123:1:2", runtime.activeVideoId)
+        assertFalse(runtime.showEpisodesPanel)
     }
 
     @Test
