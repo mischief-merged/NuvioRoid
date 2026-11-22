@@ -368,7 +368,7 @@ internal fun seasonBatchKey(parentMetaId: String, seasonNumber: Int): String =
  * same rules.
  *
  * Each episode holds one of [maxConcurrent] slots (shared by every batch of this downloader) from
- * source lookup until its download finishes or is paused,
+ * source lookup until its network transfer finishes or is paused. File checks release the slot,
  * so a 20 episode season never opens 20 transfers or 20 addon lookups at once. A source that fails
  * is replaced by the next matching one, and at most [MaxSourcesPerEpisode] sources are tried per
  * episode. A source whose file is implausibly small ([minVideoBytes]) is a failed source: it is
@@ -450,7 +450,8 @@ internal class SeasonBatchDownloader(
      * when the app was closed.
      */
     fun adoptRunning(downloadIds: Collection<String>) {
-        fun stillRunning(state: DownloadsUiState, id: String) = state.items.any { it.id == id && it.status == DownloadStatus.Downloading }
+        fun stillRunning(state: DownloadsUiState, id: String) = id !in state.checkingIds &&
+            state.items.any { it.id == id && it.status == DownloadStatus.Downloading }
         downloadIds.filter { stillRunning(downloads.value, it) }.forEach { id ->
             // Started at once, so that it stands in line for a slot before a batch that starts next.
             scope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -481,33 +482,37 @@ internal class SeasonBatchDownloader(
             coroutineScope {
                 request.episodes.forEach { episode ->
                     launch {
-                        slots.acquire()
+                        val slot = TransferSlot()
+                        slot.acquire()
                         var slotHandedOver = false
                         val result = try {
                             // Once something is paused the batch stops starting more episodes.
                             if (synchronized(lock) { batch.sawPause(downloads.value, request) }) {
                                 SeasonBatchEpisodeResult.Paused
                             } else {
-                                processEpisode(request, episode, batch).also {
+                                processEpisode(request, episode, batch, slot).also {
                                     if (it == SeasonBatchEpisodeResult.Paused) synchronized(lock) { batch.pauseSeen = true }
                                 }
                             }
                         } catch (error: CancellationException) {
                             // Stop queueing leaves a running download in the Downloads screen. It keeps
                             // its slot until it settles, so stopping never raises the number of transfers.
-                            if (downloads.value.itemFor(request, episode)?.status == DownloadStatus.Downloading) {
+                            val current = downloads.value.itemFor(request, episode)
+                            if (slot.held && current?.status == DownloadStatus.Downloading && current.id !in downloads.value.checkingIds) {
                                 slotHandedOver = true
                                 scope.launch {
                                     try {
-                                        downloads.first { state -> state.itemFor(request, episode).isSettledOrGone() }
+                                        downloads.first { state ->
+                                            state.itemFor(request, episode).let { it.isSettledOrGone() || it?.id in state.checkingIds }
+                                        }
                                     } finally {
-                                        slots.release()
+                                        slot.release()
                                     }
                                 }
                             }
                             throw error
                         } finally {
-                            if (!slotHandedOver) slots.release()
+                            if (!slotHandedOver) slot.release()
                         }
                         results.update { it + (episode to result) }
                         _running.update { current ->
@@ -534,10 +539,29 @@ internal class SeasonBatchDownloader(
         }
     }
 
+    /** A released slot is acquired again before a failed source is replaced. */
+    private inner class TransferSlot {
+        var held = false
+            private set
+        suspend fun acquire() {
+            if (!held) {
+                slots.acquire()
+                held = true
+            }
+        }
+        fun release() {
+            if (held) {
+                held = false
+                slots.release()
+            }
+        }
+    }
+
     private suspend fun processEpisode(
         request: SeasonBatchRequest,
         episode: SeasonBatchEpisode,
         batch: Batch,
+        slot: TransferSlot,
     ): SeasonBatchEpisodeResult {
         val minBytes = minVideoBytes(episode)
         if (downloads.value.hasActiveOrFinishedDownload(request, episode, minBytes)) return SeasonBatchEpisodeResult.AlreadyDownloaded
@@ -549,6 +573,7 @@ internal class SeasonBatchDownloader(
         var sourceFailed = false
         for (source in listOfNotNull(fetchStreams, fetchFallbackStreams)) {
             if (attempts >= MaxSourcesPerEpisode) break
+            slot.acquire()
             val candidates = try {
                 rankBatchCandidates(
                     streams = source(episode),
@@ -569,6 +594,7 @@ internal class SeasonBatchDownloader(
                 if (attempts >= MaxSourcesPerEpisode) break
                 // A source that says itself that its file is tiny is not worth a lookup or a transfer.
                 if (candidate.announcedSizeBytes()?.let { it < minBytes } == true) continue
+                slot.acquire()
                 attempts++
                 val prepared = try {
                     prepareStream(candidate, episode)
@@ -594,6 +620,7 @@ internal class SeasonBatchDownloader(
                         val item = downloads
                             .first { state ->
                                 val current = state.itemFor(request, episode)
+                                if (current?.id in state.checkingIds) slot.release()
                                 current.isSettledOrGone() || current.isAnnouncedSmallerThan(minBytes)
                             }
                             .itemFor(request, episode)

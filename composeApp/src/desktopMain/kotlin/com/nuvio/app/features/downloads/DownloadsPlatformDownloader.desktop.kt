@@ -219,14 +219,11 @@ internal actual object DownloadsPlatformDownloader {
     /** The identity of each file this downloader published in this run, by address. */
     private val publishedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    /** Removes a file this downloader just published, only while it still has the identity it had then. */
+    /** Trashes a file this downloader just published, only while it still has the identity it had then. */
     fun removeJustPublished(localFileUri: String): Boolean {
         val key = publishedKeys.remove(localFileUri) ?: return false
         val path = localFileUri.toLocalFileOrNull()?.toPath() ?: return false
-        return runCatching {
-            if (!Files.isSymbolicLink(path) && DownloadMover.identityOf(path) == key) Files.delete(path)
-            !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-        }.getOrDefault(false)
+        return trashPublishedFile(path, key, DownloadsTrash::moveToTrash)
     }
 
     actual fun removeFile(localFileUri: String?): Boolean {
@@ -734,3 +731,12 @@ internal fun freeDownloadName(folder: java.nio.file.Path, name: String): String 
     }
     throw IOException("No free name for $name")
 }
+
+
+/** The rejected file goes to the Trash only while its recorded identity still matches. */
+internal fun trashPublishedFile(path: java.nio.file.Path, key: String, moveToTrash: (java.nio.file.Path) -> Boolean): Boolean =
+    runCatching {
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return@runCatching true
+        if (Files.isSymbolicLink(path) || DownloadMover.identityOf(path) != key) return@runCatching false
+        moveToTrash(path) && !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+    }.getOrDefault(false)

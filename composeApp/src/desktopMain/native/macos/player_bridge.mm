@@ -25,6 +25,7 @@
 #include <memory>
 #include <chrono>
 #include <clocale>
+#include <locale.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -3837,6 +3838,25 @@ static void samplerUpdateCallback(void *context) {
     if (context) static_cast<std::atomic<bool> *>(context)->store(true);
 }
 
+/** Numeric formatting for this calling thread only, restored on every return and exception. */
+class SampleNumericLocale {
+public:
+    SampleNumericLocale() {
+        locale_ = newlocale(LC_NUMERIC_MASK, "C", nullptr);
+        if (locale_) previous_ = uselocale(locale_);
+    }
+    ~SampleNumericLocale() {
+        if (previous_) uselocale(previous_);
+        if (locale_) freelocale(locale_);
+    }
+    bool ready() const { return locale_ && previous_; }
+    SampleNumericLocale(const SampleNumericLocale &) = delete;
+    SampleNumericLocale &operator=(const SampleNumericLocale &) = delete;
+private:
+    locale_t locale_ = nullptr;
+    locale_t previous_ = nullptr;
+};
+
 class FrameSampler {
 public:
     FrameSampler() = default;
@@ -3850,11 +3870,6 @@ public:
     /** Opens [path]; false when the file cannot be played or the budget ran out. */
     bool open(const std::string &path, SamplerClock::time_point deadline) {
         if (path.empty() || path[0] != '/') return false;
-        const char *current = setlocale(LC_NUMERIC, nullptr);
-        if (!current || std::string(current) != "C") {
-            // libmpv requires LC_NUMERIC=C, as the player does; the JVM formats numbers itself.
-            if (setlocale(LC_NUMERIC, "C") == nullptr) return false;
-        }
         if (posix_memalign(&surface_, 64, kSampleStride * kSampleSide) != 0 || !surface_) {
             surface_ = nullptr;
             return false;
@@ -4052,6 +4067,8 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_sampleFrames(
     jlong budgetMs
 ) {
     if (!path || !fractions) return nullptr;
+    SampleNumericLocale numericLocale;
+    if (!numericLocale.ready()) return nullptr;
     std::string file = jstringToString(env, path);
     jsize count = env->GetArrayLength(fractions);
     if (count <= 0 || count > 64) return nullptr;

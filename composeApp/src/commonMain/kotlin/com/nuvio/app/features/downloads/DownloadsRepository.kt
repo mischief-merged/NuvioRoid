@@ -67,6 +67,23 @@ object DownloadsRepository {
     // the backend only. Both delete paths therefore take the per-video lock before entering here.
     private val stateLock = SynchronizedObject()
 
+    // One frame look at a time, including its confirming frames, across finishes and rechecks.
+    private val frameProbePermit = SynchronizedObject()
+
+    private class FrameLook(val samples: FrameSamples?, val verdict: FrameVerdict?)
+
+    private fun lookAtFrames(uri: String): FrameLook = synchronized(frameProbePermit) {
+        val samples = runCatching { backend.sampleFrames(uri) }.getOrNull()
+        val verdict = samples?.let { first ->
+            runCatching { confirmedFramesProblem(first) { backend.sampleConfirmingFrames(uri, first.durationMs) } }.getOrNull()
+        }
+        FrameLook(samples, verdict)
+    }
+
+    private fun needsFrames(item: DownloadItem, facts: DownloadedFileFacts, runtime: Int?, verdict: PlaceholderVerdict): Boolean =
+        verdict !is PlaceholderVerdict.NotTheRealVideo && runtime != null && item.framesCheck != DownloadFramesCheck.Passed &&
+            (facts.durationMs == null || looksLikePlaceholder(facts.durationMs, runtime))
+
     // The transfer that currently owns each download. A transfer that was paused, replaced or removed
     // is no longer in this map, so whatever it reports afterwards is ignored.
     private val activeTransfers = mutableMapOf<String, ActiveTransfer>()
@@ -880,32 +897,55 @@ object DownloadsRepository {
 
     /**
      * A transfer reported that its file is complete. The file is accepted only if its checks pass:
-     * first the look at the file itself, then, for what that passed, a look at decoded frames. The
-     * frame look takes seconds, so it runs outside the state lock, while the transfer still owns the
+     * first the file's size and duration, then decoded frames only when they can settle the answer.
+     * The frame look runs outside the state lock, while the transfer still owns the
      * download; the result is applied under the lock, and only if the transfer still owns it.
      */
     private fun finishTransfer(item: DownloadItem, transfer: ActiveTransfer, localFileUri: String, totalBytes: Long?) {
         transfer.finishing = true
+        try {
+            finishCheckedTransfer(item, transfer, localFileUri, totalBytes)
+        } finally {
+            synchronized(stateLock) {
+                // A late callback must not clear the check of a newer transfer of this item.
+                if (activeTransfers[item.id] == null || activeTransfers[item.id] === transfer) {
+                    _uiState.update { it.copy(checkingIds = it.checkingIds - item.id) }
+                }
+            }
+        }
+    }
+
+    private fun finishCheckedTransfer(item: DownloadItem, transfer: ActiveTransfer, localFileUri: String, totalBytes: Long?) {
         // A download is finished only when its file is there, has the size the server
         // announced and is a video. Anything else is a failed download without a file.
         val inspection = synchronized(stateLock) {
             if (activeTransfers[item.id] !== transfer) return
+            // Its network transfer is over. A season may use that slot while the file is checked.
+            _uiState.update { it.copy(checkingIds = it.checkingIds + item.id) }
             val facts = backend.inspectFile(localFileUri)
             FileInspection(facts, facts?.problem(announcedBytes = totalBytes, expectedVideoHash = item.expectedVideoHash))
         }
         val facts = inspection.facts
         val problem = inspection.problem
 
-        // Null samples: the platform cannot look, which is no fault and is not recorded as a check.
-        val samples = if (problem == null) runCatching { backend.sampleFrames(localFileUri) }.getOrNull() else null
-        val verdict = samples?.let { first ->
-            runCatching {
-                confirmedFramesProblem(first) { backend.sampleConfirmingFrames(localFileUri, first.durationMs) }
-            }.getOrNull()
-        }
+        val runtime = runtimeMinutesOf(item)
+        fun evidence(durationMs: Long?) = PlaceholderEvidence(
+            fileBytes = facts?.sizeBytes,
+            claimedBytes = item.claimedSizeBytes(runtime),
+            durationMs = durationMs,
+            runtimeMinutes = runtime,
+            sourceSaysNotCached = sourceLabelSaysNotCached(item.streamTitle),
+        )
+        val initialVerdict = placeholderVerdict(evidence(facts?.durationMs))
+        // Null samples mean no check was made, including when size and duration suffice.
+        val look = if (problem == null && facts != null && needsFrames(item, facts, runtime, initialVerdict)) {
+            lookAtFrames(localFileUri)
+        } else null
+        val samples = look?.samples
+        val verdict = look?.verdict
         val framesProblem = verdict?.problem
         val framesCheck = when {
-            verdict == null || !verdict.conclusive || framesProblem != null -> DownloadFramesCheck.NotChecked
+            samples == null || verdict == null || !verdict.conclusive || framesProblem != null -> DownloadFramesCheck.NotChecked
             samples.titleNamesAnotherEpisode(
                 expectedSeason = item.seasonNumber.takeIf { item.isEpisode },
                 expectedEpisode = item.episodeNumber.takeIf { item.isEpisode },
@@ -915,15 +955,7 @@ object DownloadsRepository {
 
         // What the source claimed and the title's running time, held against the file that arrived.
         val placeholder = if (problem == null && framesProblem == null && facts != null) {
-            (placeholderVerdict(
-                PlaceholderEvidence(
-                    fileBytes = facts.sizeBytes,
-                    claimedBytes = item.claimedSizeBytes(runtimeMinutesOf(item)),
-                    durationMs = facts.durationMs ?: samples?.durationMs,
-                    runtimeMinutes = runtimeMinutesOf(item),
-                    sourceSaysNotCached = sourceLabelSaysNotCached(item.streamTitle),
-                ),
-            ) as? PlaceholderVerdict.NotTheRealVideo)?.reason
+            (placeholderVerdict(evidence(facts.durationMs ?: samples?.durationMs)) as? PlaceholderVerdict.NotTheRealVideo)?.reason
         } else {
             null
         }
@@ -1052,13 +1084,10 @@ object DownloadsRepository {
         var picturePassed = false
         // The picture is worth the seconds it takes only when it can change the answer: the title's
         // running time is known and the file is short for it, or the container did not state its length.
-        val needsPicture = verdict !is PlaceholderVerdict.NotTheRealVideo && runtime != null && item.framesCheck != DownloadFramesCheck.Passed &&
-            (facts.durationMs == null || looksLikePlaceholder(facts.durationMs, runtime))
-        if (needsPicture) {
-            val samples = runCatching { backend.sampleFrames(uri) }.getOrNull()
-            val framesVerdict = samples?.let { first ->
-                runCatching { confirmedFramesProblem(first) { backend.sampleConfirmingFrames(uri, first.durationMs) } }.getOrNull()
-            }
+        if (needsFrames(item, facts, runtime, verdict)) {
+            val look = lookAtFrames(uri)
+            val samples = look.samples
+            val framesVerdict = look.verdict
             if (samples != null && framesVerdict != null && framesVerdict.conclusive) {
                 verdict = placeholderVerdict(evidence(facts.durationMs ?: samples.durationMs, framesVerdict.problem))
                 picturePassed = framesVerdict.problem == null && samples.structuralProblem() == null

@@ -162,6 +162,8 @@ data class DownloadsUiState(
     val items: List<DownloadItem> = emptyList(),
     /** Set when the stored list could not be read. The screen must not present the list as simply empty then. */
     val storeProblem: DownloadsStoreProblem? = null,
+    /** Transfers whose bodies are finished but whose files are still being checked. Never persisted. */
+    val checkingIds: Set<String> = emptySet(),
 ) {
     /** What is not downloaded: running, paused, failed, and finished files that are not the video. */
     val activeItems: List<DownloadItem>
