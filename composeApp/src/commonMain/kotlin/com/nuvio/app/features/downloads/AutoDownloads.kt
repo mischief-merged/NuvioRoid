@@ -12,7 +12,9 @@ import com.nuvio.app.features.watched.releasedPlayableEpisodes
 import com.nuvio.app.features.watching.domain.WatchingContentRef
 import com.nuvio.app.features.watching.domain.buildPlaybackVideoId
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
+import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
+import com.nuvio.app.features.watchprogress.WatchProgressSourceLocal
 import com.nuvio.app.isDesktop
 import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.CancellationException
@@ -418,7 +420,8 @@ internal object AutoDownloads : AutoDownloadController {
 
 /**
  * Whether [episode] counts as watched for an automatic-download rule: either marked watched in
- * history or finished in local playback progress.
+ * history or finished by verified local playback on this device (never a tracker's synced progress
+ * snapshot).
  */
 internal fun isEpisodeWatchedForAutoDownload(
     rule: AutoDownloadRule,
@@ -426,17 +429,21 @@ internal fun isEpisodeWatchedForAutoDownload(
     isWatchedInHistory: (id: String, type: String, season: Int, episode: Int) -> Boolean = { id, type, season, number ->
         WatchedRepository.isWatched(id = id, type = type, season = season, episode = number)
     },
-    isCompletedInProgress: (videoId: String, parentMetaId: String, season: Int, episode: Int) -> Boolean = { videoId, parentMetaId, season, number ->
-        WatchProgressRepository.progressForVideo(
+    localProgressForEpisode: (videoId: String, parentMetaId: String, season: Int, episode: Int) -> WatchProgressEntry? = { videoId, parentMetaId, season, number ->
+        WatchProgressRepository.localProgressForVideo(
             videoId = videoId,
             parentMetaId = parentMetaId,
             seasonNumber = season,
             episodeNumber = number,
-        )?.isEffectivelyCompleted == true
+        )
     },
 ): Boolean =
     isWatchedInHistory(rule.parentMetaId, rule.parentMetaType, episode.seasonNumber, episode.episodeNumber) ||
-        isCompletedInProgress(episode.videoId, rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
+        localProgressForEpisode(episode.videoId, rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
+            ?.isVerifiedLocalCompletion == true
+
+internal val WatchProgressEntry.isVerifiedLocalCompletion: Boolean
+    get() = source == WatchProgressSourceLocal && isEffectivelyCompleted
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
 internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {

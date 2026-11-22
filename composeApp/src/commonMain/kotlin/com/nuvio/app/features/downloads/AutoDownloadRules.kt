@@ -123,7 +123,7 @@ internal fun planAutoDownload(
         .sortedWith(compareBy({ it.seasonNumber }, { it.episodeNumber }))
     val statusByEpisode = downloads.episodeStatuses(rule.parentMetaId)
     val placeholders = downloads.placeholderEpisodeKeys(rule.parentMetaId, ordered)
-    val pendingRemovalEpisodes = downloads.pendingRemovalEpisodeKeys(rule.parentMetaId, pendingRemovalDownloadIds)
+    val pendingRemovalEpisodes = downloads.pendingRemovalEpisodeKeys(rule.parentMetaId, ordered, pendingRemovalDownloadIds)
     val treatedAsWatched: (SeasonBatchEpisode) -> Boolean = { episode ->
         episode.autoDownloadKey in pendingRemovalEpisodes || isWatched(episode)
     }
@@ -154,21 +154,32 @@ internal fun planAutoDownload(
 internal val SeasonBatchEpisode.autoDownloadKey: String
     get() = autoDownloadEpisodeKey(seasonNumber, episodeNumber)
 
-/** The episodes of [parentMetaId] that have a download waiting for deletion after watching. */
+/**
+ * The episodes of [parentMetaId] that have a completed, real-video download waiting for deletion
+ * after watching. Incomplete downloads and placeholders never count as watched.
+ */
 private fun List<DownloadItem>.pendingRemovalEpisodeKeys(
     parentMetaId: String,
+    episodes: List<SeasonBatchEpisode>,
     pendingRemovalDownloadIds: Set<String>,
 ): Set<String> {
     if (pendingRemovalDownloadIds.isEmpty()) return emptySet()
     val parent = parentMetaId.trim()
+    val runtimes = episodes.associate { it.autoDownloadKey to it.runtimeMinutes }
     return mapNotNullTo(mutableSetOf()) { item ->
         if (item.id !in pendingRemovalDownloadIds) return@mapNotNullTo null
         if (item.parentMetaId.trim() != parent) return@mapNotNullTo null
+        if (item.status != DownloadStatus.Completed) return@mapNotNullTo null
         val season = item.seasonNumber ?: return@mapNotNullTo null
         val episode = item.episodeNumber ?: return@mapNotNullTo null
-        autoDownloadEpisodeKey(season, episode)
+        val key = autoDownloadEpisodeKey(season, episode)
+        if (item.isNotTheVideo(runtimes[key])) return@mapNotNullTo null
+        key
     }
 }
+
+private fun DownloadItem.isNotTheVideo(runtimeMinutes: Int?): Boolean =
+    isPlaceholder || finishedSizeBytes < minPlausibleVideoBytes(runtimeMinutes)
 
 /**
  * The episodes of a show whose only finished download is not the video: marked as not the real
@@ -179,8 +190,6 @@ private fun List<DownloadItem>.pendingRemovalEpisodeKeys(
 private fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, episodes: List<SeasonBatchEpisode>): Set<String> {
     val parent = parentMetaId.trim()
     val runtimes = episodes.associate { it.autoDownloadKey to it.runtimeMinutes }
-    fun isNotTheVideo(item: DownloadItem, key: String) =
-        item.isPlaceholder || item.finishedSizeBytes < minPlausibleVideoBytes(runtimes[key])
     val ofShow = mapNotNull { item ->
         val season = item.seasonNumber ?: return@mapNotNull null
         val episode = item.episodeNumber ?: return@mapNotNull null
@@ -191,7 +200,7 @@ private fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, epis
         val finished = items.filter { it.status == DownloadStatus.Completed }
         val others = items.filter { it.status != DownloadStatus.Completed && it.status != DownloadStatus.Failed }
         key.takeIf {
-            finished.isNotEmpty() && finished.all { isNotTheVideo(it, key) } && others.isEmpty()
+            finished.isNotEmpty() && finished.all { it.isNotTheVideo(runtimes[key]) } && others.isEmpty()
         }
     }
 }

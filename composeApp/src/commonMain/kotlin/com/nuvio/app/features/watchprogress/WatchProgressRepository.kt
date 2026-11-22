@@ -1203,7 +1203,8 @@ object WatchProgressRepository {
                 entry.videoId in videoIds &&
                     (parentMetaId == null || entry.parentMetaId == parentMetaId)
             }
-            val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove)
+            val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove) +
+                removeLocalEntriesForVideoIds(videoIds = videoIds, parentMetaId = parentMetaId)
             provider.applyOptimisticRemoval(entriesToRemove)
             if (locallyRemovedEntries.isNotEmpty()) persist()
             publish()
@@ -1235,7 +1236,7 @@ object WatchProgressRepository {
         val normalizedContentId = contentId.trim()
         if (normalizedContentId.isBlank()) return
 
-        val entriesToRemove = currentEntries().filter { entry ->
+        val matchesTarget: (WatchProgressEntry) -> Boolean = { entry ->
             if (entry.parentMetaId != normalizedContentId) {
                 false
             } else if (seasonNumber != null && episodeNumber != null) {
@@ -1244,18 +1245,24 @@ object WatchProgressRepository {
                 true
             }
         }
-        if (entriesToRemove.isEmpty()) return
+        val entriesToRemove = currentEntries().filter(matchesTarget)
 
         activeProgressProvider()?.let { provider ->
-            val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove)
+            val matchingLocalEntries = localEntriesSnapshot().filter(matchesTarget)
+            val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove + matchingLocalEntries)
+            if (entriesToRemove.isEmpty() && locallyRemovedEntries.isEmpty()) return
             provider.applyOptimisticRemoval(entriesToRemove)
             if (locallyRemovedEntries.isNotEmpty()) persist()
             publish()
-            syncScope.launch {
-                removeProviderProgress(provider, entriesToRemove, "remove playback progress")
+            if (entriesToRemove.isNotEmpty()) {
+                syncScope.launch {
+                    removeProviderProgress(provider, entriesToRemove, "remove playback progress")
+                }
             }
             return
         }
+
+        if (entriesToRemove.isEmpty()) return
 
         entriesToRemove.forEach { entry ->
             removeLocalEntry(entry.resolvedProgressKey())
@@ -1278,6 +1285,27 @@ object WatchProgressRepository {
             seasonNumber = seasonNumber,
             episodeNumber = episodeNumber,
         )
+    }
+
+    /**
+     * Resolves playback progress recorded locally on this device, never a connected tracker's
+     * synced progress snapshot.
+     */
+    fun localProgressForVideo(
+        videoId: String,
+        parentMetaId: String? = null,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+    ): WatchProgressEntry? {
+        ensureLoaded()
+        return localEntriesSnapshot()
+            .filter { it.source == WatchProgressSourceLocal }
+            .resolveProgressForVideo(
+                videoId = videoId,
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+            )
     }
 
     fun resumeEntryForSeries(metaId: String): WatchProgressEntry? {

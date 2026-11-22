@@ -138,6 +138,35 @@ object TrackingProviderRegistry {
         ratingProviders[provider.providerId] = provider
     }
 
+    internal fun replaceProviderPorts(
+        id: TrackingProviderId,
+        auth: TrackingAuthProvider?,
+        scrobbler: TrackingScrobbler?,
+        historyWriter: TrackingHistoryWriter?,
+        watchedProvider: TrackingWatchedProvider?,
+        progressProvider: TrackingProgressProvider?,
+    ) {
+        if (auth != null) {
+            register(auth)
+        } else {
+            val (previousAuth, previousJob) = synchronized(lock) {
+                val removedAuth = authProviders.remove(id)
+                if (removedAuth != null) profileStores.remove(removedAuth)
+                removedAuth to authObservationJobs.remove(id)
+            }
+            previousJob?.cancel()
+            if (previousAuth != null) {
+                _connectedProviderIds.update { it - id }
+            }
+        }
+        synchronized(lock) {
+            if (scrobbler != null) scrobblers[id] = scrobbler else scrobblers.remove(id)
+            if (historyWriter != null) historyWriters[id] = historyWriter else historyWriters.remove(id)
+            if (watchedProvider != null) watchedProviders[id] = watchedProvider else watchedProviders.remove(id)
+            if (progressProvider != null) progressProviders[id] = progressProvider else progressProviders.remove(id)
+        }
+    }
+
     fun authProvider(id: TrackingProviderId): TrackingAuthProvider? = synchronized(lock) {
         authProviders[id]
     }

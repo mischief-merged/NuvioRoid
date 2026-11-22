@@ -16,8 +16,12 @@ import com.nuvio.app.features.trakt.TraktScrobbleRepository
 import com.nuvio.app.features.trakt.TraktTrackingLibraryProvider
 import com.nuvio.app.features.trakt.TraktTrackingProgressProvider
 import com.nuvio.app.features.watching.sync.TraktWatchedSyncAdapter
+import kotlinx.atomicfu.atomic
+
+private val trackingProvidersBootstrapped = atomic(false)
 
 fun ensureTrackingProvidersRegistered() {
+    if (!trackingProvidersBootstrapped.compareAndSet(expect = false, update = true)) return
     MdbListTracker.register()
     TraktAuthRepository.descriptor
     TraktScrobbleRepository.ensureRegistered()

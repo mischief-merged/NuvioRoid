@@ -689,4 +689,29 @@ class AutoDownloadEngineTest {
         assertEquals(listOf(4, 5), harness.downloading())
         assertEquals(AutoDownloadStatus.Downloading, harness.status())
     }
+
+    @Test
+    fun a_scheduled_removal_flagged_as_a_placeholder_does_not_advance_the_window_and_fetches_its_replacement() = runTest {
+        val harness = harness(testRule(keepCount = 3).copy(deleteAfterWatching = true))
+        val ep1 = testDownload(1, DownloadStatus.Completed, ruleKey = ruleKey)
+        val ep2 = testDownload(2, DownloadStatus.Completed, ruleKey = ruleKey)
+        val ep3 = testDownload(3, DownloadStatus.Completed, ruleKey = ruleKey)
+        harness.downloads.value = DownloadsUiState(listOf(ep1, ep2, ep3))
+        assertTrue(harness.store.scheduleRemoval(1, AutoDownloadRemoval(ep1.id, ruleKey, dueAtEpochMs = 24 * hour)))
+
+        // A later inspection flags episode 1 as a placeholder before its removal runs.
+        harness.downloads.value = DownloadsUiState(
+            listOf(
+                ep1.copy(framesCheck = DownloadFramesCheck.NotTheRealVideo),
+                ep2,
+                ep3,
+            ),
+        )
+
+        harness.check()
+
+        assertEquals(listOf(1), harness.requests.last().episodes.map { it.episodeNumber })
+        assertEquals(listOf(1), harness.downloading())
+        assertEquals(AutoDownloadStatus.Downloading, harness.status())
+    }
 }
