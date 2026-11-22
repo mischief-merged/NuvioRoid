@@ -7,6 +7,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -18,16 +19,26 @@ class CatalogLoadThreadTest {
     private class Probe : DownloadsBackend {
         var loads = 0
         var loadThread: Thread? = null
+        var payload: String? = ""
+        var beforeReturn: () -> Unit = {}
+        var failuresLeft = 0
 
         override fun loadPayload(): String? {
             loads++
             loadThread = Thread.currentThread()
-            return ""
+            beforeReturn()
+            if (failuresLeft > 0) {
+                failuresLeft -= 1
+                error("store locked")
+            }
+            return payload
         }
 
         override fun savePayload(payload: String) = Unit
 
         override fun restoreItem(item: DownloadItem): DownloadItem = item
+
+        var startFailuresLeft = 0
 
         override fun start(
             request: DownloadPlatformRequest,
@@ -35,8 +46,14 @@ class CatalogLoadThreadTest {
             onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
             onFailure: (message: String) -> Unit,
             onPaused: () -> Unit,
-        ): DownloadsTaskHandle = object : DownloadsTaskHandle {
-            override fun cancel() = Unit
+        ): DownloadsTaskHandle {
+            if (startFailuresLeft > 0) {
+                startFailuresLeft -= 1
+                error("cannot start")
+            }
+            return object : DownloadsTaskHandle {
+                override fun cancel() = Unit
+            }
         }
 
         override fun removeFile(localFileUri: String?): Boolean = true
@@ -74,11 +91,24 @@ class CatalogLoadThreadTest {
     fun drawing_the_screen_does_not_read_the_list() {
         DownloadsRepository.deferLoadOnThisThread = { true }
 
-        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.ensureLoadedForDisplay()
 
         assertEquals(0, probe.loads)
         assertFalse(DownloadsRepository.catalogReady.value)
         assertFalse(EventQueue.isDispatchThread())
+    }
+
+    @Test
+    fun drawing_on_the_interface_thread_does_not_read_the_list() {
+        DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
+
+        EventQueue.invokeAndWait {
+            assertTrue(EventQueue.isDispatchThread())
+            DownloadsRepository.ensureLoadedForDisplay()
+        }
+
+        assertEquals(0, probe.loads)
+        assertFalse(DownloadsRepository.catalogReady.value)
     }
 
     @Test
@@ -175,4 +205,152 @@ class CatalogLoadThreadTest {
             world.close()
         }
     }
+
+    @Test
+    fun a_pause_during_the_read_still_pauses_what_the_read_finds() {
+        val release = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        probe.payload = payloadOf(stored("d1", "Downloading"))
+        probe.beforeReturn = {
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+        }
+        val loader = Thread({ DownloadsRepository.ensureLoaded() }, "catalog-loader")
+        val done = CountDownLatch(1)
+        val pauser = Thread({
+            DownloadsRepository.pauseActiveDownloads()
+            done.countDown()
+        }, "catalog-pauser")
+        loader.start()
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            pauser.start()
+            val returnedWhileReading = pauseReturnedWhileReadWasBlocked(pauser, done)
+            release.countDown()
+            loader.join(5_000)
+            pauser.join(5_000)
+            assertFalse(loader.isAlive)
+            assertFalse(pauser.isAlive)
+            assertEquals(1, probe.loads)
+            assertFalse(returnedWhileReading)
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.single().status)
+        } finally {
+            release.countDown()
+            loader.join(5_000)
+            pauser.join(5_000)
+        }
+    }
+
+    @Test
+    fun a_pause_on_the_interface_thread_still_reads_the_list() {
+        DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
+
+        EventQueue.invokeAndWait {
+            assertTrue(EventQueue.isDispatchThread())
+            DownloadsRepository.pauseActiveDownloads()
+        }
+
+        assertEquals(1, probe.loads)
+        assertTrue(DownloadsRepository.catalogReady.value)
+    }
+
+    @Test
+    fun a_failed_read_is_tried_again() {
+        probe.failuresLeft = 1
+
+        assertFails { DownloadsRepository.ensureLoaded() }
+
+        assertEquals(1, probe.loads)
+        assertFalse(DownloadsRepository.catalogReady.value)
+
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(2, probe.loads)
+        assertTrue(DownloadsRepository.catalogReady.value)
+    }
+
+    @Test
+    fun a_read_that_fails_after_publishing_does_not_keep_the_half_list() {
+        probe.payload = payloadOf(stored("d1", "Downloading"))
+        probe.startFailuresLeft = 1
+
+        assertFails { DownloadsRepository.ensureLoaded() }
+
+        assertFalse(DownloadsRepository.catalogReady.value)
+        assertEquals(emptyList(), DownloadsRepository.uiState.value.items)
+
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals("d1", DownloadsRepository.uiState.value.items.single().id)
+        assertEquals(DownloadStatus.Downloading, DownloadsRepository.uiState.value.items.single().status)
+        assertTrue(DownloadsRepository.catalogReady.value)
+        assertEquals(2, probe.loads)
+    }
+
+    @Test
+    fun the_location_thread_reads_the_list_and_a_pause_during_that_read_still_pauses_it() {
+        val world = FolderWorld()
+        val release = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        probe.payload = payloadOf(stored("d1", "Downloading"))
+        probe.beforeReturn = {
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+        }
+        val folders = DesktopDownloadFolders(
+            world.locations,
+            world.validator,
+            world.mover(),
+            ProfileHooks(emptyList()),
+        )
+        DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
+        DownloadsRepository.beforeCatalogLoad = {
+            if (Thread.currentThread() !== folders.recoveryRunner) folders.awaitRecovery()
+        }
+        val done = CountDownLatch(1)
+        val pauser = Thread({
+            DownloadsRepository.pauseActiveDownloads()
+            done.countDown()
+        }, "catalog-pauser")
+        try {
+            folders.start(afterRecovery = { DownloadsRepository.ensureLoaded() })
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            pauser.start()
+            val returnedWhileReading = pauseReturnedWhileReadWasBlocked(pauser, done)
+            release.countDown()
+            pauser.join(5_000)
+            assertFalse(pauser.isAlive)
+            assertEquals("download-locations", probe.loadThread?.name)
+            assertEquals(1, probe.loads)
+            assertFalse(returnedWhileReading)
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.single().status)
+            assertTrue(DownloadsRepository.catalogReady.value)
+            DownloadsRepository.ensureLoaded()
+            assertEquals(1, probe.loads)
+        } finally {
+            release.countDown()
+            pauser.join(5_000)
+            folders.stop()
+            world.close()
+        }
+    }
+
+    /** True when [thread] finished the pause while the read still held the list. */
+    private fun pauseReturnedWhileReadWasBlocked(thread: Thread, done: CountDownLatch): Boolean {
+        val deadline = System.nanoTime() + 2_000_000_000L
+        while (System.nanoTime() < deadline) {
+            if (done.count == 0L) return true
+            val state = thread.state
+            if (state == Thread.State.BLOCKED || state == Thread.State.WAITING) return false
+            Thread.yield()
+        }
+        return done.count == 0L
+    }
+
+    private fun stored(id: String, status: String) =
+        """{"id":"$id","contentType":"series","parentMetaId":"tt1","parentMetaType":"series","videoId":"tt1:1:1","title":"Show",""" +
+            """"streamTitle":"1080p","providerName":"Addon","sourceUrl":"https://example.com/$id.mkv","fileName":"$id.mkv",""" +
+            """"status":"$status","createdAtEpochMs":1,"updatedAtEpochMs":2}"""
+
+    private fun payloadOf(vararg items: String) = """{"items":[${items.joinToString(",")}]}"""
 }

@@ -183,7 +183,7 @@ fun StreamsScreen(
         metaScreenSettings.backgroundMode == MetaScreenBackgroundMode.DominantColor
     remember {
         if (AppFeaturePolicy.downloadsEnabled) {
-            DownloadsRepository.ensureLoaded()
+            DownloadsRepository.ensureLoadedForDisplay()
         }
     }
     val isEpisode = seasonNumber != null && episodeNumber != null

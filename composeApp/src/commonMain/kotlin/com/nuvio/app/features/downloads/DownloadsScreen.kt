@@ -157,7 +157,7 @@ internal fun DownloadsScreenContent(
     posterPatternOverride: String? = null,
 ) {
     val uiState by remember {
-        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.ensureLoadedForDisplay()
         DownloadsRepository.uiState
     }.collectAsStateWithLifecycle()
     val watchProgressState by remember {
