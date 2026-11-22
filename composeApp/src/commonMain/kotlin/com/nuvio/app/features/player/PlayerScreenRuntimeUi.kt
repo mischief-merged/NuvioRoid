@@ -1380,7 +1380,7 @@ private fun PlayerScreenRuntime.seekPlayerBy(offsetMs: Long): Boolean {
     }
     val controller = playerController ?: return false
     seekFromNativeControls(offsetMs)
-    controller.seekBy(offsetMs)
+    seekByWithNote(controller, offsetMs)
     return true
 }
 
