@@ -256,15 +256,15 @@ internal fun DownloadsScreenContent(
     val openDownloadsDirectoryFailedText = stringResource(Res.string.downloads_open_directory_failed)
     val deleteScope = rememberCoroutineScope()
 
-    val completedEpisodes = remember(uiState.items) {
-        uiState.completedItems
+    val allEpisodes = remember(uiState.items) {
+        uiState.items
             .filter { it.isEpisode }
             .sortedForSeriesDownloads()
     }
 
-    val selectedShowTitle = remember(selectedShowId, completedEpisodes) {
+    val selectedShowTitle = remember(selectedShowId, allEpisodes) {
         selectedShowId?.let { showId ->
-            completedEpisodes.firstOrNull { it.parentMetaId == showId }?.title
+            allEpisodes.firstOrNull { it.parentMetaId == showId }?.title
         }
     }
 
@@ -407,11 +407,14 @@ internal fun DownloadsScreenContent(
                 onCheckAgain = checkAgain,
             )
         } else {
+            val goodCopies = uiState.completedItems.mapTo(mutableSetOf()) { it.logicalContentKey }
             downloadsShowContent(
                 showId = selectedShowId.orEmpty(),
-                episodes = completedEpisodes,
+                episodes = allEpisodes,
                 clock = clock,
+                speeds = speeds,
                 watchStatusOf = watchStatusOf,
+                onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDownload = onOpenDownload,
                 onOpenDetails = onOpenDetails,
                 onDeleteDownload = { downloadPendingDeletionId = it },
@@ -419,6 +422,7 @@ internal fun DownloadsScreenContent(
                 onKeepScheduled = { autoDownloads?.keepDownload(activeProfileId, it) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = checkAgain,
+                goodCopies = goodCopies,
             )
         }
     }
@@ -802,7 +806,9 @@ private fun LazyListScope.downloadsShowContent(
     showId: String,
     episodes: List<DownloadItem>,
     clock: RowClock,
+    speeds: Map<String, Long>,
     watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
     onOpenDownload: (DownloadItem) -> Unit,
     onOpenDetails: ((DownloadItem) -> Unit)?,
     onDeleteDownload: (String) -> Unit,
@@ -810,6 +816,7 @@ private fun LazyListScope.downloadsShowContent(
     onKeepScheduled: (downloadId: String) -> Unit,
     episodeLinks: DownloadEpisodeLinks?,
     onCheckAgain: ((DownloadItem) -> Unit)?,
+    goodCopies: Set<String> = emptySet(),
 ) {
     val showEpisodes = episodes
         .filter { it.parentMetaId == showId }
@@ -878,8 +885,9 @@ private fun LazyListScope.downloadsShowContent(
             DownloadRow(
                 item = item,
                 clock = clock,
+                speedBytesPerSecond = speeds[item.id],
                 watchStatus = watchStatusOf(item),
-                onChooseAnotherSource = null,
+                onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDetails = onOpenDetails,
                 onOpen = { onOpenDownload(item) },
                 onPause = { DownloadsRepository.pauseDownload(item.id) },
@@ -890,6 +898,7 @@ private fun LazyListScope.downloadsShowContent(
                 onKeepScheduled = { onKeepScheduled(item.id) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
+                newCopyReady = item.isPlaceholder && item.logicalContentKey in goodCopies,
             )
         }
     }
