@@ -2,7 +2,10 @@ package com.nuvio.app.features.downloads
 
 import androidx.compose.ui.Modifier
 import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.core.tracking.SerializedOneTimeBootstrap
 import com.nuvio.app.core.tracking.ensureTrackingProvidersRegistered
+import com.nuvio.app.features.details.MetaDetails
+import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerScreenArgs
 import com.nuvio.app.features.player.PlayerScreenRuntime
@@ -15,6 +18,7 @@ import com.nuvio.app.features.tracking.TrackingHistoryItem
 import com.nuvio.app.features.tracking.TrackingHistoryWriter
 import com.nuvio.app.features.tracking.TrackingMediaReference
 import com.nuvio.app.features.tracking.TrackingMutationResult
+import com.nuvio.app.features.tracking.TrackingProfileStore
 import com.nuvio.app.features.tracking.TrackingProgressProvider
 import com.nuvio.app.features.tracking.TrackingProgressSnapshot
 import com.nuvio.app.features.tracking.TrackingProviderDescriptor
@@ -28,6 +32,8 @@ import com.nuvio.app.features.tracking.WatchProgressSource
 import com.nuvio.app.features.watched.WatchedItem
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watched.WatchedStorage
+import com.nuvio.app.features.watching.application.WatchingActions
+import com.nuvio.app.features.watchprogress.WatchProgressCodec
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressPlaybackSession
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
@@ -35,14 +41,22 @@ import com.nuvio.app.features.watchprogress.WatchProgressSourceLocal
 import com.nuvio.app.features.watchprogress.WatchProgressSourceTraktPlayback
 import com.nuvio.app.features.watchprogress.WatchProgressStorage
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -144,9 +158,10 @@ class WatchedAfterDownloadTest {
     private fun recordingWatchedProvider(
         id: TrackingProviderId,
         recorder: TrackerCallRecorder,
+        pulledItems: () -> List<WatchedItem> = { emptyList() },
     ): TrackingWatchedProvider = object : TrackingWatchedProvider {
         override val providerId: TrackingProviderId = id
-        override suspend fun pull(profileId: Int, pageSize: Int): List<WatchedItem> = emptyList()
+        override suspend fun pull(profileId: Int, pageSize: Int): List<WatchedItem> = pulledItems()
         override suspend fun push(profileId: Int, items: Collection<WatchedItem>) {
             recorder.watchedPushes += RecordedWatchedPush(id, profileId, items.toList())
         }
@@ -176,6 +191,7 @@ class WatchedAfterDownloadTest {
         source: WatchProgressSource,
         connectedProviders: Set<TrackingProviderId>,
         crossinline providerEntries: (TrackingProviderId) -> List<WatchProgressEntry> = { emptyList() },
+        crossinline watchedPulledItems: (TrackingProviderId) -> List<WatchedItem> = { emptyList() },
         block: (profileId: Int, recorder: TrackerCallRecorder) -> Unit,
     ) {
         ensureTrackingProvidersRegistered()
@@ -197,12 +213,16 @@ class WatchedAfterDownloadTest {
         val recorder = TrackerCallRecorder()
         try {
             TrackingProviderId.entries.forEach { id ->
-                TrackingProviderRegistry.replaceProviderPorts(
+                replaceProviderPortsForTest(
                     id = id,
                     auth = fakeAuthProvider(id, authenticated = id in connectedProviders),
                     scrobbler = recordingScrobbler(id, recorder),
                     historyWriter = recordingHistoryWriter(id, recorder),
-                    watchedProvider = recordingWatchedProvider(id, recorder),
+                    watchedProvider = recordingWatchedProvider(
+                        id = id,
+                        recorder = recorder,
+                        pulledItems = { watchedPulledItems(id) },
+                    ),
                     progressProvider = fakeProgressProvider(
                         id = id,
                         snapshotEntries = { providerEntries(id) },
@@ -221,7 +241,7 @@ class WatchedAfterDownloadTest {
             WatchedRepository.clearLocalState()
             WatchProgressRepository.clearLocalState()
             savedPorts.forEach { saved ->
-                TrackingProviderRegistry.replaceProviderPorts(
+                replaceProviderPortsForTest(
                     id = saved.id,
                     auth = saved.auth,
                     scrobbler = saved.scrobbler,
@@ -242,6 +262,58 @@ class WatchedAfterDownloadTest {
             } else {
                 WatchProgressStorage.savePayload(profileId, previousProgress)
             }
+        }
+    }
+
+    private inline fun withIsolatedDownloadsAndAutoDownloadStore(
+        profileId: Int,
+        items: List<DownloadItem>,
+        rule: AutoDownloadRule,
+        block: (store: AutoDownloadStore) -> Unit,
+    ) {
+        val realBackend = DownloadsRepository.backend
+        val autoDownloadsStore = DesktopStorage.store("nuvio_auto_downloads")
+        val previousAutoPayload = AutoDownloadStorage.loadPayload(profileId)
+        val inMemoryBackend = object : DownloadsBackend {
+            var payload: String? = DownloadsCodec.encode(items, loaded = null)
+            override fun loadPayload(): String? = payload
+            override fun savePayload(payload: String) {
+                this.payload = payload
+            }
+
+            override fun restoreItem(item: DownloadItem): DownloadItem = item
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (Long, Long?) -> Unit,
+                onSuccess: (String, Long?) -> Unit,
+                onFailure: (String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle = object : DownloadsTaskHandle {
+                override fun cancel() = Unit
+            }
+
+            override fun removeFile(localFileUri: String?): Boolean = true
+            override fun removePartialFile(destinationFileName: String): Boolean = true
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+            override fun trashFile(localFileUri: String): Boolean = true
+        }
+        val liveStore = autoDownloadsStoreForTest()
+        try {
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = inMemoryBackend
+            DownloadsRepository.ensureLoaded()
+            liveStore.upsert(profileId, rule)
+            block(liveStore)
+        } finally {
+            liveStore.remove(profileId, rule.key)
+            if (previousAutoPayload == null) {
+                autoDownloadsStore.remove("auto_downloads_$profileId")
+            } else {
+                AutoDownloadStorage.savePayload(profileId, previousAutoPayload)
+            }
+            resetLoadedProfileForTest(liveStore)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = realBackend
         }
     }
 
@@ -676,31 +748,13 @@ class WatchedAfterDownloadTest {
     fun local_completed_progress_counts_as_watched_but_tracker_progress_fallback_does_not() {
         val rule = testRule(keepCount = 3)
         val episode = testEpisode(1)
-        val localCompleted = WatchProgressEntry(
-            contentType = "series",
-            parentMetaId = rule.parentMetaId,
-            parentMetaType = "series",
-            videoId = episode.videoId,
-            title = rule.title,
-            seasonNumber = 1,
-            episodeNumber = 1,
-            lastPositionMs = 2_400_000L,
-            durationMs = 2_400_000L,
-            lastUpdatedEpochMs = 1_000L,
-            isCompleted = true,
-            source = WatchProgressSourceLocal,
-        )
-        val trackerSnapshot = localCompleted.copy(
-            progressPercent = 90f,
-            source = WatchProgressSourceTraktPlayback,
-        )
 
         assertTrue(
             isEpisodeWatchedForAutoDownload(
                 rule = rule,
                 episode = episode,
                 isWatchedInHistory = { _, _, _, _ -> false },
-                localProgressForEpisode = { _, _, _, _ -> localCompleted },
+                isLocallyFinishedOnDevice = { _, _, _ -> true },
             ),
         )
         assertFalse(
@@ -708,9 +762,430 @@ class WatchedAfterDownloadTest {
                 rule = rule,
                 episode = episode,
                 isWatchedInHistory = { _, _, _, _ -> false },
-                localProgressForEpisode = { _, _, _, _ -> trackerSnapshot },
+                isLocallyFinishedOnDevice = { _, _, _ -> false },
             ),
         )
+    }
+
+    @Test
+    fun concurrent_tracker_bootstrap_callers_wait_until_all_providers_are_registered() {
+        val bootstrap = SerializedOneTimeBootstrap()
+        val initCalls = AtomicInteger(0)
+        val registeredProviders = Collections.synchronizedList(mutableListOf<String>())
+        val firstEntered = CountDownLatch(1)
+        val allowFinish = CountDownLatch(1)
+        val waitingCallersStarted = CountDownLatch(5)
+        val finishedCount = AtomicInteger(0)
+        val observedByCaller = Collections.synchronizedList(mutableListOf<List<String>>())
+
+        val firstThread = thread(name = "bootstrap-first") {
+            bootstrap.run {
+                initCalls.incrementAndGet()
+                registeredProviders += "mdblist"
+                firstEntered.countDown()
+                assertTrue(allowFinish.await(5, TimeUnit.SECONDS))
+                registeredProviders += "trakt"
+                registeredProviders += "simkl"
+            }
+            finishedCount.incrementAndGet()
+            observedByCaller += registeredProviders.toList()
+        }
+
+        assertTrue(firstEntered.await(5, TimeUnit.SECONDS))
+
+        val concurrentThreads = (1..5).map { idx ->
+            thread(name = "bootstrap-waiter-$idx") {
+                waitingCallersStarted.countDown()
+                bootstrap.run {
+                    initCalls.incrementAndGet()
+                }
+                finishedCount.incrementAndGet()
+                observedByCaller += registeredProviders.toList()
+            }
+        }
+
+        assertTrue(waitingCallersStarted.await(5, TimeUnit.SECONDS))
+        // Give waiting callers a brief moment to hit the guard; none may return before registration finishes.
+        Thread.sleep(75L)
+        assertEquals(0, finishedCount.get(), "Concurrent callers must wait until registration completes")
+
+        allowFinish.countDown()
+        firstThread.join(5_000L)
+        concurrentThreads.forEach { it.join(5_000L) }
+
+        assertEquals(1, initCalls.get())
+        assertEquals(6, observedByCaller.size)
+        observedByCaller.forEach { seen ->
+            assertEquals(listOf("mdblist", "trakt", "simkl"), seen)
+        }
+
+        // A failed initialization must not publish readiness; a later caller retries and succeeds.
+        val retryBootstrap = SerializedOneTimeBootstrap()
+        val attempts = AtomicInteger(0)
+        assertFailsWith<IllegalStateException> {
+            retryBootstrap.run {
+                attempts.incrementAndGet()
+                throw IllegalStateException("transient failure")
+            }
+        }
+        retryBootstrap.run {
+            attempts.incrementAndGet()
+            // Re-entrant call on the same thread must not recurse infinitely.
+            retryBootstrap.run { attempts.incrementAndGet() }
+        }
+        assertEquals(2, attempts.get())
+    }
+
+    @Test
+    fun replacing_and_restoring_tracking_auth_provider_does_not_leak_profile_stores() {
+        ensureTrackingProvidersRegistered()
+        val original = TrackingProviderRegistry.authProvider(TrackingProviderId.TRAKT)!!
+        val fake = fakeAuthProvider(TrackingProviderId.TRAKT, authenticated = true)
+        try {
+            TrackingProviderRegistry.register(fake)
+            val during = profileStoresSnapshotForTest()
+            assertTrue(fake in during)
+            assertFalse(original in during)
+        } finally {
+            TrackingProviderRegistry.register(original)
+        }
+        val after = profileStoresSnapshotForTest()
+        assertTrue(original in after)
+        assertFalse(fake in after, "Replaced fake auth provider must not remain in profileStores")
+    }
+
+    @Test
+    fun old_cloud_synced_90_percent_row_on_a_later_episode_does_not_advance_the_auto_download_window() {
+        val showId = "tt9911510"
+        val oldCloudRow = WatchProgressEntry(
+            contentType = "series",
+            parentMetaId = showId,
+            parentMetaType = "series",
+            videoId = "$showId:1:8",
+            title = "Example Show",
+            seasonNumber = 1,
+            episodeNumber = 8,
+            lastPositionMs = 2_160_000L,
+            durationMs = 2_400_000L,
+            lastUpdatedEpochMs = 1_000L,
+            isCompleted = true,
+            source = WatchProgressSourceLocal,
+        ).normalizedCompletion()
+
+        withIsolatedTrackerHarness(
+            source = WatchProgressSource.NUVIO_SYNC,
+            connectedProviders = setOf(TrackingProviderId.TRAKT),
+        ) { profileId, _ ->
+            // Simulate a cloud-synced 90% row persisted in local watch progress storage (whose
+            // source defaults to "local" when decoded from ProgressSyncRecord).
+            WatchProgressStorage.savePayload(
+                profileId,
+                WatchProgressCodec.encodeEntries(listOf(oldCloudRow)),
+            )
+            WatchProgressRepository.clearLocalState()
+            WatchProgressRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+            assertTrue(
+                WatchProgressRepository.progressForVideo(
+                    videoId = "$showId:1:8",
+                    parentMetaId = showId,
+                    seasonNumber = 1,
+                    episodeNumber = 8,
+                )?.isEffectivelyCompleted == true,
+            )
+
+            // Switch to Trakt so the old cloud-synced row remains in local storage behind Trakt.
+            WatchedRepository.activateSource(WatchProgressSource.TRAKT)
+            WatchProgressRepository.activateSource(WatchProgressSource.TRAKT)
+
+            val rule = testRule(showId = showId, keepCount = 3)
+            val released = (1..12).map { testEpisode(it, showId = showId) }
+            val downloads = (1..3).map { testDownload(it, DownloadStatus.Completed, showId = showId, ruleKey = rule.key) }
+
+            assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 8))
+            assertFalse(
+                isEpisodeWatchedForAutoDownload(rule, released[7]),
+                "Old cloud-synced 90% row must not count as a device-local completion",
+            )
+
+            val beforeLocalFinish = planAutoDownload(
+                rule = rule,
+                released = released,
+                isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                downloads = downloads,
+            )
+            assertEquals(listOf(1, 2, 3), beforeLocalFinish.window.map { it.episodeNumber })
+            assertEquals(emptyList(), beforeLocalFinish.toDownload.map { it.episodeNumber })
+
+            // Finishing episode 1 on this device advances the window by one episode, not past episode 8.
+            WatchProgressRepository.flushPlaybackProgress(
+                session = downloadedEpisodeSession(profileId, showId, episodeNumber = 1),
+                snapshot = PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = false,
+                    isEnded = true,
+                    durationMs = 2_400_000L,
+                    positionMs = 2_400_000L,
+                ),
+            )
+
+            assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+            val afterLocalFinish = planAutoDownload(
+                rule = rule,
+                released = released,
+                isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                downloads = downloads,
+            )
+            assertEquals(listOf(2, 3, 4), afterLocalFinish.window.map { it.episodeNumber })
+            assertEquals(listOf(4), afterLocalFinish.toDownload.map { it.episodeNumber })
+        }
+    }
+
+    @Test
+    fun in_app_unwatch_cancels_pending_removal_and_local_finished_mark_so_planning_treats_episode_as_unwatched() {
+        val showId = "tt9911511"
+        val rule = testRule(showId = showId, keepCount = 3).copy(deleteAfterWatching = true)
+        val released = (1..6).map { testEpisode(it, showId = showId) }
+        val downloads = (1..3).map { testDownload(it, DownloadStatus.Completed, showId = showId, ruleKey = rule.key) }
+        val ep1Video = MetaVideo(id = "$showId:1:1", title = "Episode 1", released = "2024-01-01", season = 1, episode = 1)
+        val ep2Video = MetaVideo(id = "$showId:1:2", title = "Episode 2", released = "2024-01-08", season = 1, episode = 2)
+        val meta = MetaDetails(id = showId, type = "series", name = "Example Show", videos = listOf(ep1Video, ep2Video))
+
+        withIsolatedTrackerHarness(
+            source = WatchProgressSource.TRAKT,
+            connectedProviders = setOf(TrackingProviderId.TRAKT),
+        ) { profileId, _ ->
+            withIsolatedDownloadsAndAutoDownloadStore(profileId, downloads, rule) { liveStore ->
+                // Finish episodes 1 and 2 locally and schedule removals for both.
+                for (ep in 1..2) {
+                    WatchProgressRepository.flushPlaybackProgress(
+                        session = downloadedEpisodeSession(profileId, showId, episodeNumber = ep),
+                        snapshot = PlayerPlaybackSnapshot(
+                            isLoading = false,
+                            isPlaying = false,
+                            isEnded = true,
+                            durationMs = 2_400_000L,
+                            positionMs = 2_400_000L,
+                        ),
+                    )
+                    assertTrue(
+                        liveStore.scheduleRemoval(
+                            profileId,
+                            AutoDownloadRemoval(downloads[ep - 1].id, rule.key, dueAtEpochMs = 10_000_000L),
+                        ),
+                    )
+                }
+                WatchedRepository.reconcileSeriesWatchedState(meta, todayIsoDate = "2026-01-01")
+                assertTrue(WatchedRepository.isWatched(id = showId, type = "series"))
+
+                // Unwatching episode 2 clears episode 2's mark and removal, without touching episode 1
+                // even though reconcileSeriesWatchedState unmarks the series-level watched marker.
+                WatchingActions.toggleEpisodeWatched(meta = meta, episode = ep2Video, isCurrentlyWatched = true)
+                assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 2))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 2))
+                assertEquals(listOf(downloads[0].id), AutoDownloads.removals.value.map { it.downloadId })
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+
+                val afterUnwatchEp2 = planAutoDownload(
+                    rule = rule,
+                    released = released,
+                    isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                    downloads = downloads,
+                    pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
+                )
+                assertEquals(listOf(2, 3, 4), afterUnwatchEp2.window.map { it.episodeNumber })
+
+                // Unwatching episode 1 cancels its pending removal and local finished mark; planning
+                // returns the window to [1, 2, 3].
+                WatchingActions.toggleEpisodeWatched(meta = meta, episode = ep1Video, isCurrentlyWatched = true)
+                assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+
+                val afterUnwatchEp1 = planAutoDownload(
+                    rule = rule,
+                    released = released,
+                    isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                    downloads = downloads,
+                    pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
+                )
+                assertEquals(listOf(1, 2, 3), afterUnwatchEp1.window.map { it.episodeNumber })
+                assertEquals(emptyList(), afterUnwatchEp1.toDownload.map { it.episodeNumber })
+            }
+        }
+    }
+
+    @Test
+    fun clearing_progress_cancels_pending_removal_and_local_finished_mark() {
+        val showId = "tt9911512"
+        val rule = testRule(showId = showId, keepCount = 3).copy(deleteAfterWatching = true)
+        val released = (1..6).map { testEpisode(it, showId = showId) }
+        val downloads = (1..3).map { testDownload(it, DownloadStatus.Completed, showId = showId, ruleKey = rule.key) }
+
+        withIsolatedTrackerHarness(
+            source = WatchProgressSource.TRAKT,
+            connectedProviders = setOf(TrackingProviderId.TRAKT),
+        ) { profileId, _ ->
+            withIsolatedDownloadsAndAutoDownloadStore(profileId, downloads, rule) { liveStore ->
+                // 1) clearProgress(videoId, parentMetaId)
+                WatchProgressRepository.flushPlaybackProgress(
+                    session = downloadedEpisodeSession(profileId, showId, episodeNumber = 1),
+                    snapshot = PlayerPlaybackSnapshot(
+                        isLoading = false,
+                        isPlaying = false,
+                        isEnded = true,
+                        durationMs = 2_400_000L,
+                        positionMs = 2_400_000L,
+                    ),
+                )
+                WatchedRepository.clearLocalState()
+                DesktopStorage.store("nuvio_watched").remove("watched_$profileId")
+                WatchedRepository.activateSource(WatchProgressSource.TRAKT)
+                assertTrue(
+                    liveStore.scheduleRemoval(
+                        profileId,
+                        AutoDownloadRemoval(downloads[0].id, rule.key, dueAtEpochMs = 10_000_000L),
+                    ),
+                )
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+
+                WatchProgressRepository.clearProgress(videoId = "$showId:1:1", parentMetaId = showId)
+
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+                val afterClear = planAutoDownload(
+                    rule = rule,
+                    released = released,
+                    isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                    downloads = downloads,
+                    pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
+                )
+                assertEquals(listOf(1, 2, 3), afterClear.window.map { it.episodeNumber })
+
+                // 2) removeProgress(contentId, seasonNumber, episodeNumber)
+                WatchProgressRepository.flushPlaybackProgress(
+                    session = downloadedEpisodeSession(profileId, showId, episodeNumber = 1),
+                    snapshot = PlayerPlaybackSnapshot(
+                        isLoading = false,
+                        isPlaying = false,
+                        isEnded = true,
+                        durationMs = 2_400_000L,
+                        positionMs = 2_400_000L,
+                    ),
+                )
+                WatchedRepository.clearLocalState()
+                DesktopStorage.store("nuvio_watched").remove("watched_$profileId")
+                WatchedRepository.activateSource(WatchProgressSource.TRAKT)
+                assertTrue(
+                    liveStore.scheduleRemoval(
+                        profileId,
+                        AutoDownloadRemoval(downloads[0].id, rule.key, dueAtEpochMs = 10_000_000L),
+                    ),
+                )
+
+                WatchProgressRepository.removeProgress(contentId = showId, seasonNumber = 1, episodeNumber = 1)
+
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+                val afterRemove = planAutoDownload(
+                    rule = rule,
+                    released = released,
+                    isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                    downloads = downloads,
+                    pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
+                )
+                assertEquals(listOf(1, 2, 3), afterRemove.window.map { it.episodeNumber })
+            }
+        }
+    }
+
+    @Test
+    fun out_of_band_unwatch_via_watched_repository_or_remote_sync_clears_local_finished_mark_and_pending_removal() = runTest {
+        val showId = "tt9911513"
+        val rule = testRule(showId = showId, keepCount = 3).copy(deleteAfterWatching = true)
+        val released = (1..6).map { testEpisode(it, showId = showId) }
+        val downloads = (1..3).map { testDownload(it, DownloadStatus.Completed, showId = showId, ruleKey = rule.key) }
+        var remoteWatched: List<WatchedItem> = emptyList()
+
+        withIsolatedTrackerHarness(
+            source = WatchProgressSource.TRAKT,
+            connectedProviders = setOf(TrackingProviderId.TRAKT),
+            watchedPulledItems = { id -> if (id == TrackingProviderId.TRAKT) remoteWatched else emptyList() },
+        ) { profileId, _ ->
+            withIsolatedDownloadsAndAutoDownloadStore(profileId, downloads, rule) { liveStore ->
+                // Part A: Direct WatchedRepository.unmarkWatched (bypassing WatchingActions).
+                WatchProgressRepository.flushPlaybackProgress(
+                    session = downloadedEpisodeSession(profileId, showId, episodeNumber = 1),
+                    snapshot = PlayerPlaybackSnapshot(
+                        isLoading = false,
+                        isPlaying = false,
+                        isEnded = true,
+                        durationMs = 2_400_000L,
+                        positionMs = 2_400_000L,
+                    ),
+                )
+                assertTrue(
+                    liveStore.scheduleRemoval(
+                        profileId,
+                        AutoDownloadRemoval(downloads[0].id, rule.key, dueAtEpochMs = 10_000_000L),
+                    ),
+                )
+
+                WatchedRepository.unmarkWatched(id = showId, type = "series", season = 1, episode = 1)
+
+                assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+
+                // Part B: Remote tracker sync unmarks a previously confirmed episode out-of-band.
+                WatchProgressRepository.flushPlaybackProgress(
+                    session = downloadedEpisodeSession(profileId, showId, episodeNumber = 1),
+                    snapshot = PlayerPlaybackSnapshot(
+                        isLoading = false,
+                        isPlaying = false,
+                        isEnded = true,
+                        durationMs = 2_400_000L,
+                        positionMs = 2_400_000L,
+                    ),
+                )
+                assertTrue(
+                    liveStore.scheduleRemoval(
+                        profileId,
+                        AutoDownloadRemoval(downloads[0].id, rule.key, dueAtEpochMs = 10_000_000L),
+                    ),
+                )
+                // First pull confirms the watched episode on the tracker (clears dirty bit).
+                remoteWatched = listOf(
+                    WatchedItem(
+                        id = showId,
+                        type = "series",
+                        name = "Example Show",
+                        season = 1,
+                        episode = 1,
+                        markedAtEpochMs = 5_000L,
+                    ),
+                )
+                WatchedRepository.pullFromServer(profileId)
+                assertTrue(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(listOf(downloads[0].id), AutoDownloads.removals.value.map { it.downloadId })
+
+                // Second pull reflects an out-of-band unwatch on the tracker.
+                remoteWatched = emptyList()
+                WatchedRepository.pullFromServer(profileId)
+
+                assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+                val plan = planAutoDownload(
+                    rule = rule,
+                    released = released,
+                    isWatched = { isEpisodeWatchedForAutoDownload(rule, it) },
+                    downloads = downloads,
+                    pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
+                )
+                assertEquals(listOf(1, 2, 3), plan.window.map { it.episodeNumber })
+            }
+        }
     }
 
     @Test
@@ -752,5 +1227,79 @@ class WatchedAfterDownloadTest {
                 "Expected ended local playback to mark the episode watched locally",
             )
         }
+    }
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun replaceProviderPortsForTest(
+    id: TrackingProviderId,
+    auth: TrackingAuthProvider?,
+    scrobbler: TrackingScrobbler?,
+    historyWriter: TrackingHistoryWriter?,
+    watchedProvider: TrackingWatchedProvider?,
+    progressProvider: TrackingProgressProvider?,
+) {
+    val registry = TrackingProviderRegistry
+    val lock = registryField(registry, "lock")
+    if (auth != null) {
+        registry.register(auth)
+    } else {
+        val (removedAuth, previousJob) = synchronized(lock) {
+            val authProviders = registryField(registry, "authProviders") as MutableMap<TrackingProviderId, TrackingAuthProvider>
+            val profileStores = registryField(registry, "profileStores") as MutableSet<TrackingProfileStore>
+            val jobs = registryField(registry, "authObservationJobs") as MutableMap<TrackingProviderId, Job>
+            val removed = authProviders.remove(id)
+            if (removed != null) profileStores.remove(removed)
+            removed to jobs.remove(id)
+        }
+        previousJob?.cancel()
+        if (removedAuth != null) {
+            val connected = registryField(registry, "_connectedProviderIds") as MutableStateFlow<Set<TrackingProviderId>>
+            connected.update { it - id }
+        }
+    }
+    if (scrobbler != null) registry.registerScrobbler(scrobbler) else removeRegistryMapEntry(registry, lock, "scrobblers", id)
+    if (historyWriter != null) registry.registerHistoryWriter(historyWriter) else removeRegistryMapEntry(registry, lock, "historyWriters", id)
+    if (watchedProvider != null) registry.registerWatchedProvider(watchedProvider) else removeRegistryMapEntry(registry, lock, "watchedProviders", id)
+    if (progressProvider != null) registry.registerProgressProvider(progressProvider) else removeRegistryMapEntry(registry, lock, "progressProviders", id)
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun profileStoresSnapshotForTest(): Set<TrackingProfileStore> {
+    val registry = TrackingProviderRegistry
+    val lock = registryField(registry, "lock")
+    return synchronized(lock) {
+        (registryField(registry, "profileStores") as Set<TrackingProfileStore>).toSet()
+    }
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun removeRegistryMapEntry(
+    registry: TrackingProviderRegistry,
+    lock: Any,
+    fieldName: String,
+    id: TrackingProviderId,
+) {
+    synchronized(lock) {
+        (registryField(registry, fieldName) as MutableMap<TrackingProviderId, Any?>).remove(id)
+    }
+}
+
+private fun registryField(registry: TrackingProviderRegistry, name: String): Any =
+    registry.javaClass.getDeclaredField(name).let { field ->
+        field.isAccessible = true
+        field.get(registry)
+    }
+
+private fun autoDownloadsStoreForTest(): AutoDownloadStore =
+    AutoDownloads.javaClass.getDeclaredField("store").let { field ->
+        field.isAccessible = true
+        field.get(AutoDownloads) as AutoDownloadStore
+    }
+
+private fun resetLoadedProfileForTest(store: AutoDownloadStore) {
+    store.javaClass.getDeclaredField("loadedProfileId").let { field ->
+        field.isAccessible = true
+        field.set(store, null)
     }
 }

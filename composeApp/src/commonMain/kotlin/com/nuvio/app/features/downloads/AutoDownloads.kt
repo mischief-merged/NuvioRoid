@@ -12,9 +12,7 @@ import com.nuvio.app.features.watched.releasedPlayableEpisodes
 import com.nuvio.app.features.watching.domain.WatchingContentRef
 import com.nuvio.app.features.watching.domain.buildPlaybackVideoId
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
-import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
-import com.nuvio.app.features.watchprogress.WatchProgressSourceLocal
 import com.nuvio.app.isDesktop
 import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.CancellationException
@@ -382,6 +380,38 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    /** Cancels pending watched removals when content is unwatched or its playback progress is cleared. */
+    fun cancelPendingRemovals(
+        parentMetaId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
+        if (!isAvailable) return
+        val profileId = ProfileRepository.activeProfileId
+        runCatching {
+            val cancelled = deleteAfterWatching.cancelForContent(
+                profileId = profileId,
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+                onlyNonEpisode = onlyNonEpisode,
+            )
+            if (cancelled) {
+                val normalizedParent = parentMetaId.trim()
+                scope.launch {
+                    runCatching {
+                        store.currentRules()
+                            .filter { it.parentMetaId.trim() == normalizedParent }
+                            .forEach { engine.refreshStatus(profileId, it.key) }
+                    }
+                }
+            }
+        }
+    }
+
     /** Says that [item] will be deleted, with a Keep button for as long as the message stays. */
     private suspend fun announceScheduledDeletion(profileId: Int, item: DownloadItem) {
         val due = store.removals(profileId).firstOrNull { it.downloadId == item.id } ?: return
@@ -420,8 +450,8 @@ internal object AutoDownloads : AutoDownloadController {
 
 /**
  * Whether [episode] counts as watched for an automatic-download rule: either marked watched in
- * history or finished by verified local playback on this device (never a tracker's synced progress
- * snapshot).
+ * history or finished by local playback on this device during this install (never a cloud-synced
+ * or tracker-synced progress row).
  */
 internal fun isEpisodeWatchedForAutoDownload(
     rule: AutoDownloadRule,
@@ -429,9 +459,8 @@ internal fun isEpisodeWatchedForAutoDownload(
     isWatchedInHistory: (id: String, type: String, season: Int, episode: Int) -> Boolean = { id, type, season, number ->
         WatchedRepository.isWatched(id = id, type = type, season = season, episode = number)
     },
-    localProgressForEpisode: (videoId: String, parentMetaId: String, season: Int, episode: Int) -> WatchProgressEntry? = { videoId, parentMetaId, season, number ->
-        WatchProgressRepository.localProgressForVideo(
-            videoId = videoId,
+    isLocallyFinishedOnDevice: (parentMetaId: String, season: Int, episode: Int) -> Boolean = { parentMetaId, season, number ->
+        WatchProgressRepository.isEpisodeLocallyFinished(
             parentMetaId = parentMetaId,
             seasonNumber = season,
             episodeNumber = number,
@@ -439,11 +468,7 @@ internal fun isEpisodeWatchedForAutoDownload(
     },
 ): Boolean =
     isWatchedInHistory(rule.parentMetaId, rule.parentMetaType, episode.seasonNumber, episode.episodeNumber) ||
-        localProgressForEpisode(episode.videoId, rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
-            ?.isVerifiedLocalCompletion == true
-
-internal val WatchProgressEntry.isVerifiedLocalCompletion: Boolean
-    get() = source == WatchProgressSourceLocal && isEffectivelyCompleted
+        isLocallyFinishedOnDevice(rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
 internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {

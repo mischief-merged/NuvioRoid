@@ -10,6 +10,7 @@ import com.nuvio.app.features.addons.AddonLibraryAction
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.servers.ServerWatched
 import com.nuvio.app.features.tracking.TrackingProviderId
@@ -23,6 +24,7 @@ import com.nuvio.app.features.watching.sync.SupabaseWatchedSyncAdapter
 import com.nuvio.app.features.watching.sync.WatchedDeltaEvent
 import com.nuvio.app.features.watching.sync.WatchedSyncAdapter
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.CancellationException
@@ -489,16 +491,17 @@ object WatchedRepository {
             }
             return false
         }
-        itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
+        val removedByRemote = itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
             val items = source.providerId
                 ?.let { providerId -> providerItems[providerId]?.values.orEmpty() }
                 ?: nuvioItems.values
+            val previousItems = items.toList()
             val dirtyKeys = source.providerId
                 ?.let { providerId -> dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf) }
                 ?: dirtyNuvioKeys
             val merged = mergeWatchedSnapshot(
                 serverItems = serverItems,
-                localItems = items.toList(),
+                localItems = previousItems,
                 dirtyKeys = dirtyKeys,
                 acknowledgeDirtyByPresence = source.providerId != null,
             )
@@ -510,6 +513,12 @@ object WatchedRepository {
             )
             dirtyKeys.clear()
             dirtyKeys += merged.dirtyKeys
+            previousItems.filter { item ->
+                watchedItemKey(item.type, item.id, item.season, item.episode) !in merged.items
+            }
+        }
+        if (removedByRemote.isNotEmpty()) {
+            onItemsUnwatched(removedByRemote)
         }
         fullyWatchedSeriesKeys?.let { keys ->
             setFullyWatchedSeriesKeysForSource(source, keys)
@@ -578,12 +587,15 @@ object WatchedRepository {
             if (!isActiveOperation(operation)) return false
             if (events.isEmpty()) break
 
-            itemsStore.update { nuvioItems, _, dirtyNuvioKeys, _ ->
+            val removedByDelta = itemsStore.update { nuvioItems, _, dirtyNuvioKeys, _ ->
                 applyWatchedDeltaEvents(
                     targetItems = nuvioItems,
                     dirtyKeys = dirtyNuvioKeys,
                     events = events,
                 )
+            }
+            if (removedByDelta.isNotEmpty()) {
+                onItemsUnwatched(removedByDelta)
             }
             cursor = maxOf(cursor, events.maxOf { it.eventId })
             deltaCursorEventId = cursor
@@ -610,7 +622,7 @@ object WatchedRepository {
         targetItems: MutableMap<String, WatchedItem>,
         dirtyKeys: MutableSet<String>,
         events: Collection<WatchedDeltaEvent>,
-    ) {
+    ): List<WatchedItem> {
         var upsertCount = 0
         var deleteCount = 0
         var removedCount = 0
@@ -618,6 +630,7 @@ object WatchedRepository {
         var preservedDirtyCount = 0
         var acknowledgedDirtyCount = 0
         var ignoredCount = 0
+        val removedItems = mutableListOf<WatchedItem>()
 
         events.forEach { event ->
             val key = watchedItemKey(event.contentType, event.contentId, event.season, event.episode)
@@ -668,6 +681,7 @@ object WatchedRepository {
                     }
                     val removedItem = targetItems.remove(matchingKey)
                     if (removedItem != null) {
+                        removedItems += removedItem
                         removedCount += 1
                         if (matchingKey != key) {
                             removedByFallbackKeyCount += 1
@@ -686,6 +700,7 @@ object WatchedRepository {
                 "preservedDirty=$preservedDirtyCount acknowledgedDirty=$acknowledgedDirtyCount " +
                 "ignored=$ignoredCount"
         }
+        return removedItems
     }
 
     private fun findWatchedItemStableDeleteKey(
@@ -929,6 +944,33 @@ object WatchedRepository {
                 persist()
             }
             if (syncRemote) pushDeleteToServer(items = items.toList(), source = source)
+        }
+        onItemsUnwatched(items)
+    }
+
+    private fun onItemsUnwatched(items: Collection<WatchedItem>) {
+        items.forEach { item ->
+            val season = item.season
+            val episode = item.episode
+            if (season != null && episode != null) {
+                WatchProgressRepository.clearLocallyFinishedEpisode(
+                    parentMetaId = item.id,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                )
+                AutoDownloads.cancelPendingRemovals(
+                    parentMetaId = item.id,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                    videoId = item.videoId,
+                )
+            } else if (!item.type.isSeriesLikeWatchingContentType()) {
+                AutoDownloads.cancelPendingRemovals(
+                    parentMetaId = item.id,
+                    videoId = item.videoId,
+                    onlyNonEpisode = true,
+                )
+            }
         }
     }
 
@@ -1213,17 +1255,24 @@ object WatchedRepository {
                             },
                         ) ?: return@collectLatest
                         providerExtraWatchedKeys[providerId] = extraKeys
-                        itemsStore.update { _, providerItems, _, dirtyProviderKeys ->
+                        val removedByRemote = itemsStore.update { _, providerItems, _, dirtyProviderKeys ->
+                            val previousItems = providerItems[providerId]?.values.orEmpty().toList()
                             val dirtyKeys = dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf)
                             val merged = mergeWatchedSnapshot(
                                 serverItems = freshItems,
-                                localItems = providerItems[providerId]?.values.orEmpty().toList(),
+                                localItems = previousItems,
                                 dirtyKeys = dirtyKeys,
                                 acknowledgeDirtyByPresence = true,
                             )
                             providerItems[providerId] = merged.items.toMutableMap()
                             dirtyKeys.clear()
                             dirtyKeys += merged.dirtyKeys
+                            previousItems.filter { item ->
+                                watchedItemKey(item.type, item.id, item.season, item.episode) !in merged.items
+                            }
+                        }
+                        if (removedByRemote.isNotEmpty()) {
+                            onItemsUnwatched(removedByRemote)
                         }
                         loadedProviders += providerId
                         providersLoadedFromRemote += providerId

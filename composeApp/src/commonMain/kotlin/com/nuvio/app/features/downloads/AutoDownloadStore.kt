@@ -254,6 +254,24 @@ internal class AutoDownloadStore(
         true
     }
 
+    /** Cancels any scheduled or kept-aside removal for [downloadIds]. */
+    fun cancelRemovals(profileId: Int, downloadIds: Set<String>): Boolean = WatchedRemovalGuard.change {
+        if (downloadIds.isEmpty() || ensureLoaded() != profileId) return@change false
+        val nextRemovals = state.removals.filterNot { it.downloadId in downloadIds }
+        val nextKeptRemovals = state.keptRemovals.filterNot { it.downloadId in downloadIds }
+        if (nextRemovals.size == state.removals.size && nextKeptRemovals.size == state.keptRemovals.size) {
+            return@change false
+        }
+        save(
+            profileId,
+            state.copy(
+                removals = nextRemovals,
+                keptRemovals = nextKeptRemovals,
+            ),
+        )
+        true
+    }
+
     /** Keeps a download for good: its scheduled removal is set aside and none is scheduled again. */
     fun keep(profileId: Int, downloadId: String): Boolean {
         val key = profileId to downloadId

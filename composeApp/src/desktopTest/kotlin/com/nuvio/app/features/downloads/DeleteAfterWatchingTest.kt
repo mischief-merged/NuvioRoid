@@ -1128,4 +1128,22 @@ class DeleteAfterWatchingTest {
         assertEquals(emptyList(), removeCalls)
         assertTrue(items.any { it.episodeNumber == 1 })
     }
+
+    @Test
+    fun cancelling_content_drops_pending_and_kept_removals_only_for_that_episode() {
+        optIn()
+        assertTrue(watch(1))
+        assertTrue(watch(2))
+
+        // Cancel a directly scheduled removal for episode 1 without touching episode 2.
+        assertTrue(feature.cancelForContent(1, parentMetaId = "tt1", seasonNumber = 1, episodeNumber = 1))
+        assertEquals(listOf(item(2).id), store.removals(1).map { it.downloadId })
+
+        // Cancel a kept-aside removal for episode 2 so Undo Keep cannot resurrect it.
+        feature.keep(1, item(2).id)
+        assertTrue(feature.cancelForContent(1, parentMetaId = "tt1", seasonNumber = 1, episodeNumber = 2))
+        feature.undoKeep(1, item(2).id)
+        assertFalse(store.isKept(1, item(2).id))
+        assertEquals(emptyList(), store.removals(1))
+    }
 }

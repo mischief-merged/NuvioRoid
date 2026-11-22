@@ -23,7 +23,31 @@ internal data class StoredWatchProgressPayload(
     val deltaCursorEventId: Long = 0L,
     val deltaInitialized: Boolean = false,
     val dirtyProgressKeys: Set<String> = emptySet(),
+    val locallyFinishedEpisodeKeys: Set<String> = emptySet(),
 )
+
+internal fun localFinishedEpisodeKey(
+    parentMetaId: String,
+    seasonNumber: Int,
+    episodeNumber: Int,
+): String = "${parentMetaId.trim()}|$seasonNumber|$episodeNumber"
+
+internal fun parseEpisodeFromPlaybackVideoId(
+    videoId: String,
+    parentMetaId: String? = null,
+): Triple<String, Int, Int>? {
+    val trimmedVideoId = videoId.trim()
+    val lastColon = trimmedVideoId.lastIndexOf(':')
+    if (lastColon <= 0) return null
+    val episode = trimmedVideoId.substring(lastColon + 1).toIntOrNull() ?: return null
+    val prevColon = trimmedVideoId.lastIndexOf(':', startIndex = lastColon - 1)
+    if (prevColon <= 0) return null
+    val season = trimmedVideoId.substring(prevColon + 1, lastColon).toIntOrNull() ?: return null
+    val resolvedParent = parentMetaId?.trim()?.takeIf { it.isNotEmpty() }
+        ?: trimmedVideoId.substring(0, prevColon).trim().takeIf { it.isNotEmpty() }
+        ?: return null
+    return Triple(resolvedParent, season, episode)
+}
 
 internal object WatchProgressCodec {
     private val json = Json {
@@ -65,6 +89,7 @@ internal object WatchProgressCodec {
         deltaCursorEventId: Long,
         deltaInitialized: Boolean,
         dirtyProgressKeys: Set<String> = emptySet(),
+        locallyFinishedEpisodeKeys: Set<String> = emptySet(),
     ): String =
         json.encodeToString(
             StoredWatchProgressPayload(
@@ -76,6 +101,7 @@ internal object WatchProgressCodec {
                 deltaCursorEventId = deltaCursorEventId,
                 deltaInitialized = deltaInitialized,
                 dirtyProgressKeys = dirtyProgressKeys,
+                locallyFinishedEpisodeKeys = locallyFinishedEpisodeKeys,
             ),
         )
 }

@@ -61,6 +61,43 @@ internal class DeleteAfterWatching(
         store.undoKeep(profileId, downloadId, nowEpochMs, holdMs)
     }
 
+    /** Cancels scheduled or kept-aside removals for downloads matching unwatched or cleared content. */
+    fun cancelForContent(
+        profileId: Int,
+        parentMetaId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ): Boolean {
+        val normalizedParent = parentMetaId.trim()
+        val normalizedVideoId = videoId?.trim()?.takeIf { it.isNotEmpty() }
+        if (normalizedParent.isBlank() && normalizedVideoId == null) return false
+        val matchingIds = downloads().mapNotNullTo(mutableSetOf()) { item ->
+            val matches = when {
+                onlyNonEpisode ->
+                    normalizedParent.isNotBlank() &&
+                        item.parentMetaId.trim() == normalizedParent &&
+                        item.seasonNumber == null &&
+                        item.episodeNumber == null
+                seasonNumber != null && episodeNumber != null ->
+                    (normalizedParent.isNotBlank() &&
+                        item.parentMetaId.trim() == normalizedParent &&
+                        item.seasonNumber == seasonNumber &&
+                        item.episodeNumber == episodeNumber) ||
+                        (normalizedVideoId != null && item.videoId.trim() == normalizedVideoId)
+                normalizedVideoId != null ->
+                    item.videoId.trim() == normalizedVideoId &&
+                        (normalizedParent.isBlank() || item.parentMetaId.trim() == normalizedParent)
+                else ->
+                    normalizedParent.isNotBlank() && item.parentMetaId.trim() == normalizedParent
+            }
+            item.id.takeIf { matches }
+        }
+        if (matchingIds.isEmpty()) return false
+        return store.cancelRemovals(profileId, matchingIds)
+    }
+
     /** Removes the download now, at the user's request. Null when no removal is scheduled for it. */
     fun deleteNow(profileId: Int, downloadId: String): AutoDownloadRemovalOutcome? =
         store.withScheduledRemoval(profileId, downloadId) { scheduled ->
