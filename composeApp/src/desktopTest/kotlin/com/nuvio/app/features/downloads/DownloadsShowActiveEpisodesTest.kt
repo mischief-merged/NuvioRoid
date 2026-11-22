@@ -53,7 +53,6 @@ class DownloadsShowActiveEpisodesTest {
         updatedAtEpochMs: Long = 2L,
         extra: String = "",
     ): String {
-        if (status == "Completed") backend.files += "file:/$id.mkv"
         val filePart = if (status == "Completed") ""","localFileUri":"file:/$id.mkv"""" else ""
         return """{"id":"$id","contentType":"series","parentMetaId":"tt1","parentMetaType":"series","videoId":"tt1:2:$episode",""" +
             """"title":"Pantheon","episodeTitle":"Episode $episode","seasonNumber":2,"episodeNumber":$episode,""" +

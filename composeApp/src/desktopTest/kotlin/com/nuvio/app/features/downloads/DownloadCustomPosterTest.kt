@@ -49,6 +49,8 @@ class DownloadCustomPosterTest {
         fileName = "arrival.mkv",
         status = DownloadStatus.Completed,
         localFileUri = "file:/arrival.mkv",
+        createdAtEpochMs = 1L,
+        updatedAtEpochMs = 2L,
     )
 
     private fun episodeWithoutArtwork() = DownloadItem(
@@ -70,6 +72,8 @@ class DownloadCustomPosterTest {
         fileName = "pantheon.mkv",
         status = DownloadStatus.Completed,
         localFileUri = "file:/pantheon.mkv",
+        createdAtEpochMs = 1L,
+        updatedAtEpochMs = 2L,
     )
 
     @Test
@@ -87,8 +91,6 @@ class DownloadCustomPosterTest {
 
     @Test
     fun downloads_screen_composes_custom_posters_for_movies_and_shows_without_original_artwork() {
-        backend.files += "file:/arrival.mkv"
-        backend.files += "file:/pantheon.mkv"
         backend.payload = """{"items":[
             {"id":"m1","contentType":"movie","parentMetaId":"tt2543164","parentMetaType":"movie","videoId":"tt2543164","title":"Arrival","streamTitle":"1080p","providerName":"Addon","sourceUrl":"https://example.com/arrival.mkv","fileName":"arrival.mkv","status":"Completed","localFileUri":"file:/arrival.mkv","downloadedBytes":100,"totalBytes":100,"createdAtEpochMs":1,"updatedAtEpochMs":2},
             {"id":"e1","contentType":"series","parentMetaId":"tt11680642","parentMetaType":"series","videoId":"tt11680642:1:1","title":"Pantheon","episodeTitle":"Episode 1","seasonNumber":1,"episodeNumber":1,"streamTitle":"1080p","providerName":"Addon","sourceUrl":"https://example.com/pantheon.mkv","fileName":"pantheon.mkv","status":"Completed","localFileUri":"file:/pantheon.mkv","downloadedBytes":100,"totalBytes":100,"createdAtEpochMs":1,"updatedAtEpochMs":2}
@@ -113,8 +115,6 @@ class DownloadCustomPosterTest {
 
     @Test
     fun downloads_screen_omits_poster_when_neither_custom_nor_original_artwork_exists() {
-        backend.files += "file:/arrival.mkv"
-        backend.files += "file:/pantheon.mkv"
         backend.payload = """{"items":[
             {"id":"m1","contentType":"movie","parentMetaId":"tt2543164","parentMetaType":"movie","videoId":"tt2543164","title":"Arrival","streamTitle":"1080p","providerName":"Addon","sourceUrl":"https://example.com/arrival.mkv","fileName":"arrival.mkv","status":"Completed","localFileUri":"file:/arrival.mkv","downloadedBytes":100,"totalBytes":100,"createdAtEpochMs":1,"updatedAtEpochMs":2},
             {"id":"e1","contentType":"series","parentMetaId":"tt11680642","parentMetaType":"series","videoId":"tt11680642:1:1","title":"Pantheon","episodeTitle":"Episode 1","seasonNumber":1,"episodeNumber":1,"streamTitle":"1080p","providerName":"Addon","sourceUrl":"https://example.com/pantheon.mkv","fileName":"pantheon.mkv","status":"Completed","localFileUri":"file:/pantheon.mkv","downloadedBytes":100,"totalBytes":100,"createdAtEpochMs":1,"updatedAtEpochMs":2}

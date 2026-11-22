@@ -48,7 +48,6 @@ class DownloadsShowEscapeTest {
     private fun text(resource: StringResource, vararg arguments: Any) = runBlocking { getString(resource, *arguments) }
 
     private fun completedEpisode(): String {
-        backend.files += "file:/ep1.mkv"
         return """{"id":"ep1","contentType":"series","parentMetaId":"tt1","parentMetaType":"series","videoId":"tt1:2:3","title":"Pantheon",""" +
             """"episodeTitle":"Episode 3","seasonNumber":2,"episodeNumber":3,"streamTitle":"1080p","providerName":"Addon",""" +
             """"sourceUrl":"https://example.com/ep1.mkv","fileName":"ep1.mkv","status":"Completed","localFileUri":"file:/ep1.mkv",""" +
@@ -64,7 +63,7 @@ class DownloadsShowEscapeTest {
             KeyEvent.VK_ESCAPE,
             KeyEvent.CHAR_UNDEFINED,
         )
-        return KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchKeyEvent(event)
+        return KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(event)
     }
 
     @Test
