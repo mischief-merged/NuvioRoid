@@ -23,6 +23,7 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.youtube_resolution_failed
@@ -440,8 +441,23 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     applyEpisodeStreamMetadata(stream, episode, resume)
 }
 
-internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: DownloadItem, episode: MetaVideo) {
-    val localFileUri = DownloadsRepository.playableLocalFileUri(downloadItem) ?: return
+internal enum class DownloadedEpisodeSwitchResult { Accepted, Pending, Rejected }
+
+internal class DownloadedEpisodeSwitch(val episodeId: String, val job: Job)
+
+internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
+    downloadItem: DownloadItem,
+    episode: MetaVideo,
+    continuePending: Boolean = false,
+    isStillValid: () -> Boolean = { true },
+): DownloadedEpisodeSwitchResult {
+    val localFileUri = playableDownloadedUri(downloadItem) ?: return DownloadedEpisodeSwitchResult.Rejected
+    if (!isStillValid()) return DownloadedEpisodeSwitchResult.Rejected
+    val inFlight = synchronized(episodeSwitchLock) { downloadedEpisodeSwitch }
+    if (inFlight != null && inFlight.job.isActive) {
+        if (inFlight.episodeId == episode.id && !continuePending) return DownloadedEpisodeSwitchResult.Pending
+        if (!(continuePending && inFlight.episodeId == episode.id)) inFlight.job.cancel()
+    }
     restartSourceFailoverAfterUserChoice(newVideo = true)
     resetEpisodePanelAndNextEpisodeState()
     flushProgressForEpisodeChange(episode)
@@ -496,6 +512,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     activeInitialPositionMs = epResumePositionMs
     activeInitialProgressFraction = epResumeFraction
     controlsVisible = true
+    return DownloadedEpisodeSwitchResult.Accepted
 }
 
 internal fun PlayerScreenRuntime.resolvePlayablePreviousEpisode(): MetaVideo? {
@@ -562,71 +579,87 @@ private fun PlayerScreenRuntime.playTargetEpisode(
         cancelNextEpisodeAutoPlay()
         return false
     }
-    if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
-    nextEpisodePreloadTriggered = false
-    val playbackKey = activePlaybackKey
-    fun isCurrentRequest(): Boolean = isStillValid(playbackKey)
-    if (!isCurrentRequest()) return false
-    nextEpisodeAutoPlayAutomatic = automatic
     var downloadedEpisodeSelected = false
-
-    val job = scope.launchPlayerNextEpisodeAutoPlay(
-        previousJob = nextEpisodeAutoPlayJob,
-        nextEpisodeInfo = targetInfo,
-        allEpisodes = playerMetaVideos,
-        parentMetaId = parentMetaId,
-        parentMetaType = parentMetaType,
-        contentType = contentType,
-        settings = playerSettingsUiState,
-        currentStreamBingeGroup = currentStreamBingeGroup,
-        isOffline = episodePlaybackOffline,
-        findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
-        verifyDownloadedEpisode = verifyEpisodeDownload,
-        onDownloadedEpisodeSelected = { item, episode ->
-            if (isCurrentRequest()) {
-                switchToDownloadedEpisode(item, episode)
-                downloadedEpisodeSelected = activePlaybackKey != playbackKey
-            }
-        },
-        onEpisodeStreamSelected = { stream, episode, tried ->
-            // Auto source selection picked it, whether or not the user asked for the episode.
-            if (isCurrentRequest()) switchToEpisodeStream(stream, episode, autoSelection = tried)
-        },
-        onManualSelectionRequired = { targetVideo ->
-            if (isCurrentRequest()) {
-                nextEpisodeCardDismissed = true
-                episodeStreamsPanelState = EpisodeStreamsPanelState(
-                    showStreams = true,
-                    selectedEpisode = targetVideo,
-                )
-                showEpisodesPanel = true
-            }
-        },
-        onSearchingChanged = {
-            if (playbackKey == activePlaybackKey) {
-                if (it) nextEpisodeAutoPlayTarget = PlayerEpisodeCardState(targetInfo, isPrevious)
-                nextEpisodeAutoPlaySearching = it
-            }
-        },
-        onSourceNameChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySourceName = it
-        },
-        onCountdownChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlayCountdown = it
-        },
-        onNextEpisodeCardVisibleChanged = {
-            if (playbackKey == activePlaybackKey) showNextEpisodeCard = it
-        },
-    )
-    if (job != null) {
-        nextEpisodeAutoPlayJob = job
-        job.invokeOnCompletion {
-            if (nextEpisodeAutoPlayJob === job && playbackKey == activePlaybackKey) {
-                nextEpisodeAutoPlayTarget = null
+    val job = synchronized(episodeSwitchLock) {
+        val pending = downloadedEpisodeSwitch
+        if (pending != null && pending.job.isActive) return true
+        if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
+        nextEpisodePreloadTriggered = false
+        val playbackKey = activePlaybackKey
+        fun isCurrentRequest(): Boolean = isStillValid(playbackKey)
+        if (!isCurrentRequest()) return false
+        nextEpisodeAutoPlayAutomatic = automatic
+        val started = scope.launchPlayerNextEpisodeAutoPlay(
+            previousJob = nextEpisodeAutoPlayJob,
+            nextEpisodeInfo = targetInfo,
+            allEpisodes = playerMetaVideos,
+            parentMetaId = parentMetaId,
+            parentMetaType = parentMetaType,
+            contentType = contentType,
+            settings = playerSettingsUiState,
+            currentStreamBingeGroup = currentStreamBingeGroup,
+            isOffline = episodePlaybackOffline,
+            findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
+            verifyDownloadedEpisode = verifyEpisodeDownload,
+            onDownloadVerificationJob = { verification ->
+                downloadedEpisodeSwitch = DownloadedEpisodeSwitch(targetInfo.videoId, verification)
+                verification.invokeOnCompletion {
+                    synchronized(episodeSwitchLock) {
+                        if (downloadedEpisodeSwitch?.job === verification) downloadedEpisodeSwitch = null
+                    }
+                }
+            },
+            onDownloadedEpisodeSelected = { item, episode ->
+                if (isCurrentRequest()) {
+                    when (switchToDownloadedEpisode(item, episode, continuePending = true) { isCurrentRequest() }) {
+                        DownloadedEpisodeSwitchResult.Accepted,
+                        DownloadedEpisodeSwitchResult.Pending,
+                        -> downloadedEpisodeSelected = true
+                        DownloadedEpisodeSwitchResult.Rejected -> Unit
+                    }
+                }
+            },
+            onEpisodeStreamSelected = { stream, episode, tried ->
+                // Auto source selection picked it, whether or not the user asked for the episode.
+                if (isCurrentRequest()) switchToEpisodeStream(stream, episode, autoSelection = tried)
+            },
+            onManualSelectionRequired = { targetVideo ->
+                if (isCurrentRequest()) {
+                    nextEpisodeCardDismissed = true
+                    episodeStreamsPanelState = EpisodeStreamsPanelState(
+                        showStreams = true,
+                        selectedEpisode = targetVideo,
+                    )
+                    showEpisodesPanel = true
+                }
+            },
+            onSearchingChanged = {
+                if (playbackKey == activePlaybackKey) {
+                    if (it) nextEpisodeAutoPlayTarget = PlayerEpisodeCardState(targetInfo, isPrevious)
+                    nextEpisodeAutoPlaySearching = it
+                }
+            },
+            onSourceNameChanged = {
+                if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySourceName = it
+            },
+            onCountdownChanged = {
+                if (playbackKey == activePlaybackKey) nextEpisodeAutoPlayCountdown = it
+            },
+            onNextEpisodeCardVisibleChanged = {
+                if (playbackKey == activePlaybackKey) showNextEpisodeCard = it
+            },
+        )
+        if (started != null) {
+            nextEpisodeAutoPlayJob = started
+            started.invokeOnCompletion {
+                if (nextEpisodeAutoPlayJob === started && playbackKey == activePlaybackKey) {
+                    nextEpisodeAutoPlayTarget = null
+                }
             }
         }
+        started
     }
-    return downloadedEpisodeSelected || job != null
+    return downloadedEpisodeSelected || job != null || downloadedEpisodeSwitch?.job?.isActive == true
 }
 
 internal fun PlayerScreenRuntime.openSourcesPanel() {

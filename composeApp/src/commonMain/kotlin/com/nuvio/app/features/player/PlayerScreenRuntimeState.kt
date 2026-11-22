@@ -136,6 +136,17 @@ internal class PlayerScreenRuntime(
     var verifyEpisodeDownload: suspend (DownloadItem) -> Boolean = { item ->
         DownloadsRepository.verifyCompletedDownload(item.id)
     }
+
+    /** Address of a downloaded file chosen for playback. */
+    var playableDownloadedUri: (DownloadItem) -> String? = { item ->
+        DownloadsRepository.playableLocalFileUri(item)
+    }
+
+    /** A downloaded episode whose file is being checked. */
+    var downloadedEpisodeSwitch: DownloadedEpisodeSwitch? = null
+
+    /** Keeps a second press from cancelling the check the first press already started. */
+    internal val episodeSwitchLock = Any()
     var p2pSettingsUiState by mutableStateOf(P2pSettingsUiState())
     var p2pStreamingState by mutableStateOf<P2pStreamingState>(P2pStreamingState.Idle)
     var metaScreenSettingsUiState: MetaScreenSettingsUiState = MetaScreenSettingsUiState()
