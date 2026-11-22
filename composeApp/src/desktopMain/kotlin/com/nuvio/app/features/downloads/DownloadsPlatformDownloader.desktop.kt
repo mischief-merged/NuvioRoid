@@ -784,8 +784,8 @@ internal actual object DownloadsPlatformDownloader {
                 val lastReadAtNanos = AtomicLong(System.nanoTime())
                 val stalled = AtomicBoolean(false)
                 val reading = AtomicBoolean(true)
-                // Cancelling the transfer closes the body, which ends a read that is blocked on a
-                // silent connection, so a pause or a move does not wait for data that never comes.
+                // Cancelling the transfer closes the underlying response stream before the outer
+                // pushback stream, so a read blocked on a silent connection returns at once.
                 val closer = launch {
                     try {
                         awaitCancellation()
@@ -901,14 +901,17 @@ internal actual object DownloadsPlatformDownloader {
         }
         val body = java.io.PushbackInputStream(raw, SniffBytes)
         val isPage = try {
-            isWebPage(response.header("Content-Type")) || startsLikeWebPage(peekHead(body))
+            isWebPage(response.header("Content-Type")) ||
+                startsLikeWebPage(peekHead(body) { response.cancel(); runCatching { raw.close() } })
         } catch (error: Throwable) {
             runCatching { response.close() }
+            runCatching { raw.close() }
             runCatching { body.close() }
             throw error
         }
         if (isPage) {
             runCatching { response.close() }
+            runCatching { raw.close() }
             runCatching { body.close() }
             throw PageInsteadOfFile()
         }
@@ -1008,7 +1011,7 @@ internal actual object DownloadsPlatformDownloader {
                 else -> throw RefreshNeedsNewPartial()
             }
             val remoteBytes = readExactWithStallGuard(input, length, stallTimeoutMs) {
-                opened.response.body().close()
+                opened.response.close()
             }
             if (!remoteBytes.contentEquals(expectedBytes)) {
                 throw RefreshNeedsNewPartial()
@@ -1633,14 +1636,30 @@ internal const val SniffBytes = 512
 /** ...and waited for, at least (or the end of a shorter body): enough to see past a byte order mark and white space. */
 internal const val SniffMinBytes = 64
 
-/** The first bytes of [body], which stay to be read. Gives up (closing the body) when nothing comes in time. */
-private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = coroutineScope {
+/**
+ * The first bytes of [body], which stay to be read. Gives up, by [cancelCall], when nothing comes in time
+ * or the transfer is cancelled. [body] is not closed here: its read holds its own lock, so closing it from
+ * this watcher would wait behind that read and the connection would stay open.
+ */
+internal suspend fun peekHead(body: java.io.PushbackInputStream, cancelCall: () -> Unit): ByteArray = coroutineScope {
+    val sniffing = AtomicBoolean(true)
+    val stalled = AtomicBoolean(false)
     val guard = launch {
         delay(DownloadsPlatformDownloader.stallTimeoutMs)
-        runCatching { body.close() }
+        if (sniffing.get()) {
+            stalled.set(true)
+            runCatching { cancelCall() }
+        }
+    }
+    val cancelCloser = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        try {
+            awaitCancellation()
+        } finally {
+            if (sniffing.get()) runCatching { cancelCall() }
+        }
     }
     try {
-        runInterruptible(Dispatchers.IO) {
+        val bytes = runInterruptible(Dispatchers.IO) {
             val head = ByteArray(SniffBytes)
             var filled = 0
             while (filled < SniffMinBytes) {
@@ -1650,9 +1669,15 @@ private suspend fun peekHead(body: java.io.PushbackInputStream): ByteArray = cor
             }
             if (filled > 0) body.unread(head, 0, filled)
             head.copyOf(filled)
-        }
+        }.also { sniffing.set(false) }
+        if (stalled.get()) throw IOException("Connection stalled")
+        bytes
+    } catch (error: IOException) {
+        currentCoroutineContext().ensureActive()
+        throw if (stalled.get()) IOException("Connection stalled", error) else error
     } finally {
         guard.cancel()
+        cancelCloser.cancel()
     }
 }
 
