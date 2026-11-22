@@ -171,6 +171,8 @@ internal actual object DownloadsPlatformDownloader {
         return removePathIfExists("$destinationPath.part")
     }
 
+    actual fun retirePartial(item: DownloadItem): Boolean = removePartialFile(item.fileName)
+
     actual fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? {
         localFileUri?.toLocalPath()
             ?.takeIf { NSFileManager.defaultManager.fileExistsAtPath(it) }

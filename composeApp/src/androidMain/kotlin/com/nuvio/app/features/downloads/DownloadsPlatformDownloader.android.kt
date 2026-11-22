@@ -81,6 +81,8 @@ internal actual object DownloadsPlatformDownloader {
         return true
     }
 
+    actual fun retirePartial(item: DownloadItem): Boolean = removePartialFile(item.fileName)
+
     actual fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? {
         localFileUri
             ?.toLocalFileOrNull()
