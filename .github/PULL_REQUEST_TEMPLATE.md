@@ -49,6 +49,7 @@
 - [ ] This PR does not bundle unrelated refactors, cleanups, formatting, or drive-by changes.
 - [ ] This PR does not add dependencies, architecture changes, migrations, or product-direction changes without explicit approval.
 - [ ] I listed the testing performed below.
+- [ ] I added a plain-English line under `Unreleased` in `CHANGELOG.md` (or this PR has no user-facing changes).
 
 > UI polish, cosmetic-only changes, minor behavior tweaks, and unapproved product changes will be closed without review.
 
