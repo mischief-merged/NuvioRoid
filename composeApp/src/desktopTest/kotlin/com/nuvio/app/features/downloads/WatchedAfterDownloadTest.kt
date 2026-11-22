@@ -59,6 +59,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -175,6 +177,8 @@ class WatchedAfterDownloadTest {
         snapshotEntries: () -> List<WatchProgressEntry> = { emptyList() },
         ownsCompletedHistory: Boolean = true,
         normalizeParentId: (parentContentId: String, videoId: String?) -> String = { parentContentId, _ -> parentContentId },
+        onOptimisticProgress: (WatchProgressEntry) -> Unit = {},
+        onOptimisticRemoval: (Collection<WatchProgressEntry>) -> Unit = {},
     ): TrackingProgressProvider = object : TrackingProgressProvider {
         override val providerId: TrackingProviderId = id
         override val changes: Flow<Unit> = emptyFlow()
@@ -188,6 +192,10 @@ class WatchedAfterDownloadTest {
 
         override suspend fun removeProgress(entries: Collection<WatchProgressEntry>) = Unit
 
+        override fun applyOptimisticProgress(entry: WatchProgressEntry) = onOptimisticProgress(entry)
+
+        override fun applyOptimisticRemoval(entries: Collection<WatchProgressEntry>) = onOptimisticRemoval(entries)
+
         override fun normalizeParentContentId(parentContentId: String, videoId: String?): String =
             normalizeParentId(parentContentId, videoId)
     }
@@ -198,6 +206,8 @@ class WatchedAfterDownloadTest {
         crossinline providerEntries: (TrackingProviderId) -> List<WatchProgressEntry> = { emptyList() },
         crossinline watchedPulledItems: (TrackingProviderId) -> List<WatchedItem> = { emptyList() },
         crossinline normalizeParentId: (TrackingProviderId, String, String?) -> String = { _, parentContentId, _ -> parentContentId },
+        crossinline onOptimisticProgress: (TrackingProviderId, WatchProgressEntry) -> Unit = { _, _ -> },
+        crossinline onOptimisticRemoval: (TrackingProviderId, Collection<WatchProgressEntry>) -> Unit = { _, _ -> },
         block: (profileId: Int, recorder: TrackerCallRecorder) -> Unit,
     ) {
         ensureTrackingProvidersRegistered()
@@ -234,6 +244,8 @@ class WatchedAfterDownloadTest {
                         snapshotEntries = { providerEntries(id) },
                         ownsCompletedHistory = id == TrackingProviderId.TRAKT || id == TrackingProviderId.MDBLIST,
                         normalizeParentId = { parentContentId, videoId -> normalizeParentId(id, parentContentId, videoId) },
+                        onOptimisticProgress = { entry -> onOptimisticProgress(id, entry) },
+                        onOptimisticRemoval = { entries -> onOptimisticRemoval(id, entries) },
                     ),
                 )
             }
@@ -1653,6 +1665,192 @@ class WatchedAfterDownloadTest {
                     pendingRemovalDownloadIds = AutoDownloads.removals.value.mapTo(mutableSetOf()) { it.downloadId },
                 )
                 assertEquals(listOf(1, 2, 3), plan.window.map { it.episodeNumber })
+            }
+        }
+    }
+
+    @Test
+    fun in_app_unwatch_through_addon_id_clears_canonical_completion_row_finished_mark_and_removal() {
+        val addonShowId = "tun_tt7821586"
+        val canonicalShowId = "tt7821586"
+        val canonicalRule = testRule(showId = canonicalShowId, keepCount = 3).copy(deleteAfterWatching = true)
+        val canonicalDownloads = (1..3).map {
+            testDownload(it, DownloadStatus.Completed, showId = canonicalShowId, ruleKey = canonicalRule.key)
+        }
+        val ep1AddonVideo = MetaVideo(
+            id = "$addonShowId:1:1",
+            title = "Episode 1",
+            released = "2024-01-01",
+            season = 1,
+            episode = 1,
+        )
+        val ep2AddonVideo = MetaVideo(
+            id = "$addonShowId:1:2",
+            title = "Episode 2",
+            released = "2024-01-08",
+            season = 1,
+            episode = 2,
+        )
+        val addonMeta = MetaDetails(
+            id = addonShowId,
+            type = "series",
+            name = "Example Show",
+            videos = listOf(ep1AddonVideo, ep2AddonVideo),
+        )
+        val providerProgressEntries = mutableListOf<WatchProgressEntry>()
+
+        withIsolatedTrackerHarness(
+            source = WatchProgressSource.TRAKT,
+            connectedProviders = setOf(TrackingProviderId.TRAKT),
+            providerEntries = { id -> if (id == TrackingProviderId.TRAKT) providerProgressEntries.toList() else emptyList() },
+            normalizeParentId = { _, parentId, videoId -> resolveEffectiveContentId(parentId, videoId) },
+            onOptimisticProgress = { id, entry ->
+                if (id == TrackingProviderId.TRAKT) {
+                    providerProgressEntries.removeAll {
+                        it.parentMetaId == entry.parentMetaId &&
+                            it.seasonNumber == entry.seasonNumber &&
+                            it.episodeNumber == entry.episodeNumber
+                    }
+                    providerProgressEntries += entry
+                }
+            },
+            onOptimisticRemoval = { id, entries ->
+                if (id == TrackingProviderId.TRAKT) {
+                    providerProgressEntries.removeAll { existing ->
+                        entries.any { removed ->
+                            existing.parentMetaId == removed.parentMetaId &&
+                                existing.seasonNumber == removed.seasonNumber &&
+                                existing.episodeNumber == removed.episodeNumber
+                        }
+                    }
+                }
+            },
+        ) { profileId, _ ->
+            withIsolatedDownloadsAndAutoDownloadStore(profileId, canonicalDownloads, canonicalRule) { liveStore ->
+                // Finish episodes 1 and 2 under the addon id while Trakt normalizes progress to the canonical id.
+                for (ep in 1..2) {
+                    WatchProgressRepository.flushPlaybackProgress(
+                        session = downloadedEpisodeSession(
+                            profileId = profileId,
+                            showId = addonShowId,
+                            episodeNumber = ep,
+                            videoId = "$canonicalShowId:1:$ep",
+                        ),
+                        snapshot = PlayerPlaybackSnapshot(
+                            isLoading = false,
+                            isPlaying = false,
+                            isEnded = true,
+                            durationMs = 2_400_000L,
+                            positionMs = 2_400_000L,
+                        ),
+                    )
+                    assertTrue(
+                        liveStore.scheduleRemoval(
+                            profileId,
+                            AutoDownloadRemoval(canonicalDownloads[ep - 1].id, canonicalRule.key, dueAtEpochMs = 10_000_000L),
+                        ),
+                    )
+                }
+
+                // Confirm canonical completion rows, finished marks, watched marks, and pending removals exist before unwatch.
+                val ep1Before = WatchProgressRepository.progressForVideo(
+                    videoId = "$canonicalShowId:1:1",
+                    parentMetaId = canonicalShowId,
+                    seasonNumber = 1,
+                    episodeNumber = 1,
+                )
+                assertNotNull(ep1Before, "Expected canonical completion row for episode 1 before unwatch")
+                assertTrue(ep1Before.isCompleted)
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(addonShowId, 1, 1))
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(canonicalShowId, 1, 1))
+                assertTrue(WatchedRepository.isWatched(id = canonicalShowId, type = "series", season = 1, episode = 1))
+                assertEquals(
+                    listOf(canonicalDownloads[0].id, canonicalDownloads[1].id),
+                    AutoDownloads.removals.value.map { it.downloadId },
+                )
+
+                // Part 1: In-app single-episode unwatch through the addon id via WatchingActions.toggleEpisodeWatched.
+                WatchingActions.toggleEpisodeWatched(
+                    meta = addonMeta,
+                    episode = ep1AddonVideo,
+                    isCurrentlyWatched = true,
+                )
+
+                assertNull(
+                    WatchProgressRepository.progressForVideo(
+                        videoId = "$canonicalShowId:1:1",
+                        parentMetaId = canonicalShowId,
+                        seasonNumber = 1,
+                        episodeNumber = 1,
+                    ),
+                    "Expected canonical completion row for episode 1 to be cleared after in-app addon unwatch",
+                )
+                assertTrue(
+                    WatchProgressRepository.uiState.value.entries.none {
+                        it.parentMetaId == canonicalShowId && it.seasonNumber == 1 && it.episodeNumber == 1
+                    },
+                    "Expected no published canonical progress entry for episode 1",
+                )
+                assertFalse(WatchedRepository.isWatched(id = addonShowId, type = "series", season = 1, episode = 1))
+                assertFalse(WatchedRepository.isWatched(id = canonicalShowId, type = "series", season = 1, episode = 1))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(addonShowId, 1, 1))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(canonicalShowId, 1, 1))
+                assertEquals(listOf(canonicalDownloads[1].id), AutoDownloads.removals.value.map { it.downloadId })
+
+                // Episode 2 must remain intact until unwatched.
+                val ep2StillPresent = WatchProgressRepository.progressForVideo(
+                    videoId = "$canonicalShowId:1:2",
+                    parentMetaId = canonicalShowId,
+                    seasonNumber = 1,
+                    episodeNumber = 2,
+                )
+                assertNotNull(ep2StillPresent, "Expected sibling episode 2 canonical completion row to remain")
+                assertTrue(ep2StillPresent.isCompleted)
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(addonShowId, 1, 2))
+                assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(canonicalShowId, 1, 2))
+
+                // Part 2: In-app multi-episode unwatch through the addon id via WatchingActions.toggleSeasonWatched.
+                WatchingActions.toggleSeasonWatched(
+                    meta = addonMeta,
+                    episodes = listOf(ep2AddonVideo),
+                    areCurrentlyWatched = true,
+                )
+
+                assertNull(
+                    WatchProgressRepository.progressForVideo(
+                        videoId = "$canonicalShowId:1:2",
+                        parentMetaId = canonicalShowId,
+                        seasonNumber = 1,
+                        episodeNumber = 2,
+                    ),
+                    "Expected canonical completion row for episode 2 to be cleared after in-app season unwatch",
+                )
+                assertFalse(WatchedRepository.isWatched(id = addonShowId, type = "series", season = 1, episode = 2))
+                assertFalse(WatchedRepository.isWatched(id = canonicalShowId, type = "series", season = 1, episode = 2))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(addonShowId, 1, 2))
+                assertFalse(WatchProgressRepository.isEpisodeLocallyFinished(canonicalShowId, 1, 2))
+                assertEquals(emptyList(), AutoDownloads.removals.value)
+
+                // Stored local watch progress entries must also have no leftover canonical completion rows.
+                WatchProgressRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+                assertNull(
+                    WatchProgressRepository.progressForVideo(
+                        videoId = "$canonicalShowId:1:1",
+                        parentMetaId = canonicalShowId,
+                        seasonNumber = 1,
+                        episodeNumber = 1,
+                    ),
+                    "Expected local stored canonical completion row for episode 1 to be cleared",
+                )
+                assertNull(
+                    WatchProgressRepository.progressForVideo(
+                        videoId = "$canonicalShowId:1:2",
+                        parentMetaId = canonicalShowId,
+                        seasonNumber = 1,
+                        episodeNumber = 2,
+                    ),
+                    "Expected local stored canonical completion row for episode 2 to be cleared",
+                )
             }
         }
     }

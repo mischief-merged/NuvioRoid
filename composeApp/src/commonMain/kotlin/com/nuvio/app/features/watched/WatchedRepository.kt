@@ -865,13 +865,7 @@ object WatchedRepository {
     }
 
     fun unmarkWatched(items: Collection<WatchedItem>) {
-        val changedItems = if (AddonEventDispatcher.hasEnabledAddonFor(ADDON_LIBRARY_RESOURCE)) {
-            items.filter { isWatched(it.id, it.type, it.season, it.episode) }
-        } else {
-            emptyList()
-        }
-        unmarkWatched(items = items, syncRemote = true)
-        emitAddonWatchedEvents(changedItems, AddonLibraryAction.UNWATCHED)
+        unmarkWatchedWithAddonEvents(items = items)
     }
 
     private fun emitAddonWatchedEvents(items: Collection<WatchedItem>, action: AddonLibraryAction) {
@@ -896,9 +890,50 @@ object WatchedRepository {
         }
     }
 
-    private fun unmarkWatched(items: Collection<WatchedItem>, syncRemote: Boolean) {
+    internal fun unmarkWatchedPreservingAliases(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> = unmarkWatchedWithAddonEvents(
+        items = items,
+        clearLocallyFinished = false,
+        additionalAliases = additionalAliases,
+    )
+
+    private fun unmarkWatchedWithAddonEvents(
+        items: Collection<WatchedItem>,
+        clearLocallyFinished: Boolean = true,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> {
+        val changedItems = if (AddonEventDispatcher.hasEnabledAddonFor(ADDON_LIBRARY_RESOURCE)) {
+            items.filter { isWatched(it.id, it.type, it.season, it.episode) }
+        } else {
+            emptyList()
+        }
+        return unmarkWatched(
+            items = items,
+            syncRemote = true,
+            clearLocallyFinished = clearLocallyFinished,
+            additionalAliases = additionalAliases,
+        ).also {
+            emitAddonWatchedEvents(changedItems, AddonLibraryAction.UNWATCHED)
+        }
+    }
+
+    internal fun finishUnwatchCleanup(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ) {
+        onItemsUnwatched(items = items, additionalAliases = additionalAliases)
+    }
+
+    private fun unmarkWatched(
+        items: Collection<WatchedItem>,
+        syncRemote: Boolean,
+        clearLocallyFinished: Boolean = true,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> {
         ensureLoaded()
-        if (items.isEmpty()) return
+        if (items.isEmpty()) return emptyList()
         val source = activeSource
         val aliasesByItem = items.map { watchedItem ->
             val season = watchedItem.season
@@ -909,7 +944,10 @@ object WatchedRepository {
                     seasonNumber = season,
                     episodeNumber = episode,
                     videoId = watchedItem.videoId,
-                ) + watchedItem.id.trim()
+                ) + additionalAliases
+                    .filter { it.seasonNumber == season && it.episodeNumber == episode }
+                    .map { it.parentMetaId } +
+                    watchedItem.id.trim()
             } else {
                 setOf(watchedItem.id.trim())
             }.filterTo(linkedSetOf()) { it.isNotEmpty() }
@@ -966,10 +1004,17 @@ object WatchedRepository {
         }
         val unwatchedTargets = (items + removedItems)
             .distinctBy { listOf(it.id, it.type, it.season, it.episode, it.videoId) }
-        onItemsUnwatched(unwatchedTargets)
+        if (clearLocallyFinished) {
+            onItemsUnwatched(items = unwatchedTargets, additionalAliases = additionalAliases)
+        }
+        return unwatchedTargets
     }
 
-    private fun onItemsUnwatched(items: Collection<WatchedItem>) {
+    private fun onItemsUnwatched(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ) {
+        val handledAliases = mutableSetOf<LocallyFinishedEpisodeAlias>()
         items.forEach { item ->
             val season = item.season
             val episode = item.episode
@@ -986,7 +1031,11 @@ object WatchedRepository {
                         add(LocallyFinishedEpisodeAlias(trimmedId, season, episode))
                     }
                     addAll(clearedAliases)
+                    additionalAliases
+                        .filter { it.seasonNumber == season && it.episodeNumber == episode }
+                        .forEach(::add)
                 }
+                handledAliases += cancelTargets
                 cancelTargets
                     .groupBy(
                         keySelector = { it.seasonNumber to it.episodeNumber },
@@ -1007,6 +1056,30 @@ object WatchedRepository {
                     onlyNonEpisode = true,
                 )
             }
+        }
+        val remainingAliases = additionalAliases.filterTo(linkedSetOf()) { it !in handledAliases }
+        if (remainingAliases.isNotEmpty()) {
+            val extraCancelTargets = linkedSetOf<LocallyFinishedEpisodeAlias>()
+            remainingAliases.forEach { alias ->
+                extraCancelTargets += alias
+                extraCancelTargets += WatchProgressRepository.clearLocallyFinishedEpisode(
+                    parentMetaId = alias.parentMetaId,
+                    seasonNumber = alias.seasonNumber,
+                    episodeNumber = alias.episodeNumber,
+                )
+            }
+            extraCancelTargets
+                .groupBy(
+                    keySelector = { it.seasonNumber to it.episodeNumber },
+                    valueTransform = { it.parentMetaId },
+                )
+                .forEach { (seasonEpisode, parentMetaIds) ->
+                    AutoDownloads.cancelPendingRemovals(
+                        parentMetaIds = parentMetaIds,
+                        seasonNumber = seasonEpisode.first,
+                        episodeNumber = seasonEpisode.second,
+                    )
+                }
         }
     }
 

@@ -1205,11 +1205,26 @@ object WatchProgressRepository {
         videoIds: Collection<String>,
         parentMetaId: String? = null,
     ) {
+        clearProgress(
+            videoIds = videoIds,
+            parentMetaId = parentMetaId,
+            additionalAliases = emptySet(),
+            clearLocallyFinished = true,
+        )
+    }
+
+    internal fun clearProgress(
+        videoIds: Collection<String>,
+        parentMetaId: String? = null,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias>,
+        clearLocallyFinished: Boolean = true,
+    ) {
         ensureLoaded()
-        if (videoIds.isEmpty()) return
+        if (videoIds.isEmpty() && additionalAliases.isEmpty()) return
         remoteWriteDeduplicator.clear()
 
-        val initialAliases = resolveClearProgressAliases(videoIds = videoIds, parentMetaId = parentMetaId)
+        val initialAliases = resolveClearProgressAliases(videoIds = videoIds, parentMetaId = parentMetaId) +
+            additionalAliases
         val matchingParentIds = buildSet {
             parentMetaId?.trim()?.takeIf { it.isNotEmpty() }?.let { normalizedParent ->
                 add(normalizedParent)
@@ -1241,11 +1256,16 @@ object WatchProgressRepository {
             val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove) +
                 removeLocalEntriesMatching(matchesClearedEntry)
             val removedAll = entriesToRemove + locallyRemovedEntries
-            val clearedLocalFinish = clearLocallyFinishedForClearedProgress(
-                removedEntries = removedAll,
-                videoIds = videoIds,
-                parentMetaId = parentMetaId,
-            )
+            val clearedLocalFinish = if (clearLocallyFinished) {
+                clearLocallyFinishedForClearedProgress(
+                    removedEntries = removedAll,
+                    videoIds = videoIds,
+                    parentMetaId = parentMetaId,
+                    additionalAliases = additionalAliases,
+                )
+            } else {
+                ClearedLocallyFinishedResult(changed = false, aliases = emptySet())
+            }
             provider.applyOptimisticRemoval(entriesToRemove)
             if (locallyRemovedEntries.isNotEmpty() || clearedLocalFinish.changed) persist()
             publish()
@@ -1264,11 +1284,16 @@ object WatchProgressRepository {
         }
 
         val removedEntries = removeLocalEntriesMatching(matchesClearedEntry)
-        val clearedLocalFinish = clearLocallyFinishedForClearedProgress(
-            removedEntries = removedEntries,
-            videoIds = videoIds,
-            parentMetaId = parentMetaId,
-        )
+        val clearedLocalFinish = if (clearLocallyFinished) {
+            clearLocallyFinishedForClearedProgress(
+                removedEntries = removedEntries,
+                videoIds = videoIds,
+                parentMetaId = parentMetaId,
+                additionalAliases = additionalAliases,
+            )
+        } else {
+            ClearedLocallyFinishedResult(changed = false, aliases = emptySet())
+        }
         if (removedEntries.isNotEmpty()) {
             publish()
             persist()
@@ -1389,13 +1414,13 @@ object WatchProgressRepository {
         return synchronized(entriesLock) { locallyFinishedEpisodeGroups.any { key in it } }
     }
 
-    /** Returns every parent ID recorded together as an alias for this finished episode. */
-    internal fun locallyFinishedParentAliases(
+    /** Returns every episode alias recorded together for this finished episode. */
+    internal fun locallyFinishedEpisodeAliases(
         parentMetaId: String,
         seasonNumber: Int,
         episodeNumber: Int,
         videoId: String? = null,
-    ): Set<String> {
+    ): Set<LocallyFinishedEpisodeAlias> {
         ensureLoaded()
         val seedParents = seedParentIdsFor(
             parentMetaId = parentMetaId,
@@ -1407,13 +1432,33 @@ object WatchProgressRepository {
         val seedKeys = seedParents.mapTo(mutableSetOf()) { parent ->
             localFinishedEpisodeKey(parent, seasonNumber, episodeNumber)
         }
-        val groupParents = synchronized(entriesLock) {
+        val groupAliases = synchronized(entriesLock) {
             locallyFinishedEpisodeGroups
                 .filter { group -> group.any { it in seedKeys } }
-                .flatMap { group -> group.mapNotNull { parseLocalFinishedEpisodeKey(it)?.parentMetaId } }
+                .flatMapTo(linkedSetOf()) { group ->
+                    group.mapNotNull(::parseLocalFinishedEpisodeKey)
+                }
         }
-        return seedParents + groupParents
+        return buildSet {
+            seedParents.forEach { parent ->
+                add(LocallyFinishedEpisodeAlias(parent, seasonNumber, episodeNumber))
+            }
+            addAll(groupAliases)
+        }
     }
+
+    /** Returns every parent ID recorded together as an alias for this finished episode. */
+    internal fun locallyFinishedParentAliases(
+        parentMetaId: String,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        videoId: String? = null,
+    ): Set<String> = locallyFinishedEpisodeAliases(
+        parentMetaId = parentMetaId,
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber,
+        videoId = videoId,
+    ).mapTo(linkedSetOf()) { it.parentMetaId }
 
     /**
      * Clears the device-local finished mark and every alias recorded for that episode when an
@@ -1946,10 +1991,11 @@ object WatchProgressRepository {
         }
     }
 
-    private fun resolveClearProgressAliases(
+    internal fun resolveClearProgressAliases(
         videoIds: Collection<String>,
         parentMetaId: String?,
     ): Set<LocallyFinishedEpisodeAlias> {
+        ensureLoaded()
         val seedKeys = buildClearProgressSeedKeys(
             removedEntries = emptyList(),
             videoIds = videoIds,
@@ -1969,7 +2015,13 @@ object WatchProgressRepository {
         removedEntries: Collection<WatchProgressEntry>,
         videoIds: Collection<String>,
         parentMetaId: String?,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
     ): Set<String> = buildSet {
+        additionalAliases.forEach { alias ->
+            if (alias.parentMetaId.isNotBlank()) {
+                add(localFinishedEpisodeKey(alias.parentMetaId, alias.seasonNumber, alias.episodeNumber))
+            }
+        }
         removedEntries.forEach { entry ->
             val season = entry.seasonNumber ?: return@forEach
             val episode = entry.episodeNumber ?: return@forEach
@@ -2044,11 +2096,13 @@ object WatchProgressRepository {
         removedEntries: Collection<WatchProgressEntry>,
         videoIds: Collection<String>,
         parentMetaId: String?,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
     ): ClearedLocallyFinishedResult {
         val seedKeys = buildClearProgressSeedKeys(
             removedEntries = removedEntries,
             videoIds = videoIds,
             parentMetaId = parentMetaId,
+            additionalAliases = additionalAliases,
         )
         if (seedKeys.isEmpty()) {
             return ClearedLocallyFinishedResult(changed = false, aliases = emptySet())

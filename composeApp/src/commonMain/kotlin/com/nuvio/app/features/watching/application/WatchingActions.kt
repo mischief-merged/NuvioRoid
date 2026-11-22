@@ -68,8 +68,8 @@ object WatchingActions {
         }
 
         if (isCurrentlyWatched) {
-            WatchedRepository.unmarkWatched(seriesItems)
-            WatchProgressRepository.clearProgress(
+            unwatchAndClearProgress(
+                items = seriesItems,
                 videoIds = releasedMainEpisodes.map(meta::episodePlaybackId),
                 parentMetaId = meta.id,
             )
@@ -99,9 +99,9 @@ object WatchingActions {
     ) {
         val watchedItem = meta.toEpisodeWatchedItem(episode)
         if (isCurrentlyWatched) {
-            WatchedRepository.unmarkWatched(watchedItem)
-            WatchProgressRepository.clearProgress(
-                videoId = meta.episodePlaybackId(episode),
+            unwatchAndClearProgress(
+                items = listOf(watchedItem),
+                videoIds = listOf(meta.episodePlaybackId(episode)),
                 parentMetaId = meta.id,
             )
         } else {
@@ -207,8 +207,8 @@ object WatchingActions {
         if (episodes.isEmpty()) return
         val watchedItems = episodes.map(meta::toEpisodeWatchedItem)
         if (areCurrentlyWatched) {
-            WatchedRepository.unmarkWatched(watchedItems)
-            WatchProgressRepository.clearProgress(
+            unwatchAndClearProgress(
+                items = watchedItems,
                 videoIds = episodes.map(meta::episodePlaybackId),
                 parentMetaId = meta.id,
             )
@@ -220,6 +220,49 @@ object WatchingActions {
             )
         }
         reconcileSeriesWatchedState(meta)
+    }
+
+    private fun unwatchAndClearProgress(
+        items: Collection<WatchedItem>,
+        videoIds: Collection<String>,
+        parentMetaId: String,
+    ) {
+        val resolvedAliases = buildSet {
+            items.forEach { item ->
+                val season = item.season
+                val episode = item.episode
+                if (season != null && episode != null) {
+                    addAll(
+                        WatchProgressRepository.locallyFinishedEpisodeAliases(
+                            parentMetaId = item.id,
+                            seasonNumber = season,
+                            episodeNumber = episode,
+                            videoId = item.videoId,
+                        ),
+                    )
+                }
+            }
+            addAll(
+                WatchProgressRepository.resolveClearProgressAliases(
+                    videoIds = videoIds,
+                    parentMetaId = parentMetaId,
+                ),
+            )
+        }
+        val unwatchedTargets = WatchedRepository.unmarkWatchedPreservingAliases(
+            items = items,
+            additionalAliases = resolvedAliases,
+        )
+        WatchProgressRepository.clearProgress(
+            videoIds = videoIds,
+            parentMetaId = parentMetaId,
+            additionalAliases = resolvedAliases,
+            clearLocallyFinished = false,
+        )
+        WatchedRepository.finishUnwatchCleanup(
+            items = unwatchedTargets,
+            additionalAliases = resolvedAliases,
+        )
     }
 }
 
