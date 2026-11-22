@@ -360,4 +360,65 @@ class AddonPlayerEventsTest {
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
         assertNull(runtime.activeAddonPlayerEventTarget)
     }
+
+    @Test
+    fun placeholder_failover_clears_placeholder_flag_and_tracks_healthy_replacement() {
+        val placeholderUrl = "https://provider.example/static/downloading.mp4"
+        val healthyUrl = "https://cdn.example/show/healthy.mkv"
+        val placeholder = stream("[TB⚡] Comet Placeholder", placeholderUrl)
+        val healthy = stream("[TB⚡] Comet Healthy", healthyUrl)
+        val runtime = runtime(
+            sourceUrl = placeholderUrl,
+            runtimeMinutes = 45,
+            activeStream = placeholder,
+            search = ListSearch(listOf(placeholder, healthy)),
+        )
+        runtime.autoSelectedSourceUrl = placeholderUrl
+        runtime.checkForPlaceholderBySourceSignals()
+
+        val deadline = System.currentTimeMillis() + 10_000
+        while (runtime.activeSourceUrl == placeholderUrl && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals(healthyUrl, runtime.activeSourceUrl)
+        assertTrue(events.isEmpty(), "placeholder must never send tracking events, got $events")
+
+        // First non-loading frame of the replacement clears failover state and allows START.
+        runtime.previousIsPlaying = false
+        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+            isLoading = false,
+            isPlaying = true,
+            durationMs = 2_700_000L,
+            positionMs = 2_000L,
+        )
+        runtime.announceSourceFailoverIfPending()
+        runtime.syncAddonPlayerStartForPlayback()
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun active_session_emits_stop_if_duration_drops_to_short_placeholder_while_playing() {
+        val runtime = runtime(runtimeMinutes = 45)
+        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+            isLoading = false,
+            isPlaying = true,
+            durationMs = 2_700_000L,
+            positionMs = 5_000L,
+        )
+        runtime.syncAddonPlayerStartForPlayback()
+        runtime.previousIsPlaying = true
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+            isLoading = false,
+            isPlaying = true,
+            durationMs = 15_000L,
+            positionMs = 6_000L,
+        )
+        runtime.syncAddonPlayerStartForPlayback()
+
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
 }

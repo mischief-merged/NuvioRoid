@@ -423,6 +423,10 @@ internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
 
 internal fun PlayerScreenRuntime.syncAddonPlayerStartForPlayback() {
     if (!playbackSnapshot.isPlaying || playbackSnapshot.isLoading) return
+    if (activeAddonPlayerEventTarget != null && !isSourceAcceptedForAddonPlayerEvents()) {
+        emitAddonPlayerEvent(AddonPlayerAction.STOP)
+        return
+    }
     if (!previousIsPlaying || activeAddonPlayerEventTarget == null) {
         emitAddonPlayerEvent(AddonPlayerAction.START)
     }

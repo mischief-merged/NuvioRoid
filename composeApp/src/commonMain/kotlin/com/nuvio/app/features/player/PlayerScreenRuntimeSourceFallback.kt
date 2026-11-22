@@ -134,6 +134,8 @@ internal fun PlayerScreenRuntime.endSourceFailover() {
     sourceFallbackJob = null
     sourceFailoverTryingName = null
     sourceFailoverPlayingName = null
+    sourceFailoverForPlaceholder = false
+    sourceFailoverForStall = false
 }
 
 /** The name of a source as the loading screen and the messages give it. */
@@ -145,6 +147,8 @@ internal fun PlayerScreenRuntime.announceSourceFailoverIfPending() {
     val name = sourceFailoverPlayingName ?: return
     sourceFailoverPlayingName = null
     sourceFailoverTryingName = null
+    sourceFailoverForPlaceholder = false
+    sourceFailoverForStall = false
     scope.launch { showSourceNotice(getString(Res.string.player_failover_now_playing, name)) }
 }
 
