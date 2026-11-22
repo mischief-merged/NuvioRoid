@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.debrid.DebridSettingsRepository
@@ -277,6 +278,8 @@ internal fun PlayerScreenRuntime.checkForPlaceholderBySourceSignals() {
  * the setting is off (or the device is offline) the source is kept and the user is told once.
  */
 private fun PlayerScreenRuntime.handleDetectedPlaceholder(url: String, byLength: Boolean = false) {
+    placeholderDetectedUrl = url
+    emitAddonPlayerEvent(AddonPlayerAction.STOP)
     sourceFailoverPlaceholderByLength = byLength
     if (tryFallbackToNextSourceAfterError(message = null, failureOverride = SourceFailure.PlaceholderClip)) return
     // Not moved on: the setting is off (or the device is offline). Say so once, only when the user chose to stay.
@@ -357,6 +360,7 @@ internal fun PlayerScreenRuntime.tryFallbackToNextSourceAfterError(
         SourceFailure.FailedToStart -> null
     }
     errorMessage = null
+    emitAddonPlayerEvent(AddonPlayerAction.STOP)
 
     sourceFallbackJob = scope.launch {
         var stopReason = SourceFailoverStop.Exhausted

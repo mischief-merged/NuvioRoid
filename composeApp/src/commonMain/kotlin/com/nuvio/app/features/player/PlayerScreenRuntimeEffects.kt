@@ -493,6 +493,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     DisposableEffect(Unit) {
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
+            emitAddonPlayerEvent(AddonPlayerAction.STOP)
             args.launchId?.let { launchId ->
                 PlayerLaunchStore.update(launchId) { currentLaunch(it) }
                 // The player is gone: release the launch payload once the restore window has
@@ -602,9 +603,7 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
             flushWatchProgress(TrackingScrobbleAction.PAUSE)
         }
 
-        if (!previousIsPlaying && playbackSnapshot.isPlaying) {
-            emitAddonPlayerEvent(AddonPlayerAction.START)
-        }
+        syncAddonPlayerStartForPlayback()
 
         if (playbackSnapshot.isPlaying && pendingSeekScrobbleRestart) {
             pendingSeekScrobbleRestart = false

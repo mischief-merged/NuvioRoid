@@ -680,6 +680,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                     }
                     errorMessage = message
                     if (message != null) {
+                        emitAddonPlayerEvent(com.nuvio.app.features.addons.AddonPlayerAction.STOP)
                         scrubbingPositionMs = null
                         controlsVisible = !playerControlsLocked
                         removeFailedStreamFromCache()

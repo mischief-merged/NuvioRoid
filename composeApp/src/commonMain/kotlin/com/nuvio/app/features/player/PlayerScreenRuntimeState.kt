@@ -228,6 +228,13 @@ internal class PlayerScreenRuntime(
     var currentTrackingMedia by mutableStateOf<TrackingMediaReference?>(null)
     var activeAddonPlayerEventTarget: AddonPlayerEventTarget? = null
     var lastAddonPlayerAction: AddonPlayerAction? = null
+    /** Where Stremio player tracking events are sent. Tests replace it to record events. */
+    var dispatchAddonPlayerEvent: (
+        target: AddonPlayerEventTarget,
+        action: AddonPlayerAction,
+        currentTimeMs: Long,
+        durationMs: Long,
+    ) -> Unit = com.nuvio.app.features.addons.AddonEventDispatcher::player
 
     var showSourcesPanel by mutableStateOf(false)
     var showEpisodesPanel by mutableStateOf(false)
@@ -304,6 +311,8 @@ internal class PlayerScreenRuntime(
     var lastSeekTargetMs: Long? = null
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
+    /** The source confirmed as a placeholder clip; never receives tracking events. */
+    var placeholderDetectedUrl: String? = null
     /** The source whose first seconds were checked for being a placeholder, so each is checked once. */
     var placeholderCheckedUrl: String? = null
     var placeholderCheckStateUrl: String? = null
