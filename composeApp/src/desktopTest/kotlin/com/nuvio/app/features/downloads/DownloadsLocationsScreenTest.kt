@@ -174,7 +174,7 @@ class DownloadsLocationsScreenTest {
     }
 
     @Test
-    fun when_the_trash_fails_the_user_is_told_and_may_delete_for_good_after_a_second_confirmation() {
+    fun when_the_trash_fails_the_user_is_told_the_file_is_kept_and_no_permanent_delete_is_offered() {
         val item = movieIn(null, "one")
         backend.trashSucceeds = false
         show(item)
@@ -182,20 +182,17 @@ class DownloadsLocationsScreenTest {
 
         compose.onNodeWithContentDescription(text(Res.string.downloads_delete_description, "Film one")).performClick()
         compose.onNodeWithText(text(Res.string.downloads_delete_confirm_trash)).performClick()
-        waitForText(text(Res.string.downloads_delete_permanent_confirm))
+        compose.waitUntil(5_000) {
+            NuvioToastController.currentToast.value?.message == text(Res.string.downloads_delete_not_moved_toast)
+        }
+        compose.waitForIdle()
 
         assertEquals(text(Res.string.downloads_delete_not_moved_toast), NuvioToastController.currentToast.value?.message)
         assertEquals(1, DownloadsRepository.uiState.value.items.size)
-        assertTrue(backend.removedOutright.isEmpty(), "it was deleted without asking")
-
-        compose.onNodeWithText(text(Res.string.downloads_delete_permanent_confirm)).performClick()
-        compose.waitUntil(5_000) { DownloadsRepository.uiState.value.items.isEmpty() }
-
-        // The same file, whichever way its address is spelled.
-        assertEquals(
-            listOf(java.net.URI(item.localFileUri!!).path),
-            backend.removedOutright.map { java.net.URI(it!!).path },
-        )
+        assertTrue(backend.removedOutright.isEmpty(), "the app must never permanently delete user files")
+        assertTrue(Files.exists(java.nio.file.Paths.get(java.net.URI(item.localFileUri!!))), "the file must remain on disk")
+        compose.onAllNodesWithText("Delete permanently").assertCountEquals(0)
+        compose.onAllNodesWithText(text(Res.string.action_cancel)).assertCountEquals(0)
     }
 
     @Test

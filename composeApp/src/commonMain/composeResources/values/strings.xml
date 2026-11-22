@@ -3184,9 +3184,6 @@
     <string name="downloads_location_banner_title">A download location is not connected</string>
     <string name="downloads_location_banner_message">%1$s is not available. Its downloads stay in the list and open again when it is back. Auto-downloads and removal after watching wait for it.</string>
     <string name="downloads_delete_not_connected_toast">Its drive is not connected, so it can&apos;t be deleted now.</string>
-    <string name="downloads_delete_permanent_title">Delete %1$s for good?</string>
-    <string name="downloads_delete_permanent_message">It could not be moved to the Trash. Deleting it now cannot be undone.</string>
-    <string name="downloads_delete_permanent_confirm">Delete permanently</string>
     <string name="downloads_auto_status_folder_not_connected">Waiting: the drive that holds this show is not connected</string>
     <string name="downloads_auto_delete_not_connected_toast">Its drive is not connected, so it was left alone.</string>
     <string name="download_folder_saved_toast">New downloads will go to %1$s.</string>

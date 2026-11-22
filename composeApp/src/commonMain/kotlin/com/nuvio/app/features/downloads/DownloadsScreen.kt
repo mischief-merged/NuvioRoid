@@ -206,7 +206,6 @@ internal fun DownloadsScreenContent(
     // A file the user picked for a download without one, waiting for the user to confirm it.
     var locatePick by remember { mutableStateOf<Pair<DownloadItem, String>?>(null) }
     val locateScope = rememberCoroutineScope()
-    var permanentDeletionId by remember { mutableStateOf<String?>(null) }
     // Looking at the volumes can take a while on a drive that is failing, so never on this thread.
     LaunchedEffect(folders) { if (folders.supported) withContext(Dispatchers.Default) { folders.refresh() } }
     val extras = if (folders.supported) {
@@ -428,26 +427,6 @@ internal fun DownloadsScreenContent(
     val deleteNotMovedText = stringResource(Res.string.downloads_delete_not_moved_toast)
     val deleteNotConnectedText = stringResource(Res.string.downloads_delete_not_connected_toast)
     val deleteMovingText = stringResource(Res.string.downloads_delete_moving_toast)
-    val permanentDeletion = permanentDeletionId?.let { id -> uiState.items.firstOrNull { it.id == id } }
-    if (permanentDeletion != null) {
-        NuvioStatusModal(
-            title = stringResource(Res.string.downloads_delete_permanent_title, permanentDeletion.nameForLabels()),
-            message = stringResource(Res.string.downloads_delete_not_moved_toast) + " " + stringResource(Res.string.downloads_delete_permanent_message),
-            isVisible = true,
-            destructive = true,
-            confirmText = stringResource(Res.string.downloads_delete_permanent_confirm),
-            dismissText = stringResource(Res.string.action_cancel),
-            onConfirm = {
-                permanentDeletionId = null
-                deleteScope.launch {
-                    if (DownloadsRepository.deleteDownload(permanentDeletion.id, permanently = true) == DownloadDeleteResult.NotMoved) {
-                        NuvioToastController.show(deleteNotMovedText)
-                    }
-                }
-            },
-            onDismiss = { permanentDeletionId = null },
-        )
-    }
     moveRequest?.let { active ->
         DownloadMoveFlow(
             request = active,
@@ -522,11 +501,8 @@ internal fun DownloadsScreenContent(
                 deleteScope.launch {
                     rememberDeletion(pendingDeletion)
                     when (DownloadsRepository.deleteDownload(pendingDeletion.id)) {
-                        // Say so, and offer to delete it for good, which needs its own confirmation.
-                        DownloadDeleteResult.NotMoved -> {
-                            NuvioToastController.show(deleteNotMovedText)
-                            permanentDeletionId = pendingDeletion.id
-                        }
+                        // When the Trash is unavailable, keep the file and tell the user why.
+                        DownloadDeleteResult.NotMoved -> NuvioToastController.show(deleteNotMovedText)
                         DownloadDeleteResult.NotReachable -> NuvioToastController.show(deleteNotConnectedText)
                         DownloadDeleteResult.Moving -> NuvioToastController.show(deleteMovingText)
                         DownloadDeleteResult.Removed, DownloadDeleteResult.Gone -> Unit
