@@ -30,6 +30,7 @@ import com.nuvio.app.features.downloads.SeasonBatchRequest
 import com.nuvio.app.features.downloads.SeasonBatchStart
 import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.library.LibraryRepository
+import com.nuvio.app.features.plugins.runtime.PluginRuntime
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamBehaviorHints
@@ -52,6 +53,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.withTimeout
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.compose_player_close
 import nuvio.composeapp.generated.resources.player_replace_playback_confirm
@@ -1114,6 +1116,85 @@ class MiniPlayerSessionTest {
         assertTrue(snapshots.size >= 2, "250 ms polling restored on reopen")
         assertTrue(backend.videoDimensionQueries.get() > queriesAtMiniStart, "dimension queries restored on reopen")
         compose.mainClock.autoAdvance = true
+    }
+
+    @Test
+    fun minimizing_and_closing_player_do_not_leave_local_plugin_search_paused() {
+        val harness = startSessionHarness()
+        val scraperJs = """
+            module.exports.getStreams = async function(tmdbId, mediaType) {
+                return [{ title: "Stream " + tmdbId, url: "https://example.test/s.mp4", provider: "Test" }];
+            };
+        """.trimIndent()
+
+        compose.runOnIdle { harness.runtime.requestMinimize() }
+        compose.waitForIdle()
+        assertEquals(PlayerPresentationMode.Mini, harness.sessionController.activeSession?.mode)
+
+        val whileMinimized = runBlocking {
+            withTimeout(5_000L) {
+                PluginRuntime.executePlugin(
+                    code = scraperJs,
+                    tmdbId = "101",
+                    mediaType = "movie",
+                    season = null,
+                    episode = null,
+                    scraperId = "mini-plugin-check",
+                )
+            }
+        }
+        assertEquals(1, whileMinimized.size)
+
+        // Switching episodes while minimized clears episode streams without re-pausing local scrapers.
+        compose.runOnIdle {
+            harness.runtime.switchToEpisodeStream(
+                stream = StreamItem(
+                    name = "1080p",
+                    url = "https://example.com/episode-2.mp4",
+                    addonName = "Test",
+                    addonId = "test",
+                ),
+                episode = episodes[1],
+            )
+        }
+        compose.waitForIdle()
+
+        val afterMinimizedSwitch = runBlocking {
+            withTimeout(5_000L) {
+                PluginRuntime.executePlugin(
+                    code = scraperJs,
+                    tmdbId = "102",
+                    mediaType = "movie",
+                    season = null,
+                    episode = null,
+                    scraperId = "mini-switch-plugin-check",
+                )
+            }
+        }
+        assertEquals(1, afterMinimizedSwitch.size)
+
+        // Reopen Full mode (re-pausing idle background search while focused), then close directly from Full mode.
+        compose.runOnIdle { harness.sessionController.restoreFullScreen() }
+        compose.waitForIdle()
+        assertEquals(PlayerPresentationMode.Full, harness.sessionController.activeSession?.mode)
+
+        compose.runOnIdle { harness.sessionController.closeActiveSession() }
+        compose.waitForIdle()
+        assertNull(harness.sessionController.activeSession)
+
+        val afterClose = runBlocking {
+            withTimeout(5_000L) {
+                PluginRuntime.executePlugin(
+                    code = scraperJs,
+                    tmdbId = "103",
+                    mediaType = "movie",
+                    season = null,
+                    episode = null,
+                    scraperId = "closed-plugin-check",
+                )
+            }
+        }
+        assertEquals(1, afterClose.size)
     }
 
     private class RecordingEngineController : PlayerEngineController {

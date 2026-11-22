@@ -20,6 +20,7 @@ import com.nuvio.app.features.streams.StreamBadgeSettingsRepository
 import com.nuvio.app.features.streams.StreamLoadCompletion
 import com.nuvio.app.features.streams.StreamSearchSessions
 import com.nuvio.app.features.streams.StreamSearchTargets
+import com.nuvio.app.features.streams.StreamsRepository
 import com.nuvio.app.features.streams.withoutPendingGroups
 import com.nuvio.app.features.streams.StreamsUiState
 import com.nuvio.app.features.streams.sortedForGroupedDisplay
@@ -27,6 +28,7 @@ import com.nuvio.app.features.streams.streamAddonInstanceId
 import com.nuvio.app.features.streams.supportsStream
 import com.nuvio.app.features.streams.toEmptyStateReason
 import com.nuvio.app.features.streams.toPluginProviderGroups
+import kotlin.concurrent.Volatile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -62,6 +64,8 @@ object PlayerStreamsRepository {
         season: Int?,
         episode: Int?,
     ) -> StreamsUiState?)? = null
+    @Volatile
+    private var playbackInFocus: Boolean = false
 
     fun loadSources(
         type: String,
@@ -114,15 +118,37 @@ object PlayerStreamsRepository {
         )
     }
 
+    fun setPlaybackInFocus(inFocus: Boolean) {
+        playbackInFocus = inFocus
+        if (!inFocus) {
+            PluginRepository.setLocalPluginSearchPaused(false)
+        } else {
+            pauseIdlePluginSearch()
+        }
+    }
+
     fun stopSourcesLoading() {
-        PluginRepository.setLocalPluginSearchPaused(true)
         cancelSourceJob()
+        pauseIdlePluginSearch()
     }
 
     fun pauseSearchForPlayback() {
-        PluginRepository.setLocalPluginSearchPaused(true)
         cancelSourceJob()
         cancelEpisodeStreamsJob()
+        if (playbackInFocus) {
+            PluginRepository.setLocalPluginSearchPaused(true)
+        }
+    }
+
+    private fun pauseIdlePluginSearch() {
+        if (
+            playbackInFocus &&
+            !_sourceState.value.isAnyLoading &&
+            !_episodeStreamsState.value.isAnyLoading &&
+            !StreamsRepository.uiState.value.isAnyLoading
+        ) {
+            PluginRepository.setLocalPluginSearchPaused(true)
+        }
     }
 
     private fun cancelSourceJob() {
@@ -170,19 +196,25 @@ object PlayerStreamsRepository {
     }
 
     fun clearEpisodeStreams() {
-        PluginRepository.setLocalPluginSearchPaused(true)
         episodeStreamsJob?.cancel()
+        episodeStreamsJob = null
         episodeStreamsRequestKey = null
         _episodeStreamsState.value = StreamsUiState()
+        pauseIdlePluginSearch()
     }
 
     fun clearAll() {
+        playbackInFocus = false
         episodeStreamsProviderForTest = null
-        PluginRepository.setLocalPluginSearchPaused(true)
         sourceJob?.cancel()
+        sourceJob = null
         sourceRequestKey = null
         _sourceState.value = StreamsUiState()
-        clearEpisodeStreams()
+        episodeStreamsJob?.cancel()
+        episodeStreamsJob = null
+        episodeStreamsRequestKey = null
+        _episodeStreamsState.value = StreamsUiState()
+        PluginRepository.setLocalPluginSearchPaused(false)
     }
 
     private fun fetchStreams(

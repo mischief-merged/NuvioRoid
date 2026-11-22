@@ -14,6 +14,7 @@ import com.nuvio.app.features.shuffle.shuffleEpisodeProgress
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -487,7 +488,14 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         }
     }
 
+    val isInPipForSearch = rememberIsInPictureInPicture()
+    val playbackInFocus = !args.isMinimized && !isInPipForSearch
+    SideEffect {
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
+    }
+
     DisposableEffect(Unit) {
+        PlayerStreamsRepository.setPlaybackInFocus(!args.isMinimized && !isInPipForSearch)
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
             emitAddonPlayerProgressEvent()
