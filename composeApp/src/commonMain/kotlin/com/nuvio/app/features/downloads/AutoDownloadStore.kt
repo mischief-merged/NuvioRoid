@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -59,6 +60,11 @@ internal data class AutoDownloadRemoval(
     val dueAtEpochMs: Long,
 )
 
+internal data class ScheduledAutoDownloadRemoval(
+    val removal: AutoDownloadRemoval,
+    val keepEpoch: Long,
+)
+
 /**
  * The automatic-download rules of the active profile.
  *
@@ -71,9 +77,13 @@ internal data class AutoDownloadRemoval(
 internal class AutoDownloadStore(
     private val payloads: AutoDownloadPayloads,
     private val nowEpochMs: () -> Long = { DownloadsClock.nowEpochMs() },
+    private val afterSignallingKeep: () -> Unit = {},
     private val activeProfileId: () -> Int,
 ) {
     private val lock = WatchedRemovalGuard.lock
+    private val keepSignalLock = SynchronizedObject()
+    private val pendingKeeps = mutableMapOf<Pair<Int, String>, Int>()
+    private val acceptedKeepEpochs = mutableMapOf<Pair<Int, String>, Long>()
     // Every field is written, also one that has its default value, so that a rule keeps what it
     // was saved with when a default changes later.
     private val json = Json {
@@ -133,6 +143,23 @@ internal class AutoDownloadStore(
         if (ensureLoaded() != profileId) emptyList() else state.removals
     }
 
+    /** Scheduled removals for [profileId] paired with each download's Keep counter at read time. */
+    fun scheduledRemovals(profileId: Int): List<ScheduledAutoDownloadRemoval> = synchronized(lock) {
+        if (ensureLoaded() != profileId) return emptyList()
+        synchronized(keepSignalLock) {
+            state.removals.map { removal ->
+                ScheduledAutoDownloadRemoval(
+                    removal = removal,
+                    keepEpoch = acceptedKeepEpochs[profileId to removal.downloadId] ?: 0L,
+                )
+            }
+        }
+    }
+
+    fun hasPendingKeep(profileId: Int, downloadId: String): Boolean = synchronized(keepSignalLock) {
+        (pendingKeeps[profileId to downloadId] ?: 0) > 0
+    }
+
     fun isKept(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
         ensureLoaded() == profileId && downloadId in state.keptDownloadIds
     }
@@ -151,23 +178,72 @@ internal class AutoDownloadStore(
         true
     }
 
-    /** Keeps a download for good: its scheduled removal is set aside and none is scheduled again. */
-    fun keep(profileId: Int, downloadId: String): Boolean = WatchedRemovalGuard.change {
-        if (ensureLoaded() != profileId) return@change false
-        val scheduled = state.removals.firstOrNull { it.downloadId == downloadId }
-        save(
-            profileId,
-            state.copy(
-                removals = state.removals.filterNot { it.downloadId == downloadId },
-                keptDownloadIds = state.keptDownloadIds + downloadId,
-                keptRemovals = if (scheduled != null) {
-                    state.keptRemovals.filterNot { it.downloadId == downloadId } + scheduled
-                } else {
-                    state.keptRemovals
-                },
-            ),
-        )
+    /** Drops a cancelled removal unless Keep has stepped in for its download since [scheduled] was read. */
+    fun cancelRemoval(profileId: Int, scheduled: ScheduledAutoDownloadRemoval): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        val key = profileId to scheduled.removal.downloadId
+        val keptSinceStart = synchronized(keepSignalLock) {
+            (pendingKeeps[key] ?: 0) > 0 || (acceptedKeepEpochs[key] ?: 0L) != scheduled.keepEpoch
+        }
+        if (keptSinceStart) return false
+        save(profileId, state.copy(removals = state.removals - scheduled.removal))
         true
+    }
+
+    /** Keeps a download for good: its scheduled removal is set aside and none is scheduled again. */
+    fun keep(profileId: Int, downloadId: String): Boolean {
+        val key = profileId to downloadId
+        synchronized(keepSignalLock) {
+            pendingKeeps[key] = (pendingKeeps[key] ?: 0) + 1
+        }
+        var settled = false
+        try {
+            return WatchedRemovalGuard.signalChange {
+                afterSignallingKeep()
+                synchronized(lock) {
+                    try {
+                        if (ensureLoaded() != profileId) return@synchronized false
+                        val scheduled = state.removals.firstOrNull { it.downloadId == downloadId }
+                        save(
+                            profileId,
+                            state.copy(
+                                removals = state.removals.filterNot { it.downloadId == downloadId },
+                                keptDownloadIds = state.keptDownloadIds + downloadId,
+                                keptRemovals = if (scheduled != null) {
+                                    state.keptRemovals.filterNot { it.downloadId == downloadId } + scheduled
+                                } else {
+                                    state.keptRemovals
+                                },
+                            ),
+                        )
+                        synchronized(keepSignalLock) {
+                            acceptedKeepEpochs[key] = (acceptedKeepEpochs[key] ?: 0L) + 1L
+                            decrementPendingKeep(key)
+                            settled = true
+                        }
+                        true
+                    } finally {
+                        if (!settled) {
+                            synchronized(keepSignalLock) {
+                                decrementPendingKeep(key)
+                                settled = true
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            if (!settled) {
+                synchronized(keepSignalLock) {
+                    decrementPendingKeep(key)
+                }
+            }
+        }
+    }
+
+    private fun decrementPendingKeep(key: Pair<Int, String>) {
+        val remaining = (pendingKeeps[key] ?: 1) - 1
+        if (remaining <= 0) pendingKeeps.remove(key) else pendingKeeps[key] = remaining
     }
 
     /** Undoing Keep puts back a removal Keep set aside, with a fresh hold when its time has passed. */

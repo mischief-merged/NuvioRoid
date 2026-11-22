@@ -1,5 +1,9 @@
 package com.nuvio.app.features.downloads
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -417,14 +421,93 @@ class DeleteAfterWatchingTest {
         feature.keep(1, item(1).id)
         assertEquals(emptyList(), store.removals(1))
         restart()
-        assertTrue(store.undoKeep(1, item(1).id))
+        feature.undoKeep(1, item(1).id)
 
+        assertFalse(store.isKept(1, item(1).id))
         assertEquals(listOf(AutoDownloadRemoval(item(1).id, ruleKey, due)), store.removals(1))
         assertEquals(store.removals(1), store.removals.value)
         now = due - 1
         assertEquals(emptyMap(), feature.runDue(1))
         now = due
         assertEquals(AutoDownloadRemovalOutcome.Removed, feature.runDue(1).values.single())
+    }
+
+    @Test
+    fun keep_cancelling_delete_now_before_the_due_time_keeps_the_original_schedule_for_undo_keep() {
+        optIn()
+        val removalInFlight = CountDownLatch(1)
+        val keepSignalled = CountDownLatch(1)
+        val removalCancelled = CountDownLatch(1)
+        store = AutoDownloadStore(
+            payloads = payloads,
+            nowEpochMs = { now },
+            afterSignallingKeep = {
+                keepSignalled.countDown()
+                check(removalCancelled.await(5, TimeUnit.SECONDS))
+            },
+        ) { activeProfile }
+        feature = DeleteAfterWatching(
+            store = store,
+            downloads = { items },
+            isWatchedToTheEnd = { it.id !in notWatchedToTheEnd },
+            isInPlayer = { it.id == playing },
+            hasLaterEpisode = { _, _ -> laterEpisode },
+            removeDownload = { downloadId, key, stillWanted ->
+                synchronized(WatchedRemovalGuard.lock) {
+                    val checked = WatchedRemovalGuard.check(stillWanted)
+                    removalInFlight.countDown()
+                    check(keepSignalled.await(5, TimeUnit.SECONDS))
+                    if (!checked()) {
+                        AutoDownloadRemovalResult.Changed
+                    } else {
+                        removeCalls += downloadId to key
+                        AutoDownloadRemovalResult.Removed
+                    }
+                }
+            },
+            nowEpochMs = { now },
+        )
+        assertTrue(watch(1))
+        val due = store.removals(1).single().dueAtEpochMs
+        now += 2 * hour
+
+        val failure = AtomicReference<Throwable?>()
+        val outcome = AtomicReference<AutoDownloadRemovalOutcome?>()
+        val removal = thread(isDaemon = true) {
+            runCatching {
+                outcome.set(feature.deleteNow(1, item(1).id))
+            }.onFailure { failure.set(it) }.also {
+                removalCancelled.countDown()
+            }
+        }
+        val keep = thread(isDaemon = true) {
+            runCatching {
+                check(removalInFlight.await(5, TimeUnit.SECONDS))
+                feature.keep(1, item(1).id)
+            }.onFailure { failure.set(it) }.also {
+                keepSignalled.countDown()
+            }
+        }
+        try {
+            removal.join(5_000)
+            keep.join(5_000)
+        } finally {
+            keepSignalled.countDown()
+            removalCancelled.countDown()
+            removal.join(5_000)
+            keep.join(5_000)
+        }
+        assertFalse(removal.isAlive)
+        assertFalse(keep.isAlive)
+        failure.get()?.let { throw it }
+        assertEquals(AutoDownloadRemovalOutcome.Cancelled, outcome.get())
+        assertEquals(emptyList(), removeCalls)
+
+        restart()
+        feature.undoKeep(1, item(1).id)
+
+        assertFalse(store.isKept(1, item(1).id))
+        assertEquals(listOf(AutoDownloadRemoval(item(1).id, ruleKey, due)), store.removals(1))
     }
 
     @Test

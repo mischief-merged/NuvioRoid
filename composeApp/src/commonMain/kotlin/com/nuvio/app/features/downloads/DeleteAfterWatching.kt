@@ -63,19 +63,20 @@ internal class DeleteAfterWatching(
 
     /** Removes the download now, at the user's request. Null when no removal is scheduled for it. */
     fun deleteNow(profileId: Int, downloadId: String): AutoDownloadRemovalOutcome? {
-        val removal = store.removals(profileId).firstOrNull { it.downloadId == downloadId } ?: return null
-        return process(profileId, removal, askedByUser = true)
+        val scheduled = store.scheduledRemovals(profileId).firstOrNull { it.removal.downloadId == downloadId } ?: return null
+        return process(profileId, scheduled, askedByUser = true)
     }
 
     /** Handles every removal whose time has come. */
     fun runDue(profileId: Int): Map<String, AutoDownloadRemovalOutcome> {
         val now = nowEpochMs()
-        return store.removals(profileId)
-            .filter { it.dueAtEpochMs <= now }
-            .associate { it.downloadId to process(profileId, it, askedByUser = false) }
+        return store.scheduledRemovals(profileId)
+            .filter { it.removal.dueAtEpochMs <= now }
+            .associate { it.removal.downloadId to process(profileId, it, askedByUser = false) }
     }
 
-    private fun process(profileId: Int, removal: AutoDownloadRemoval, askedByUser: Boolean): AutoDownloadRemovalOutcome {
+    private fun process(profileId: Int, scheduled: ScheduledAutoDownloadRemoval, askedByUser: Boolean): AutoDownloadRemovalOutcome {
+        val removal = scheduled.removal
         val item = downloads().firstOrNull { it.id == removal.downloadId }
         val rule = removal.ruleKey?.let { store.rule(profileId, it) }
         if (
@@ -85,13 +86,14 @@ internal class DeleteAfterWatching(
             item.status != DownloadStatus.Completed ||
             // A file marked as not the real video is the user's to remove, never removed by this.
             item.isPlaceholder ||
+            store.hasPendingKeep(profileId, item.id) ||
             store.isKept(profileId, item.id)
         ) {
-            return cancel(profileId, removal)
+            return cancel(profileId, scheduled)
         }
         if (isInPlayer(item)) return AutoDownloadRemovalOutcome.Playing
         if (!askedByUser) {
-            if (!isWatchedToTheEnd(item)) return cancel(profileId, removal)
+            if (!isWatchedToTheEnd(item)) return cancel(profileId, scheduled)
             if (rule != null && hasLaterEpisode(rule, item) != true) return AutoDownloadRemovalOutcome.LastEpisode
         }
         // Things may change while this runs: the episode is opened, Keep, a new time after a rewatch,
@@ -100,6 +102,7 @@ internal class DeleteAfterWatching(
         val stillWanted = {
             !isInPlayer(item) &&
                 removal in store.removals(profileId) &&
+                !store.hasPendingKeep(profileId, item.id) &&
                 !store.isKept(profileId, item.id) &&
                 store.allowsRemoval(profileId, removal.ruleKey) &&
                 (askedByUser || isWatchedToTheEnd(item))
@@ -118,15 +121,15 @@ internal class DeleteAfterWatching(
                 store.recordDeleted(profileId, AutoDownloadDeleted(item.title, season, episode, nowEpochMs()))
                 AutoDownloadRemovalOutcome.Removed
             }
-            AutoDownloadRemovalResult.Changed -> cancel(profileId, removal)
+            AutoDownloadRemovalResult.Changed -> cancel(profileId, scheduled)
             AutoDownloadRemovalResult.NotMoved -> AutoDownloadRemovalOutcome.NotMoved
             AutoDownloadRemovalResult.NotReachable -> AutoDownloadRemovalOutcome.NotReachable
             AutoDownloadRemovalResult.Busy -> AutoDownloadRemovalOutcome.Moving
         }
     }
 
-    private fun cancel(profileId: Int, removal: AutoDownloadRemoval): AutoDownloadRemovalOutcome {
-        store.dropRemoval(profileId, removal)
+    private fun cancel(profileId: Int, scheduled: ScheduledAutoDownloadRemoval): AutoDownloadRemovalOutcome {
+        store.cancelRemoval(profileId, scheduled)
         return AutoDownloadRemovalOutcome.Cancelled
     }
 
