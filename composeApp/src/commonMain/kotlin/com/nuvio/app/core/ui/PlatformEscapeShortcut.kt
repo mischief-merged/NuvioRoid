@@ -10,3 +10,6 @@ import androidx.compose.runtime.Composable
  */
 @Composable
 internal expect fun PlatformEscapeShortcut(handler: () -> Unit)
+
+/** Runs the innermost active local [PlatformBackHandler] on desktop; returns false when none is active. */
+internal expect fun dispatchPlatformLocalBack(): Boolean

@@ -13,3 +13,5 @@ internal actual fun PlatformEscapeShortcut(handler: () -> Unit) {
         onDispose { DesktopEscapeShortcut.unregister(bridged) }
     }
 }
+
+internal actual fun dispatchPlatformLocalBack(): Boolean = DesktopEscapeShortcut.dispatchLocalBack()

@@ -5,10 +5,17 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import com.nuvio.app.AppScreenTab
+import com.nuvio.app.controller.ControllerEvent
+import com.nuvio.app.controller.ControllerFocusEngine
+import com.nuvio.app.controller.ControllerNavigationHost
+import com.nuvio.app.controller.XboxButton
 import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.core.ui.DesktopKeyboardShortcutHost
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.core.ui.PlatformEscapeShortcut
+import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.navigation.DownloadsRoute
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_section_shows
@@ -100,6 +107,51 @@ class DownloadsShowEscapeTest {
         // Wait past the Escape debounce window; second Escape leaves Downloads via root back.
         Thread.sleep(350)
         assertTrue(sendAwtEscape())
+        compose.waitForIdle()
+
+        assertEquals(1, rootBackCalls)
+    }
+
+    @Test
+    fun gamepad_b_on_downloads_show_page_returns_to_downloads_list_before_leaving_downloads() {
+        backend.payload = """{"items":[${completedEpisode()}]}"""
+        DownloadsRepository.ensureLoaded()
+        var rootBackCalls = 0
+
+        compose.setContent {
+            NuvioTheme {
+                ControllerNavigationHost(
+                    currentRoute = DownloadsRoute(),
+                    selectedTab = AppScreenTab.Library,
+                    onBack = {
+                        if (!dispatchPlatformLocalBack()) {
+                            rootBackCalls += 1
+                        }
+                        true
+                    },
+                )
+                DownloadsScreenContent(
+                    onBack = { rootBackCalls += 1 },
+                    onOpenDownload = {},
+                    showAutoDownloads = false,
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        compose.onNodeWithText("Pantheon").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText(text(Res.string.episodes_season, 2)).assertIsDisplayed()
+
+        // First gamepad B runs the show page's PlatformBackHandler without leaving Downloads.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+
+        assertEquals(0, rootBackCalls, "Gamepad B left Downloads instead of returning to the downloads list")
+        compose.onNodeWithText(text(Res.string.downloads_section_shows)).assertIsDisplayed()
+
+        // Second gamepad B leaves Downloads via root back.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
         compose.waitForIdle()
 
         assertEquals(1, rootBackCalls)

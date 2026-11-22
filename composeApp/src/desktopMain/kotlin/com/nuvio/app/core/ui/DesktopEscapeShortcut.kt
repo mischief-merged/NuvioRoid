@@ -36,13 +36,16 @@ internal object DesktopEscapeShortcut {
         }
     }
 
+    /** Runs the innermost active local back handler, returning true if one handled back. */
+    fun dispatchLocalBack(): Boolean {
+        val local = synchronized(localHandlers) { localHandlers.lastOrNull() } ?: return false
+        local()
+        return true
+    }
+
     /** Runs the innermost active local back handler, or falls back to the root navigation back handler. */
     fun dispatchBack(): Boolean {
-        val local = synchronized(localHandlers) { localHandlers.lastOrNull() }
-        if (local != null) {
-            local()
-            return true
-        }
+        if (dispatchLocalBack()) return true
         val root = onBack ?: return false
         root()
         return true

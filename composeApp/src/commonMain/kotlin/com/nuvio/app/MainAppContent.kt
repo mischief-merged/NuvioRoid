@@ -217,6 +217,7 @@ import com.nuvio.app.core.ui.PresenceSnapshot
 import androidx.compose.ui.ExperimentalComposeUiApi
 import com.nuvio.app.features.player.dispatchNavigationBack
 import com.nuvio.app.core.ui.PlatformEscapeShortcut
+import com.nuvio.app.core.ui.dispatchPlatformLocalBack
 import com.nuvio.app.controller.ControllerMainOverlay
 import com.nuvio.app.controller.ControllerNavigationHost
 
@@ -1474,7 +1475,9 @@ internal fun MainAppContent(
                     currentRoute = currentRoute,
                     selectedTab = selectedTab,
                     onBack = {
-                        navigateBack()
+                        if (!dispatchPlatformLocalBack()) {
+                            navigateBack()
+                        }
                         true
                     },
                 )

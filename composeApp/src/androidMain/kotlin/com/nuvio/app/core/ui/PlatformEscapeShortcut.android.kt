@@ -6,3 +6,5 @@ import androidx.compose.runtime.Composable
 internal actual fun PlatformEscapeShortcut(handler: () -> Unit) {
     // No-op on Android — Back is handled by the platform.
 }
+
+internal actual fun dispatchPlatformLocalBack(): Boolean = false
