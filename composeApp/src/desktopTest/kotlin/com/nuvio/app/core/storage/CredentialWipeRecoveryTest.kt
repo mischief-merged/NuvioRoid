@@ -4,6 +4,15 @@ import java.nio.file.Files
 import kotlin.test.*
 
 class CredentialWipeRecoveryTest {
+    private val explicitSignOutStoreNames = setOf(
+        "nuvio_account_sessions",
+        "nuvio_trakt_auth",
+        "nuvio_simkl_auth",
+        "nuvio_mdblist_auth",
+        "nuvio_addons",
+        "nuvio_debrid_settings",
+        "server_credentials",
+    )
     @Test fun failedWipeKeepsAPendingMarkerAndRetriesEveryNamespaceIncludingLegacy() {
         val root = Files.createTempDirectory("wipe-recovery")
         try {
@@ -19,12 +28,12 @@ class CredentialWipeRecoveryTest {
                 })
             }
             assertTrue(legacyCleared)
-            assertEquals(setOf("nuvio_account_sessions"), attempts.toSet())
+            assertEquals(explicitSignOutStoreNames, attempts.toSet())
             assertTrue(Files.exists(root.resolve("credential-wipe-pending")))
             assertTrue(Files.exists(root.resolve("nuvio_account_sessions.properties")))
             attempts.clear()
             DesktopStorage.wipeCredentialsAndFiles(root, { legacyCleared = true }, { attempts.add(it) })
-            assertEquals(setOf("nuvio_account_sessions"), attempts.toSet())
+            assertEquals(explicitSignOutStoreNames, attempts.toSet())
             assertFalse(Files.exists(root.resolve("credential-wipe-pending")))
             assertFalse(Files.exists(root.resolve("nuvio_account_sessions.properties")))
             assertEquals("partial", Files.readString(downloads.resolve("movie.part")))

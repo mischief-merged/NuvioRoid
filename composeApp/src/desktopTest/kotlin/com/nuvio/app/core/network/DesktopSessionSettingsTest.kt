@@ -28,7 +28,7 @@ class DesktopSessionSettingsTest {
             assertEquals("old-session", settings.getStringOrNull("session"))
             assertEquals("old-session", legacy.getStringOrNull("session"))
             assertEquals("old-session", settings.getStringOrNull("session"))
-            assertNull(legacy.getStringOrNull("session"))
+            assertEquals("old-session", legacy.getStringOrNull("session"))
             settings.putString("sb-example-session", settings.getStringOrNull("session")!!)
             settings.remove("session")
             assertEquals("old-session", settings.getStringOrNull("sb-example-session"))

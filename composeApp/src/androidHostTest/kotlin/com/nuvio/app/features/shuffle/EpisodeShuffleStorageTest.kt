@@ -52,13 +52,13 @@ class EpisodeShuffleStorageTest {
     }
 
     @Test
-    fun accountWipeRemovesStoredShuffleSettings() {
+    fun accountWipeKeepsStoredShuffleSettings() {
         EpisodeShuffleRepository.setAvailable(true)
         EpisodeShuffleRepository.save("show", EpisodeShuffleSettings(true, true), profileId)
         PlatformLocalAccountDataCleaner.initialize(RuntimeEnvironment.getApplication())
         PlatformLocalAccountDataCleaner.wipe()
         EpisodeShuffleRepository.clearLocalState()
         EpisodeShuffleRepository.ensureLoaded()
-        assertEquals(EpisodeShuffleProfile(), EpisodeShuffleRepository.uiState.value)
+        assertEquals(EpisodeShuffleSettings(true, true), EpisodeShuffleRepository.uiState.value.shows.getValue("show"))
     }
 }

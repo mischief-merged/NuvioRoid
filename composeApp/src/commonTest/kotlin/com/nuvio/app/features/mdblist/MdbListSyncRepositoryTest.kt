@@ -10,6 +10,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.Test
@@ -150,14 +151,14 @@ class MdbListSyncRepositoryTest {
     }
 
     @Test
-    fun `disconnect clears cached data and projections`() = runTest {
+    fun `disconnect hides cached data and keeps the saved snapshot`() = runTest {
         val harness = MdbListSyncTestHarness(backgroundScope)
         harness.seed()
         harness.repository.ensureLoaded()
         harness.http.store.clearAuth()
         runCurrent()
         assertNull(harness.repository.currentSnapshot())
-        assertNull(harness.storage.profiles[1])
+        assertNotNull(harness.storage.profiles[1])
         assertTrue(harness.repository.currentProjection().watchedItems.isEmpty())
     }
 

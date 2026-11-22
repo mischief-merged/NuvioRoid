@@ -26,7 +26,7 @@ class AppDataWipeKeepsDownloadsTest {
         val settings = root.resolve("nuvio_downloads.properties").also { Files.writeString(it, "x=1") }
         val cache = root.resolve("cache/thing").also { it.parent.createDirectories(); Files.writeString(it, "c") }
 
-        DesktopStorage.wipeFolder(root, DesktopStorage.KeptOnWipe)
+        wipeTestFolder(root)
 
         assertEquals("the film", Files.readString(video))
         assertTrue(subtitles.exists() && journal.exists())

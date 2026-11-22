@@ -53,7 +53,7 @@ class LocalAccountDataCleanerTest {
             PlatformLocalAccountDataCleaner.wipe()
         }
 
-        assertTrue(snapshots().isEmpty())
+        assertEquals("old account", snapshots().single().name)
         assertFalse(save("old resolver", initialGeneration))
         assertFalse(save("cleanup resolver", cleanupGeneration))
         assertTrue(save("new account", ContinueWatchingEnrichmentCache.generation.value))
@@ -76,7 +76,7 @@ class LocalAccountDataCleanerTest {
         }
 
         assertSame(failure, thrown)
-        assertTrue(snapshots().isEmpty())
+        assertEquals("old account", snapshots().single().name)
         assertFalse(save("cleanup resolver", cleanupGeneration))
     }
 

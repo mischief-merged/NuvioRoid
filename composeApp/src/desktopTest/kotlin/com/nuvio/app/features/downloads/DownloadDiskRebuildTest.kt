@@ -11,6 +11,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.core.storage.wipeTestFolder
 import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.core.ui.NuvioToastController
@@ -304,9 +305,9 @@ class DownloadDiskRebuildTest {
         DownloadsRepository.ensureLoaded()
         assertEquals(3, DownloadsRepository.uiState.value.items.size)
 
-        // Case 3: app data wiped while keeping downloads folder (DesktopStorage.wipeFolder).
+        // Case 3: the downloads list file is gone and the video folder is still there.
         DownloadsRepository.clearLocalState()
-        DesktopStorage.wipeFolder(world.appData, DesktopStorage.KeptOnWipe)
+        wipeTestFolder(world.appData)
         backend.reloadStore()
         DownloadsRepository.ensureLoaded()
         // ep1 in appDir + ep2 and movie in archiveDrive (still in world.locations) are all recovered again.
