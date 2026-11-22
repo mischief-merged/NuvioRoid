@@ -107,6 +107,7 @@ internal class AutoDownloadEngine(
             released = episodes,
             isWatched = { isWatched(current, it) },
             downloads = items,
+            pendingRemovalDownloadIds = store.removals(profileId).mapTo(mutableSetOf()) { it.downloadId },
         )
         resumeStoppedDownloads(ruleKey, items)
         val now = nowEpochMs()
@@ -280,7 +281,13 @@ internal class AutoDownloadEngine(
         val rule = store.rule(profileId, ruleKey) ?: return
         val episodes = knownEpisodes(ruleKey) ?: return
         val items = downloads()
-        val plan = planAutoDownload(rule, episodes, { isWatched(rule, it) }, items)
+        val plan = planAutoDownload(
+            rule = rule,
+            released = episodes,
+            isWatched = { isWatched(rule, it) },
+            downloads = items,
+            pendingRemovalDownloadIds = store.removals(profileId).mapTo(mutableSetOf()) { it.downloadId },
+        )
         val statusByEpisode = items.episodeStatuses(rule.parentMetaId)
         val windowStatuses = plan.window.map { statusByEpisode[it.autoDownloadKey] }
         val waiting = plan.toDownload.mapNotNull { retryFor(ruleKey, it) }

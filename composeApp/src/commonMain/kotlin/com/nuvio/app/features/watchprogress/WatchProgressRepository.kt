@@ -1411,13 +1411,18 @@ object WatchProgressRepository {
         if (syncRemote) {
             pushScrobbleToServer(entry = entry, profileId = targetProfileId)
         }
+        val providerOwnsCompletedHistory = progressProvider?.ownsCompletedHistoryProjection == true
         if (
             shouldCascadeCompletedProgressToWatchedHistory(
                 entry = entry,
-                providerOwnsCompletedHistory = progressProvider?.ownsCompletedHistoryProjection == true,
+                providerOwnsCompletedHistory = providerOwnsCompletedHistory,
             )
         ) {
             WatchingActions.onProgressEntryUpdated(entry, syncRemote = syncRemote)
+        } else if (entry.normalizedCompletion().isCompleted) {
+            // Even when a tracker owns remote history, record the completed watch locally right
+            // away so offline playback, watched state and automatic downloads stay in sync.
+            WatchingActions.onProgressEntryUpdated(entry, syncRemote = false)
         }
     }
 

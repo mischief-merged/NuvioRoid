@@ -650,4 +650,43 @@ class AutoDownloadEngineTest {
 
         assertEquals(listOf("tt2"), harness.requests.map { it.parentMetaId })
     }
+
+    @Test
+    fun an_episode_waiting_for_deletion_after_watching_queues_the_next_episode_in_the_same_check() = runTest {
+        val harness = harness(testRule(keepCount = 3).copy(deleteAfterWatching = true))
+        harness.downloads.value = DownloadsUiState(
+            listOf(
+                testDownload(1, DownloadStatus.Completed, ruleKey = ruleKey),
+                testDownload(2, DownloadStatus.Completed, ruleKey = ruleKey),
+                testDownload(3, DownloadStatus.Completed, ruleKey = ruleKey),
+            ),
+        )
+        assertTrue(harness.store.scheduleRemoval(1, AutoDownloadRemoval("tt1-1-1", ruleKey, dueAtEpochMs = 24 * hour)))
+
+        harness.check()
+
+        assertEquals(listOf(4), harness.requests.last().episodes.map { it.episodeNumber })
+        assertEquals(listOf(4), harness.downloading())
+        assertEquals(AutoDownloadStatus.Downloading, harness.status())
+    }
+
+    @Test
+    fun episodes_waiting_for_deletion_after_watching_do_not_count_toward_keep_next_n() = runTest {
+        val harness = harness(testRule(keepCount = 3).copy(deleteAfterWatching = true))
+        harness.downloads.value = DownloadsUiState(
+            listOf(
+                testDownload(1, DownloadStatus.Completed, ruleKey = ruleKey),
+                testDownload(2, DownloadStatus.Completed, ruleKey = ruleKey),
+                testDownload(3, DownloadStatus.Completed, ruleKey = ruleKey),
+            ),
+        )
+        assertTrue(harness.store.scheduleRemoval(1, AutoDownloadRemoval("tt1-1-1", ruleKey, dueAtEpochMs = 24 * hour)))
+        assertTrue(harness.store.scheduleRemoval(1, AutoDownloadRemoval("tt1-1-2", ruleKey, dueAtEpochMs = 24 * hour)))
+
+        harness.check()
+
+        assertEquals(listOf(4, 5), harness.requests.last().episodes.map { it.episodeNumber })
+        assertEquals(listOf(4, 5), harness.downloading())
+        assertEquals(AutoDownloadStatus.Downloading, harness.status())
+    }
 }

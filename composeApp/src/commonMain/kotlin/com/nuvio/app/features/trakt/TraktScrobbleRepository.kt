@@ -347,6 +347,9 @@ internal object TraktScrobbleRepository : TrackingScrobbler {
         )
 
         if (action == "stop") {
+            if (clampedProgress >= TRAKT_SCROBBLE_WATCHED_PERCENT) {
+                TraktWatchedShowSnapshotRepository.clear()
+            }
             runCatching { TraktProgressRepository.invalidateAndRefresh() }
                 .onFailure { error ->
                     if (error is CancellationException) throw error

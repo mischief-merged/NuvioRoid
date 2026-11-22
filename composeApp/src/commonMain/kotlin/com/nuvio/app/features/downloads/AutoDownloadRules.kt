@@ -104,6 +104,8 @@ internal data class AutoDownloadPlan(
  *   order, without the watched ones, so a show that was watched to the end gets nothing.
  * - An episode the rule finished downloading before that is no longer in [downloads] was removed
  *   and is left out.
+ * - An episode waiting for deletion after watching ([pendingRemovalDownloadIds]) counts as watched,
+ *   so it does not take a slot in the keep-next window.
  * - An episode that is downloaded, downloading or paused, by the rule or by hand, counts as kept and
  *   is not queued again. One whose download failed, or whose finished file is too small to be the
  *   episode or is marked as not the real video, is queued again.
@@ -113,6 +115,7 @@ internal fun planAutoDownload(
     released: List<SeasonBatchEpisode>,
     isWatched: (SeasonBatchEpisode) -> Boolean,
     downloads: List<DownloadItem>,
+    pendingRemovalDownloadIds: Set<String> = emptySet(),
 ): AutoDownloadPlan {
     val ordered = released
         .filter { it.seasonNumber > 0 }
@@ -120,18 +123,22 @@ internal fun planAutoDownload(
         .sortedWith(compareBy({ it.seasonNumber }, { it.episodeNumber }))
     val statusByEpisode = downloads.episodeStatuses(rule.parentMetaId)
     val placeholders = downloads.placeholderEpisodeKeys(rule.parentMetaId, ordered)
+    val pendingRemovalEpisodes = downloads.pendingRemovalEpisodeKeys(rule.parentMetaId, pendingRemovalDownloadIds)
+    val treatedAsWatched: (SeasonBatchEpisode) -> Boolean = { episode ->
+        episode.autoDownloadKey in pendingRemovalEpisodes || isWatched(episode)
+    }
     val removed = rule.ownedEpisodeKeys - statusByEpisode.keys
 
     val window = when (rule.scope) {
         AutoDownloadScope.NextUnwatched ->
             ordered
-                .drop(ordered.indexOfLast(isWatched) + 1)
+                .drop(ordered.indexOfLast(treatedAsWatched) + 1)
                 .filter { it.autoDownloadKey !in removed }
                 .take(rule.keepCount)
         AutoDownloadScope.LatestReleased ->
             ordered
                 .takeLast(rule.keepCount)
-                .filter { it.autoDownloadKey !in removed && !isWatched(it) }
+                .filter { it.autoDownloadKey !in removed && !treatedAsWatched(it) }
     }
     val toDownload = window.filter { episode ->
         when (statusByEpisode[episode.autoDownloadKey]) {
@@ -146,6 +153,22 @@ internal fun planAutoDownload(
 
 internal val SeasonBatchEpisode.autoDownloadKey: String
     get() = autoDownloadEpisodeKey(seasonNumber, episodeNumber)
+
+/** The episodes of [parentMetaId] that have a download waiting for deletion after watching. */
+private fun List<DownloadItem>.pendingRemovalEpisodeKeys(
+    parentMetaId: String,
+    pendingRemovalDownloadIds: Set<String>,
+): Set<String> {
+    if (pendingRemovalDownloadIds.isEmpty()) return emptySet()
+    val parent = parentMetaId.trim()
+    return mapNotNullTo(mutableSetOf()) { item ->
+        if (item.id !in pendingRemovalDownloadIds) return@mapNotNullTo null
+        if (item.parentMetaId.trim() != parent) return@mapNotNullTo null
+        val season = item.seasonNumber ?: return@mapNotNullTo null
+        val episode = item.episodeNumber ?: return@mapNotNullTo null
+        autoDownloadEpisodeKey(season, episode)
+    }
+}
 
 /**
  * The episodes of a show whose only finished download is not the video: marked as not the real

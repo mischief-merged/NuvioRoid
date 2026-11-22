@@ -153,14 +153,7 @@ internal object AutoDownloads : AutoDownloadController {
             MetaDetailsRepository.fetch(rule.parentMetaType, rule.parentMetaId, cacheResult = false, useCached = false)
                 ?.releasedBatchEpisodes(CurrentDateProvider.todayIsoDate())
         },
-        isWatched = { rule, episode ->
-            WatchedRepository.isWatched(
-                id = rule.parentMetaId,
-                type = rule.parentMetaType,
-                season = episode.seasonNumber,
-                episode = episode.episodeNumber,
-            )
-        },
+        isWatched = ::isEpisodeWatchedForAutoDownload,
         downloads = { DownloadsRepository.uiState.value.items },
         seasonDefaults = SeasonDownloadDefaultsRepository::load,
         startBatch = SeasonBatchDownloads::start,
@@ -422,6 +415,28 @@ internal object AutoDownloads : AutoDownloadController {
     private const val PollIntervalMs = 10L * 60 * 1000
     private const val PlaybackCheckDelayMs = 5_000L
 }
+
+/**
+ * Whether [episode] counts as watched for an automatic-download rule: either marked watched in
+ * history or finished in local playback progress.
+ */
+internal fun isEpisodeWatchedForAutoDownload(
+    rule: AutoDownloadRule,
+    episode: SeasonBatchEpisode,
+    isWatchedInHistory: (id: String, type: String, season: Int, episode: Int) -> Boolean = { id, type, season, number ->
+        WatchedRepository.isWatched(id = id, type = type, season = season, episode = number)
+    },
+    isCompletedInProgress: (videoId: String, parentMetaId: String, season: Int, episode: Int) -> Boolean = { videoId, parentMetaId, season, number ->
+        WatchProgressRepository.progressForVideo(
+            videoId = videoId,
+            parentMetaId = parentMetaId,
+            seasonNumber = season,
+            episodeNumber = number,
+        )?.isEffectivelyCompleted == true
+    },
+): Boolean =
+    isWatchedInHistory(rule.parentMetaId, rule.parentMetaType, episode.seasonNumber, episode.episodeNumber) ||
+        isCompletedInProgress(episode.videoId, rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
 internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
