@@ -613,6 +613,109 @@ class ReplacePlaybackPromptTest {
         )
     }
 
+    @Test
+    fun external_playback_reopens_same_target_and_awaits_native_teardown_before_replacing_active_session() {
+        val disposeStarted = CountDownLatch(1)
+        val allowDispose = CountDownLatch(1)
+        val backend = CountingNativePlayerBackend(
+            onDisposeHook = {
+                disposeStarted.countDown()
+                allowDispose.await(5, TimeUnit.SECONDS)
+            },
+        )
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        val firstLaunch = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/severance-s1e1.mp4",
+        )
+        val secondLaunch = sampleLaunch(
+            title = "The Bear",
+            videoId = secondVideoId,
+            parentMetaId = "tt2222222",
+            sourceUrl = "file:///tmp/the-bear-s1e1.mkv",
+        )
+        val externalLaunched = mutableListOf<String>()
+
+        sessionController.open(launch = firstLaunch, launchId = 601L)
+        mountPlayerSessionHost(sessionController, navigator, backend)
+        compose.waitUntil(5_000L) { backend.createCount == 1 }
+
+        compose.runOnIdle {
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 510_000L
+                durationMs = 1_800_000L
+            }
+        }
+        compose.mainClock.advanceTimeBy(300L)
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            sessionController.minimize()
+            assertTrue(sessionController.isMinimized)
+            // Same playing target with external player enabled reopens the active session instead of spawning a duplicate player.
+            sessionController.launchExternalOrAskToReplace(
+                launch = firstLaunch,
+                allowSameTargetReopen = true,
+            ) {
+                externalLaunched += firstLaunch.sourceUrl
+            }
+        }
+        compose.waitForIdle()
+        assertTrue(sessionController.isFullScreen)
+        assertTrue(externalLaunched.isEmpty())
+        assertEquals(0, backend.disposeCount)
+
+        // Minimize again and request a different title for external playback: prompts first.
+        compose.runOnIdle {
+            sessionController.minimize()
+            sessionController.launchExternalOrAskToReplace(
+                launch = secondLaunch,
+                allowSameTargetReopen = false,
+            ) {
+                externalLaunched += secondLaunch.sourceUrl
+            }
+        }
+        compose.waitForIdle()
+        compose.onNodeWithText(text(Res.string.player_replace_playback_title)).assertIsDisplayed()
+
+        // Keep playing leaves the minimized session untouched and launches nothing externally.
+        compose.onNodeWithText(text(Res.string.player_replace_playback_keep)).performClick()
+        compose.waitForIdle()
+        assertTrue(sessionController.isMinimized)
+        assertTrue(externalLaunched.isEmpty())
+        assertEquals(0, backend.disposeCount)
+
+        // Confirm replacement: external launch waits until watch progress is flushed and native disposal finishes.
+        compose.runOnIdle {
+            sessionController.launchExternalOrAskToReplace(
+                launch = secondLaunch,
+                allowSameTargetReopen = false,
+            ) {
+                externalLaunched += secondLaunch.sourceUrl
+            }
+        }
+        compose.waitForIdle()
+        compose.onNodeWithText(text(Res.string.player_replace_playback_confirm)).performClick()
+
+        assertTrue(disposeStarted.await(5, TimeUnit.SECONDS))
+        assertTrue(externalLaunched.isEmpty(), "external player must not launch while native teardown is still running")
+
+        allowDispose.countDown()
+        compose.waitUntil(5_000L) { externalLaunched.size == 1 }
+        compose.waitForIdle()
+
+        assertFalse(sessionController.hasActiveSession)
+        assertEquals(1, backend.disposeCount)
+        assertEquals(0, backend.activeHandleCount)
+        assertEquals(listOf(secondLaunch.sourceUrl), externalLaunched)
+        assertEquals(510_000L, WatchProgressRepository.progressForVideo(firstVideoId)?.lastPositionMs)
+    }
+
     private fun mountPlayerSessionHost(
         sessionController: PlayerSessionController,
         navigator: NuvioNavigator,

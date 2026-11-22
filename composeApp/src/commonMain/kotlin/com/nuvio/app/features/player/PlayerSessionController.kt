@@ -311,6 +311,23 @@ internal class PlayerSessionController(
         }
     }
 
+    fun launchExternalOrAskToReplace(
+        launch: PlayerLaunch,
+        allowSameTargetReopen: Boolean = true,
+        onProceed: () -> Unit,
+    ) {
+        launchOrAskToReplace(
+            incomingTitle = launch.title,
+            videoId = launch.videoId,
+            parentMetaId = launch.parentMetaId,
+            seasonNumber = launch.seasonNumber,
+            episodeNumber = launch.episodeNumber,
+            sourceUrl = launch.sourceUrl,
+            allowSameTargetReopen = allowSameTargetReopen,
+            onProceed = onProceed,
+        )
+    }
+
     fun requestTrailerOrAskToReplace(
         contentTitle: String,
         trailerTitle: String = "",

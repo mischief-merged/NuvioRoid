@@ -868,7 +868,7 @@ internal fun MainAppContent(
             }
         }
 
-        suspend fun openExternalPlayback(launch: PlayerLaunch): Boolean {
+        suspend fun launchExternalPlaybackNow(launch: PlayerLaunch): Boolean {
             if (!externalPlayerSupported) return false
 
             lastExternalPlayerLaunch = launch
@@ -924,6 +924,25 @@ internal fun MainAppContent(
             }
         }
 
+        suspend fun openExternalPlayback(launch: PlayerLaunch): Boolean {
+            if (!externalPlayerSupported) return false
+            if (playerSessionController.hasActiveSession) {
+                playerSessionController.launchExternalOrAskToReplace(
+                    launch = launch,
+                    allowSameTargetReopen = false,
+                ) {
+                    if (navController.currentRoute is StreamRoute) {
+                        navController.popBackStack()
+                    }
+                    coroutineScope.launch {
+                        launchExternalPlaybackNow(launch)
+                    }
+                }
+                return true
+            }
+            return launchExternalPlaybackNow(launch)
+        }
+
         val currentAppFullscreen = com.nuvio.app.core.ui.isFullscreenActionActive()
         val latestAppFullscreen = rememberUpdatedState(currentAppFullscreen)
 
@@ -960,7 +979,6 @@ internal fun MainAppContent(
         fun openDownloadedItem(item: DownloadItem) {
             val sourceUrl = DownloadsRepository.playableLocalFileUri(item) ?: return
             if (
-                !playerSettingsUiState.externalPlayerEnabled &&
                 playerSessionController.reopenIfMatching(
                     videoId = item.videoId,
                     parentMetaId = item.parentMetaId,
@@ -1002,8 +1020,13 @@ internal fun MainAppContent(
                 initialPositionMs = resumeEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L,
                 initialProgressFraction = resumeEntry?.progressFraction?.takeIf { it > 0f },
             )
-            if (playerSettingsUiState.externalPlayerEnabled) {
-                coroutineScope.launch { openExternalPlayback(playerLaunch) }
+            if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
+                playerSessionController.launchExternalOrAskToReplace(
+                    launch = playerLaunch,
+                    allowSameTargetReopen = false,
+                ) {
+                    coroutineScope.launch { launchExternalPlaybackNow(playerLaunch) }
+                }
                 return
             }
             openPlayerSession(playerLaunch)
@@ -1071,11 +1094,9 @@ internal fun MainAppContent(
             resumeProgressFraction: Float? = null,
             startFromBeginning: Boolean = false,
         ): Boolean {
-            val useExternalPlayer = externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled
             val cloudVideoId = item.playbackVideoId(file)
             if (
                 !startFromBeginning &&
-                !useExternalPlayer &&
                 playerSessionController.reopenIfMatching(
                     videoId = cloudVideoId,
                     parentMetaId = item.stableKey,
@@ -1085,7 +1106,7 @@ internal fun MainAppContent(
             ) {
                 return true
             }
-            if (!useExternalPlayer && playerSessionController.hasActiveSession) {
+            if (playerSessionController.hasActiveSession) {
                 playerSessionController.launchOrAskToReplace(
                     incomingTitle = file.name.ifBlank { item.name },
                     videoId = cloudVideoId,
@@ -1144,7 +1165,6 @@ internal fun MainAppContent(
             if (
                 !manualSelection &&
                 !startFromBeginning &&
-                !useExternalPlayer &&
                 playerSessionController.reopenIfMatching(
                     videoId = videoId,
                     parentMetaId = parentMetaId,
@@ -1193,7 +1213,12 @@ internal fun MainAppContent(
                         initialProgressFraction = targetResumeProgressFraction,
                     )
                     if (useExternalPlayer) {
-                        coroutineScope.launch { openExternalPlayback(playerLaunch) }
+                        playerSessionController.launchExternalOrAskToReplace(
+                            launch = playerLaunch,
+                            allowSameTargetReopen = false,
+                        ) {
+                            coroutineScope.launch { launchExternalPlaybackNow(playerLaunch) }
+                        }
                         return
                     }
                     openPlayerSession(playerLaunch)
@@ -1235,7 +1260,7 @@ internal fun MainAppContent(
                 )
             }
 
-            if (promptBeforeStreamRoute && !useExternalPlayer && playerSessionController.hasActiveSession) {
+            if (promptBeforeStreamRoute && playerSessionController.hasActiveSession) {
                 playerSessionController.launchOrAskToReplace(
                     incomingTitle = title,
                     videoId = videoId,
