@@ -527,11 +527,15 @@ internal fun PlayerScreenRuntime.resolvePlayablePreviousEpisode(): MetaVideo? {
     return previous
 }
 
-internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false): Boolean {
+internal fun PlayerScreenRuntime.playNextEpisode(
+    automatic: Boolean = false,
+    onNoEpisodeSwitch: () -> Unit = {},
+): Boolean {
     val targetInfo = nextEpisodeInfo?.takeIf { it.hasAired } ?: return false
     return playTargetEpisode(
         targetInfo = targetInfo,
         automatic = automatic,
+        onNoEpisodeSwitch = onNoEpisodeSwitch,
         isStillValid = { playbackKey ->
             playbackKey == activePlaybackKey &&
                 nextEpisodeInfo?.videoId == targetInfo.videoId &&
@@ -545,7 +549,7 @@ internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false): Bo
     )
 }
 
-internal fun PlayerScreenRuntime.playPreviousEpisode(): Boolean {
+internal fun PlayerScreenRuntime.playPreviousEpisode(onNoEpisodeSwitch: () -> Unit = {}): Boolean {
     val previous = resolvePlayablePreviousEpisode() ?: return false
     val season = previous.season ?: return false
     val episode = previous.episode ?: return false
@@ -565,6 +569,7 @@ internal fun PlayerScreenRuntime.playPreviousEpisode(): Boolean {
         targetInfo = targetInfo,
         automatic = false,
         isPrevious = true,
+        onNoEpisodeSwitch = onNoEpisodeSwitch,
         isStillValid = { playbackKey -> playbackKey == activePlaybackKey },
     )
 }
@@ -573,6 +578,7 @@ private fun PlayerScreenRuntime.playTargetEpisode(
     targetInfo: NextEpisodeInfo,
     automatic: Boolean,
     isPrevious: Boolean = false,
+    onNoEpisodeSwitch: () -> Unit = {},
     isStillValid: (PlaybackKey) -> Boolean,
 ): Boolean {
     if (automatic && sleepTimer.blocksAutomaticNextEpisode()) {
@@ -608,6 +614,9 @@ private fun PlayerScreenRuntime.playTargetEpisode(
                         if (downloadedEpisodeSwitch?.job === verification) downloadedEpisodeSwitch = null
                     }
                 }
+            },
+            onOfflineDownloadDeclined = {
+                if (!automatic) onNoEpisodeSwitch()
             },
             onDownloadedEpisodeSelected = { item, episode ->
                 if (isCurrentRequest()) {

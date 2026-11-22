@@ -1152,6 +1152,13 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
     return true
 }
 
+/** One step when a saved episode cannot be played. A party seek already happened inside the first call. */
+private fun PlayerScreenRuntime.seekAfterDeclinedDownload(offsetMs: Long) {
+    if (!seekFromNativeControls(offsetMs, revealControls = false)) {
+        playerController?.seekBy(offsetMs)
+    }
+}
+
 internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: Double): Boolean {
     if (type.shouldLogPlayerControlsEvent()) {
         playerControlsLog.d { "event type=$type value=$value ${playerControlLogContext()}" }
@@ -1191,12 +1198,12 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
                 )
             ) {
                 MediaTrackResolution.SWITCH_NEXT_EPISODE -> {
-                    if (!partyBlocksControl() && !playNextEpisode()) {
+                    if (!partyBlocksControl() && !playNextEpisode(onNoEpisodeSwitch = { seekAfterDeclinedDownload(10_000L) })) {
                         return seekFromNativeControls(10_000L, revealControls = false)
                     }
                 }
                 MediaTrackResolution.SWITCH_PREVIOUS_EPISODE -> {
-                    if (!partyBlocksControl() && !playPreviousEpisode()) {
+                    if (!partyBlocksControl() && !playPreviousEpisode(onNoEpisodeSwitch = { seekAfterDeclinedDownload(-10_000L) })) {
                         return seekFromNativeControls(-10_000L, revealControls = false)
                     }
                 }
