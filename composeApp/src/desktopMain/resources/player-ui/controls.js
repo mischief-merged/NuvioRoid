@@ -4556,7 +4556,13 @@ window.addEventListener("blur", () => {
 
 root.addEventListener("click", event => {
   if (event.button !== 0) return;
-  if (state.isInMiniPlayer) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (suppressNextRootClick) {
     clearSuppressNextRootClick();
@@ -4615,7 +4621,13 @@ if (pipLockBadge) {
 
 root.addEventListener("dblclick", event => {
   if (event.button !== 0) return;
-  if (state.isInMiniPlayer) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (playbackErrorText() || isControlsSurfaceEvent(event)) return;
   event.preventDefault();

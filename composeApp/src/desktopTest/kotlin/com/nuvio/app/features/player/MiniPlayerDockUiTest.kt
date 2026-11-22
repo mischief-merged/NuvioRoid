@@ -12,6 +12,7 @@ import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -39,6 +40,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class MiniPlayerDockUiTest {
@@ -269,6 +271,7 @@ class MiniPlayerDockUiTest {
                                 onSeekForward = sessionController::seekForward,
                                 onPlayNextEpisode = sessionController::playNextEpisode,
                                 onClose = { sessionController.closeActiveSession() },
+                                onReopenFullPlayer = { sessionController.restoreFullScreen() },
                             )
                         }
                     }
@@ -309,7 +312,19 @@ class MiniPlayerDockUiTest {
         compose.waitForIdle()
         assertEquals(listOf(10_000L), seekOffsets)
 
-        // Close from the mini player: flushes progress, releases player, and removes dock.
+        // Clicking the mini player card reopens full player at the same position with the same runtime.
+        val initialRuntime = runtimeRef
+        compose.onNodeWithText("Severance").performClick()
+        compose.waitForIdle()
+        assertTrue(sessionController.isFullScreen)
+        assertSame(initialRuntime, runtimeRef)
+        assertEquals(500_000L, runtimeRef.playbackSnapshot.positionMs)
+        assertEquals(0, releaseCalls)
+        compose.onAllNodesWithTag(MiniPlayerDockTestTag).assertCountEquals(0)
+
+        // Minimize again and close from the mini player: flushes progress, releases player, and removes dock.
+        compose.runOnIdle { sessionController.minimize() }
+        compose.waitForIdle()
         compose.onNodeWithContentDescription(closeLabel).performClick()
         compose.waitForIdle()
         assertEquals(1, releaseCalls)

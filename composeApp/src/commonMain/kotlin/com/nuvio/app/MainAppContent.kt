@@ -955,6 +955,18 @@ internal fun MainAppContent(
 
         fun openDownloadedItem(item: DownloadItem) {
             val sourceUrl = DownloadsRepository.playableLocalFileUri(item) ?: return
+            if (
+                !playerSettingsUiState.externalPlayerEnabled &&
+                playerSessionController.reopenIfMatching(
+                    videoId = item.videoId,
+                    parentMetaId = item.parentMetaId,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    sourceUrl = sourceUrl,
+                )
+            ) {
+                return
+            }
             val resumeEntry = item.videoId
                 .takeIf { it.isNotBlank() }
                 ?.let(WatchProgressRepository::progressForVideo)
@@ -1010,6 +1022,18 @@ internal fun MainAppContent(
             resumeProgressFraction: Float? = null,
             startFromBeginning: Boolean = false,
         ): Boolean {
+            if (
+                !startFromBeginning &&
+                !(externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) &&
+                playerSessionController.reopenIfMatching(
+                    videoId = item.playbackVideoId(file),
+                    parentMetaId = item.stableKey,
+                    seasonNumber = null,
+                    episodeNumber = null,
+                )
+            ) {
+                return true
+            }
             return when (
                 val resolved = CloudLibraryRepository.resolvePlayback(
                     item = item,
@@ -1069,6 +1093,19 @@ internal fun MainAppContent(
             startFromBeginning: Boolean,
             pickPurpose: StreamPickPurpose = StreamPickPurpose.Play,
         ) {
+            if (
+                !manualSelection &&
+                !startFromBeginning &&
+                !(externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) &&
+                playerSessionController.reopenIfMatching(
+                    videoId = videoId,
+                    parentMetaId = parentMetaId,
+                    seasonNumber = seasonNumber,
+                    episodeNumber = episodeNumber,
+                )
+            ) {
+                return
+            }
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
             val targetResumeProgressFraction = if (startFromBeginning) null else resumeProgressFraction
 

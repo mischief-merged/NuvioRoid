@@ -366,6 +366,116 @@ class MiniPlayerSessionTest {
         }
     }
 
+    @Test
+    fun reopening_from_mini_player_keeps_same_runtime_controller_and_position_without_reload() {
+        val harness = startSessionHarness()
+        val initialRuntime = harness.runtime
+        val initialLaunchId = harness.sessionController.activeSession?.launchId
+
+        compose.runOnIdle {
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 735_000L,
+                    durationMs = 1_800_000L,
+                ),
+            )
+            harness.runtime.requestMinimize()
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isMinimized)
+            harness.navigator.navigate(DetailRoute(type = "series", id = "tt8888", title = "Browsed Show"))
+            harness.navigator.navigate(DownloadsRoute("Downloads"))
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 748_000L,
+                    durationMs = 1_800_000L,
+                ),
+            )
+            harness.runtime.handlePlayerControlsEvent("restoreMiniPlayer", 0.0)
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isFullScreen)
+            assertFalse(harness.sessionController.isMinimized)
+            assertEquals(initialLaunchId, harness.sessionController.activeSession?.launchId)
+            assertSame(initialRuntime, harness.runtime)
+            assertSame(harness.controller, harness.runtime.playerController)
+            assertEquals(748_000L, harness.runtime.playbackSnapshot.positionMs)
+            assertEquals(0, harness.controller.releaseCalls)
+            assertEquals(0, harness.disposedCount)
+        }
+    }
+
+    @Test
+    fun playing_same_episode_while_minimized_reopens_and_resumes_without_reload() {
+        val harness = startSessionHarness()
+        val initialRuntime = harness.runtime
+
+        compose.runOnIdle {
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.switchToEpisodeStream(
+                StreamItem(url = "https://example.com/episode-2.mp4", addonName = "Test", addonId = "test"),
+                episodes[1],
+            )
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            harness.runtime.playerController = harness.controller
+            harness.runtime.playerLifecycleController = harness.controller
+            harness.runtime.playerControllerSourceUrl = harness.runtime.activeSourceUrl
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = false,
+                    positionMs = 92_000L,
+                    durationMs = 1_200_000L,
+                ),
+            )
+            harness.runtime.requestMinimize()
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isMinimized)
+            assertFalse(
+                harness.sessionController.reopenIfMatching(
+                    videoId = episodes[0].id,
+                    parentMetaId = testSeriesId,
+                    seasonNumber = 1,
+                    episodeNumber = 1,
+                ),
+                "finished episode 1 does not match active episode 2",
+            )
+            assertTrue(
+                harness.sessionController.reopenIfMatching(
+                    videoId = episodes[1].id,
+                    parentMetaId = testSeriesId,
+                    seasonNumber = 1,
+                    episodeNumber = 2,
+                ),
+            )
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isFullScreen)
+            assertSame(initialRuntime, harness.runtime)
+            assertEquals(92_000L, harness.runtime.playbackSnapshot.positionMs)
+            assertEquals(1, harness.controller.playCalls)
+            assertEquals(0, harness.controller.releaseCalls)
+        }
+    }
+
     private class RecordingEngineController : PlayerEngineController {
         var playCalls = 0
         var pauseCalls = 0
@@ -488,6 +598,7 @@ class MiniPlayerSessionTest {
                                 }
                             }
                         },
+                        onRestoreMiniPlayer = { sessionController.restoreFullScreen() },
                         onSessionStateChanged = { state ->
                             sessionController.updatePlaybackState(active.launchId, state)
                         },

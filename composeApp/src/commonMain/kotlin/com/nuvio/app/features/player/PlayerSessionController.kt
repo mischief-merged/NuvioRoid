@@ -40,6 +40,7 @@ internal data class MiniPlayerPlaybackState(
 
 internal data class PlayerSessionControls(
     val togglePlayback: () -> Unit,
+    val resumePlayback: () -> Unit = {},
     val seekForward: () -> Unit,
     val playNextEpisode: (() -> Unit)? = null,
     val requestClose: (onClosed: () -> Unit) -> Unit,
@@ -78,6 +79,45 @@ internal fun shouldMinimizePlayerOnBack(
         !hasError &&
         !isEnded &&
         (isPlaying || (shouldPlay && initialLoadCompleted))
+
+internal fun matchesActivePlaybackTarget(
+    activeState: MiniPlayerPlaybackState?,
+    activeLaunch: PlayerLaunch?,
+    videoId: String?,
+    parentMetaId: String?,
+    seasonNumber: Int?,
+    episodeNumber: Int?,
+    sourceUrl: String? = null,
+): Boolean {
+    if (activeState == null && activeLaunch == null) return false
+    val currentSourceUrl = activeState?.sourceUrl?.takeIf { it.isNotBlank() }
+        ?: activeLaunch?.sourceUrl?.takeIf { it.isNotBlank() }
+    if (!sourceUrl.isNullOrBlank() && sourceUrl == currentSourceUrl) {
+        return true
+    }
+
+    val currentVideoId = activeState?.videoId?.takeIf { it.isNotBlank() }
+        ?: activeLaunch?.videoId?.takeIf { it.isNotBlank() }
+    val candidateVideoId = videoId?.takeIf { it.isNotBlank() }
+    if (currentVideoId != null && candidateVideoId != null && currentVideoId == candidateVideoId) {
+        return true
+    }
+
+    val currentParentId = activeState?.parentMetaId?.takeIf { it.isNotBlank() }
+        ?: activeLaunch?.parentMetaId?.takeIf { it.isNotBlank() }
+    val candidateParentId = parentMetaId?.takeIf { it.isNotBlank() }
+    if (currentParentId != null && currentParentId == candidateParentId) {
+        val currentSeason = activeState?.seasonNumber ?: activeLaunch?.seasonNumber
+        val currentEpisode = activeState?.episodeNumber ?: activeLaunch?.episodeNumber
+        if (currentSeason != null && currentEpisode != null) {
+            return seasonNumber == currentSeason && episodeNumber == currentEpisode
+        }
+        if (currentSeason == null && currentEpisode == null && seasonNumber == null && episodeNumber == null) {
+            return true
+        }
+    }
+    return false
+}
 
 /**
  * Owns the active in-app playback session outside route navigation so minimizing or entering
@@ -152,6 +192,43 @@ internal class PlayerSessionController {
         val current = activeSession ?: return false
         if (current.mode == PlayerPresentationMode.Full) return true
         activeSession = current.copy(mode = PlayerPresentationMode.Full)
+        return true
+    }
+
+    fun matchesActiveTarget(
+        videoId: String?,
+        parentMetaId: String?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        sourceUrl: String? = null,
+    ): Boolean {
+        val current = activeSession ?: return false
+        return matchesActivePlaybackTarget(
+            activeState = playbackState,
+            activeLaunch = current.launch,
+            videoId = videoId,
+            parentMetaId = parentMetaId,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            sourceUrl = sourceUrl,
+        )
+    }
+
+    fun reopenIfMatching(
+        videoId: String?,
+        parentMetaId: String?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        sourceUrl: String? = null,
+    ): Boolean {
+        val current = activeSession ?: return false
+        if (!matchesActiveTarget(videoId, parentMetaId, seasonNumber, episodeNumber, sourceUrl)) {
+            return false
+        }
+        restoreFullScreen()
+        if (playbackState?.isPlaying == false && boundLaunchId == current.launchId) {
+            boundControls?.resumePlayback?.invoke()
+        }
         return true
     }
 

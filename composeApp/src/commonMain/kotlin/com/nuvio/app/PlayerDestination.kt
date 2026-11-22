@@ -143,6 +143,7 @@ internal fun BoxScope.PlayerSessionHost(
                 onSeekForward = controller::seekForward,
                 onPlayNextEpisode = controller::playNextEpisode,
                 onClose = { controller.closeActiveSession() },
+                onReopenFullPlayer = { controller.restoreFullScreen() },
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(end = MiniPlayerHorizontalInset, bottom = MiniPlayerBottomInset)
@@ -215,6 +216,7 @@ internal fun BoxScope.PlayerSessionHost(
             onBack = onBack,
             isMinimized = session.mode == PlayerPresentationMode.Mini,
             onMinimize = onMinimize,
+            onRestoreMiniPlayer = { controller.restoreFullScreen() },
             onSessionStateChanged = { state -> controller.updatePlaybackState(session.launchId, state) },
             onSessionControlsChanged = { controls -> controller.bindControls(session.launchId, controls) },
             onExitTarget = { exitTarget.target = it },

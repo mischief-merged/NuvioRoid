@@ -115,6 +115,11 @@ internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
         controlsRegistration?.invoke(
             PlayerSessionControls(
                 togglePlayback = { runtime.togglePlayback() },
+                resumePlayback = {
+                    if (!runtime.playbackSnapshot.isPlaying) {
+                        runtime.togglePlayback()
+                    }
+                },
                 seekForward = { runtime.seekBy(10_000L) },
                 playNextEpisode = { latestNextEpisodeAction.value?.invoke() },
                 requestClose = { onClosed -> runtime.requestClose(afterClosed = onClosed) },
@@ -166,6 +171,14 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     BindPlayerSessionBridge()
     val isInPip = rememberIsInPictureInPicture()
     val isMinimized = args.isMinimized
+    val wasMinimized = remember { mutableStateOf(isMinimized) }
+    LaunchedEffect(isMinimized) {
+        if (wasMinimized.value && !isMinimized && !playerControlsLocked) {
+            controlsVisible = true
+            controlsActivityTick += 1
+        }
+        wasMinimized.value = isMinimized
+    }
     val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
     val seasonNumber = activeSeasonNumber
     val episodeNumber = activeEpisodeNumber
@@ -1289,10 +1302,13 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
     }
     when (type) {
         "cursorActivity" -> {
-            if (!playerControlsLocked) {
+            if (!playerControlsLocked && !args.isMinimized) {
                 controlsVisible = true
                 controlsActivityTick += 1
             }
+        }
+        "restoreMiniPlayer" -> {
+            args.onRestoreMiniPlayer?.invoke()
         }
         "hideChrome" -> {
             controlsVisible = false
