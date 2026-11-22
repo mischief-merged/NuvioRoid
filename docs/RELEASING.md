@@ -43,7 +43,7 @@ Update and commit these files before running the release tests, candidate DMG bu
 1. `composeApp/Configuration/DesktopVersion.properties` — set `VERSION_NAME` to the three-part numeric package version and `VERSION_CODE` to the monotonic integer code (directly or with `./scripts/set-version.sh --desktop <package-version> --desktop-code <version-code>`).
 2. `CHANGELOG.md` — move the entries under `## [Unreleased]` into a new dated section `## [<fork-version>] - YYYY-MM-DD`, leave an empty `## [Unreleased]` section above it, and update the comparison links at the bottom of the file.
 3. `README.md` — update the macOS download link text and target URL so they point to tag `nuvioroid-<fork-version>`.
-4. `composeApp/src/commonMain/kotlin/com/nuvio/app/features/settings/ForkAttribution.kt` *(on the `nuvioroid` branch only)* — update `ForkIdentity.BUILD` to `<fork-release>` (and verify the Settings > About footer on the candidate build shows the intended version and build number without duplicating the fork release suffix).
+4. `composeApp/src/commonMain/kotlin/com/nuvio/app/features/settings/ForkAttribution.kt` *(on the `nuvioroid` branch only)* — update `ForkIdentity.BUILD` to `<fork-release>`. Note that `ForkIdentity.version()` currently appends `".$BUILD"` directly to `AppVersionPolicy.displayVersionName`, which would format `1.1.3602` as `1.1.3602.2`; the first release under this scheme (`1.1.36.2`) must change that formatting before testing (decode the encoded patch or keep the display version separately) so Settings shows `1.1.36.2` rather than `1.1.3602.2`.
 
 ## Release branches
 
@@ -72,7 +72,9 @@ Before running the release test pass or building the candidate DMG:
 2. Update [CHANGELOG.md](../CHANGELOG.md) (move `## [Unreleased]` into `## [<fork-version>] - YYYY-MM-DD`, leave an empty `## [Unreleased]` above it, and update the comparison links).
 3. Update the download link and version label in [README.md](../README.md) to point to tag `nuvioroid-<fork-version>`.
 4. Commit these changes on `downloads-suite` and merge `downloads-suite` into `nuvioroid`.
-5. On `nuvioroid`, update `ForkIdentity.BUILD` in `composeApp/src/commonMain/kotlin/com/nuvio/app/features/settings/ForkAttribution.kt` if needed and commit.
+5. On `nuvioroid`, update `composeApp/src/commonMain/kotlin/com/nuvio/app/features/settings/ForkAttribution.kt` and commit before running Step 3:
+   - Set `ForkIdentity.BUILD` to `<fork-release>`.
+   - **First release under this scheme (`1.1.36.2`):** `ForkIdentity.version()` on `nuvioroid` currently appends `".$BUILD"` to `AppVersionPolicy.displayVersionName`, so `1.1.3602` would display as `1.1.3602.2`. Before testing, change `ForkIdentity.version()` (decode the encoded patch back into `<upstream-major>.<upstream-minor>.<upstream-patch>.<fork-release>`, or keep the four-part display version separately) so Settings shows `<fork-version>` (e.g. `1.1.36.2`), not `1.1.3602.2`.
 
 ### 3. Run the full desktop test suite
 
@@ -108,7 +110,7 @@ Run the full release check tracked in [issue #113](https://github.com/mischief-m
 
 1. Back up the current app and data folder (settings files, not videos).
 2. Install `NuvioRoid.app` from the candidate DMG over the currently installed build and start it on a copy of a real data folder (signed in when account sign-in is enabled).
-3. Confirm the installed app's `Contents/Info.plist` version (`<package-version>`) and Settings > About version and build code (`<version-code>`) match the release candidate.
+3. Confirm the installed app's `Contents/Info.plist` version (`<package-version>`, e.g. `1.1.3602`), Settings display version (`<fork-version>`, e.g. `1.1.36.2`, not `1.1.3602.2`), and build code (`<version-code>`, e.g. `3602`) match the release candidate.
 4. Verify on first start, after a normal quit and reopen, and after a forced quit that sign-in state, library, downloads list, watch progress, auto-download rules, profiles, and settings are all present and that downloaded videos still play.
 5. Click through every path the release adds or changes from start to finish.
 6. Repeat the changed paths under constrained networks (hotspot, slow, lossy, one host blocked, offline), then restore the network.
@@ -164,7 +166,7 @@ Before announcing the release or considering it done, verify what users actually
    hdiutil attach NuvioRoid-<fork-version>-macos-arm64.dmg -nobrowse -readonly
    plutil -p /Volumes/NuvioRoid/NuvioRoid.app/Contents/Info.plist | grep -E 'CFBundle(ShortVersionString|Version)'
    ```
-   Confirm `CFBundleShortVersionString` and `CFBundleVersion` match `<package-version>` (and, after installing/opening on the test machine, confirm Settings > About matches `<fork-version>` and build `<version-code>`). Detach the volume when done.
+   Confirm `CFBundleShortVersionString` and `CFBundleVersion` match `<package-version>` (e.g. `1.1.3602`), and after installing and opening the app on the test machine, confirm Settings shows `<fork-version>` (e.g. `1.1.36.2`, not `1.1.3602.2`) and build `<version-code>` (e.g. `3602`). Detach the volume when done.
 4. Open [README.md](../README.md) on GitHub and click the download link to confirm it resolves to tag `nuvioroid-<fork-version>` and lists the newly uploaded `NuvioRoid-<fork-version>-macos-arm64.dmg` and `SHA256SUMS.txt`.
 
 If any post-publish check fails, fix and re-upload the corrected assets (or delete the broken release) before pointing users to it.
