@@ -1052,7 +1052,7 @@ private fun DownloadRow(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = statusText(item, rowStatus, speedBytesPerSecond),
+                        text = statusText(item, rowStatus),
                         // Announced when the phase changes. The description has no sizes, so the
                         // bytes arriving do not make it speak again.
                         modifier = Modifier.semantics {
@@ -1068,6 +1068,22 @@ private fun DownloadRow(
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
                     )
+                    val activeSpeed = speedBytesPerSecond?.takeIf { it > 0L && rowStatus.phase == DownloadPhase.Downloading }
+                    if (activeSpeed != null) {
+                        val speedLabel = stringResource(Res.string.downloads_speed, formatBytes(activeSpeed))
+                        val total = item.totalBytes?.takeIf { it > 0L }
+                        val speedLine = if (total != null) {
+                            val timeLeft = formatTimeLeft((total - item.downloadedBytes).coerceAtLeast(0L) * 1_000L / activeSpeed)
+                            listOf(speedLabel, timeLeft).joinToString(DownloadTextSeparator)
+                        } else {
+                            speedLabel
+                        }
+                        Text(
+                            text = speedLine,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (item.status == DownloadStatus.Completed) {
                         val watchNote = when {
                             watchStatus.isWatched -> stringResource(Res.string.episodes_cd_watched)
@@ -1319,7 +1335,6 @@ private fun SectionTitle(
 private fun statusText(
     item: DownloadItem,
     status: DownloadRowStatus,
-    speedBytesPerSecond: Long? = null,
 ): String {
     val size = if (item.status == DownloadStatus.Completed) {
         formatBytes(item.totalBytes ?: item.downloadedBytes)
@@ -1329,7 +1344,7 @@ private fun statusText(
         formatBytes(item.downloadedBytes)
     }
 
-    val baseLine = when (status.phase) {
+    val line = when (status.phase) {
         DownloadPhase.Failed -> stringResource(Res.string.downloads_status_failed_reason, failureReasonText(item))
         DownloadPhase.NotTheRealVideo -> placeholderRowReason(item)
         else -> if (status.phase.showsSize) {
@@ -1337,12 +1352,6 @@ private fun statusText(
         } else {
             stringResource(status.phase.message)
         }
-    }
-    val speed = speedBytesPerSecond?.takeIf { it > 0L && status.phase == DownloadPhase.Downloading }
-    val line = if (speed != null) {
-        baseLine + DownloadTextSeparator + stringResource(Res.string.downloads_speed, formatBytes(speed))
-    } else {
-        baseLine
     }
     return if (status.isAuto) {
         stringResource(Res.string.downloads_status_auto) + " • " + line
