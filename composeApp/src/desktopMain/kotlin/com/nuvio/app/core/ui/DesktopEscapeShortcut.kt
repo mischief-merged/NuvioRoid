@@ -13,11 +13,38 @@ internal object DesktopEscapeShortcut {
     @Volatile
     var onBack: (() -> Unit)? = null
 
+    private val localHandlers = mutableListOf<() -> Unit>()
+
     fun register(handler: () -> Unit) {
         onBack = handler
     }
 
     fun unregister(handler: () -> Unit) {
         if (onBack === handler) onBack = null
+    }
+
+    fun registerLocal(handler: () -> Unit) {
+        synchronized(localHandlers) {
+            localHandlers.removeAll { it === handler }
+            localHandlers.add(handler)
+        }
+    }
+
+    fun unregisterLocal(handler: () -> Unit) {
+        synchronized(localHandlers) {
+            localHandlers.removeAll { it === handler }
+        }
+    }
+
+    /** Runs the innermost active local back handler, or falls back to the root navigation back handler. */
+    fun dispatchBack(): Boolean {
+        val local = synchronized(localHandlers) { localHandlers.lastOrNull() }
+        if (local != null) {
+            local()
+            return true
+        }
+        val root = onBack ?: return false
+        root()
+        return true
     }
 }

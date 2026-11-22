@@ -33,8 +33,7 @@ internal fun DesktopKeyboardShortcutHost() {
             val nowMs = System.currentTimeMillis()
             if (nowMs - lastEscapeAtMs < ESCAPE_DEBOUNCE_MS) return@KeyEventDispatcher true
             lastEscapeAtMs = nowMs
-            val back = DesktopEscapeShortcut.onBack ?: return@KeyEventDispatcher false
-            back()
+            if (!DesktopEscapeShortcut.dispatchBack()) return@KeyEventDispatcher false
             true
         }
         KeyboardFocusManager.getCurrentKeyboardFocusManager()
