@@ -78,7 +78,11 @@ object AuthRepository {
                         }
                         is SessionStatus.NotAuthenticated -> {
                             if (AuthStorage.loadFlag(KEY_HAD_ACCOUNT_SESSION)) {
-                                resetAfterLostSession()
+                                if (com.nuvio.app.core.storage.credentialAccess.blocked.value) {
+                                    log.w { "Secure storage is unavailable; not treating this as a lost session" }
+                                } else {
+                                    resetAfterLostSession()
+                                }
                             } else {
                                 _state.value = AuthState.Unauthenticated
                             }
@@ -103,7 +107,7 @@ object AuthRepository {
             validatedRemoteUserId = userId
             true
         }.getOrElse { e ->
-            val invalid = if (e.isJwtExpiredError()) refreshRejected() else e.isInvalidSessionError()
+            val invalid = if (e.isJwtExpiredError()) refreshRejected() else shouldClearLocalSessionAfterValidationError(e)
             if (invalid) {
                 log.w(e) { "Stored Supabase session no longer belongs to an active account; clearing local auth" }
                 clearLocalSessionAfterRemoteInvalidation()

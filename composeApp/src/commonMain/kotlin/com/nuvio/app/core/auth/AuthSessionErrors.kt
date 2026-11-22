@@ -1,5 +1,6 @@
 package com.nuvio.app.core.auth
 
+import com.nuvio.app.core.storage.SecureStorageUnavailable
 import io.github.jan.supabase.exceptions.RestException
 
 private val invalidSessionMarkers = listOf(
@@ -30,6 +31,36 @@ internal inline fun <reified T : Throwable> Throwable.findCause(): T? {
         current = current.cause
     }
     return null
+}
+
+internal fun shouldClearLocalSessionAfterValidationError(error: Throwable): Boolean {
+    if (error.isTransientKeepSessionError()) return false
+    if (error.isJwtExpiredError()) return false
+    return error.isInvalidSessionError()
+}
+
+internal fun Throwable.isTransientKeepSessionError(): Boolean {
+    if (findCause<SecureStorageUnavailable>() != null) return true
+    var current: Throwable? = this
+    while (current != null) {
+        when (current::class.simpleName) {
+            "SocketTimeoutException", "UnknownHostException", "ConnectException",
+            "SocketException", "HttpRequestTimeoutException",
+            -> return true
+        }
+        current = current.cause
+    }
+    val messages = authMessages()
+    return "secure storage" in messages ||
+        "user canceled" in messages ||
+        "(-128)" in messages ||
+        "timed out" in messages ||
+        "timeout" in messages ||
+        "unknown host" in messages ||
+        "no address" in messages ||
+        "network unreachable" in messages ||
+        "failed to connect" in messages ||
+        "connection refused" in messages
 }
 
 internal fun Throwable.isJwtExpiredError(): Boolean = "jwt expired" in authMessages()

@@ -26,6 +26,8 @@ class DesktopSessionSettingsTest {
             assertFalse(Files.exists(directory.resolve("session.properties")))
             locked = false
             assertEquals("old-session", settings.getStringOrNull("session"))
+            assertEquals("old-session", legacy.getStringOrNull("session"))
+            assertEquals("old-session", settings.getStringOrNull("session"))
             assertNull(legacy.getStringOrNull("session"))
             settings.putString("sb-example-session", settings.getStringOrNull("session")!!)
             settings.remove("session")
@@ -78,6 +80,54 @@ class DesktopSessionSettingsTest {
         keys.forEach { assertNull(legacy.getStringOrNull(it)) }
         assertEquals("kept", legacy.getStringOrNull("unrelated"))
         assertTrue(flushed)
+    }
+
+    @Test fun startupMigrationThenAuthLoadKeepsALegacySessionWhenTheNewStoreCannotBeReadBack() = kotlinx.coroutines.runBlocking {
+        val directory = Files.createTempDirectory("session-startup")
+        try {
+            val sessionKey = "sb-https:--example-supabase-co-session"
+            val sessionJson = """{"access_token":"access-token","refresh_token":"refresh-token","expires_in":3600,"token_type":"bearer"}"""
+            val saved = mutableMapOf<String, String>()
+            val vault = object : CredentialVault {
+                override fun read(account: String): String? = saved[account]
+                override fun write(account: String, value: String) { saved[account] = value }
+                override fun remove(account: String) { saved.remove(account) }
+            }
+            val file = directory.resolve("nuvio_account_sessions.properties")
+            val legacy = PropertiesSettings(Properties().apply { setProperty(sessionKey, sessionJson) })
+            val store = DesktopStorage.Store(file, vault, { true }, {})
+            DesktopSessionSettings(legacy, store) {}.migrate()
+
+            val denied = object : CredentialVault {
+                override fun read(account: String): String? { error("user canceled") }
+                override fun write(account: String, value: String) { error("user canceled") }
+                override fun remove(account: String) {}
+            }
+            val cold = DesktopSessionSettings(legacy, DesktopStorage.Store(file, denied, { true }, {})) {}
+            val loaded = io.github.jan.supabase.auth.SettingsSessionManager(settings = cold, key = sessionKey).loadSession()
+            assertEquals("access-token", loaded?.accessToken)
+            assertEquals(sessionJson, cold.getStringOrNull(sessionKey))
+            assertEquals(sessionJson, legacy.getStringOrNull(sessionKey))
+        } finally { directory.toFile().deleteRecursively() }
+    }
+
+    @Test fun aCanceledKeychainWriteKeepsTheLegacySessionAndStaysSignedIn() = kotlinx.coroutines.runBlocking {
+        val directory = Files.createTempDirectory("session-cancel")
+        try {
+            val sessionKey = "sb-https:--example-supabase-co-session"
+            val sessionJson = """{"access_token":"access-token","refresh_token":"refresh-token","expires_in":3600,"token_type":"bearer"}"""
+            val vault = object : CredentialVault {
+                override fun read(account: String): String? { error("user canceled") }
+                override fun write(account: String, value: String) { error("user canceled") }
+                override fun remove(account: String) {}
+            }
+            val legacy = PropertiesSettings(Properties().apply { setProperty(sessionKey, sessionJson) })
+            val settings = DesktopSessionSettings(legacy, DesktopStorage.Store(directory.resolve("session.properties"), vault, { true }, {})) {}
+            settings.migrate()
+            val loaded = io.github.jan.supabase.auth.SettingsSessionManager(settings = settings, key = sessionKey).loadSession()
+            assertEquals("access-token", loaded?.accessToken)
+            assertEquals(sessionJson, legacy.getStringOrNull(sessionKey))
+        } finally { directory.toFile().deleteRecursively() }
     }
 
 }

@@ -9,7 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Signing out, a lost session or deleting the account wipes the app's data, never the user's downloaded videos. */
+/** Signing out or a lost session drops the account session and never deletes the user's local data files. */
 class AppDataWipeKeepsDownloadsTest {
     private val root = Files.createTempDirectory("nuvio-wipe").toRealPath()
 
@@ -32,5 +32,30 @@ class AppDataWipeKeepsDownloadsTest {
         assertTrue(subtitles.exists() && journal.exists())
         assertFalse(settings.exists())
         assertFalse(cache.exists())
+    }
+
+    @Test
+    fun a_lost_session_or_sign_out_leaves_library_downloads_watch_progress_rules_profiles_and_player_settings() {
+        val kept = listOf(
+            "nuvio_library.properties",
+            "nuvio_downloads.properties",
+            "nuvio_watch_progress.properties",
+            "nuvio_auto_downloads.properties",
+            "nuvio_profile_cache.properties",
+            "nuvio_player_settings.properties",
+        )
+        kept.forEach { Files.writeString(root.resolve(it), "keep=true") }
+        val video = root.resolve("downloads/Film.mkv").also { it.parent.createDirectories(); Files.writeString(it, "the film") }
+        Files.writeString(root.resolve("nuvio_account_sessions.properties"), "session=@keychain:v1:dead")
+
+        DesktopStorage.wipeCredentialsAndFiles(root, {}, { name ->
+            if (name == "nuvio_account_sessions") Files.deleteIfExists(root.resolve("$name.properties"))
+        })
+
+        kept.forEach { name ->
+            assertTrue(root.resolve(name).exists(), name)
+            assertEquals("keep=true", Files.readString(root.resolve(name)))
+        }
+        assertEquals("the film", Files.readString(video))
     }
 }

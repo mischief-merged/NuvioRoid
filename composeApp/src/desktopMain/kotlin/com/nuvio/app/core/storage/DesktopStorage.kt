@@ -77,23 +77,40 @@ internal object DesktopStorage {
         java.nio.channels.FileChannel.open(root, java.nio.file.StandardOpenOption.READ).use { it.force(true) }
         var failure: Throwable? = null
         runCatching(clearLegacy).onFailure { failure = it }
-        DesktopCredentials.storeNames.forEach { name ->
-            runCatching { clearStore(name) }.onFailure { if (failure == null) failure = it }
-        }
+        runCatching { clearStore(ACCOUNT_SESSION_STORE) }.onFailure { if (failure == null) failure = it }
         if (failure != null) throw SecureStorageUnavailable()
-        wipeFolder(root, KeptOnWipe + pending.fileName.toString())
-        val remaining = Files.list(root).use { files ->
-            files.anyMatch { it != pending && it.fileName.toString() !in KeptOnWipe }
-        }
-        if (remaining) throw SecureStorageUnavailable()
+        removeAccountSessionFiles(root)
         Files.delete(pending)
         java.nio.channels.FileChannel.open(root, java.nio.file.StandardOpenOption.READ).use { it.force(true) }
     }
 
+    private const val ACCOUNT_SESSION_STORE = "nuvio_account_sessions"
+
+    private fun removeAccountSessionFiles(root: Path) {
+        val names = listOf(
+            "$ACCOUNT_SESSION_STORE.properties",
+            "$ACCOUNT_SESSION_STORE.properties.bak",
+            "$ACCOUNT_SESSION_STORE.properties.tmp",
+            "$ACCOUNT_SESSION_STORE.properties.secure-tmp",
+            "$ACCOUNT_SESSION_STORE.properties.bak.secure-tmp",
+            "$ACCOUNT_SESSION_STORE.properties.tmp.secure-tmp",
+        )
+        names.forEach { name ->
+            val path = root.resolve(name)
+            if (!Files.exists(path)) return@forEach
+            try {
+                Files.deleteIfExists(path)
+            } catch (_: Exception) {
+                throw SecureStorageUnavailable()
+            }
+            if (Files.exists(path)) throw SecureStorageUnavailable()
+        }
+    }
+
     /**
-     * What a wipe of the app's data (sign-out, a lost session, account deletion) never touches: the app's own
-     * downloads folder, which holds the user's downloaded videos, and the move journals that may still name
-     * copies of them. Settings and lists go; the files stay where they are.
+     * Folders a full data-folder sweep never touches: downloaded videos and the move journals that may
+     * still name copies of them. Sign-out and a lost session no longer run that sweep; they only drop
+     * the account session.
      */
     internal val KeptOnWipe = setOf("downloads", "moves")
 
