@@ -1132,6 +1132,8 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     mpv_set_option_string(mpv, name, value);
 }
 
+static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
+
 @implementation MpvWebPlayer {
     NSView *_hostView;
     PlayerMetalView *_videoView;
@@ -1148,6 +1150,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     NSInteger _windowTrackingEdge;
     NSPoint _windowTrackingStartMouse;
     NSRect _windowTrackingStartFrame;
+    BOOL _allowsRemoteCommands;
     BOOL _remoteCommandsActive;
     id _toggleCommandTarget;
     id _playCommandTarget;
@@ -1332,6 +1335,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
         }
         return [strongSelf handleMediaKeyEvent:event];
     }];
+    _allowsRemoteCommands = YES;
     [self activateRemoteCommands];
     [self layoutNativeSubviews];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -2127,6 +2131,31 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     }
 }
 
+- (void)applyMiniPlayerMode:(BOOL)nextMiniPlayer {
+    if (nextMiniPlayer == _isInMiniPlayer) {
+        return;
+    }
+    _isInMiniPlayer = nextMiniPlayer;
+    _lastAppliedNativeLayoutBounds = NSZeroRect;
+    _lastAppliedNativeLayoutWasLiveResize = NO;
+    _lightweightResizeSettleUntil = 0.0;
+    if (!_fullscreenTransitionActive) {
+        [_videoView setFullscreenTransitionActive:NO];
+    }
+    [self layoutNativeSubviews];
+    [_videoView updateMetalLayerLayout];
+    [_videoView scheduleRenderUpdate];
+    if (nextMiniPlayer) {
+        _didFocusControlsWebView = NO;
+        NSWindow *window = _hostView.window;
+        NSView *contentView = window.contentView;
+        if (window && contentView && [window.firstResponder isKindOfClass:[NSView class]] &&
+            [(NSView *)window.firstResponder isDescendantOf:_hostView]) {
+            [window makeFirstResponder:contentView];
+        }
+    }
+}
+
 - (void)updateControlsJson:(NSString *)controlsJson {
     if (!_webView) {
         return;
@@ -2135,27 +2164,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
         return;
     }
     BOOL nextMiniPlayer = [controlsJson rangeOfString:@"\"isInMiniPlayer\":true"].location != NSNotFound;
-    if (nextMiniPlayer != _isInMiniPlayer) {
-        _isInMiniPlayer = nextMiniPlayer;
-        _lastAppliedNativeLayoutBounds = NSZeroRect;
-        _lastAppliedNativeLayoutWasLiveResize = NO;
-        _lightweightResizeSettleUntil = 0.0;
-        if (!_fullscreenTransitionActive) {
-            [_videoView setFullscreenTransitionActive:NO];
-        }
-        [self layoutNativeSubviews];
-        [_videoView updateMetalLayerLayout];
-        [_videoView scheduleRenderUpdate];
-        if (nextMiniPlayer) {
-            _didFocusControlsWebView = NO;
-            NSWindow *window = _hostView.window;
-            NSView *contentView = window.contentView;
-            if (window && contentView && [window.firstResponder isKindOfClass:[NSView class]] &&
-                [(NSView *)window.firstResponder isDescendantOf:_hostView]) {
-                [window makeFirstResponder:contentView];
-            }
-        }
-    }
+    [self applyMiniPlayerMode:nextMiniPlayer];
     _pendingControlsJson = [controlsJson copy];
     [self flushPendingControlsJsonIfReady];
 }
@@ -3104,7 +3113,11 @@ static void nuvioMpvWakeup(void *ctx) {
         return event;
     }
 
-    if (!NSApp.isActive) {
+    if (!NSApp.isActive || !_allowsRemoteCommands) {
+        return event;
+    }
+    MpvWebPlayer *currentOwner = gRemoteCommandOwner;
+    if (currentOwner != nil && currentOwner != self) {
         return event;
     }
 
@@ -3118,23 +3131,36 @@ static void nuvioMpvWakeup(void *ctx) {
     return nil;
 }
 
+- (void)setRemoteCommandsEnabled:(BOOL)enabled {
+    _allowsRemoteCommands = enabled;
+    if (enabled) {
+        [self activateRemoteCommands];
+    } else {
+        [self deactivateRemoteCommands];
+    }
+}
+
 // Registers with the system's now-playing infrastructure so macOS (rcd) routes
 // hardware media keys here instead of launching the default media app (Music).
-// While registration is active, the local NSSystemDefined monitor only swallows
-// the raw key events; playback commands arrive through these handlers.
+// Only one player instance owns remote command registration at a time, and its
+// handlers are removed individually so another player shutting down never clears them.
 - (void)activateRemoteCommands {
-    if (_remoteCommandsActive) {
+    if (!_allowsRemoteCommands || _remoteCommandsActive) {
         return;
     }
+    MpvWebPlayer *currentOwner = gRemoteCommandOwner;
+    if (currentOwner != nil && currentOwner != self) {
+        return;
+    }
+    gRemoteCommandOwner = self;
     _remoteCommandsActive = YES;
     __weak MpvWebPlayer *weakSelf = self;
     MPRemoteCommandCenter *center = [MPRemoteCommandCenter sharedCommandCenter];
-
     center.togglePlayPauseCommand.enabled = YES;
     _toggleCommandTarget = [center.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"keyboardToggle"];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3144,7 +3170,7 @@ static void nuvioMpvWakeup(void *ctx) {
     _playCommandTarget = [center.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPlay"];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3154,7 +3180,7 @@ static void nuvioMpvWakeup(void *ctx) {
     _pauseCommandTarget = [center.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPause"];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3164,7 +3190,7 @@ static void nuvioMpvWakeup(void *ctx) {
     _nextCommandTarget = [center.nextTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"mediaNext"];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3174,7 +3200,7 @@ static void nuvioMpvWakeup(void *ctx) {
     _previousCommandTarget = [center.previousTrackCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent *event) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaKeyPlayerEvent:@"mediaPrevious"];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3189,7 +3215,7 @@ static void nuvioMpvWakeup(void *ctx) {
         long long targetMs = (long long)llround(requestedSeconds * 1000.0);
         dispatch_async(dispatch_get_main_queue(), ^{
             MpvWebPlayer *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv) return;
+            if (!strongSelf || !strongSelf->_remoteCommandsActive || !strongSelf->_mpv || gRemoteCommandOwner != strongSelf) return;
             [strongSelf dispatchMediaSeekToMilliseconds:targetMs];
         });
         return MPRemoteCommandHandlerStatusSuccess;
@@ -3236,9 +3262,14 @@ static void nuvioMpvWakeup(void *ctx) {
     }
     center.changePlaybackPositionCommand.enabled = NO;
 
+    // The instance that reaches here is the registered owner. Clear Now Playing,
+    // then drop ownership so the next player can register on the shared center.
     MPNowPlayingInfoCenter *info = [MPNowPlayingInfoCenter defaultCenter];
     info.playbackState = MPNowPlayingPlaybackStateStopped;
     info.nowPlayingInfo = nil;
+    if (gRemoteCommandOwner == self) {
+        gRemoteCommandOwner = nil;
+    }
     _lastNowPlayingTitle = nil;
     _lastNowPlayingPaused = YES;
     _lastNowPlayingDuration = 0.0;
@@ -3312,7 +3343,7 @@ static void nuvioMpvWakeup(void *ctx) {
 }
 
 - (void)pushNowPlayingArtwork {
-    if (!_remoteCommandsActive) {
+    if (!_remoteCommandsActive || gRemoteCommandOwner != self) {
         return;
     }
     [self pushCurrentNowPlayingInfoFromCache];
@@ -3323,7 +3354,7 @@ static void nuvioMpvWakeup(void *ctx) {
                          position:(double)position
                            paused:(BOOL)paused
                             speed:(double)speed {
-    if (!_remoteCommandsActive) {
+    if (!_remoteCommandsActive || gRemoteCommandOwner != self) {
         return;
     }
     // The system extrapolates elapsed time from rate, so only push an update on
@@ -3626,6 +3657,36 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setNowPlayingMetad
         [player setNowPlayingTitle:[NSString stringWithUTF8String:titleText.c_str()]
                           subtitle:[NSString stringWithUTF8String:subtitleText.c_str()]
                         artworkUrl:[NSString stringWithUTF8String:url.c_str()]];
+    });
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setRemoteCommandsEnabled(
+    JNIEnv * /* env */,
+    jobject /* bridge */,
+    jlong handle,
+    jboolean enabled
+) {
+    if (handle == 0) return;
+    MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
+    BOOL allowCommands = enabled == JNI_TRUE;
+    runOnMainAsync(^{
+        [player setRemoteCommandsEnabled:allowCommands];
+    });
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setMiniPlayerMode(
+    JNIEnv * /* env */,
+    jobject /* bridge */,
+    jlong handle,
+    jboolean inMiniPlayer
+) {
+    if (handle == 0) return;
+    MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
+    BOOL miniMode = inMiniPlayer == JNI_TRUE;
+    runOnMainAsync(^{
+        [player applyMiniPlayerMode:miniMode];
     });
 }
 

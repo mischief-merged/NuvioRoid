@@ -438,6 +438,7 @@ fun main(args: Array<String>) {
                 NuvioTheme {
                     PlatformPlayerSurface(
                         sourceUrl = smokePlayerUrl,
+                        useNativeController = true,
                         modifier = Modifier.fillMaxSize(),
                         onControllerReady = {},
                         onSnapshot = {},

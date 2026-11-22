@@ -99,8 +99,8 @@ internal fun matchesActivePlaybackTarget(
     val currentVideoId = activeState?.videoId?.takeIf { it.isNotBlank() }
         ?: activeLaunch?.videoId?.takeIf { it.isNotBlank() }
     val candidateVideoId = videoId?.takeIf { it.isNotBlank() }
-    if (currentVideoId != null && candidateVideoId != null && currentVideoId == candidateVideoId) {
-        return true
+    if (currentVideoId != null && candidateVideoId != null) {
+        return currentVideoId == candidateVideoId
     }
 
     val currentParentId = activeState?.parentMetaId?.takeIf { it.isNotBlank() }
@@ -138,6 +138,9 @@ internal class PlayerSessionController(
 
     private var boundLaunchId: Long? = null
     private var boundControls by mutableStateOf<PlayerSessionControls?>(null)
+    private var closingLaunchId: Long? = null
+    private val pendingCloseCallbacks = mutableListOf<() -> Unit>()
+    private var confirmedReplacementCallback: (() -> Unit)? = null
 
     val hasActiveSession: Boolean
         get() = activeSession != null
@@ -167,6 +170,9 @@ internal class PlayerSessionController(
         )
         boundLaunchId = null
         boundControls = null
+        closingLaunchId = null
+        pendingCloseCallbacks.clear()
+        confirmedReplacementCallback = null
         activeSession = session
         playbackState = MiniPlayerPlaybackState(
             title = launch.title,
@@ -305,12 +311,41 @@ internal class PlayerSessionController(
         }
     }
 
+    fun requestTrailerOrAskToReplace(
+        contentTitle: String,
+        trailerTitle: String = "",
+        onProceed: () -> Unit,
+    ) {
+        val cleanContent = contentTitle.trim()
+        val cleanTrailer = trailerTitle.trim()
+        val label = when {
+            cleanContent.isNotEmpty() && cleanTrailer.isNotEmpty() &&
+                !cleanTrailer.equals(cleanContent, ignoreCase = true) -> "$cleanContent — $cleanTrailer"
+            cleanContent.isNotEmpty() -> cleanContent
+            else -> cleanTrailer
+        }
+        launchOrAskToReplace(
+            incomingTitle = label,
+            videoId = null,
+            parentMetaId = null,
+            seasonNumber = null,
+            episodeNumber = null,
+            sourceUrl = null,
+            allowSameTargetReopen = false,
+            onProceed = onProceed,
+        )
+    }
+
     fun confirmPendingReplacement() {
         val pending = pendingReplacement ?: return
         pendingReplacement = null
-        closeActiveSession {
+        val current = activeSession ?: run {
             pending.onConfirm()
+            return
         }
+        prepareClosingState(current.launchId)
+        confirmedReplacementCallback = pending.onConfirm
+        requestSessionClose(current)
     }
 
     fun cancelPendingReplacement() {
@@ -368,14 +403,36 @@ internal class PlayerSessionController(
             onClosed()
             return
         }
+        prepareClosingState(current.launchId)
+        pendingCloseCallbacks += onClosed
+        requestSessionClose(current)
+    }
+
+    fun notifyCloseFailed(launchId: Long) {
+        if (closingLaunchId != launchId) return
+        closingLaunchId = null
+        pendingCloseCallbacks.clear()
+        confirmedReplacementCallback = null
+    }
+
+    private fun prepareClosingState(launchId: Long) {
+        if (closingLaunchId != launchId) {
+            closingLaunchId = launchId
+            pendingCloseCallbacks.clear()
+            confirmedReplacementCallback = null
+        }
+    }
+
+    private fun requestSessionClose(current: ActivePlayerSession) {
         val controls = boundControls.takeIf { boundLaunchId == current.launchId }
         if (controls != null) {
-            controls.requestClose(onClosed)
+            controls.requestClose {
+                clearSession(current.launchId)
+            }
         } else {
             ResumePromptRepository.markPlayerExitedNormally()
             PlayerLaunchStore.remove(current.launchId)
             clearSession(current.launchId)
-            onClosed()
         }
     }
 
@@ -388,7 +445,21 @@ internal class PlayerSessionController(
             boundLaunchId = null
             boundControls = null
         }
+        val closeCallbacks: List<() -> Unit>
+        val replacementCallback: (() -> Unit)?
+        if (closingLaunchId == launchId) {
+            closingLaunchId = null
+            closeCallbacks = pendingCloseCallbacks.toList()
+            pendingCloseCallbacks.clear()
+            replacementCallback = confirmedReplacementCallback
+            confirmedReplacementCallback = null
+        } else {
+            closeCallbacks = emptyList()
+            replacementCallback = null
+        }
         ActivePlayerSessionRegistry.setActive(false)
+        closeCallbacks.forEach { it.invoke() }
+        replacementCallback?.invoke()
         return true
     }
 }

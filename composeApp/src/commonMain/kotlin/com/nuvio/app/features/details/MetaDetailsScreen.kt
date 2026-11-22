@@ -60,6 +60,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -149,6 +150,7 @@ import com.nuvio.app.features.library.TrackingMembershipRemovalConfirmationHost
 import com.nuvio.app.features.library.executeTrackingMembershipOperation
 import com.nuvio.app.features.library.showTrackingMembershipRewriteFeedback
 import com.nuvio.app.features.library.toLibraryItem
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.shuffle.EpisodeShuffleRepository
 import com.nuvio.app.features.shuffle.EpisodeShuffleSheet
@@ -223,6 +225,7 @@ fun MetaDetailsScreen(
     onBack: () -> Unit,
     onPlay: ((type: String, videoId: String, parentMetaId: String, parentMetaType: String, title: String, logo: String?, poster: String?, background: String?, seasonNumber: Int?, episodeNumber: Int?, episodeTitle: String?, episodeThumbnail: String?, pauseDescription: String?, resumePositionMs: Long?) -> Unit)? = null,
     onPlayManually: ((type: String, videoId: String, parentMetaId: String, parentMetaType: String, title: String, logo: String?, poster: String?, background: String?, seasonNumber: Int?, episodeNumber: Int?, episodeTitle: String?, episodeThumbnail: String?, pauseDescription: String?, resumePositionMs: Long?) -> Unit)? = null,
+    onRequestInAppTrailer: ((contentTitle: String, trailerTitle: String, onProceed: () -> Unit) -> Unit)? = null,
     onOpenMeta: ((MetaPreview) -> Unit)? = null,
     onCastClick: ((MetaPerson, String?) -> Unit)? = null,
     onCompanyClick: ((MetaCompany, String) -> Unit)? = null,
@@ -798,13 +801,24 @@ fun MetaDetailsScreen(
                 var trailerErrorMessage by remember(meta.id) { mutableStateOf<String?>(null) }
                 var trailerRequestToken by remember(meta.id) { mutableIntStateOf(0) }
                 var isLeavingDetails by remember(meta.id) { mutableStateOf(false) }
+                val activePlayerSession by ActivePlayerSessionRegistry.isActive.collectAsStateWithLifecycle()
                 val heroTrailerCandidate = remember(meta.trailers) {
                     selectHeroTrailer(meta.trailers)
                 }
-                val heroTrailerPlaybackEnabled = AppFeaturePolicy.heroTrailerPlaybackSupported &&
+                val heroTrailerPlaybackEnabled = !activePlayerSession &&
+                    AppFeaturePolicy.heroTrailerPlaybackSupported &&
                     inAppTrailerPlaybackEnabled &&
                     trailersAvailableOffline &&
                     metaScreenSettingsUiState.heroTrailerPlayback
+                LaunchedEffect(activePlayerSession) {
+                    if (activePlayerSession && selectedTrailer != null) {
+                        trailerRequestToken += 1
+                        trailerLoading = false
+                        trailerPlaybackSource = null
+                        trailerErrorMessage = null
+                        selectedTrailer = null
+                    }
+                }
                 var heroTrailerPlaybackSource by remember(meta.id, heroTrailerCandidate?.id) { mutableStateOf<TrailerPlaybackSource?>(null) }
                 var heroTrailerReady by remember(meta.id, heroTrailerCandidate?.id) { mutableStateOf(false) }
                 var heroTrailerFinished by remember(meta.id, heroTrailerCandidate?.id) { mutableStateOf(false) }
@@ -844,32 +858,52 @@ fun MetaDetailsScreen(
                         trailerLoading = false
                     }
                 }
-                val resolveTrailer: (MetaTrailer) -> Unit = remember(meta.id, trailerPlaybackMode, uriHandler, connection.travel.previewsAllowed) {
+                val latestOnRequestInAppTrailer = rememberUpdatedState(onRequestInAppTrailer)
+                val resolveTrailer: (MetaTrailer) -> Unit = remember(
+                    meta.id,
+                    meta.name,
+                    trailerPlaybackMode,
+                    uriHandler,
+                    connection.travel.previewsAllowed,
+                ) {
                     { trailer ->
                         val youtubeUrl = trailer.youtubePlaybackUrl()
                         if (connection.travel.previewsAllowed) when (trailerPlaybackMode) {
                             TrailerPlaybackMode.EXTERNAL -> runCatching { uriHandler.openUri(youtubeUrl) }
                             TrailerPlaybackMode.IN_APP -> {
-                                selectedTrailer = trailer
-                                trailerPlaybackSource = null
-                                trailerErrorMessage = null
-                                trailerLoading = true
-                                trailerRequestToken += 1
-                                val currentRequestToken = trailerRequestToken
-                                trailerScope.launch {
-                                    val resolvedSource = runCatching {
-                                        TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
-                                    }.getOrNull()
-                                    if (currentRequestToken != trailerRequestToken) {
-                                        return@launch
+                                val startTrailer = {
+                                    selectedTrailer = trailer
+                                    trailerPlaybackSource = null
+                                    trailerErrorMessage = null
+                                    trailerLoading = true
+                                    trailerRequestToken += 1
+                                    val currentRequestToken = trailerRequestToken
+                                    trailerScope.launch {
+                                        val resolvedSource = runCatching {
+                                            TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
+                                        }.getOrNull()
+                                        if (currentRequestToken != trailerRequestToken) {
+                                            return@launch
+                                        }
+                                        trailerPlaybackSource = resolvedSource
+                                        trailerErrorMessage = if (resolvedSource == null) {
+                                            getString(Res.string.trailer_no_playable_stream)
+                                        } else {
+                                            null
+                                        }
+                                        trailerLoading = false
                                     }
-                                    trailerPlaybackSource = resolvedSource
-                                    trailerErrorMessage = if (resolvedSource == null) {
-                                        getString(Res.string.trailer_no_playable_stream)
-                                    } else {
-                                        null
-                                    }
-                                    trailerLoading = false
+                                    Unit
+                                }
+                                val requestHook = latestOnRequestInAppTrailer.value
+                                if (requestHook != null) {
+                                    requestHook(
+                                        meta.name,
+                                        trailer.displayName ?: trailer.name,
+                                        startTrailer,
+                                    )
+                                } else if (!ActivePlayerSessionRegistry.isActive.value) {
+                                    startTrailer()
                                 }
                             }
                         }

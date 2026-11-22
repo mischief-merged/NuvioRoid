@@ -43,12 +43,12 @@ actual fun HeroTrailerPlayerSurface(
     onError: () -> Unit,
 ) {
     val activePlayerSession by ActivePlayerSessionRegistry.isActive.collectAsState()
-    val effectivePlayWhenReady = playWhenReady && !activePlayerSession
+    if (activePlayerSession) return
     key(sourceUrl, sourceAudioUrl, startPositionMillis) {
         DesktopTrailerPlayerSession(
             sourceUrl = sourceUrl,
             sourceAudioUrl = sourceAudioUrl,
-            playWhenReady = effectivePlayWhenReady,
+            playWhenReady = playWhenReady,
             muted = muted,
             startPositionMillis = startPositionMillis,
             fillFrame = fillFrame,

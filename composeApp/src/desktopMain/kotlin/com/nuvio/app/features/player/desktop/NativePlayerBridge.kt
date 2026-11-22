@@ -96,6 +96,12 @@ internal object NativePlayerBridge {
 
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
     external fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
+
+    /** macOS only: enables or releases remote media-key and Now Playing ownership for this player. */
+    external fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean)
+
+    /** macOS only: marks docked mini-player mode so native layout and background timers adapt cleanly. */
+    external fun setMiniPlayerMode(handle: Long, inMiniPlayer: Boolean)
     external fun requestFocus(handle: Long)
     external fun beginWindowDrag(handle: Long)
     external fun setWindowResizable(windowHwnd: Long, enabled: Boolean)

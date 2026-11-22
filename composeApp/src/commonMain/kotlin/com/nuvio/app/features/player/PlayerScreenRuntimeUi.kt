@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
@@ -111,21 +112,25 @@ internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
         null
     }
     val latestNextEpisodeAction = rememberUpdatedState(nextEpisodeAction)
-    DisposableEffect(runtime, controlsRegistration) {
-        controlsRegistration?.invoke(
-            PlayerSessionControls(
-                togglePlayback = { runtime.togglePlayback() },
-                resumePlayback = {
-                    if (!runtime.playbackSnapshot.isPlaying) {
-                        runtime.togglePlayback()
-                    }
-                },
-                seekForward = { runtime.seekBy(10_000L) },
-                playNextEpisode = { latestNextEpisodeAction.value?.invoke() },
-                requestClose = { onClosed -> runtime.requestClose(afterClosed = onClosed) },
-                requestBack = { runtime.requestBack() },
-            ),
+    val sessionControls = remember(runtime) {
+        PlayerSessionControls(
+            togglePlayback = { runtime.togglePlayback() },
+            resumePlayback = {
+                if (!runtime.playbackSnapshot.isPlaying) {
+                    runtime.togglePlayback()
+                }
+            },
+            seekForward = { runtime.seekBy(10_000L) },
+            playNextEpisode = { latestNextEpisodeAction.value?.invoke() },
+            requestClose = { onClosed -> runtime.requestClose(afterClosed = onClosed) },
+            requestBack = { runtime.requestBack() },
         )
+    }
+    SideEffect {
+        controlsRegistration?.invoke(sessionControls)
+    }
+    DisposableEffect(runtime, controlsRegistration) {
+        controlsRegistration?.invoke(sessionControls)
         onDispose { controlsRegistration?.invoke(null) }
     }
     val onSessionStateChanged = args.onSessionStateChanged
@@ -1203,6 +1208,7 @@ internal fun PlayerScreenRuntime.requestClose(
                         return@releaseRetainedPlayerBeforeNavigation
                     }
                     errorMessage = message
+                    args.onSessionCloseFailed?.invoke()
                     releaseFailed(message)
                 },
             )

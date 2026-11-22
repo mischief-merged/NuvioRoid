@@ -110,8 +110,10 @@ internal fun BoxScope.PlayerSessionHost(
                     },
                     pop = {
                         val cleared = controller.clearSession(session.launchId)
-                        if (cleared) {
+                        if (cleared && !controller.hasActiveSession) {
                             openPendingExitTarget()
+                        } else if (cleared) {
+                            exitTarget.target = null
                         }
                         cleared
                     },
@@ -238,6 +240,7 @@ internal fun BoxScope.PlayerSessionHost(
             onRestoreMiniPlayer = { controller.restoreFullScreen() },
             onSessionStateChanged = { state -> controller.updatePlaybackState(session.launchId, state) },
             onSessionControlsChanged = { controls -> controller.bindControls(session.launchId, controls) },
+            onSessionCloseFailed = { controller.notifyCloseFailed(session.launchId) },
             onExitTarget = { exitTarget.target = it },
             onSystemBackHandlerChanged = { handler -> systemBackHandler = handler },
             onOpenInExternalPlayer = if (externalPlayerSupported) {

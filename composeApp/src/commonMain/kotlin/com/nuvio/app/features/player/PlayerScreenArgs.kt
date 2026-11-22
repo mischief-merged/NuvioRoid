@@ -45,6 +45,7 @@ internal data class PlayerScreenArgs(
     val onRestoreMiniPlayer: (() -> Unit)? = null,
     val onSessionStateChanged: ((MiniPlayerPlaybackState) -> Unit)? = null,
     val onSessionControlsChanged: ((PlayerSessionControls?) -> Unit)? = null,
+    val onSessionCloseFailed: (() -> Unit)? = null,
     val onSystemBackHandlerChanged: (handler: (() -> Unit)?) -> Unit = {},
     /** Told, before every Back request, where to go after it: null for a plain Back. */
     val onExitTarget: (PlayerExitTarget?) -> Unit = {},

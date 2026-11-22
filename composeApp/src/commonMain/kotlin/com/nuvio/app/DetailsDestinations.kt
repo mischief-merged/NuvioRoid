@@ -72,6 +72,7 @@ internal fun DetailsDestination(
     navController: NuvioNavigator,
     onPlay: ContentPlayAction,
     onPlayManually: ContentPlayAction,
+    onRequestInAppTrailer: ((contentTitle: String, trailerTitle: String, onProceed: () -> Unit) -> Unit)? = null,
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
 ) {
@@ -86,6 +87,7 @@ internal fun DetailsDestination(
         onBack = onBack,
         onPlay = onPlay,
         onPlayManually = onPlayManually,
+        onRequestInAppTrailer = onRequestInAppTrailer,
         onOpenMeta = onOpenMeta,
         onOpenEpisode = { video ->
             navController.navigate(

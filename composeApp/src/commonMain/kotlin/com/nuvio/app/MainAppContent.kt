@@ -1883,6 +1883,13 @@ internal fun MainAppContent(
                         navController = navController,
                         onPlay = onPlay,
                         onPlayManually = onPlayManually,
+                        onRequestInAppTrailer = { contentTitle, trailerTitle, startTrailer ->
+                            playerSessionController.requestTrailerOrAskToReplace(
+                                contentTitle = contentTitle,
+                                trailerTitle = trailerTitle,
+                                onProceed = startTrailer,
+                            )
+                        },
                         sharedTransitionScope = this@SharedTransitionLayout,
                         animatedVisibilityScope = LocalNavAnimatedContentScope.current,
                     )

@@ -17,6 +17,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,12 +31,27 @@ import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerPictureInPicture
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
 import com.nuvio.app.features.autosync.AutoSyncMpvCoordinator
 import com.nuvio.app.features.autosync.DesktopAutoSyncMpvPlatform
 import com.nuvio.app.features.autosync.withAutoSyncMessage
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
+
+internal data class DesktopNativePlayerHooks(
+    val createController: (NativePlayerHost, Boolean) -> NativePlayerController = { host, enableRemoteCommands ->
+        NativePlayerController(
+            host = host,
+            lifecycleCoordinator = NativePlayerLifecycleCoordinator.Default,
+            remoteCommandsEnabledByDefault = enableRemoteCommands,
+        )
+    },
+    val forceHostReady: Boolean = false,
+    val attachDelayMs: Long = 16L,
+)
+
+internal val LocalDesktopNativePlayerHooks = staticCompositionLocalOf { DesktopNativePlayerHooks() }
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -124,10 +140,11 @@ private fun NativePlayerSurface(
     onError: (String?) -> Unit,
 ) {
     val platformDensity = LocalNuvioPlatformDensity.current
+    val nativeHooks = LocalDesktopNativePlayerHooks.current
     val host = remember { NativePlayerHost() }
-    val controller = remember(host) { NativePlayerController(host) }
-    val hostFirstPaintComplete = remember { mutableStateOf(false) }
-    val hostFirstFullSizePaintComplete = remember { mutableStateOf(false) }
+    val controller = remember(host, nativeHooks) { nativeHooks.createController(host, useNativeController) }
+    val hostFirstPaintComplete = remember { mutableStateOf(nativeHooks.forceHostReady) }
+    val hostFirstFullSizePaintComplete = remember { mutableStateOf(nativeHooks.forceHostReady) }
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestExternalSubtitles = rememberUpdatedState(externalSubtitles)
     val latestPlayerControlsState = rememberUpdatedState(playerControlsState)
@@ -174,16 +191,22 @@ private fun NativePlayerSurface(
     val nvidiaRtxHdrEnabled = playerSettings.nvidiaRtxHdrEnabled
 
     SideEffect {
+        controller.setRemoteCommandsEnabled(useNativeController)
+        controller.setMiniPlayerMode(controlsState.isInMiniPlayer)
         onControllerReady(readyController)
     }
 
-    DisposableEffect(host, useNativeController) {
+    DisposableEffect(host, useNativeController, nativeHooks.forceHostReady) {
+        if (nativeHooks.forceHostReady) {
+            hostFirstPaintComplete.value = true
+            hostFirstFullSizePaintComplete.value = true
+        }
         if (useNativeController) {
             DesktopPlayerPictureInPicture.setHost(host)
             DesktopPlayerPictureInPicture.setController(controller)
         }
         host.onDisplayableChanged = { displayable ->
-            if (!displayable) {
+            if (!displayable && !nativeHooks.forceHostReady) {
                 hostFirstPaintComplete.value = false
                 hostFirstFullSizePaintComplete.value = false
             }
@@ -252,7 +275,9 @@ private fun NativePlayerSurface(
         if (!sourceAvailable || !hostFirstFullSizePaintComplete.value) {
             return@LaunchedEffect
         }
-        delay(16L)
+        if (nativeHooks.attachDelayMs > 0L) {
+            delay(nativeHooks.attachDelayMs)
+        }
         controller.attach(
             sourceUrl = sourceUrl,
             sourceHeaders = playbackHeaders,
