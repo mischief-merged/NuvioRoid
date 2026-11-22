@@ -30,6 +30,9 @@ internal class CountingNativePlayerBackend(
         @Volatile var speed: Float = 1f,
         @Volatile var remoteCommandsEnabled: Boolean = true,
         @Volatile var miniPlayerMode: Boolean = false,
+        @Volatile var nowPlayingTitle: String = "",
+        @Volatile var nowPlayingSubtitle: String = "",
+        @Volatile var nowPlayingArtworkUrl: String = "",
         val eventSink: NativePlayerEventSink,
     )
 
@@ -41,6 +44,8 @@ internal class CountingNativePlayerBackend(
     val events: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val createdSources: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val disposedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+    val snapshotQueries = AtomicInteger(0)
+    val audioTrackQueries = AtomicInteger(0)
     val videoDimensionQueries = AtomicInteger(0)
 
     @Volatile
@@ -133,7 +138,13 @@ internal class CountingNativePlayerBackend(
         statesByHandle[handle]?.miniPlayerMode = inMini
     }
 
-    override fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String) = Unit
+    override fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String) {
+        statesByHandle[handle]?.apply {
+            nowPlayingTitle = title
+            nowPlayingSubtitle = subtitle
+            nowPlayingArtworkUrl = artworkUrl
+        }
+    }
 
     override fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean) {
         statesByHandle[handle]?.remoteCommandsEnabled = enabled
@@ -170,13 +181,19 @@ internal class CountingNativePlayerBackend(
     override fun setVolume(handle: Long, level: Float) = Unit
     override fun setResizeMode(handle: Long, mode: Int) = Unit
     override fun durationMs(handle: Long): Long = statesByHandle[handle]?.durationMs ?: 0L
-    override fun positionMs(handle: Long): Long = statesByHandle[handle]?.positionMs ?: 0L
+    override fun positionMs(handle: Long): Long {
+        snapshotQueries.incrementAndGet()
+        return statesByHandle[handle]?.positionMs ?: 0L
+    }
     override fun bufferedPositionMs(handle: Long): Long = statesByHandle[handle]?.bufferedPositionMs ?: 0L
     override fun isLoading(handle: Long): Boolean = statesByHandle[handle]?.loading ?: true
     override fun isEnded(handle: Long): Boolean = statesByHandle[handle]?.ended ?: false
     override fun isPaused(handle: Long): Boolean = statesByHandle[handle]?.paused ?: true
     override fun speed(handle: Long): Float = statesByHandle[handle]?.speed ?: 1f
-    override fun audioTracksJson(handle: Long): String = "[]"
+    override fun audioTracksJson(handle: Long): String {
+        audioTrackQueries.incrementAndGet()
+        return "[]"
+    }
     override fun subtitleTracksJson(handle: Long): String = "[]"
 
     override fun stringProperty(handle: Long, name: String): String = when (name) {

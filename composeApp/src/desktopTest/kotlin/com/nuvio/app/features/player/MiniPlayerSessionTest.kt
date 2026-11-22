@@ -1,8 +1,12 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -10,26 +14,42 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import com.nuvio.app.PlayerSessionHost
 import com.nuvio.app.core.ui.NuvioTheme
-import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
-import com.nuvio.app.performDesktopQuit
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.details.components.DetailActions
+import com.nuvio.app.features.details.components.SeasonDownloadButton
+import com.nuvio.app.features.downloads.AutoDownloadController
+import com.nuvio.app.features.downloads.AutoDownloadRemoval
+import com.nuvio.app.features.downloads.AutoDownloadRule
+import com.nuvio.app.features.downloads.AutoDownloadScope
+import com.nuvio.app.features.downloads.AutoDownloadStatus
 import com.nuvio.app.features.downloads.BatchQuality
 import com.nuvio.app.features.downloads.DownloadEnqueueResult
+import com.nuvio.app.features.downloads.DownloadItem
+import com.nuvio.app.features.downloads.DownloadStatus
 import com.nuvio.app.features.downloads.DownloadsUiState
 import com.nuvio.app.features.downloads.SeasonBatchDownloader
-import com.nuvio.app.features.downloads.SeasonBatchEpisode
-import com.nuvio.app.features.downloads.SeasonBatchRequest
-import com.nuvio.app.features.downloads.SeasonBatchStart
+import com.nuvio.app.features.downloads.SeasonDownloadDefaultsStorage
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
+import com.nuvio.app.features.tracking.TrackingProviderId
+import com.nuvio.app.features.tracking.TrackingScrobbleAction
+import com.nuvio.app.features.tracking.TrackingScrobbleCoordinator
+import com.nuvio.app.features.tracking.TrackingScrobbleEvent
+import com.nuvio.app.features.tracking.TrackingScrobbler
+import com.nuvio.app.performDesktopQuit
 import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.library.LibraryRepository
 import com.nuvio.app.features.plugins.runtime.PluginRuntime
@@ -60,7 +80,17 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.withTimeout
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.compose_action_pause
 import nuvio.composeapp.generated.resources.compose_player_close
+import nuvio.composeapp.generated.resources.compose_player_seek_forward_10
+import nuvio.composeapp.generated.resources.detail_btn_play
+import nuvio.composeapp.generated.resources.details_actions_menu_label
+import nuvio.composeapp.generated.resources.downloads_season_button
+import nuvio.composeapp.generated.resources.downloads_season_dialog_title
+import nuvio.composeapp.generated.resources.downloads_season_start
+import nuvio.composeapp.generated.resources.episodes_season
+import nuvio.composeapp.generated.resources.hero_add_to_library
+import nuvio.composeapp.generated.resources.hero_remove_from_library
 import nuvio.composeapp.generated.resources.player_replace_playback_confirm
 import nuvio.composeapp.generated.resources.player_replace_playback_keep
 import nuvio.composeapp.generated.resources.player_replace_playback_title
@@ -84,6 +114,7 @@ class MiniPlayerSessionTest {
     private val scope = CoroutineScope(testDispatcher + SupervisorJob())
     private val testSeriesId = "tt9991109"
     private val browsedSeriesId = "tt9992202"
+    private val testDialogProfileId = 9_900_099
     private val episodes = (1..4).map { number ->
         MetaVideo(
             id = "$testSeriesId:1:$number",
@@ -93,7 +124,7 @@ class MiniPlayerSessionTest {
         )
     }
 
-    private fun text(resource: StringResource): String = runBlocking { getString(resource) }
+    private fun text(resource: StringResource, vararg args: Any): String = runBlocking { getString(resource, *args) }
 
     @After
     fun tearDown() {
@@ -101,6 +132,8 @@ class MiniPlayerSessionTest {
         WatchProgressRepository.clearProgress(testSeriesId)
         WatchProgressRepository.clearLocalState()
         LibraryRepository.remove(browsedSeriesId)
+        SeasonDownloadDefaultsStorage.savePayload(testDialogProfileId, "")
+        TrackingScrobbleCoordinator.scrobblersOverrideForTest = null
         PlayerStreamsRepository.clearAll()
         ActivePlayerSessionRegistry.setActive(false)
         scope.cancel()
@@ -746,19 +779,175 @@ class MiniPlayerSessionTest {
     fun native_session_host_browse_season_download_library_save_reopen_creates_none_and_close_disposes_one() {
         val backend = CountingNativePlayerBackend()
         val hooks = backend.toDesktopHooks()
+        val scrobbles = java.util.Collections.synchronizedList(mutableListOf<Pair<TrackingScrobbleAction, Int>>())
+        val fakeScrobbler = object : TrackingScrobbler {
+            override val providerId: TrackingProviderId = TrackingProviderId.TRAKT
+            override suspend fun scrobble(
+                profileId: Int,
+                action: TrackingScrobbleAction,
+                event: TrackingScrobbleEvent,
+            ) {
+                scrobbles += action to event.progressPercent.toInt()
+            }
+        }
+        TrackingScrobbleCoordinator.scrobblersOverrideForTest = { listOf(fakeScrobbler) }
+
         val sessionController = PlayerSessionController(onExitPictureInPicture = {})
-        val navigator = NuvioNavigator(
-            NavBackStack<NavKey>(
-                TabsRoute,
-                DetailRoute(type = "series", id = testSeriesId, title = "Series"),
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        val browsedMeta = MetaDetails(
+            id = browsedSeriesId,
+            type = "series",
+            name = "Browsed Show",
+            videos = listOf(
+                MetaVideo(id = "$browsedSeriesId:1:1", title = "Ep 1", released = "2024-01-01T00:00:00Z", season = 1, episode = 1, runtime = 45),
+                MetaVideo(id = "$browsedSeriesId:1:2", title = "Ep 2", released = "2024-01-08T00:00:00Z", season = 1, episode = 2, runtime = 45),
             ),
         )
+        val queuedSeasonUrls = mutableListOf<String>()
+        val fakeDownloadsState = MutableStateFlow(DownloadsUiState())
+        val seasonDownloader = SeasonBatchDownloader(
+            scope = scope,
+            downloads = fakeDownloadsState,
+            fetchStreams = { batchEp ->
+                listOf(
+                    StreamItem(
+                        name = "1080p",
+                        url = "https://example.com/dl-${batchEp.episodeNumber}.mp4",
+                        addonName = "Test",
+                        addonId = "test",
+                    ),
+                )
+            },
+            prepareStream = { stream, _ -> stream },
+            enqueue = { req, batchEp, stream ->
+                queuedSeasonUrls += stream.url.orEmpty()
+                val added = DownloadItem(
+                    id = "dl-${batchEp.episodeNumber}",
+                    contentType = req.contentType,
+                    parentMetaId = req.parentMetaId,
+                    parentMetaType = req.parentMetaType,
+                    videoId = batchEp.videoId,
+                    title = "${req.title} — ${batchEp.title}",
+                    seasonNumber = batchEp.seasonNumber,
+                    episodeNumber = batchEp.episodeNumber,
+                    episodeTitle = batchEp.title,
+                    streamTitle = "1080p",
+                    providerName = "Test",
+                    sourceUrl = stream.url.orEmpty(),
+                    fileName = "dl-${batchEp.episodeNumber}.mp4",
+                    status = DownloadStatus.Downloading,
+                    createdAtEpochMs = 1L,
+                    updatedAtEpochMs = 1L,
+                )
+                fakeDownloadsState.value = DownloadsUiState(items = fakeDownloadsState.value.items + added)
+                DownloadEnqueueResult.Started
+            },
+            onFinished = { _, _ -> },
+            discard = {},
+        )
+        val noOpAutoDownloads = object : AutoDownloadController {
+            override val rules = MutableStateFlow(emptyList<AutoDownloadRule>())
+            override val statuses = MutableStateFlow(emptyMap<String, AutoDownloadStatus>())
+            override val storageLimitGb = MutableStateFlow<Int?>(50)
+            override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
+            override val usesSystemTrash = true
+            override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
+            override fun keepDownload(profileId: Int, downloadId: String) = Unit
+            override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
+            override fun turnOff(profileId: Int, ruleKey: String) = Unit
+            override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
+            override fun checkNow() = Unit
+        }
+
         sessionController.open(launch = sampleSeriesLaunch(), launchId = 601L)
 
         compose.setContent {
             NuvioTheme {
                 CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                    var activeTab by remember { mutableStateOf("home") }
+                    val libraryState by LibraryRepository.uiState.collectAsState()
+                    val downloadsUi by fakeDownloadsState.collectAsState()
+
                     Box(modifier = Modifier.fillMaxSize()) {
+                        when (val currentRoute = navigator.currentRoute) {
+                            is TabsRoute -> Column {
+                                Button(onClick = { activeTab = "home" }) { Text("Tab Home") }
+                                Button(onClick = { activeTab = "library" }) { Text("Tab Library") }
+                                Button(onClick = { navigator.navigate(DownloadsRoute("Downloads")) }) { Text("Open Downloads") }
+                                if (activeTab == "home") {
+                                    Button(
+                                        onClick = {
+                                            navigator.navigate(DetailRoute(type = "series", id = browsedSeriesId, title = "Browsed Show"))
+                                        },
+                                    ) {
+                                        Text("Browse Browsed Show")
+                                    }
+                                } else {
+                                    libraryState.items.forEach { saved ->
+                                        Text("Library Saved: ${saved.name}")
+                                    }
+                                }
+                            }
+                            is DetailRoute -> Column {
+                                Text("Details: ${currentRoute.title}")
+                                val isSaved = libraryState.items.any { it.id == browsedSeriesId && it.type == "series" }
+                                DetailActions(
+                                    playLabel = text(Res.string.detail_btn_play),
+                                    playEnabled = true,
+                                    isSaved = isSaved,
+                                    isWatched = false,
+                                    isTablet = false,
+                                    shuffleEnabled = false,
+                                    onPlayClick = {},
+                                    onPlayLongClick = null,
+                                    onShuffleClick = null,
+                                    onWatchedClick = {},
+                                    onSaveClick = {
+                                        if (isSaved) {
+                                            LibraryRepository.remove(browsedSeriesId)
+                                        } else {
+                                            LibraryRepository.save(
+                                                LibraryItem(
+                                                    id = browsedSeriesId,
+                                                    type = "series",
+                                                    name = browsedMeta.name,
+                                                    savedAtEpochMs = 0L,
+                                                ),
+                                            )
+                                        }
+                                    },
+                                    onSaveLongClick = null,
+                                )
+                                SeasonDownloadButton(
+                                    meta = browsedMeta,
+                                    seasonNumber = 1,
+                                    profileId = testDialogProfileId,
+                                    startBatch = seasonDownloader::start,
+                                    autoDownloads = noOpAutoDownloads,
+                                )
+                                Button(onClick = { navigator.navigate(DownloadsRoute("Downloads")) }) {
+                                    Text("Go To Downloads")
+                                }
+                            }
+                            is DownloadsRoute -> Column {
+                                Text("Downloads Screen")
+                                downloadsUi.items.forEach { item ->
+                                    Text("Queued Download: ${item.title}")
+                                }
+                                Button(
+                                    onClick = {
+                                        while (navigator.currentRoute !is TabsRoute) {
+                                            navigator.popBackStack()
+                                        }
+                                        activeTab = "library"
+                                    },
+                                ) {
+                                    Text("Return To Library")
+                                }
+                            }
+                            else -> Unit
+                        }
+
                         PlayerSessionHost(
                             controller = sessionController,
                             navController = navigator,
@@ -779,96 +968,110 @@ class MiniPlayerSessionTest {
             backend.statesByHandle[1L]?.apply {
                 loading = false
                 paused = false
-                positionMs = 415_000L
+                positionMs = 450_000L
                 durationMs = 1_800_000L
             }
         }
         compose.mainClock.advanceTimeBy(300L)
         compose.waitForIdle()
+        compose.runOnIdle { testDispatcher.scheduler.runCurrent() }
+        compose.waitUntil(5_000L) {
+            backend.statesByHandle[1L]?.nowPlayingTitle == "Series" &&
+                scrobbles.any { it.first == TrackingScrobbleAction.START }
+        }
 
-        // Minimize while playing: keeps the same native handle, sets mini mode on native controller.
+        val fullSlotBounds = compose.onNodeWithTag("player_session_surface_slot").fetchSemanticsNode().boundsInRoot
+        assertTrue(fullSlotBounds.width >= 1000f && fullSlotBounds.height >= 700f, "Full mode surface fills window")
+        assertEquals("Series", backend.statesByHandle[1L]?.nowPlayingTitle)
+        assertEquals("S1E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
+
+        // Minimize while playing: surface slot shrinks to exact 334x188 mini slot above dock controls.
         compose.runOnIdle {
             sessionController.dispatchSystemBack()
         }
         compose.waitForIdle()
-        compose.runOnIdle {
-            assertTrue(sessionController.isMinimized)
-            assertEquals(1, backend.createCount)
-            assertEquals(0, backend.disposeCount)
-            assertEquals(true, backend.statesByHandle[1L]?.miniPlayerMode)
-            assertEquals(true, backend.statesByHandle[1L]?.remoteCommandsEnabled)
-        }
+        val miniSlotBounds = compose.onNodeWithTag("player_session_surface_slot").fetchSemanticsNode().boundsInRoot
+        val dockBounds = compose.onNodeWithTag("mini_player_dock").fetchSemanticsNode().boundsInRoot
+        assertTrue(sessionController.isMinimized)
+        assertTrue(miniSlotBounds.width in 330f..340f && miniSlotBounds.height in 184f..192f, "Mini slot resized to 334x188 dp")
+        assertTrue(miniSlotBounds.bottom <= dockBounds.bottom - 60f, "Mini video slot sits above 68 dp dock controls")
+        assertEquals(1, backend.createCount)
+        assertEquals(0, backend.disposeCount)
+        assertEquals(true, backend.statesByHandle[1L]?.miniPlayerMode)
+        assertEquals(true, backend.statesByHandle[1L]?.remoteCommandsEnabled)
 
-        // Browse to another show, start a season download, and add the title to Library while minimized.
-        val queuedSeasonUrls = mutableListOf<String>()
-        val fakeDownloadsState = MutableStateFlow(DownloadsUiState())
-        val seasonDownloader = SeasonBatchDownloader(
-            scope = scope,
-            downloads = fakeDownloadsState,
-            fetchStreams = { batchEp ->
-                listOf(
-                    StreamItem(
-                        name = "1080p",
-                        url = "https://example.com/dl-${batchEp.episodeNumber}.mp4",
-                        addonName = "Test",
-                        addonId = "test",
-                    ),
-                )
-            },
-            prepareStream = { stream, _ -> stream },
-            enqueue = { _, _, stream ->
-                queuedSeasonUrls += stream.url.orEmpty()
-                DownloadEnqueueResult.Started
-            },
-            onFinished = { _, _ -> },
-            discard = {},
+        // Drive UI navigation: click Browsed Show card -> click Add to Library -> open SeasonDownloadDialog & confirm.
+        compose.onNodeWithText("Browse Browsed Show").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Details: Browsed Show").assertIsDisplayed()
+
+        compose.onNodeWithContentDescription(text(Res.string.details_actions_menu_label)).performClick()
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription(text(Res.string.hero_add_to_library)).performClick()
+        compose.waitForIdle()
+        assertTrue(LibraryRepository.isSaved(browsedSeriesId, "series"))
+        compose.onNodeWithContentDescription(text(Res.string.hero_remove_from_library)).assertIsDisplayed()
+
+        val seasonLabel = text(Res.string.episodes_season, 1)
+        compose.onNodeWithText(text(Res.string.downloads_season_start)).performClick()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_season_dialog_title, seasonLabel)).performClick()
+        compose.onNode(hasText(text(Res.string.downloads_season_button)) and hasAnyAncestor(isDialog())).performClick()
+        compose.runOnIdle { testDispatcher.scheduler.runCurrent() }
+        compose.waitForIdle()
+        assertEquals(
+            listOf("https://example.com/dl-1.mp4", "https://example.com/dl-2.mp4"),
+            queuedSeasonUrls,
         )
 
-        compose.runOnIdle {
-            navigator.navigate(DetailRoute(type = "series", id = browsedSeriesId, title = "Browsed Show"))
-            LibraryRepository.save(
-                LibraryItem(
-                    id = browsedSeriesId,
-                    type = "series",
-                    name = "Browsed Show",
-                    savedAtEpochMs = 0L,
-                ),
-            )
-            assertTrue(LibraryRepository.isSaved(browsedSeriesId, "series"))
+        // Open Downloads screen via UI button and verify queued season episodes render while mini-player stays active.
+        compose.onNodeWithText("Go To Downloads").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Queued Download: Browsed Show — Ep 1").assertIsDisplayed()
+        compose.onNodeWithText("Queued Download: Browsed Show — Ep 2").assertIsDisplayed()
 
-            val startResult = seasonDownloader.start(
-                SeasonBatchRequest(
-                    contentType = "series",
-                    parentMetaId = browsedSeriesId,
-                    parentMetaType = "series",
-                    title = "Browsed Show",
-                    logo = null,
-                    poster = null,
-                    background = null,
-                    seasonNumber = 1,
-                    episodes = listOf(
-                        SeasonBatchEpisode("$browsedSeriesId:1:1", 1, 1, "Ep 1", null, runtimeMinutes = 45),
-                        SeasonBatchEpisode("$browsedSeriesId:1:2", 1, 2, "Ep 2", null, runtimeMinutes = 45),
-                    ),
-                    quality = BatchQuality.P1080,
-                ),
-            )
-            assertEquals(SeasonBatchStart.Started, startResult)
-            testDispatcher.scheduler.runCurrent()
-            assertEquals(
-                listOf("https://example.com/dl-1.mp4", "https://example.com/dl-2.mp4"),
-                queuedSeasonUrls,
-            )
+        // Navigate to Library tab via UI button and verify saved show renders while mini-player keeps Now Playing metadata.
+        compose.onNodeWithText("Return To Library").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Library Saved: Browsed Show").assertIsDisplayed()
+        assertEquals("Series", backend.statesByHandle[1L]?.nowPlayingTitle)
+        assertEquals("S1E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
 
-            navigator.navigate(DownloadsRoute("Downloads"))
-            backend.statesByHandle[1L]?.positionMs = 468_000L
+        // Dispatch native media-key toggle while minimized: pauses playback and delivers PAUSE scrobble, then resumes & delivers START.
+        val scrobblesBeforeMediaKey = scrobbles.size
+        backend.statesByHandle[1L]?.eventSink?.onPlayerEvent("keyboardToggle", 0.0)
+        compose.waitUntil(5_000L) { backend.statesByHandle[1L]?.paused == true }
+        compose.mainClock.advanceTimeBy(200L)
+        compose.waitForIdle()
+        compose.waitUntil(5_000L) {
+            scrobbles.drop(scrobblesBeforeMediaKey).any { it.first == TrackingScrobbleAction.PAUSE }
         }
+
+        val scrobblesBeforeResume = scrobbles.size
+        backend.statesByHandle[1L]?.positionMs = 468_000L
+        backend.statesByHandle[1L]?.eventSink?.onPlayerEvent("keyboardToggle", 0.0)
+        compose.waitUntil(5_000L) { backend.statesByHandle[1L]?.paused == false }
         compose.mainClock.advanceTimeBy(1_050L)
+        compose.waitForIdle()
+        compose.waitUntil(5_000L) {
+            scrobbles.drop(scrobblesBeforeResume).any { it.first == TrackingScrobbleAction.START }
+        }
+
+        // Verify Picture in Picture shrinks main-window anchor to 1 dp without creating or disposing handles.
+        compose.runOnIdle { sessionController.setPictureInPicture(true) }
+        compose.waitForIdle()
+        val pipSlotBounds = compose.onNodeWithTag("player_session_surface_slot").fetchSemanticsNode().boundsInRoot
+        assertTrue(pipSlotBounds.width <= 2f && pipSlotBounds.height <= 2f, "PiP anchor shrinks to 1 dp")
+        compose.runOnIdle {
+            sessionController.setPictureInPicture(false)
+            sessionController.minimize()
+        }
         compose.waitForIdle()
 
         // Reopen full player by clicking the docked mini-player title: zero new native creates, zero disposes.
         compose.onNodeWithText("Series").performClick()
         compose.waitForIdle()
+        val reopenedBounds = compose.onNodeWithTag("player_session_surface_slot").fetchSemanticsNode().boundsInRoot
+        assertTrue(reopenedBounds.width >= 1000f && reopenedBounds.height >= 700f)
         compose.runOnIdle {
             assertTrue(sessionController.isFullScreen)
             assertEquals(1, backend.createCount)
@@ -878,7 +1081,8 @@ class MiniPlayerSessionTest {
             assertEquals(468_000L, sessionController.playbackState?.positionMs)
         }
 
-        // Minimize again and close from MiniPlayerDock: disposes exactly one native player.
+        // Minimize again and close from MiniPlayerDock: delivers STOP scrobble and disposes exactly one native player.
+        val scrobblesBeforeClose = scrobbles.size
         compose.runOnIdle {
             sessionController.minimize()
         }
@@ -886,6 +1090,9 @@ class MiniPlayerSessionTest {
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
         compose.waitUntil(5_000L) { backend.disposeCount == 1 && !sessionController.hasActiveSession }
         compose.waitForIdle()
+        compose.waitUntil(5_000L) {
+            scrobbles.drop(scrobblesBeforeClose).any { it.first == TrackingScrobbleAction.STOP }
+        }
 
         assertEquals(1, backend.createCount)
         assertEquals(1, backend.disposeCount)
@@ -1201,6 +1408,89 @@ class MiniPlayerSessionTest {
         compose.mainClock.advanceTimeBy(300L)
         assertTrue(snapshots.size >= 2, "250 ms polling restored on reopen")
         assertTrue(backend.videoDimensionQueries.get() > queriesAtMiniStart, "dimension queries restored on reopen")
+        compose.mainClock.autoAdvance = true
+    }
+
+    @Test
+    fun minimized_session_host_skips_audio_track_scans_and_stops_polling_while_paused() {
+        val backend = CountingNativePlayerBackend()
+        val hooks = backend.toDesktopHooks()
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        sessionController.open(launch = sampleSeriesLaunch(), launchId = 905L)
+
+        compose.mainClock.autoAdvance = false
+        compose.setContent {
+            NuvioTheme {
+                CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        PlayerSessionHost(
+                            controller = sessionController,
+                            navController = navigator,
+                            externalPlayerId = null,
+                            externalPlayerNotConfiguredText = "",
+                            externalPlayerFailedText = "",
+                            onExternalPlayerLaunch = {},
+                            launchExternalPlayer = { false },
+                            openExternalStreamUrl = { false },
+                            onOpenPartyMedia = {},
+                        )
+                    }
+                }
+            }
+        }
+        compose.mainClock.advanceTimeBy(50L)
+        compose.waitUntil(5_000L) { backend.createCount == 1 }
+        backend.statesByHandle[1L]?.apply {
+            loading = false
+            paused = false
+            positionMs = 100_000L
+            durationMs = 1_800_000L
+        }
+
+        // Let initial track selection settle in Full mode.
+        compose.mainClock.advanceTimeBy(3_500L)
+        assertTrue(backend.audioTrackQueries.get() >= 2, "Full mode scans audio tracks")
+
+        // Minimize while playing: 1 s snapshot cadence, zero audio-track scans, zero dimension queries.
+        sessionController.minimize()
+        compose.mainClock.advanceTimeBy(100L)
+        val audioQueriesAtMiniPlay = backend.audioTrackQueries.get()
+        val dimQueriesAtMiniPlay = backend.videoDimensionQueries.get()
+        val snapQueriesAtMiniPlay = backend.snapshotQueries.get()
+
+        compose.mainClock.advanceTimeBy(3_000L)
+        assertEquals(audioQueriesAtMiniPlay, backend.audioTrackQueries.get(), "no audio-track scans while minimized")
+        assertEquals(dimQueriesAtMiniPlay, backend.videoDimensionQueries.get(), "no video-dimension reads while minimized")
+        assertTrue(backend.snapshotQueries.get() in (snapQueriesAtMiniPlay + 2)..(snapQueriesAtMiniPlay + 4), "1 s snapshot cadence while playing minimized")
+
+        // Pause from MiniPlayerDock: once settled in paused state, zero polling occurs across 10 seconds.
+        compose.onNodeWithContentDescription(text(Res.string.compose_action_pause)).performClick()
+        compose.mainClock.advanceTimeBy(100L)
+        val snapQueriesWhenPaused = backend.snapshotQueries.get()
+        val audioQueriesWhenPaused = backend.audioTrackQueries.get()
+        val dimQueriesWhenPaused = backend.videoDimensionQueries.get()
+
+        compose.mainClock.advanceTimeBy(10_000L)
+        assertEquals(snapQueriesWhenPaused, backend.snapshotQueries.get(), "zero snapshot polls while paused and minimized")
+        assertEquals(audioQueriesWhenPaused, backend.audioTrackQueries.get(), "zero audio-track scans while paused and minimized")
+        assertEquals(dimQueriesWhenPaused, backend.videoDimensionQueries.get(), "zero dimension reads while paused and minimized")
+
+        // Seeking forward +10s while paused refreshes the dock position once and goes right back to idle.
+        compose.onNodeWithContentDescription(text(Res.string.compose_player_seek_forward_10)).performClick()
+        compose.mainClock.advanceTimeBy(100L)
+        assertEquals(110_000L, sessionController.playbackState?.positionMs)
+        val snapQueriesAfterPausedSeek = backend.snapshotQueries.get()
+        compose.mainClock.advanceTimeBy(5_000L)
+        assertEquals(snapQueriesAfterPausedSeek, backend.snapshotQueries.get(), "returns to zero polling after paused seek")
+
+        // Reopen Full mode and resume playback: restores 250 ms polling, dimension reads, and audio-track refresh.
+        sessionController.restoreFullScreen()
+        sessionController.togglePlayback()
+        compose.mainClock.advanceTimeBy(600L)
+        assertTrue(backend.snapshotQueries.get() >= snapQueriesAfterPausedSeek + 2, "250 ms polling restored on reopen")
+        assertTrue(backend.videoDimensionQueries.get() > dimQueriesWhenPaused, "dimension queries restored on reopen")
+        assertTrue(backend.audioTrackQueries.get() > audioQueriesWhenPaused, "audio-track checks restored on reopen")
         compose.mainClock.autoAdvance = true
     }
 

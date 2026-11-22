@@ -18,6 +18,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.nuvio.app.core.ui.NuvioToastController
@@ -183,6 +184,7 @@ internal fun BoxScope.PlayerSessionHost(
         val playerSurfaceModifier = when (session.mode) {
             PlayerPresentationMode.Full -> Modifier
                 .fillMaxSize()
+                .testTag("player_session_surface_slot")
                 .zIndex(12f)
             PlayerPresentationMode.Mini -> Modifier
                 .align(Alignment.BottomEnd)
@@ -191,6 +193,7 @@ internal fun BoxScope.PlayerSessionHost(
                     bottom = MiniPlayerBottomInset + MiniPlayerControlsHeight,
                 )
                 .size(width = MiniPlayerWidth - 2.dp, height = MiniPlayerVideoHeight - 1.dp)
+                .testTag("player_session_surface_slot")
                 .clip(
                     RoundedCornerShape(
                         topStart = MiniPlayerCornerRadius - 1.dp,
@@ -201,6 +204,7 @@ internal fun BoxScope.PlayerSessionHost(
             PlayerPresentationMode.PictureInPicture -> Modifier
                 .align(Alignment.BottomEnd)
                 .size(1.dp)
+                .testTag("player_session_surface_slot")
         }
 
         PlayerScreen(
