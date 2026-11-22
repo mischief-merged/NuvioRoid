@@ -159,6 +159,7 @@ class DownloadFolderBehaviourTest {
         // Without system Trash, the archived file is never permanently deleted.
         assertEquals(0, trashWithoutSystem.purgeHeldFiles(now + HeldFileDays * 24L * 60 * 60 * 1000 + 1))
         assertTrue(archived.exists())
+        assertTrue(Files.size(archived) > 0L)
 
         // Once system Trash is available, the aged archived file moves to system Trash.
         val trashed = mutableListOf<File>()
