@@ -937,7 +937,9 @@ internal actual object DownloadsPlatformDownloader {
                 }
                 else -> throw RefreshNeedsNewPartial()
             }
-            val remoteBytes = readExactWithStallGuard(input, length, stallTimeoutMs)
+            val remoteBytes = readExactWithStallGuard(input, length, stallTimeoutMs) {
+                opened.response.body().close()
+            }
             if (!remoteBytes.contentEquals(expectedBytes)) {
                 throw RefreshNeedsNewPartial()
             }
@@ -1145,13 +1147,16 @@ private suspend fun readExactWithStallGuard(
     input: java.io.InputStream,
     expectedBytes: Int,
     stallTimeoutMs: Long,
+    cancelCall: () -> Unit,
 ): ByteArray = coroutineScope {
     val lastReadAtNanos = AtomicLong(System.nanoTime())
     val stalled = AtomicBoolean(false)
+    // The read holds the stream's lock. Closing it first waits out the socket. Cancel the call, then close.
     val closer = launch {
         try {
             awaitCancellation()
         } finally {
+            runCatching { cancelCall() }
             runCatching { input.close() }
         }
     }
@@ -1160,6 +1165,7 @@ private suspend fun readExactWithStallGuard(
             delay((stallTimeoutMs / 4).coerceAtLeast(1L))
             if (System.nanoTime() - lastReadAtNanos.get() > stallTimeoutMs * 1_000_000L) {
                 stalled.set(true)
+                runCatching { cancelCall() }
                 runCatching { input.close() }
                 break
             }
