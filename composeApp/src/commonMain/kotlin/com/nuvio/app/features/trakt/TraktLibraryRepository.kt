@@ -100,6 +100,14 @@ object TraktLibraryRepository {
         TraktLibraryStorage.savePayload("")
     }
 
+    /** Drops the in-memory lists. The saved payload stays on disk. */
+    fun dropMemory() {
+        hasLoaded = false
+        lastRefreshAtMs = 0L
+        lastListTabsRefreshAtMs = 0L
+        _uiState.value = TraktLibraryUiState()
+    }
+
     fun currentListTabs(): List<TraktListTab> = _uiState.value.listTabs
 
     fun isInAnyList(itemId: String, itemType: String): Boolean {

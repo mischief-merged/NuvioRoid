@@ -270,6 +270,13 @@ object SimklSyncRepository : TrackingProfileStore {
         SimklSyncStorage.savePayload("")
     }
 
+    /** Drops the in-memory snapshot. The saved payload stays on disk. */
+    fun dropMemory() {
+        profileGeneration += 1L
+        hasLoaded = false
+        _state.value = SimklSyncUiState()
+    }
+
     /**
      * Bumps the projection version to force downstream collectors (CW, library, watched badges)
      * to recompute their projections without re-fetching from the network.

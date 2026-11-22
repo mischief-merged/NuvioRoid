@@ -2,13 +2,32 @@ package com.nuvio.app.core.auth
 
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.storage.AccountDataOwner
+import com.nuvio.app.core.storage.AccountDataPrep
 import com.nuvio.app.core.storage.LocalAccountDataCleaner
+import com.nuvio.app.core.sync.ProfileSettingsSync
+import com.nuvio.app.core.sync.SyncManager
+import com.nuvio.app.features.addons.AddonRepository
+import com.nuvio.app.features.library.LibraryRepository
+import com.nuvio.app.features.mdblist.MdbListTracker
+import com.nuvio.app.features.servers.ServerRepository
+import com.nuvio.app.features.simkl.SimklAuthRepository
+import com.nuvio.app.features.simkl.SimklSyncRepository
+import com.nuvio.app.features.trakt.TraktAuthRepository
+import com.nuvio.app.features.trakt.TraktLibraryRepository
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.exception.AuthRestException
 import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.auth.status.SessionStatus
+import io.github.jan.supabase.auth.user.UserSession
 import io.github.jan.supabase.exceptions.RestException
 import io.github.jan.supabase.functions.functions
+import kotlin.io.encoding.Base64
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
 import kotlinx.coroutines.CancellationException
@@ -66,8 +85,21 @@ object AuthRepository {
                     when (status) {
                         is SessionStatus.Authenticated -> {
                             val user = status.session.user
-                            val userId = user?.id.orEmpty()
+                            val userId = user?.id?.takeIf { it.isNotBlank() }
+                                ?: accountIdFromAccessToken(status.session.accessToken).orEmpty()
+                            if (userId.isNotBlank()) {
+                                val prepared = try {
+                                    AccountDataOwner.prepareForAccount(userId)
+                                } catch (error: CancellationException) {
+                                    throw error
+                                } catch (error: Throwable) {
+                                    log.e(error) { "Could not separate local data for the signed-in account" }
+                                    return@collect
+                                }
+                                if (prepared == AccountDataPrep.Moved) dropMovedAccountMemory()
+                            }
                             if (!validateRemoteSession(userId)) return@collect
+                            SyncManager.resumeSync()
                             AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, true)
                             AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, false)
                             _state.value = AuthState.Authenticated(
@@ -77,12 +109,8 @@ object AuthRepository {
                             )
                         }
                         is SessionStatus.NotAuthenticated -> {
-                            if (AuthStorage.loadFlag(KEY_HAD_ACCOUNT_SESSION)) {
-                                if (com.nuvio.app.core.storage.credentialAccess.blocked.value) {
-                                    log.w { "Secure storage is unavailable; not treating this as a lost session" }
-                                } else {
-                                    resetAfterLostSession()
-                                }
+                            if (AuthStorage.loadFlag(KEY_HAD_ACCOUNT_SESSION) || AuthStorage.loadFlag(KEY_SIGNED_OUT_NOTICE)) {
+                                onInvoluntarySignOut()
                             } else {
                                 _state.value = AuthState.Unauthenticated
                             }
@@ -92,7 +120,12 @@ object AuthRepository {
                                 _state.value = AuthState.Loading
                             }
                         }
-                        is SessionStatus.RefreshFailure -> Unit
+                        is SessionStatus.RefreshFailure -> {
+                            val session = runCatching {
+                                SupabaseProvider.client.auth.sessionManager.loadSession()
+                            }.getOrNull()
+                            applyOfflineSession(session)
+                        }
                     }
                 }
             }
@@ -156,7 +189,7 @@ object AuthRepository {
             ?: getString(Res.string.auth_sign_in_failed)
     }
 
-    suspend fun signOut(): Result<Unit> {
+    suspend fun signOut(): Result<Unit> = SessionClearMode.explicit {
         _error.value = null
         val anonymousRead = runCatching { AuthStorage.loadAnonymousUserId() }
         val wasAnonymous = anonymousRead.getOrNull() != null
@@ -187,7 +220,7 @@ object AuthRepository {
         val cancellation = remoteSignOut.exceptionOrNull() as? CancellationException
             ?: fallbackSessionClear.exceptionOrNull() as? CancellationException
         if (cancellation != null) throw cancellation
-        return if (failure == null) {
+        if (failure == null) {
             Result.success(Unit)
         } else {
             log.e(failure) { "Sign-out did not complete cleanly; all local cleanup steps were attempted" }
@@ -198,7 +231,7 @@ object AuthRepository {
         }
     }
 
-    suspend fun prepareForServerSwitch(): Result<Unit> {
+    suspend fun prepareForServerSwitch(): Result<Unit> = SessionClearMode.explicit {
         _error.value = null
         val anonymousClear = runCatching { AuthStorage.clearAnonymousUserId() }
         AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
@@ -208,7 +241,7 @@ object AuthRepository {
         val failure = anonymousClear.exceptionOrNull() ?: sessionClear.exceptionOrNull()
         val cancellation = sessionClear.exceptionOrNull() as? CancellationException
         if (cancellation != null) throw cancellation
-        return if (failure == null) Result.success(Unit) else Result.failure(failure)
+        if (failure == null) Result.success(Unit) else Result.failure(failure)
     }
 
     fun reinitialize() {
@@ -221,7 +254,7 @@ object AuthRepository {
     }
 
     suspend fun signOutIfSessionInvalid(error: Throwable, source: String): Boolean {
-        val invalid = if (error.isJwtExpiredError()) refreshRejected() else error.isDeletedAccountError()
+        val invalid = if (error.isJwtExpiredError()) refreshRejected() else error.isDefinitiveSessionFailure()
         if (!invalid) return false
 
         log.w(error) { "$source failed because the current Supabase account/session is no longer valid; clearing local auth" }
@@ -242,39 +275,65 @@ object AuthRepository {
     }
 
     private suspend fun clearLocalSessionAfterRemoteInvalidation() {
-        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
+        AuthSessionRetention.permitStoredClear()
         runCatching {
             SupabaseProvider.client.auth.clearSession()
         }.onFailure { e ->
-            log.w(e) { "Failed to clear Supabase session after remote invalidation; continuing local reset" }
+            log.w(e) { "Failed to clear Supabase session after remote invalidation; keeping local data" }
         }
-        resetAfterLostSession()
+        onInvoluntarySignOut()
     }
 
-    private suspend fun resetAfterLostSession() {
+    internal suspend fun onInvoluntarySignOut() {
         val notice = runCatching { getString(Res.string.auth_notice_signed_out) }.getOrNull()
-        AuthStorage.clearAnonymousUserId()
         validatedRemoteUserId = null
-        val localCleanup = runCatching { LocalAccountDataCleaner.wipe() }
-        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
         AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, true)
         _error.value = notice
         _state.value = AuthState.Unauthenticated
-        localCleanup.onFailure { error ->
-            log.e(error) { "Local account cleanup failed after losing the session" }
-        }
     }
 
-    suspend fun deleteAccount(): Result<Unit> = runCatching {
-        _error.value = null
-        SupabaseProvider.client.functions.invoke("delete-account")
-        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
-        SupabaseProvider.client.auth.signOut()
+    internal fun applyOfflineSession(session: UserSession?): Boolean {
+        val next = localAuthStateWhileOffline(session) ?: return false
+        SyncManager.pauseUntilOnline()
+        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, true)
+        _state.value = next
+        return true
+    }
+
+    /** Puts the in-memory account state back to where a fresh start leaves it. */
+    internal fun releaseHeldSessionState() {
         validatedRemoteUserId = null
-        try {
-            LocalAccountDataCleaner.wipe()
-        } finally {
-            _state.value = AuthState.Unauthenticated
+        _error.value = null
+        _state.value = AuthState.Loading
+        AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
+        AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, false)
+    }
+
+    private fun dropMovedAccountMemory() {
+        LibraryRepository.dropAccountMemory()
+        TraktLibraryRepository.dropMemory()
+        SimklSyncRepository.dropMemory()
+        WatchProgressRepository.clearLocalState()
+        ProfileSettingsSync.clearAccountState()
+        TraktAuthRepository.clearLocalState()
+        SimklAuthRepository.clearLocalState()
+        AddonRepository.clearLocalState()
+        ServerRepository.dropCredentialMemory()
+        MdbListTracker.dropAuthMemory()
+    }
+
+    suspend fun deleteAccount(): Result<Unit> = SessionClearMode.explicit {
+        runCatching {
+            _error.value = null
+            SupabaseProvider.client.functions.invoke("delete-account")
+            AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
+            SupabaseProvider.client.auth.signOut()
+            validatedRemoteUserId = null
+            try {
+                LocalAccountDataCleaner.wipe()
+            } finally {
+                _state.value = AuthState.Unauthenticated
+            }
         }
     }.onFailure { e ->
         log.e(e) { "Account deletion failed" }
@@ -294,4 +353,26 @@ object AuthRepository {
                 ?.description
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
+}
+
+private val accountIdJson = Json { ignoreUnknownKeys = true }
+
+internal fun accountIdFromAccessToken(accessToken: String): String? {
+    val payload = accessToken.split('.').getOrNull(1)?.takeIf { it.isNotBlank() } ?: return null
+    val json = runCatching {
+        Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL)
+            .decode(payload)
+            .decodeToString()
+    }.getOrNull() ?: return null
+    return runCatching {
+        accountIdJson.parseToJsonElement(json).jsonObject["sub"]?.jsonPrimitive?.contentOrNull
+    }.getOrNull()?.takeIf { it.isNotBlank() }
+}
+
+internal fun localAuthStateWhileOffline(session: UserSession?): AuthState.Authenticated? {
+    session ?: return null
+    val userId = session.user?.id?.takeIf { it.isNotBlank() }
+        ?: accountIdFromAccessToken(session.accessToken)
+        ?: return null
+    return AuthState.Authenticated(userId = userId, email = session.user?.email, isAnonymous = false)
 }

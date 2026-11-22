@@ -145,6 +145,13 @@ object LibraryRepository {
         _uiState.value = LibraryUiState()
     }
 
+    /** Drops the in-memory library after another account's files were set aside. Does not write. */
+    fun dropAccountMemory() {
+        val transition = synchronized(loadLock) { localState.reset() }
+        transition.detachedPushJob?.cancel()
+        _uiState.value = LibraryUiState()
+    }
+
     internal fun runAccountStorageWipe(wipeStorage: () -> Unit) {
         synchronized(loadLock) {
             val transition = localState.reset()
