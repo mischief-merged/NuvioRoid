@@ -21,11 +21,13 @@ internal actual fun inspectDownloadedFile(localFileUri: String): DownloadedFileF
                 input.readFully(bytes)
                 return bytes
             }
+            val info = matroskaInfo(size, ::read)
             DownloadedFileFacts(
                 exists = true,
                 sizeBytes = size,
                 isVideoContainer = startsLikeVideoContainer(read(0, VideoContainerHeaderBytes) ?: ByteArray(0)),
-                durationMs = mp4DurationMs(size, ::read),
+                durationMs = info?.durationMs ?: mp4DurationMs(size, ::read),
+                containerTitle = info?.title,
                 audioLanguages = runCatching { audioTrackLanguages(size, ::read) }.getOrNull(),
                 videoHash = if (size >= 2L * VideoHashChunkBytes) {
                     val head = read(0, VideoHashChunkBytes)

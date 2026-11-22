@@ -56,6 +56,50 @@ private fun ebmlChildren(start: Long, end: Long, read: (offset: Long, length: In
     return children
 }
 
+internal data class MatroskaInfo(val durationMs: Long?, val title: String?)
+
+/** Reads only segment info before the first media cluster, with bounded header and field reads. */
+internal fun matroskaInfo(fileSize: Long, read: (Long, Int) -> ByteArray?): MatroskaInfo? {
+    val header = ebmlElementAt(0L, read)?.takeIf { it.id == EbmlHeaderId } ?: return null
+    val segment = ebmlElementAt(header.contentStart + (header.size ?: return null), read)
+        ?.takeIf { it.id == SegmentId } ?: return null
+    val end = segment.size?.let { size ->
+        if (size > fileSize - segment.contentStart) return null
+        segment.contentStart + size
+    } ?: fileSize
+    var offset = segment.contentStart
+    repeat(MaxElementsPerLevel) {
+        if (offset >= end) return null
+        val element = ebmlElementAt(offset, read) ?: return null
+        if (element.id == ClusterId) return null
+        val size = element.size ?: return null
+        if (size > end - element.contentStart) return null
+        if (element.id == 0x1549a966L) {
+            if (size > 65_536L) return null
+            val fields = ebmlChildren(element.contentStart, element.contentStart + size, read) ?: return null
+            fun field(id: Long, max: Int): ByteArray? = fields.firstOrNull { it.id == id }?.let {
+                val length = it.size ?: return null
+                if (length !in 1L..max.toLong()) return null
+                read(it.contentStart, length.toInt())?.takeIf { bytes -> bytes.size.toLong() == length }
+            }
+            val scale = field(0x2ad7b1L, 8)?.let { uint(it, 0, it.size) } ?: 1_000_000L
+            val duration = field(0x4489L, 8)?.let {
+                when (it.size) {
+                    4 -> Float.fromBits(uint(it, 0, 4).toInt()).toDouble()
+                    8 -> Double.fromBits(uint(it, 0, 8))
+                    else -> null
+                }
+            }
+            val millis = duration?.times(scale.toDouble() / 1_000_000.0)
+                ?.takeIf { scale > 0L && it.isFinite() && it > 0.0 && it < Long.MAX_VALUE.toDouble() }?.toLong()
+            val title = field(0x7ba9L, 4096)?.decodeToString()?.trimEnd('\u0000')?.takeIf { it.isNotBlank() }
+            return MatroskaInfo(millis, title)
+        }
+        offset = element.contentStart + size
+    }
+    return null
+}
+
 private fun matroskaAudioLanguages(fileSize: Long, read: (offset: Long, length: Int) -> ByteArray?): List<String>? {
     val header = ebmlElementAt(0L, read) ?: return null
     val segment = ebmlElementAt(header.contentStart + (header.size ?: return null), read)?.takeIf { it.id == SegmentId }

@@ -33,11 +33,24 @@ class NativeFrameLocaleTest {
         retryEarlierSeconds = 0.0, positionTimeoutMs = 10_000L, budgetMs = 20_000L,
     )
 
-    @Test fun a_real_probe_restores_the_calling_threads_locale_and_leaves_the_process_locale_alone() = withCommaLocale { library, locale ->
+    @Test fun a_probe_works_before_playback_with_a_comma_process_locale() = withCommaLocale { library, locale ->
+        val set = library.getFunction("setlocale")
+        val before = set.invokeString(arrayOf<Any?>(4, null), false)
+        try {
+            assertNotNull(set.invokeString(arrayOf<Any?>(4, "fr_FR.UTF-8"), false))
+            val fixture = listOf(File("testFixtures/subtitles/video.mp4"), File("../testFixtures/subtitles/video.mp4"))
+                .first { it.isFile }
+            val result = assertNotNull(sample(fixture))
+            assertEquals(FramePixelCount, assertNotNull(result[1]).size)
+            assertEquals("C", set.invokeString(arrayOf<Any?>(4, null), false))
+            assertEquals(locale, library.getFunction("uselocale").invokePointer(arrayOf<Any?>(null)))
+        } finally { set.invokeString(arrayOf<Any?>(4, before), false) }
+    }
+
+    @Test fun a_real_probe_restores_the_calling_threads_locale_and_sets_the_process_numeric_locale() = withCommaLocale { library, locale ->
         val fixture = listOf(File("testFixtures/subtitles/video.mp4"), File("../testFixtures/subtitles/video.mp4"))
             .firstOrNull { it.isFile }
         assertNotNull(fixture, "the existing video fixture is missing")
-        val before = library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false)
         val result = assertNotNull(sample(fixture))
         assertEquals(2, result.size)
         val header = assertNotNull(result[0]).decodeToString()
@@ -45,14 +58,13 @@ class NativeFrameLocaleTest {
         assertEquals(FramePixelCount, assertNotNull(result[1]).size)
         assertEquals(locale, library.getFunction("uselocale").invokePointer(arrayOf<Any?>(null)))
         assertEquals(",", library.getFunction("localeconv").invokePointer(emptyArray<Any?>()).getPointer(0).getString(0))
-        assertEquals(before, library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false))
+        assertEquals("C", library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false))
     }
 
     @Test fun a_probe_that_cannot_open_a_file_also_restores_the_locale() = withCommaLocale { library, locale ->
-        val before = library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false)
         assertEquals(null, sample(File("/a-folder-that-does-not-exist/video.mkv")))
         assertEquals(locale, library.getFunction("uselocale").invokePointer(arrayOf<Any?>(null)))
         assertEquals(",", library.getFunction("localeconv").invokePointer(emptyArray<Any?>()).getPointer(0).getString(0))
-        assertEquals(before, library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false))
+        assertEquals("C", library.getFunction("setlocale").invokeString(arrayOf<Any?>(4, null), false))
     }
 }

@@ -12,6 +12,22 @@ import kotlin.test.assertTrue
 class PublishedFileTrashTest {
     @get:Rule val folder = TemporaryFolder()
 
+    @Test fun the_downloader_moves_only_the_file_it_published_and_keeps_bytes_when_refused() {
+        val file = folder.newFile("published.mkv").toPath()
+        Files.writeString(file, "all the bytes")
+        val uri = file.toFile().toURI().toString()
+        DownloadsPlatformDownloader.rememberPublishedFile(file)
+        var calls = 0
+        assertFalse(DownloadsPlatformDownloader.removeJustPublished(uri) { calls++; false })
+        assertEquals("all the bytes", Files.readString(file))
+        DownloadsPlatformDownloader.rememberPublishedFile(file)
+        val archive = folder.root.toPath().resolve("kept.mkv")
+        assertTrue(DownloadsPlatformDownloader.removeJustPublished(uri) { calls++; Files.move(it, archive); true })
+        assertEquals(2, calls)
+        assertEquals("all the bytes", Files.readString(archive))
+        assertFalse(DownloadsPlatformDownloader.removeJustPublished(uri) { error("already moved") })
+    }
+
     @Test fun a_rejected_file_is_moved_with_its_bytes_kept() {
         val file = folder.newFile("video.mkv").toPath()
         Files.writeString(file, "the downloaded bytes")

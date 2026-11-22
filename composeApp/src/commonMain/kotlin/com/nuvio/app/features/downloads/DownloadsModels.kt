@@ -107,6 +107,10 @@ data class DownloadItem(
      * this download's. Null before a partial file was created.
      */
     val partialFileKey: String? = null,
+    /** The published file is saved but still awaits its checks. Resuming checks never starts a transfer. */
+    val awaitingCheck: Boolean = false,
+    /** A verified body digest kept across a restart while its published file awaits checks. */
+    val publishedDigestVerified: Boolean = false,
 ) {
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null

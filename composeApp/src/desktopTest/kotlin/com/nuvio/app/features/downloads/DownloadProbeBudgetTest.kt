@@ -8,6 +8,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.io.RandomAccessFile
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -22,6 +25,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class DownloadProbeBudgetTest {
+    @get:Rule val folder = TemporaryFolder()
     private class MemoryBackend : DownloadsBackend {
         var payload: String? = null
         val writes = AtomicInteger()
@@ -37,13 +41,16 @@ class DownloadProbeBudgetTest {
         val peak = AtomicInteger()
         var duringSample: () -> Unit = {}
         var duringConfirm: () -> Unit = {}
+        var away = false
+        override fun heldByFolder(item: DownloadItem) = away
         var blank = false
         var throws = false
         var onInspect: () -> Unit = {}
+        var onRemove: () -> Unit = {}
         override fun loadPayload() = payload
         override fun savePayload(payload: String) { writes.incrementAndGet(); this.payload = payload }
         override fun restoreItem(item: DownloadItem) = item
-        override fun removeFile(localFileUri: String?): Boolean { removed += localFileUri; return true }
+        override fun removeFile(localFileUri: String?): Boolean { onRemove(); removed += localFileUri; return true }
         override fun removePartialFile(destinationFileName: String): Boolean { partialRemovals.incrementAndGet(); return true }
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String) = localFileUri
         override fun inspectFile(localFileUri: String): DownloadedFileFacts? { onInspect(); return facts[localFileUri] }
@@ -111,11 +118,162 @@ class DownloadProbeBudgetTest {
         assertTrue(workers.none { it.isAlive })
     }
 
+
+    @Test fun a_matroska_episode_with_segment_duration_finishes_without_a_probe() {
+        val file = folder.newFile("episode.mkv")
+        RandomAccessFile(file, "rw").use { it.write(matroskaEpisode()); it.setLength(300_000_000L) }
+        val facts = inspectDownloadedFile(file.toURI().toString())!!
+        assertEquals(2_700_000L, facts.durationMs)
+        enqueue(1); backend.facts[uri(1)] = facts; finish(1)
+        assertEquals(0, backend.sampled.size)
+        assertEquals(DownloadStatus.Completed, item(1).status)
+    }
+
+    @Test fun pausing_a_check_clears_its_marker_and_resume_reuses_the_published_file() {
+        enqueue(1); backend.facts[uri(1)] = video.copy(durationMs = null)
+        val entered = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }
+        await(entered)
+        val id = item(1).id
+        DownloadsRepository.pauseDownload(id)
+        assertTrue(DownloadsRepository.uiState.value.checkingIds.isEmpty())
+        assertEquals(uri(1), item(1).localFileUri)
+        DownloadsRepository.resumeDownload(id)
+        release.countDown(); first.join(10_000)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (item(1).status != DownloadStatus.Completed && System.nanoTime() < deadline) Thread.yield()
+        assertEquals(DownloadStatus.Completed, item(1).status)
+        assertEquals(1, backend.requests.size)
+        assertEquals(300_000_000L, item(1).downloadedBytes)
+        assertEquals(0, backend.partialRemovals.get())
+    }
+
+    @Test fun a_published_file_waiting_for_a_probe_survives_reload_without_a_transfer() {
+        enqueue(1)
+        backend.requests.single().onDigestVerified()
+        backend.facts[uri(1)] = video.copy(durationMs = null)
+        val entered = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }
+        await(entered)
+        val stored = DownloadsCodec.decode(backend.payload!!)!!.items.single()
+        assertEquals(uri(1), stored.localFileUri)
+        assertTrue(stored.awaitingCheck)
+        assertTrue(stored.publishedDigestVerified)
+        DownloadsRepository.clearLocalState()
+        backend.duringSample = {}
+        DownloadsRepository.ensureLoaded()
+        release.countDown(); first.join(10_000)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (item(1).status != DownloadStatus.Completed && System.nanoTime() < deadline) Thread.yield()
+        assertEquals(DownloadStatus.Completed, item(1).status)
+        assertEquals(DownloadVerification.Digest, item(1).verifiedBy)
+        assertFalse(item(1).awaitingCheck)
+        assertEquals(1, backend.requests.size)
+        assertEquals(300_000_000L, item(1).downloadedBytes)
+        assertTrue(backend.probeThreads.none { it === Thread.currentThread() })
+        assertEquals(0, backend.partialRemovals.get())
+    }
+
+    @Test fun a_published_file_on_an_unavailable_drive_waits_without_losing_its_address() {
+        enqueue(1); backend.facts[uri(1)] = video.copy(durationMs = null)
+        val entered = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }; await(entered)
+        val id = item(1).id
+        DownloadsRepository.pauseDownload(id)
+        release.countDown(); first.join(10_000)
+        backend.away = true
+        backend.facts[uri(1)] = DownloadedFileFacts(exists = false)
+        DownloadsRepository.resumeDownload(id)
+        assertEquals(DownloadStatus.Paused, item(1).status)
+        assertTrue(item(1).pausedByFolder)
+        assertTrue(item(1).awaitingCheck)
+        assertEquals(uri(1), item(1).localFileUri)
+        assertEquals(300_000_000L, item(1).downloadedBytes)
+        assertEquals(1, backend.sampled.size)
+        assertEquals(emptyList(), backend.removed)
+        backend.away = false
+        backend.facts[uri(1)] = video.copy(durationMs = null)
+        DownloadsRepository.resumeHeldByFolder()
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (item(1).status != DownloadStatus.Completed && System.nanoTime() < deadline) Thread.yield()
+        assertEquals(DownloadStatus.Completed, item(1).status)
+        assertEquals(1, backend.requests.size)
+        assertEquals(2, backend.sampled.size)
+        assertEquals(0, backend.partialRemovals.get())
+    }
+
+    @Test fun moving_a_rejected_file_does_not_hold_the_state_lock() {
+        enqueue(1); backend.facts[uri(1)] = video.copy(isVideoContainer = false)
+        backend.onRemove = {
+            val acquired = CountDownLatch(1)
+            worker { DownloadsRepository.holdStateLockForTest { acquired.countDown() } }
+            await(acquired)
+        }
+        finish(1)
+        assertEquals(DownloadStatus.Failed, item(1).status)
+        assertEquals(listOf<String?>(uri(1)), backend.removed)
+    }
+
+    @Test fun cancelling_a_waiting_check_frees_its_worker_before_the_active_probe_finishes() {
+        for (ep in 1..2) { enqueue(ep); backend.facts[uri(ep)] = video.copy(durationMs = null) }
+        val entered = CountDownLatch(1)
+        val waiting = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }; await(entered)
+        backend.onInspect = { waiting.countDown() }
+        val second = worker { finish(2) }; await(waiting)
+        DownloadsRepository.pauseDownload(item(2).id)
+        second.join(10_000)
+        assertFalse(second.isAlive, "a cancelled waiter kept its worker")
+        assertFalse(item(2).id in DownloadsRepository.uiState.value.checkingIds)
+        assertEquals(1, backend.sampled.size)
+        assertEquals(uri(2), item(2).localFileUri)
+        release.countDown(); first.join(10_000)
+    }
+
+    @Test fun an_earlier_finish_gets_the_permit_before_a_later_recheck() {
+        for (ep in 1..3) {
+            enqueue(ep); backend.facts[uri(ep)] = video
+            if (ep == 3) finish(ep)
+            backend.facts[uri(ep)] = video.copy(durationMs = null)
+        }
+        val entered = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }; await(entered)
+        val inspected = CountDownLatch(1)
+        backend.onInspect = { inspected.countDown() }
+        val second = worker { finish(2) }; await(inspected)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (second.state !in setOf(Thread.State.WAITING, Thread.State.TIMED_WAITING) && System.nanoTime() < deadline) Thread.yield()
+        assertTrue(second.state in setOf(Thread.State.WAITING, Thread.State.TIMED_WAITING))
+        backend.onInspect = {}
+        val third = worker { DownloadsRepository.recheckCompleted(item(3).id) }
+        release.countDown()
+        listOf(first, second, third).forEach { it.join(10_000) }
+        assertEquals(listOf(uri(1), uri(2), uri(3)), backend.sampled)
+        assertEquals(1, backend.peak.get())
+    }
+
+    @Test fun a_matroska_title_can_flag_the_wrong_episode_without_decoding_pictures() {
+        val file = folder.newFile("other.mkv")
+        RandomAccessFile(file, "rw").use { it.write(matroskaEpisode("Show S01E02")); it.setLength(300_000_000L) }
+        enqueue(1); backend.facts[uri(1)] = inspectDownloadedFile(file.toURI().toString())!!; finish(1)
+        assertEquals(0, backend.sampled.size)
+        assertEquals(DownloadFramesCheck.Suspect, item(1).framesCheck)
+        assertEquals(DownloadStatus.Completed, item(1).status)
+        DownloadsRepository.recheckCompleted(item(1).id)
+        assertEquals(DownloadFramesCheck.Suspect, item(1).framesCheck)
+        assertEquals(0, backend.sampled.size)
+    }
+
     @Test fun a_normal_episode_finishes_with_zero_frame_probes() {
         enqueue(1); backend.facts[uri(1)] = video
         val writesBefore = backend.writes.get()
         finish(1)
-        assertEquals(1, backend.writes.get() - writesBefore)
+        assertEquals(2, backend.writes.get() - writesBefore)
         assertEquals(DownloadStatus.Completed, item(1).status)
         assertEquals(0, backend.sampled.size)
         assertEquals(DownloadFramesCheck.NotChecked, item(1).framesCheck)
@@ -170,7 +328,7 @@ class DownloadProbeBudgetTest {
         await(entered)
         oldFinish(uri(1), video.sizeBytes)
         assertTrue(item(1).id in DownloadsRepository.uiState.value.checkingIds)
-        assertEquals(150_000_000L, item(1).downloadedBytes)
+        assertEquals(300_000_000L, item(1).downloadedBytes)
         assertFalse(backend.payload.orEmpty().contains("checkingIds"))
         release.countDown()
         current.join(10_000)
@@ -258,7 +416,7 @@ class DownloadProbeBudgetTest {
                 episodes = (1..2).map { SeasonBatchEpisode("show:1:$it", 1, it, "Episode $it", null) }, quality = BatchQuality.BestAvailable))
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
             while (notPresent(1) && System.nanoTime() < deadline) Thread.yield()
-            backend.facts[uri(1)] = video.copy(durationMs = null)
+           backend.facts[uri(1)] = video.copy(durationMs = null)
             worker { finish(1) }
             await(entered)
             await(nextStarted)

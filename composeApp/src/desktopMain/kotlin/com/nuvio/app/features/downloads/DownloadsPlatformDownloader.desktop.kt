@@ -174,7 +174,10 @@ internal actual object DownloadsPlatformDownloader {
                     // Reported finished only once the file is on disk under its final name, which never replaces
                     // a file this download did not create (a taken name gets " (2)", " (3)", ...).
                     val published = try {
-                        publishDurably(tempFile.toPath(), destination.toPath()).toFile()
+                        publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
+                            rememberPublishedFile(path)
+                            request.onPublished(path.toFile().toURI().toString(), Files.size(path))
+                        }).toFile()
                     } catch (_: DownloadNotDurable) {
                         // The partial file keeps its name: the download is not finished and goes on from it.
                         onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
@@ -183,7 +186,7 @@ internal actual object DownloadsPlatformDownloader {
 
                     val finalSize = published.length()
                     // Remembered, so that a file found bad right after this can be removed only while it is still this one.
-                    DownloadMover.identityOf(published.toPath())?.let { publishedKeys[published.toURI().toString()] = it }
+                    rememberPublishedFile(published.toPath())
                     onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
                     return@launch
                 } catch (error: CancellationException) {
@@ -219,11 +222,17 @@ internal actual object DownloadsPlatformDownloader {
     /** The identity of each file this downloader published in this run, by address. */
     private val publishedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    internal fun rememberPublishedFile(path: java.nio.file.Path) {
+        DownloadMover.identityOf(path)?.let { publishedKeys[path.toFile().toURI().toString()] = it }
+    }
+
     /** Trashes a file this downloader just published, only while it still has the identity it had then. */
-    fun removeJustPublished(localFileUri: String): Boolean {
+    fun removeJustPublished(localFileUri: String): Boolean = removeJustPublished(localFileUri, DownloadsTrash::moveToTrash)
+
+    internal fun removeJustPublished(localFileUri: String, move: (java.nio.file.Path) -> Boolean): Boolean {
         val key = publishedKeys.remove(localFileUri) ?: return false
         val path = localFileUri.toLocalFileOrNull()?.toPath() ?: return false
-        return trashPublishedFile(path, key, DownloadsTrash::moveToTrash)
+        return trashPublishedFile(path, key, move)
     }
 
     actual fun removeFile(localFileUri: String?): Boolean {
@@ -614,6 +623,7 @@ internal fun publishDurably(
     destination: java.nio.file.Path,
     flushFolder: (java.nio.file.Path) -> Boolean = { folder -> !foldersCanBeFlushed || DownloadMover.flushDirectory(folder) },
     link: (java.nio.file.Path, java.nio.file.Path) -> Unit = { name, existing -> Files.createLink(name, existing) },
+    beforeRemovingPartial: (java.nio.file.Path) -> Boolean = { true },
     copy: (java.nio.channels.FileChannel, java.nio.channels.FileChannel) -> Unit = { input, out ->
         var position = 0L
         val size = input.size()
@@ -657,6 +667,10 @@ internal fun publishDurably(
         if (!flushFolder(candidate.parent)) {
             removeIfStill(candidate, createdKey)
             throw DownloadNotDurable("The folder of the download could not be flushed")
+        }
+        if (!beforeRemovingPartial(candidate)) {
+            // Both names keep their bytes when the record could not be made durable.
+            throw DownloadNotDurable("The finished file address could not be saved")
         }
         Files.deleteIfExists(part)
         flushFolder(candidate.parent)

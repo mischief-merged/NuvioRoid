@@ -36,6 +36,14 @@
 #include <string>
 #include <vector>
 
+// Every private decoder and the player share the numeric locale required by their worker threads.
+static bool ensurePlayerNumericLocale() {
+    static std::mutex localeMutex;
+    std::lock_guard<std::mutex> guard(localeMutex);
+    const char *current = setlocale(LC_NUMERIC, nullptr);
+    return (current && strcmp(current, "C") == 0) || setlocale(LC_NUMERIC, "C") != nullptr;
+}
+
 #ifndef NX_SUBTYPE_AUX_CONTROL_BUTTONS
 #define NX_SUBTYPE_AUX_CONTROL_BUTTONS 8
 #endif
@@ -1738,7 +1746,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     // libmpv requires LC_NUMERIC=C: non-"C" locales that use comma decimals
     // make mpv_create fail. The JVM formats numbers through java.util.Locale,
     // so this C-level change does not affect Java number formatting.
-    if (setlocale(LC_NUMERIC, "C") == nullptr) {
+    if (!ensurePlayerNumericLocale()) {
         @throw [NSException exceptionWithName:@"PlayerBridgeError"
                                        reason:@"setlocale(LC_NUMERIC, \"C\") failed"
                                      userInfo:nil];
@@ -3842,6 +3850,7 @@ static void samplerUpdateCallback(void *context) {
 class SampleNumericLocale {
 public:
     SampleNumericLocale() {
+        if (!ensurePlayerNumericLocale()) return;
         locale_ = newlocale(LC_NUMERIC_MASK, "C", nullptr);
         if (locale_) previous_ = uselocale(locale_);
     }
