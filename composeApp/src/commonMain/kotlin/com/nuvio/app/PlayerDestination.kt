@@ -23,6 +23,9 @@ import com.nuvio.app.core.ui.PlatformBackHandler
 import com.nuvio.app.features.party.PartyMedia
 import com.nuvio.app.features.player.ExternalPlayerIntentResult
 import com.nuvio.app.features.player.ExternalPlayerPlatform
+import com.nuvio.app.features.player.MiniPlayerControlsHeight
+import com.nuvio.app.features.player.MiniPlayerDock
+import com.nuvio.app.features.player.MiniPlayerPlaybackState
 import com.nuvio.app.features.player.PlayerBackReleaseGuard
 import com.nuvio.app.features.player.PlayerBackRequest
 import com.nuvio.app.features.player.PlayerExitTarget
@@ -122,15 +125,48 @@ internal fun BoxScope.PlayerSessionHost(
             launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
         }
 
+        if (session.mode == PlayerPresentationMode.Mini) {
+            val dockState = controller.playbackState ?: MiniPlayerPlaybackState(
+                title = launch.title,
+                seasonNumber = launch.seasonNumber,
+                episodeNumber = launch.episodeNumber,
+                episodeTitle = launch.episodeTitle,
+                videoId = launch.videoId,
+                parentMetaId = launch.parentMetaId,
+                parentMetaType = launch.parentMetaType,
+                sourceUrl = launch.sourceUrl,
+            )
+            MiniPlayerDock(
+                state = dockState,
+                canPlayNextEpisode = controller.canPlayNextEpisode,
+                onTogglePlayback = controller::togglePlayback,
+                onSeekForward = controller::seekForward,
+                onPlayNextEpisode = controller::playNextEpisode,
+                onClose = { controller.closeActiveSession() },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = MiniPlayerHorizontalInset, bottom = MiniPlayerBottomInset)
+                    .zIndex(11f),
+            )
+        }
+
         val playerSurfaceModifier = when (session.mode) {
             PlayerPresentationMode.Full -> Modifier
                 .fillMaxSize()
                 .zIndex(12f)
             PlayerPresentationMode.Mini -> Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = MiniPlayerHorizontalInset, bottom = MiniPlayerBottomInset)
-                .size(width = MiniPlayerWidth, height = MiniPlayerVideoHeight)
-                .clip(RoundedCornerShape(MiniPlayerCornerRadius))
+                .padding(
+                    end = MiniPlayerHorizontalInset + 1.dp,
+                    bottom = MiniPlayerBottomInset + MiniPlayerControlsHeight,
+                )
+                .size(width = MiniPlayerWidth - 2.dp, height = MiniPlayerVideoHeight - 1.dp)
+                .clip(
+                    RoundedCornerShape(
+                        topStart = MiniPlayerCornerRadius - 1.dp,
+                        topEnd = MiniPlayerCornerRadius - 1.dp,
+                    ),
+                )
                 .zIndex(12f)
             PlayerPresentationMode.PictureInPicture -> Modifier
                 .align(Alignment.BottomEnd)

@@ -3100,7 +3100,12 @@ const renderChrome = () => {
   const isPlaying = Boolean(state.isPlaying);
   const showError = renderPlaybackError();
   root.classList.toggle("pip-mode", Boolean(state.isInPip));
+  root.classList.toggle("mini-mode", Boolean(state.isInMiniPlayer));
   if (!state.isInPip && isPipLocked) setPipLocked(false);
+  if (state.isInMiniPlayer && activeModal) {
+    closePlayerModal(false, false);
+    return;
+  }
   root.classList.toggle("chrome-hidden", Boolean(showError || !state.controlsVisible));
   root.classList.toggle("modal-open", Boolean(activeModal));
   root.classList.toggle("info-open", activeModal === "streamInfo");
@@ -4455,7 +4460,7 @@ root.addEventListener("contextmenu", event => {
 });
 
 root.addEventListener("pointerdown", event => {
-  if (!canSpeedBoostStart() || state.isInPip || playbackErrorText() || isControlsSurfaceEvent(event)) return;
+  if (!canSpeedBoostStart() || state.isInPip || state.isInMiniPlayer || playbackErrorText() || isControlsSurfaceEvent(event)) return;
   if (event.button !== 0) return;
 
   rootPointerStartX = event.clientX;
@@ -4551,6 +4556,7 @@ window.addEventListener("blur", () => {
 
 root.addEventListener("click", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) return;
   if (isPipLocked) return;
   if (suppressNextRootClick) {
     clearSuppressNextRootClick();
@@ -4609,6 +4615,7 @@ if (pipLockBadge) {
 
 root.addEventListener("dblclick", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) return;
   if (isPipLocked) return;
   if (playbackErrorText() || isControlsSurfaceEvent(event)) return;
   event.preventDefault();
@@ -4621,7 +4628,7 @@ root.addEventListener("dblclick", event => {
 });
 
 root.addEventListener("wheel", event => {
-  if (playbackErrorText() || activeModal) return;
+  if (state.isInMiniPlayer || playbackErrorText() || activeModal) return;
   const isProgressTarget = Boolean(event.target.closest("#seek, .time-row, .time-pill, .scrub"));
   const delta = event.deltaY !== 0 ? Math.sign(event.deltaY) * -1 : Math.sign(event.deltaX);
   if (delta === 0) return;
@@ -4635,6 +4642,7 @@ root.addEventListener("wheel", event => {
 }, { passive: false });
 
 document.addEventListener("keyup", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Alt" || event.key === "Control" || event.key === "Meta" || event.metaKey || event.ctrlKey || event.altKey) {
     clearSpaceHoldTimerAndStopSpeedBoost();
     return;
@@ -4656,6 +4664,7 @@ const isSkipPromptShown = () =>
   Boolean(state.skipPromptVisible && !state.skipPromptDismissed && !skipPromptAutoHidden);
 
 document.addEventListener("keydown", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Escape" && isPartyConfirmOpen()) {
     event.preventDefault();
     closePartyConfirm();

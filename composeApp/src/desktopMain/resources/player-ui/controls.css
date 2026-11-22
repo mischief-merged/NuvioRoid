@@ -1030,6 +1030,29 @@ button:disabled {
   display: none !important;
 }
 
+/* Docked mini player hides full-screen chrome and overlays while keeping video and subtitles live. */
+.player.mini-mode {
+  cursor: pointer;
+}
+
+.player.mini-mode .top-gradient,
+.player.mini-mode .bottom-gradient,
+.player.mini-mode .header,
+.player.mini-mode .progress,
+.player.mini-mode .center-controls,
+.player.mini-mode .pause-metadata-overlay,
+.player.mini-mode .parental-guide,
+.player.mini-mode .skip-prompt,
+.player.mini-mode .next-episode-card,
+.player.mini-mode .opening-overlay,
+.player.mini-mode .playback-error,
+.player.mini-mode .modal-layer,
+.player.mini-mode .player-toast,
+.player.mini-mode .pip-lock-overlay,
+.player.mini-mode .pip-lock-badge {
+  display: none !important;
+}
+
 .pip-lock-overlay {
   display: none;
   position: absolute;

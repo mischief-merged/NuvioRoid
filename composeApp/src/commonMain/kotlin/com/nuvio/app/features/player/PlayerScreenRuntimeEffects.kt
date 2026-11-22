@@ -102,8 +102,13 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         // Details that arrive from the network replace it.
         if (playerMetaVideos.isEmpty()) {
             val localUri = activeSourceUrl.takeIf { it.startsWith("file:") }
-            // Read off the main thread, with a time limit; applied here.
-            playerMetaVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+            if (localUri != null) {
+                // Read off the main thread, with a time limit; applied here.
+                val savedVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+                if (playerMetaVideos.isEmpty()) {
+                    playerMetaVideos = savedVideos
+                }
+            }
         }
         if (playerMeta?.videos.isNullOrEmpty()) {
             MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.let { meta ->
