@@ -15,6 +15,7 @@ import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaScreenSettingsUiState
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.downloads.DownloadItem
+import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsUiState
 import com.nuvio.app.features.p2p.P2pStreamingState
@@ -143,7 +144,16 @@ internal class PlayerScreenRuntime(
         DownloadsRepository.playableLocalFileUri(item)
     }
 
-    /** A downloaded episode whose file is being checked. */
+    /** Subtitles prepared before a downloaded episode replaces the one on screen. */
+    var prepareDownloadedSubtitles: suspend (String) -> PreparedStartupSubtitles = { localFileUri ->
+        SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
+            settings = playerSettingsUiState,
+            parentMetaId = parentMetaId,
+        )
+    }
+
+    /** A downloaded episode whose file is being checked, or whose subtitles are being prepared. */
     var downloadedEpisodeSwitch: DownloadedEpisodeSwitch? = null
 
     /** Keeps a second press from cancelling the check the first press already started. */

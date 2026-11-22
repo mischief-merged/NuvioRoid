@@ -9,7 +9,6 @@ import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.SavedDetails
 import com.nuvio.app.features.downloads.DownloadItem
-import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
@@ -25,6 +24,7 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
@@ -541,10 +541,6 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
         if (inFlight.episodeId == episode.id && !continuePending) return DownloadedEpisodeSwitchResult.Pending
         if (!(continuePending && inFlight.episodeId == episode.id)) inFlight.job.cancel()
     }
-    restartSourceFailoverAfterUserChoice(newVideo = true)
-    resetEpisodePanelAndNextEpisodeState()
-    flushProgressForEpisodeChange(episode)
-    stopActiveP2pStream()
 
     val fallbackVideoId = buildPlaybackVideoId(
         parentMetaId = parentMetaId,
@@ -553,24 +549,24 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
         fallbackVideoId = episode.id,
     )
     val resolvedVideoId = episode.id.takeIf { it.isNotBlank() } ?: fallbackVideoId
-    val epEntry = WatchProgressRepository.progressForVideo(
-        videoId = resolvedVideoId,
-        parentMetaId = parentMetaId,
-        seasonNumber = episode.season,
-        episodeNumber = episode.episode,
-    )
-        ?.takeIf { !it.isCompleted }
-    val epResumeFraction = epEntry?.progressPercent
-        ?.takeIf { it > 0f }
-        ?.let { (it / 100f).coerceIn(0f, 1f) }
-    val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
-
-    scope.launch {
-        val prepared = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
-            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
-            settings = playerSettingsUiState,
+    val job = scope.launch(start = CoroutineStart.LAZY) {
+        val prepared = prepareDownloadedSubtitles(localFileUri)
+        if (!isStillValid()) return@launch
+        restartSourceFailoverAfterUserChoice(newVideo = true)
+        resetEpisodePanelAndNextEpisodeState()
+        flushProgressForEpisodeChange(episode)
+        stopActiveP2pStream()
+        val epEntry = WatchProgressRepository.progressForVideo(
+            videoId = resolvedVideoId,
             parentMetaId = parentMetaId,
+            seasonNumber = episode.season,
+            episodeNumber = episode.episode,
         )
+            ?.takeIf { !it.isCompleted }
+        val epResumeFraction = epEntry?.progressPercent
+            ?.takeIf { it > 0f }
+            ?.let { (it / 100f).coerceIn(0f, 1f) }
+        val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
         externalSubtitles = prepared.subtitles
         startupSubtitleSelection = prepared.selection
         activeSourceUrl = localFileUri
@@ -603,6 +599,15 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
         activeInitialProgressFraction = epResumeFraction
         controlsVisible = true
     }
+    synchronized(episodeSwitchLock) {
+        downloadedEpisodeSwitch = DownloadedEpisodeSwitch(episode.id, job)
+    }
+    job.invokeOnCompletion {
+        synchronized(episodeSwitchLock) {
+            if (downloadedEpisodeSwitch?.job === job) downloadedEpisodeSwitch = null
+        }
+    }
+    job.start()
     return DownloadedEpisodeSwitchResult.Accepted
 }
 
