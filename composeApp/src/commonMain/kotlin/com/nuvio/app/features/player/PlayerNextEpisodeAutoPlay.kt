@@ -64,13 +64,20 @@ internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
 }
 
 internal fun PlayerScreenRuntime.cancelNextEpisodeAutoPlay() {
-    nextEpisodeAutoPlayJob?.cancel()
-    nextEpisodeAutoPlayJob = null
-    nextEpisodeAutoPlayAutomatic = false
-    nextEpisodeAutoPlaySearching = false
-    nextEpisodeAutoPlaySourceName = null
-    nextEpisodeAutoPlayCountdown = null
-    nextEpisodeAutoPlayTarget = null
+    val (autoPlay, pending) = synchronized(episodeSwitchLock) {
+        val autoPlay = nextEpisodeAutoPlayJob
+        val pending = downloadedEpisodeSwitch
+        nextEpisodeAutoPlayJob = null
+        downloadedEpisodeSwitch = null
+        nextEpisodeAutoPlayAutomatic = false
+        nextEpisodeAutoPlaySearching = false
+        nextEpisodeAutoPlaySourceName = null
+        nextEpisodeAutoPlayCountdown = null
+        nextEpisodeAutoPlayTarget = null
+        autoPlay to pending
+    }
+    autoPlay?.cancel()
+    if (pending != null && pending.job !== autoPlay) pending.job.cancel()
 }
 
 internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
