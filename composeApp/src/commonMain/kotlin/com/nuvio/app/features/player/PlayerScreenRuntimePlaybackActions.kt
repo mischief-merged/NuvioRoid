@@ -9,6 +9,7 @@ import com.nuvio.app.features.streams.saysNotCached
 import com.nuvio.app.features.tmdb.TmdbService
 import com.nuvio.app.features.tracking.TrackingMediaReference
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
+import com.nuvio.app.isDesktop
 import com.nuvio.app.features.tracking.TrackingScrobbleCoordinator
 import com.nuvio.app.features.tracking.TrackingScrobbleEvent
 import com.nuvio.app.features.tracking.buildTrackingMediaReference
@@ -400,6 +401,7 @@ internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     if (sourceFallbackJob?.isActive == true) return false
     if (sourceFailoverForPlaceholder) return false
     if (placeholderDetectedUrl == url) return false
+    if (isDesktop && activeVideoId != null && placeholderCheckedUrl != url) return false
     if (playbackSnapshot.isEnded) return false
     if (durationMs <= 0L) return false
     if (isShortPlaceholderDuration(durationMs)) return false

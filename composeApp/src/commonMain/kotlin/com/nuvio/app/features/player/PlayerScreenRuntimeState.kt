@@ -318,6 +318,8 @@ internal class PlayerScreenRuntime(
     var placeholderCheckStateUrl: String? = null
     var placeholderCheckState: PlaceholderCheckState? = null
     var placeholderWarnedUrl: String? = null
+    /** Monotonic clock in milliseconds for the placeholder check. Tests replace it to step time. */
+    var placeholderNowMs: () -> Long = ::defaultPlaceholderNowMs
     /** Where moving on to another source finds the sources: the player's own search. Tests give their own list. */
     var failoverSourceSearch: FailoverSourceSearch = FailoverSourceSearch.Player
 

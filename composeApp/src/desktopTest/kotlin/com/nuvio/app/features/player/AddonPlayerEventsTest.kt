@@ -29,9 +29,50 @@ class AddonPlayerEventsTest {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val events = mutableListOf<RecordedEvent>()
+    private var clockNowMs = 0L
 
     @AfterTest
     fun cleanup() = scope.cancel()
+
+    private fun deliverSnapshot(
+        runtime: PlayerScreenRuntime,
+        nowMs: Long,
+        durationMs: Long,
+        positionMs: Long,
+        isPlaying: Boolean = true,
+        isLoading: Boolean = false,
+        isEnded: Boolean = false,
+    ) {
+        clockNowMs = nowMs
+        val snapshot = PlayerPlaybackSnapshot(
+            isLoading = isLoading,
+            isPlaying = isPlaying,
+            isEnded = isEnded,
+            durationMs = durationMs,
+            positionMs = positionMs,
+        )
+        runtime.playbackSnapshot = snapshot
+        if (!isLoading) {
+            runtime.initialLoadCompleted = true
+            runtime.announceSourceFailoverIfPending()
+        }
+        runtime.checkForPlaceholderSource(snapshot)
+        runtime.syncAddonPlayerStartForPlayback()
+        if (!isLoading) {
+            runtime.previousIsPlaying = isPlaying
+        }
+    }
+
+    private fun settlePlayback(
+        runtime: PlayerScreenRuntime,
+        durationMs: Long,
+        startPositionMs: Long = 0L,
+        startClockMs: Long = clockNowMs,
+    ) {
+        deliverSnapshot(runtime, nowMs = startClockMs, durationMs = durationMs, positionMs = startPositionMs)
+        deliverSnapshot(runtime, nowMs = startClockMs + 1_500L, durationMs = durationMs, positionMs = startPositionMs + 1_500L)
+        deliverSnapshot(runtime, nowMs = startClockMs + 3_000L, durationMs = durationMs, positionMs = startPositionMs + 3_000L)
+    }
 
     private class ListSearch(private val streams: List<StreamItem>) : FailoverSourceSearch {
         override fun start(type: String, videoId: String, season: Int?, episode: Int?) = Unit
@@ -96,6 +137,7 @@ class AddonPlayerEventsTest {
         playerSettingsUiState = PlayerSettingsUiState()
         this.activeStream = activeStream
         failoverSourceSearch = search
+        placeholderNowMs = { clockNowMs }
         dispatchAddonPlayerEvent = { target, action, positionMs, durationMs ->
             events += RecordedEvent(target, action, positionMs, durationMs)
         }
@@ -225,28 +267,37 @@ class AddonPlayerEventsTest {
     }
 
     @Test
-    fun late_duration_for_real_episode_sends_start_then_exactly_one_stop() {
+    fun provisional_full_length_followed_by_short_placeholder_sends_no_events() {
         val runtime = runtime(runtimeMinutes = 45)
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 0L,
-            positionMs = 0L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
-        runtime.previousIsPlaying = true
+        // Engine initially reports a provisional full-length duration before settling.
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 2_700_000L, positionMs = 0L)
+        deliverSnapshot(runtime, nowMs = 1_000L, durationMs = 2_700_000L, positionMs = 1_000L)
+        assertTrue(events.isEmpty(), "must not send START before the duration check settles, got $events")
+
+        // Duration drops to a short placeholder clip and settles there.
+        deliverSnapshot(runtime, nowMs = 2_000L, durationMs = 15_000L, positionMs = 2_000L)
+        deliverSnapshot(runtime, nowMs = 3_500L, durationMs = 15_000L, positionMs = 3_500L)
+        deliverSnapshot(runtime, nowMs = 5_000L, durationMs = 15_000L, positionMs = 5_000L)
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+
+        assertTrue(events.isEmpty(), "placeholder must never send START or STOP, got $events")
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun late_duration_for_real_episode_defers_start_until_settled_then_sends_one_stop() {
+        val runtime = runtime(runtimeMinutes = 45)
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 0L, positionMs = 0L)
         assertTrue(events.isEmpty())
 
-        // Real duration arrives while already playing.
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 3_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
+        // Real duration arrives while already playing; START waits until 3 stable snapshots span 3 seconds.
+        deliverSnapshot(runtime, nowMs = 1_000L, durationMs = 2_700_000L, positionMs = 1_000L)
+        deliverSnapshot(runtime, nowMs = 2_500L, durationMs = 2_700_000L, positionMs = 2_500L)
+        assertTrue(events.isEmpty(), "must not send START before duration settles")
+
+        deliverSnapshot(runtime, nowMs = 4_000L, durationMs = 2_700_000L, positionMs = 4_000L)
         // Repeated tick does not send a second START.
-        runtime.syncAddonPlayerStartForPlayback()
+        deliverSnapshot(runtime, nowMs = 5_000L, durationMs = 2_700_000L, positionMs = 5_000L)
 
         assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
         assertEquals(AddonPlayerEventTarget("series", "tt1234567:1:2"), runtime.activeAddonPlayerEventTarget)
@@ -270,13 +321,7 @@ class AddonPlayerEventsTest {
     @Test
     fun active_start_still_receives_stop_even_if_duration_later_reports_short_or_zero() {
         val runtime = runtime(runtimeMinutes = 45)
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 60_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 60_000L)
         assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
 
         // Engine reports short duration during teardown before STOP.
@@ -306,14 +351,7 @@ class AddonPlayerEventsTest {
             activeStream = first,
             search = ListSearch(listOf(first, second)),
         )
-        runtime.initialLoadCompleted = true
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 120_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 120_000L)
         assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
 
         // First source stalls/errors and fails over to the second source.
@@ -326,15 +364,9 @@ class AddonPlayerEventsTest {
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
         assertNull(runtime.activeAddonPlayerEventTarget)
 
-        // Replacement source plays and then user leaves the player.
+        // Replacement source settles, plays, and then user leaves the player.
         runtime.previousIsPlaying = false
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 115_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 115_000L, startClockMs = 10_000L)
         runtime.cancelSourceFailoverOnExit()
         runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
 
@@ -348,13 +380,7 @@ class AddonPlayerEventsTest {
     @Test
     fun real_short_episode_matching_expected_runtime_is_accepted() {
         val runtime = runtime(runtimeMinutes = 3)
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 180_000L,
-            positionMs = 5_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
+        settlePlayback(runtime, durationMs = 180_000L, startPositionMs = 5_000L)
         runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
 
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
@@ -381,42 +407,10 @@ class AddonPlayerEventsTest {
         assertEquals(healthyUrl, runtime.activeSourceUrl)
         assertTrue(events.isEmpty(), "placeholder must never send tracking events, got $events")
 
-        // First non-loading frame of the replacement clears failover state and allows START.
+        // Replacement settles and emits START, then one STOP on exit.
         runtime.previousIsPlaying = false
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 2_000L,
-        )
-        runtime.announceSourceFailoverIfPending()
-        runtime.syncAddonPlayerStartForPlayback()
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 2_000L, startClockMs = 10_000L)
         runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
-
-        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
-        assertNull(runtime.activeAddonPlayerEventTarget)
-    }
-
-    @Test
-    fun active_session_emits_stop_if_duration_drops_to_short_placeholder_while_playing() {
-        val runtime = runtime(runtimeMinutes = 45)
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 2_700_000L,
-            positionMs = 5_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
-        runtime.previousIsPlaying = true
-        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
-
-        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
-            isLoading = false,
-            isPlaying = true,
-            durationMs = 15_000L,
-            positionMs = 6_000L,
-        )
-        runtime.syncAddonPlayerStartForPlayback()
 
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
         assertNull(runtime.activeAddonPlayerEventTarget)

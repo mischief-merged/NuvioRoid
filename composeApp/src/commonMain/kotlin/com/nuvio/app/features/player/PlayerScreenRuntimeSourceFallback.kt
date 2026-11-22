@@ -42,6 +42,8 @@ private val log = Logger.withTag("PlayerSourceFallback")
 /** Monotonic clock for the placeholder check; its origin does not matter, only differences do. */
 private val placeholderClock = kotlin.time.TimeSource.Monotonic.markNow()
 
+internal fun defaultPlaceholderNowMs(): Long = placeholderClock.elapsedNow().inWholeMilliseconds
+
 /**
  * Plays [stream] at [url] in place of the current source. Playback resumes at [resumePositionMs]
  * when it is given. Otherwise, before playback has started the pending resume position is kept,
@@ -185,7 +187,7 @@ internal fun PlayerScreenRuntime.checkForPlaceholderSource(snapshot: PlayerPlayb
     val url = activeSourceUrl
     val videoId = activeVideoId
     if (url.isBlank() || videoId == null || placeholderCheckedUrl == url) return
-    val nowMs = placeholderClock.elapsedNow().inWholeMilliseconds
+    val nowMs = placeholderNowMs()
     // A file that has played to its end has its final length: no need to wait for it to settle. A clip
     // shorter than the check's settling time ends before the check could decide otherwise.
     if (snapshot.isEnded && snapshot.durationMs > 0L) {
@@ -214,6 +216,7 @@ internal fun PlayerScreenRuntime.checkForPlaceholderSource(snapshot: PlayerPlayb
         PlaceholderCheckStep.Finished -> {
             placeholderCheckedUrl = url
             placeholderCheckState = null
+            syncAddonPlayerStartForPlayback()
             return
         }
         is PlaceholderCheckStep.Stable -> step.durationMs
@@ -221,6 +224,7 @@ internal fun PlayerScreenRuntime.checkForPlaceholderSource(snapshot: PlayerPlayb
     placeholderCheckedUrl = url
     placeholderCheckState = null
     judgePlaceholderLength(url, videoId, durationMs, ended = false)
+    syncAddonPlayerStartForPlayback()
 }
 
 /** Judges the final length of the source at [url]; a placeholder is moved on from. */
