@@ -623,7 +623,6 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     episode: MetaVideo,
     resume: EpisodeResume,
 ) {
-    restartSourceFailoverAfterUserChoice(newVideo = true)
     activeSourceIdentityKey = stream.playerSourceIdentityKey()
     activeSourceFilename = stream.behaviorHints.filename
     activeStreamTitle = stream.streamLabel

@@ -128,7 +128,7 @@ internal fun PlayerScreenRuntime.restartSourceFailoverAfterUserChoice(newVideo: 
     if (newVideo) sourceFallbackTriedKeys.clear()
 }
 
-private fun PlayerScreenRuntime.endSourceFailover() {
+internal fun PlayerScreenRuntime.endSourceFailover() {
     sourceFallbackJob?.cancel()
     sourceFallbackJob = null
     sourceFailoverTryingName = null
@@ -543,6 +543,9 @@ internal fun nextSourceFallbackCandidate(
     triedKeys: Set<String>,
     failedAddonId: String? = null,
     failedInfoHash: String? = null,
+    preferences: com.nuvio.app.features.downloads.SeasonDownloadDefaults = StreamAutoPlayPolicy.preferencesFor(settings.streamAutoPlayMode),
+    runtimeMinutes: Int? = null,
+    wanted: com.nuvio.app.features.streams.WantedContent? = null,
     installedAddonNames: Set<String> = AddonRepository.uiState.value.addons.enabledAddons().map { it.displayTitle }.toSet(),
     debridEnabled: Boolean = DebridSettingsRepository.snapshot().canResolvePlayableLinks,
     activeResolverProviderId: String? = DebridSettingsRepository.snapshot().activeResolverProviderId,
@@ -552,6 +555,9 @@ internal fun nextSourceFallbackCandidate(
         settings = settings,
         failedAddonId = failedAddonId,
         failedInfoHash = failedInfoHash,
+        preferences = preferences,
+        runtimeMinutes = runtimeMinutes,
+        wanted = wanted,
         installedAddonNames = installedAddonNames,
         debridEnabled = debridEnabled,
         activeResolverProviderId = activeResolverProviderId,

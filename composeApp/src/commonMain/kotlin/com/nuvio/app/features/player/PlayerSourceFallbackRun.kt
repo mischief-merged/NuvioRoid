@@ -66,7 +66,7 @@ internal fun PlayerScreenRuntime.restartSourceFallback(
     sourceUrl: String,
     autoSelection: PlayerSourceFallbackTried?,
 ) {
-    sourceFallbackJob?.cancel()
+    endSourceFailover()
     autoSelectedSourceUrl = sourceUrl.takeIf { autoSelection != null && it.isNotBlank() }
     sourceFallbackAttempts = autoSelection?.attempts ?: 0
     sourceFallbackTriedKeys.clear()
