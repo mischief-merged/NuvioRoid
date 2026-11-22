@@ -82,6 +82,7 @@ actual fun PlatformPlayerSurface(
             modifier = modifier,
             playWhenReady = playWhenReady,
             resizeMode = resizeMode,
+            useNativeController = useNativeController,
             initialPositionMs = initialPositionMs ?: 0L,
             initialPositionRequestKey = initialPositionRequestKey,
             playerControlsState = playerControlsState,
@@ -115,6 +116,7 @@ private fun NativePlayerSurface(
     modifier: Modifier,
     playWhenReady: Boolean,
     resizeMode: PlayerResizeMode,
+    useNativeController: Boolean,
     initialPositionMs: Long,
     initialPositionRequestKey: String?,
     playerControlsState: PlayerControlsState,
@@ -181,9 +183,11 @@ private fun NativePlayerSurface(
         onControllerReady(readyController)
     }
 
-    DisposableEffect(host) {
-        DesktopPlayerPictureInPicture.setHost(host)
-        DesktopPlayerPictureInPicture.setController(controller)
+    DisposableEffect(host, useNativeController) {
+        if (useNativeController) {
+            DesktopPlayerPictureInPicture.setHost(host)
+            DesktopPlayerPictureInPicture.setController(controller)
+        }
         host.onDisplayableChanged = { displayable ->
             if (!displayable) {
                 hostFirstPaintComplete.value = false
@@ -197,7 +201,9 @@ private fun NativePlayerSurface(
             hostFirstFullSizePaintComplete.value = true
         }
         onDispose {
-            DesktopPlayerPictureInPicture.release()
+            if (useNativeController) {
+                DesktopPlayerPictureInPicture.release(host)
+            }
             host.onDisplayableChanged = null
             host.onFirstPaint = null
             host.onFirstFullSizePaint = null
@@ -217,14 +223,21 @@ private fun NativePlayerSurface(
         onDispose { controller.dispose() }
     }
 
-    // The controls overlay owns the player shortcuts. After alt-tab, desktop
-    // window focus can return to the AWT/Compose host instead of the embedded
-    // WebView, so explicitly hand keyboard focus back to the native controls
-    // whenever the player window becomes active again.
-    DisposableEffect(controller, hostFirstFullSizePaintComplete.value) {
-        val uninstall = if (hostFirstFullSizePaintComplete.value) {
+    val pipChanges by DesktopPlayerPictureInPicture.changes.collectAsState()
+    val isInPip = useNativeController && pipChanges >= 0 && DesktopPlayerPictureInPicture.isEnabled
+
+    // The controls overlay owns the player shortcuts while in full-screen mode.
+    // When minimized or in PiP, focus stays with the main Compose window so
+    // search inputs and navigation shortcuts work normally.
+    val focusForwardingEnabled = hostFirstFullSizePaintComplete.value &&
+        !controlsState.isInMiniPlayer &&
+        !isInPip
+    DisposableEffect(controller, focusForwardingEnabled) {
+        val uninstall = if (focusForwardingEnabled) {
+            controller.requestKeyboardFocus()
             controller.installWindowFocusForwarding()
         } else {
+            controller.releaseKeyboardFocusToWindow()
             null
         }
         onDispose { uninstall?.invoke() }
@@ -275,18 +288,22 @@ private fun NativePlayerSurface(
         controller.setResizeMode(resizeMode)
     }
 
-    LaunchedEffect(controller, controlsState) {
+    LaunchedEffect(controller, controlsState, useNativeController) {
         controller.updateControls(controlsState)
-        DesktopPlayerPictureInPicture.setWindowTitle(controlsState.pipWindowTitle)
+        if (useNativeController) {
+            DesktopPlayerPictureInPicture.setWindowTitle(controlsState.pipWindowTitle)
+        }
     }
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, useNativeController) {
+        if (!useNativeController) return@LaunchedEffect
         DesktopPlayerPictureInPicture.changes.drop(1).collect {
             controller.updateControls(latestControlsState.value)
         }
     }
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, useNativeController) {
+        if (!useNativeController) return@LaunchedEffect
         AppPresenceState.current.collect { snapshot ->
             val player = snapshot as? PresenceSnapshot.Player
             controller.updatePresenceNowPlayingFallback(player?.title, player?.episodeLabel, player?.posterUrl)
@@ -305,9 +322,6 @@ private fun NativePlayerSurface(
             delay(250L)
         }
     }
-
-    val pipChanges by DesktopPlayerPictureInPicture.changes.collectAsState()
-    val isInPip = pipChanges >= 0 && DesktopPlayerPictureInPicture.isEnabled
 
     Box(
         modifier = modifier

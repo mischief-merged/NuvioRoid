@@ -31,10 +31,12 @@ import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -68,6 +70,7 @@ import com.nuvio.app.isDesktop
 import com.nuvio.app.features.player.skip.internalSkipAction
 import com.nuvio.app.features.servers.ServerStreams
 import com.nuvio.app.features.streams.streamAddonInstanceId
+import com.nuvio.app.features.tracking.TrackingScrobbleAction
 import com.nuvio.app.isIos
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -78,11 +81,7 @@ import org.jetbrains.compose.resources.stringResource
 private val playerControlsLog = Logger.withTag("PlayerControls")
 
 @Composable
-internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
-    partyPanelWidth: Dp,
-    partyPanelInset: Dp,
-    dockPartyPanel: Boolean,
-) {
+internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
     val runtime = this
     val systemBackRegistration = args.onSystemBackHandlerChanged
     DisposableEffect(runtime, systemBackRegistration) {
@@ -99,7 +98,74 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             onDismiss = { dismissNativeControlsModal() },
         )
     }
+    val controlsRegistration = args.onSessionControlsChanged
+    val nextEpisodeAction = if (
+        nextEpisodeInfo?.hasAired == true &&
+        !nextEpisodeAutoPlaySearching &&
+        nextEpisodeAutoPlayCountdown == null
+    ) {
+        {
+            if (!partyBlocksControl()) playNextEpisode()
+        }
+    } else {
+        null
+    }
+    val latestNextEpisodeAction = rememberUpdatedState(nextEpisodeAction)
+    DisposableEffect(runtime, controlsRegistration) {
+        controlsRegistration?.invoke(
+            PlayerSessionControls(
+                togglePlayback = { runtime.togglePlayback() },
+                seekForward = { runtime.seekBy(10_000L) },
+                playNextEpisode = { latestNextEpisodeAction.value?.invoke() },
+                requestClose = { onClosed -> runtime.requestClose(afterClosed = onClosed) },
+                requestBack = { runtime.requestBack() },
+            ),
+        )
+        onDispose { controlsRegistration?.invoke(null) }
+    }
+    val onSessionStateChanged = args.onSessionStateChanged
+    if (onSessionStateChanged != null) {
+        val latestOnSessionStateChanged = rememberUpdatedState(onSessionStateChanged)
+        val sessionState by remember(runtime) {
+            derivedStateOf {
+                val positionMs = runtime.scrubbingPositionMs ?: runtime.playbackSnapshot.positionMs
+                val quantizedPositionMs = (positionMs / 250L) * 250L
+                MiniPlayerPlaybackState(
+                    title = runtime.title,
+                    seasonNumber = runtime.activeSeasonNumber,
+                    episodeNumber = runtime.activeEpisodeNumber,
+                    episodeTitle = runtime.activeEpisodeTitle,
+                    videoId = runtime.activeVideoId,
+                    parentMetaId = runtime.parentMetaId,
+                    parentMetaType = runtime.parentMetaType,
+                    sourceUrl = runtime.activeSourceUrl,
+                    isPlaying = runtime.playbackSnapshot.isPlaying,
+                    isLoading = runtime.playbackSnapshot.isLoading,
+                    positionMs = quantizedPositionMs,
+                    durationMs = runtime.playbackSnapshot.durationMs,
+                    nextEpisodePlayable = runtime.nextEpisodeInfo?.hasAired == true &&
+                        !runtime.nextEpisodeAutoPlaySearching &&
+                        runtime.nextEpisodeAutoPlayCountdown == null,
+                    hasError = runtime.errorMessage != null,
+                )
+            }
+        }
+        LaunchedEffect(sessionState) {
+            latestOnSessionStateChanged.value(sessionState)
+        }
+    }
+}
+
+@Composable
+internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
+    partyPanelWidth: Dp,
+    partyPanelInset: Dp,
+    dockPartyPanel: Boolean,
+) {
+    val runtime = this
+    BindPlayerSessionBridge()
     val isInPip = rememberIsInPictureInPicture()
+    val isMinimized = args.isMinimized
     val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
     val seasonNumber = activeSeasonNumber
     val episodeNumber = activeEpisodeNumber
@@ -394,6 +460,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         playLabel = stringResource(Res.string.detail_btn_play),
         pauseLabel = stringResource(Res.string.compose_action_pause),
         closeLabel = stringResource(Res.string.compose_player_close),
+        minimizeLabel = if (args.onMinimize != null) stringResource(Res.string.compose_player_minimize) else "",
+        isInMiniPlayer = isMinimized,
         mutedLabel = stringResource(Res.string.compose_player_muted),
         volumeLevelLabelFormat = stringResource(Res.string.compose_player_volume_level, "%s"),
         lockLabel = stringResource(Res.string.compose_player_lock_controls),
@@ -707,6 +775,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                 initialPositionRequestKey = surfaceSource?.initialPositionRequestKey,
                 resizeMode = if (partyPanelInset > 0.dp) PlayerResizeMode.Fit else resizeMode,
                 playbackEngine = playbackEngineOverride ?: resolvedAutoEngine,
+                useNativeController = true,
                 playerControlsState = playerControlsState,
                 onPlayerControlsAction = { action -> handlePlayerControlsAction(action) },
                 onPlayerControlsEvent = { type, value -> handlePlayerControlsEvent(type, value) },
@@ -763,7 +832,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         }
 
         AnimatedVisibility(
-            visible = playerSettingsUiState.pauseOverlayEnabled && pausedOverlayVisible && !controlsVisible && !playerControlsLocked && !isInPip && fold == null,
+            visible = playerSettingsUiState.pauseOverlayEnabled && pausedOverlayVisible && !controlsVisible && !playerControlsLocked && !isInPip && !isMinimized && fold == null,
             enter = fadeIn(animationSpec = tween(durationMillis = 220)),
             exit = fadeOut(animationSpec = tween(durationMillis = 180)),
         ) {
@@ -782,7 +851,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             )
         }
 
-        if (!isDesktop) {
+        if (!isDesktop && !isMinimized) {
             RenderPlayerControls(
                 displayedPositionMs = displayedPositionMs,
                 isEpisode = isEpisode,
@@ -790,31 +859,35 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                 modifier = panelModifier,
             )
         }
-        Box(modifier = videoModifier) {
-            RenderPlaybackOverlays(
-                runtime = runtime,
-                displayedPositionMs = displayedPositionMs,
-                currentGestureFeedback = currentGestureFeedback,
-                p2pInitialLoadingMessage = p2pInitialLoadingMessage,
-                p2pInitialLoadingProgress = p2pInitialLoadingProgress,
-                showP2pRebufferStats = showP2pRebufferStats,
-                p2pRebufferMessage = p2pRebufferMessage,
-                p2pRebufferProgress = p2pRebufferProgress,
-                suppressOpeningOverlay = isDesktop && playerSurfaceSourceUrl != null,
-                folded = fold != null,
-            )
+        if (!isMinimized) {
+            Box(modifier = videoModifier) {
+                RenderPlaybackOverlays(
+                    runtime = runtime,
+                    displayedPositionMs = displayedPositionMs,
+                    currentGestureFeedback = currentGestureFeedback,
+                    p2pInitialLoadingMessage = p2pInitialLoadingMessage,
+                    p2pInitialLoadingProgress = p2pInitialLoadingProgress,
+                    showP2pRebufferStats = showP2pRebufferStats,
+                    p2pRebufferMessage = p2pRebufferMessage,
+                    p2pRebufferProgress = p2pRebufferProgress,
+                    suppressOpeningOverlay = isDesktop && playerSurfaceSourceUrl != null,
+                    folded = fold != null,
+                )
+            }
         }
     }
-    Box(modifier = panelModifier) {
-        if (!isDesktop) {
-            RenderParty(
-                runtime = runtime,
-                panelWidth = partyPanelWidth,
-                modal = !dockPartyPanel,
-                panelVisible = showPartyPanel && !isInPip,
-            )
+    if (!isMinimized) {
+        Box(modifier = panelModifier) {
+            if (!isDesktop) {
+                RenderParty(
+                    runtime = runtime,
+                    panelWidth = partyPanelWidth,
+                    modal = !dockPartyPanel,
+                    panelVisible = showPartyPanel && !isInPip,
+                )
+            }
+            RenderPlayerModals(displayedPositionMs = displayedPositionMs)
         }
-        RenderPlayerModals(displayedPositionMs = displayedPositionMs)
     }
 }
 
@@ -1047,7 +1120,47 @@ internal fun releaseRetainedPlayerBeforeNavigation(
     }
 }
 
-private fun PlayerScreenRuntime.requestBack(exitTarget: PlayerExitTarget? = null) {
+internal fun PlayerScreenRuntime.shouldMinimizeOnBack(): Boolean =
+    shouldMinimizePlayerOnBack(
+        miniPlayerSupported = args.onMinimize != null,
+        hasError = errorMessage != null,
+        isEnded = playbackSnapshot.isEnded,
+        isPlaying = playbackSnapshot.isPlaying,
+        shouldPlay = shouldPlay,
+        initialLoadCompleted = initialLoadCompleted,
+    )
+
+internal fun PlayerScreenRuntime.closeModalsForMiniPlayer() {
+    controlsVisible = false
+    playerControlsCloseModalsToken += 1
+    showSourcesPanel = false
+    showEpisodesPanel = false
+    showChaptersPanel = false
+    showAudioModal = false
+    showSubtitleModal = false
+    showVideoSettingsModal = false
+    showStreamInfo = false
+    showSubmitIntroModal = false
+    showSwitchEngineConfirm = false
+    showPartyPanel = false
+}
+
+internal fun PlayerScreenRuntime.requestMinimize(exitTarget: PlayerExitTarget? = null) {
+    val minimize = args.onMinimize
+    if (minimize == null || errorMessage != null || playbackSnapshot.isEnded) {
+        requestClose(exitTarget)
+        return
+    }
+    flushWatchProgress(TrackingScrobbleAction.START)
+    closeModalsForMiniPlayer()
+    args.onExitTarget(exitTarget)
+    minimize()
+}
+
+internal fun PlayerScreenRuntime.requestClose(
+    exitTarget: PlayerExitTarget? = null,
+    afterClosed: (() -> Unit)? = null,
+) {
     cancelSourceFailoverOnExit()
     flushWatchProgress()
     val exitingController = playerLifecycleController
@@ -1070,6 +1183,7 @@ private fun PlayerScreenRuntime.requestBack(exitTarget: PlayerExitTarget? = null
                         playerController = null
                     }
                     afterRelease()
+                    afterClosed?.invoke()
                 },
                 onReleaseFailed = { message ->
                     if (!playerReleaseSurfaceRetention.finish(releaseAttemptId)) {
@@ -1086,6 +1200,14 @@ private fun PlayerScreenRuntime.requestBack(exitTarget: PlayerExitTarget? = null
     }
 }
 
+internal fun PlayerScreenRuntime.requestBack(exitTarget: PlayerExitTarget? = null) {
+    if (shouldMinimizeOnBack()) {
+        requestMinimize(exitTarget)
+        return
+    }
+    requestClose(exitTarget)
+}
+
 private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControlsAction): Boolean {
     playerControlsLog.d { "action=$action ${playerControlLogContext()}" }
     when (action) {
@@ -1098,6 +1220,8 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
         }
         PlayerControlsAction.RevealLockedOverlay -> revealLockedOverlay()
         PlayerControlsAction.Back -> requestBack()
+        PlayerControlsAction.Minimize -> requestMinimize()
+        PlayerControlsAction.Close -> requestClose()
         PlayerControlsAction.TogglePlayback -> return toggleFromNativeControls()
         PlayerControlsAction.KeyboardTogglePlayback -> return toggleFromNativeControls(revealControls = false)
         PlayerControlsAction.SeekBack -> return seekFromNativeControls(-10_000L)

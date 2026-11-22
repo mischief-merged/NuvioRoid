@@ -76,7 +76,8 @@ internal object DesktopPlayerPictureInPicture {
         restoreOnEdt()
     }
 
-    fun release() = onEdt {
+    fun release(expectedHost: NativePlayerHost? = null) = onEdt {
+        if (expectedHost != null && host !== expectedHost) return@onEdt
         transition = true
         val window = pipWindow
         pipWindow = null

@@ -21,6 +21,7 @@ import com.nuvio.app.features.player.PlayerChapter
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.PlayerEngineController
 import com.nuvio.app.features.player.PlayerMediaInfo
+import com.nuvio.app.features.player.PlayerNowPlayingInfo
 import com.nuvio.app.features.player.mpvMediaInfo
 import com.nuvio.app.features.player.PlayerNowPlayingInfo
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
@@ -488,6 +489,14 @@ internal class NativePlayerController(
         return { window.removeWindowFocusListener(listener) }
     }
 
+    /** The dock is on the browsing window, so auto-hide must not take the cursor away there. */
+    private fun publishHostControlsVisible(
+        visible: Boolean,
+        inMiniPlayer: Boolean = controlsState.isInMiniPlayer,
+    ) {
+        setHostControlsVisible(visible || inMiniPlayer)
+    }
+
     @Synchronized
     fun updateControls(state: PlayerControlsState) {
         val cursorVisible = DesktopPlayerHideTimer.computeDesktopCursorVisible(
@@ -495,7 +504,7 @@ internal class NativePlayerController(
             hasError = state.playbackErrorMessage.isNotBlank(),
             isLoading = state.isLoading,
         )
-        setHostControlsVisible(cursorVisible)
+        publishHostControlsVisible(cursorVisible, state.isInMiniPlayer)
         val currentHandle = handle
         val current = currentHandle.takeIf { it != 0L } ?: run {
             controlsState = state
@@ -563,9 +572,19 @@ internal class NativePlayerController(
                 NativePlayerBridge.requestFocus(current)
                 return@invokeLater
             }
-            if (!isHostDisplayable()) return@invokeLater
+            if (controlsState.isInMiniPlayer || !isHostDisplayable()) return@invokeLater
             host.requestFocusInWindow()
             NativePlayerBridge.requestFocus(current)
+        }
+    }
+
+    fun releaseKeyboardFocusToWindow() {
+        SwingUtilities.invokeLater {
+            host.resetCursorVisibility()
+            val window = SwingUtilities.getWindowAncestor(host) ?: return@invokeLater
+            if (host.hasFocus()) {
+                window.requestFocusInWindow()
+            }
         }
     }
 
@@ -688,7 +707,7 @@ internal class NativePlayerController(
                 }
             }
             "hideChrome" -> {
-                setHostControlsVisible(false)
+                publishHostControlsVisible(false)
                 if (!onEvent(type, value)) {
                     ensureFallbackHideTimer().onControlsHidden()
                 }
@@ -779,7 +798,7 @@ internal class NativePlayerController(
                 if (!releaseRequested && controlsState.controlsVisible != hideState.controlsVisible) {
                     updateControls(controlsState.copy(controlsVisible = hideState.controlsVisible))
                 } else if (!releaseRequested) {
-                    setHostControlsVisible(hideState.cursorVisible)
+                    publishHostControlsVisible(hideState.cursorVisible)
                 }
             }
         }.also { fallbackHideTimer = it }
@@ -1545,6 +1564,8 @@ private fun String.toPlayerControlsAction(): PlayerControlsAction? =
     when (this) {
         "toggleChrome" -> PlayerControlsAction.ToggleChrome
         "back" -> PlayerControlsAction.Back
+        "minimize" -> PlayerControlsAction.Minimize
+        "close" -> PlayerControlsAction.Close
         "toggle" -> PlayerControlsAction.TogglePlayback
         "keyboardToggle" -> PlayerControlsAction.KeyboardTogglePlayback
         "seekBack" -> PlayerControlsAction.SeekBack
@@ -1622,6 +1643,10 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         appendJsonField("pauseLabel", pauseLabel)
         append(',')
         appendJsonField("closeLabel", closeLabel)
+        append(',')
+        appendJsonField("minimizeLabel", minimizeLabel)
+        append(',')
+        appendJsonField("isInMiniPlayer", isInMiniPlayer)
         append(',')
         appendJsonField("mutedLabel", mutedLabel)
         append(',')

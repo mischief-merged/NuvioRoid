@@ -26,6 +26,7 @@ const toggleLabel = document.getElementById("toggleLabel");
 const nextEpisodeButton = document.getElementById("nextEpisodeButton");
 const nextEpisodeButtonLabel = document.getElementById("nextEpisodeButtonLabel");
 const fullscreenButton = document.getElementById("fullscreenButton");
+const minimizeButton = document.getElementById("minimizeButton");
 const pipButton = document.getElementById("pipButton");
 const fullscreenIcon = document.getElementById("fullscreenIcon");
 const title = document.getElementById("title");
@@ -246,6 +247,8 @@ let state = {
   playLabel: "Play",
   pauseLabel: "Pause",
   closeLabel: "Close player",
+  minimizeLabel: "",
+  isInMiniPlayer: false,
   lockLabel: "Lock player controls",
   unlockLabel: "Unlock player controls",
   submitIntroLabel: "Submit Intro",
@@ -2941,6 +2944,7 @@ const clearChromeAutoHideTimer = () => {
 };
 
 const shouldHideCursorForIdleChrome = () => Boolean(
+  !state.isInMiniPlayer &&
   !playbackErrorText() &&
   !state.controlsVisible &&
   !activeModal &&
@@ -3123,6 +3127,12 @@ const renderChrome = () => {
   setActionButtonLabel("audio", state.audioLabel || "Audio");
   setActionButtonLabel("sources", state.sourcesLabel || "Sources");
   setActionButtonLabel("episodes", state.episodesLabel || "Episodes");
+  if (minimizeButton) {
+    const minimizeLabel = String(state.minimizeLabel || "").trim();
+    setAttr(minimizeButton, "aria-label", minimizeLabel);
+    setAttr(minimizeButton, "title", minimizeLabel);
+    minimizeButton.hidden = !minimizeLabel || Boolean(state.isInPip) || Boolean(state.isInMiniPlayer);
+  }
   if (pipButton) {
     const pipLabel = String(state.pipLabel || "").trim();
     setAttr(pipButton, "aria-label", pipLabel);
@@ -3177,6 +3187,7 @@ const renderChrome = () => {
   }
   syncFullscreenButtons();
   setAttr(backButton, "aria-label", state.closeLabel || "Close player");
+  setAttr(openingBackButton, "aria-label", state.closeLabel || "Close player");
   setAttr(submitIntroButton, "aria-label", state.submitIntroLabel || "Submit Intro");
   setAttr(videoSettingsButton, "aria-label", state.videoSettingsLabel || "Video settings");
   if (shortcutsButton) {

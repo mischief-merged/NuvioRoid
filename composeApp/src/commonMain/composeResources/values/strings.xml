@@ -441,6 +441,7 @@
     <string name="compose_player_bottom_offset">Bottom Offset</string>
     <string name="compose_player_capture_line">Capture</string>
     <string name="compose_player_close">Close player</string>
+    <string name="compose_player_minimize">Minimize player</string>
     <string name="compose_player_color">Color</string>
     <string name="compose_player_currently_playing">Currently playing</string>
     <string name="compose_player_episode_code_episode_only">E%1$d</string>

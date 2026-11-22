@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -17,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.trailer.TrailerExtractionPlatform
 import io.github.kdroidfilter.composemediaplayer.InitialPlayerState
 import io.github.kdroidfilter.composemediaplayer.VideoPlayerSurface
@@ -40,11 +42,13 @@ actual fun HeroTrailerPlayerSurface(
     onEnded: () -> Unit,
     onError: () -> Unit,
 ) {
+    val activePlayerSession by ActivePlayerSessionRegistry.isActive.collectAsState()
+    val effectivePlayWhenReady = playWhenReady && !activePlayerSession
     key(sourceUrl, sourceAudioUrl, startPositionMillis) {
         DesktopTrailerPlayerSession(
             sourceUrl = sourceUrl,
             sourceAudioUrl = sourceAudioUrl,
-            playWhenReady = playWhenReady,
+            playWhenReady = effectivePlayWhenReady,
             muted = muted,
             startPositionMillis = startPositionMillis,
             fillFrame = fillFrame,

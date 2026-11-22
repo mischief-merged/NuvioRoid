@@ -1190,6 +1190,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     std::atomic_bool _aoIsAvfoundation;
     std::atomic<double> _requestedVolumePercent;
     BOOL _didFocusControlsWebView;
+    BOOL _isInMiniPlayer;
     BOOL _controlsWebReady;
     BOOL _fullscreenTransitionActive;
     NSString *_pendingControlsJson;
@@ -1357,7 +1358,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 }
 
 - (void)focusControlsWebViewIfNeeded {
-    if (_didFocusControlsWebView || !_webView || !_webView.window) {
+    if (_isInMiniPlayer || _didFocusControlsWebView || !_webView || !_webView.window) {
         return;
     }
     [self requestFocus];
@@ -2132,6 +2133,28 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     }
     if (!controlsJson) {
         return;
+    }
+    BOOL nextMiniPlayer = [controlsJson rangeOfString:@"\"isInMiniPlayer\":true"].location != NSNotFound;
+    if (nextMiniPlayer != _isInMiniPlayer) {
+        _isInMiniPlayer = nextMiniPlayer;
+        _lastAppliedNativeLayoutBounds = NSZeroRect;
+        _lastAppliedNativeLayoutWasLiveResize = NO;
+        _lightweightResizeSettleUntil = 0.0;
+        if (!_fullscreenTransitionActive) {
+            [_videoView setFullscreenTransitionActive:NO];
+        }
+        [self layoutNativeSubviews];
+        [_videoView updateMetalLayerLayout];
+        [_videoView scheduleRenderUpdate];
+        if (nextMiniPlayer) {
+            _didFocusControlsWebView = NO;
+            NSWindow *window = _hostView.window;
+            NSView *contentView = window.contentView;
+            if (window && contentView && [window.firstResponder isKindOfClass:[NSView class]] &&
+                [(NSView *)window.firstResponder isDescendantOf:_hostView]) {
+                [window makeFirstResponder:contentView];
+            }
+        }
     }
     _pendingControlsJson = [controlsJson copy];
     [self flushPendingControlsJsonIfReady];

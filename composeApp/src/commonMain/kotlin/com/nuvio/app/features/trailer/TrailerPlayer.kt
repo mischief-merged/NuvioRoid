@@ -134,7 +134,7 @@ private fun TrailerPlaybackSurface(
         resizeMode = resizeMode,
         useNativeController = false,
         onPlayerControlsAction = { action ->
-            action == PlayerControlsAction.Back && onBack.invokeIfPresent()
+            (action == PlayerControlsAction.Back || action == PlayerControlsAction.Close) && onBack.invokeIfPresent()
         },
         onPlayerControlsEvent = { type, value ->
             type == "toggleFullscreen" &&
