@@ -1,27 +1,53 @@
 package com.nuvio.app.features.player.desktop
 
+import java.lang.ref.WeakReference
+
 /**
  * Coordinates background native player teardowns across distinct [NativePlayerController]
  * instances so an unmounted surface finishing [NativePlayerController.dispose] or a
- * superseded create worker cannot overlap with the next session's native player creation.
+ * superseded create worker cannot overlap with the next session's native player creation,
+ * and allows desktop quit to await all native shutdowns without retaining closed controllers.
  */
 internal class NativePlayerLifecycleCoordinator {
     companion object {
         val Default = NativePlayerLifecycleCoordinator()
     }
 
-    private data class TrackedWorker(
-        val owner: Any,
+    private class TrackedWorker(
+        owner: Any,
         val thread: Thread,
-    )
+    ) {
+        val ownerRef = WeakReference(owner)
+    }
 
     private val lock = Any()
     private val activeTeardowns = mutableListOf<TrackedWorker>()
+    private val activeControllers = mutableListOf<WeakReference<NativePlayerController>>()
 
-    fun registerTeardown(owner: Any, thread: Thread?) {
-        if (thread == null || !thread.isAlive) return
+    fun registerController(controller: NativePlayerController) {
         synchronized(lock) {
-            activeTeardowns.removeAll { !it.thread.isAlive }
+            activeControllers.removeAll { it.get() == null }
+            if (activeControllers.none { it.get() === controller }) {
+                activeControllers += WeakReference(controller)
+            }
+        }
+    }
+
+    fun unregisterController(controller: NativePlayerController) {
+        synchronized(lock) {
+            activeControllers.removeAll { ref ->
+                val target = ref.get()
+                target == null || target === controller
+            }
+        }
+    }
+
+    fun registerTeardown(owner: Any, thread: Thread?, allowUnstarted: Boolean = false) {
+        if (thread == null) return
+        if (!allowUnstarted && !thread.isAlive && thread.state == Thread.State.TERMINATED) return
+        synchronized(lock) {
+            pruneCompletedLocked()
+            if (!allowUnstarted && !thread.isAlive) return
             if (activeTeardowns.none { it.thread === thread }) {
                 activeTeardowns += TrackedWorker(owner = owner, thread = thread)
             }
@@ -31,7 +57,7 @@ internal class NativePlayerLifecycleCoordinator {
     fun registerTeardowns(owner: Any, threads: Collection<Thread>) {
         if (threads.isEmpty()) return
         synchronized(lock) {
-            activeTeardowns.removeAll { !it.thread.isAlive }
+            pruneCompletedLocked()
             threads.forEach { thread ->
                 if (thread.isAlive && activeTeardowns.none { it.thread === thread }) {
                     activeTeardowns += TrackedWorker(owner = owner, thread = thread)
@@ -40,11 +66,80 @@ internal class NativePlayerLifecycleCoordinator {
         }
     }
 
+    fun unregisterTeardown(thread: Thread?) {
+        if (thread == null) return
+        synchronized(lock) {
+            activeTeardowns.removeAll {
+                it.thread === thread ||
+                    (!it.thread.isAlive && it.thread.state == Thread.State.TERMINATED)
+            }
+            activeControllers.removeAll { it.get() == null }
+        }
+    }
+
     fun pendingTeardownsExcluding(owner: Any): List<Thread> = synchronized(lock) {
-        activeTeardowns.removeAll { !it.thread.isAlive }
+        pruneCompletedLocked()
         activeTeardowns
-            .filter { it.owner !== owner && it.thread.isAlive }
+            .filter { it.ownerRef.get() !== owner && it.thread.isAlive }
             .map { it.thread }
+    }
+
+    fun shutdownAllAndAwait(timeoutMs: Long = 5_000L) {
+        val controllers = synchronized(lock) {
+            activeControllers.mapNotNull { it.get() }.also {
+                activeControllers.removeAll { ref -> ref.get() == null }
+            }
+        }
+        controllers.forEach { controller ->
+            runCatching { controller.dispose() }
+        }
+        awaitAllPending(timeoutMs)
+    }
+
+    fun awaitAllPending(timeoutMs: Long = 5_000L) {
+        val deadlineNanos = System.nanoTime() + timeoutMs.coerceAtLeast(1L) * 1_000_000L
+        var interrupted = false
+        while (true) {
+            if (deadlineNanos - System.nanoTime() <= 0L) break
+            val pending = synchronized(lock) {
+                pruneCompletedLocked()
+                activeTeardowns
+                    .filter {
+                        it.thread !== Thread.currentThread() &&
+                            (it.thread.isAlive || it.thread.state == Thread.State.NEW)
+                    }
+                    .map { it.thread }
+            }
+            if (pending.isEmpty()) break
+            pending.forEach { worker ->
+                val waitMs = ((deadlineNanos - System.nanoTime()) / 1_000_000L).coerceAtLeast(1L)
+                if (worker.state == Thread.State.NEW) {
+                    Thread.yield()
+                } else {
+                    try {
+                        worker.join(waitMs)
+                    } catch (_: InterruptedException) {
+                        interrupted = true
+                    }
+                }
+            }
+        }
+        synchronized(lock) {
+            pruneCompletedLocked()
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    internal val trackedWorkerCountForTest: Int
+        get() = synchronized(lock) { activeTeardowns.size }
+
+    private fun pruneCompletedLocked() {
+        activeTeardowns.removeAll {
+            !it.thread.isAlive && it.thread.state == Thread.State.TERMINATED
+        }
+        activeControllers.removeAll { it.get() == null }
     }
 }
 

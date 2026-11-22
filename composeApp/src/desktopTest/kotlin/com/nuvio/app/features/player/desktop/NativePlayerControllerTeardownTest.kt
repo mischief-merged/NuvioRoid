@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.desktop
 
+import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -972,6 +973,67 @@ class NativePlayerControllerTeardownTest {
         val releasedSecond = CountDownLatch(1)
         second.releaseBeforeNavigation { releasedSecond.countDown() }
         assertTrue(releasedSecond.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun coordinatorRemovesCompletedWorkersImmediatelyAndDoesNotRetainClosedControllers() {
+        val coordinator = NativePlayerLifecycleCoordinator()
+        val disposedLatch = CountDownLatch(1)
+
+        fun createAndCloseViaRelease(): Pair<WeakReference<NativePlayerController>, WeakReference<NativePlayerHost>> {
+            val host = NativePlayerHost()
+            val controller = NativePlayerController(
+                host = host,
+                nativeCreate = failNativeCreate,
+                nativeDispose = { disposedLatch.countDown() },
+                lifecycleCoordinator = coordinator,
+            )
+            controller.setNativeHandleForTest(301L)
+            val released = CountDownLatch(1)
+            controller.releaseBeforeNavigation { released.countDown() }
+            assertTrue(released.await(2, TimeUnit.SECONDS))
+            return WeakReference(controller) to WeakReference(host)
+        }
+
+        fun createAndCloseViaDispose(): WeakReference<NativePlayerController> {
+            val done = CountDownLatch(1)
+            val controller = NativePlayerController(
+                host = NativePlayerHost(),
+                nativeCreate = failNativeCreate,
+                nativeDispose = { done.countDown() },
+                lifecycleCoordinator = coordinator,
+            )
+            controller.setNativeHandleForTest(302L)
+            controller.dispose()
+            assertTrue(done.await(2, TimeUnit.SECONDS))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (coordinator.trackedWorkerCountForTest != 0 && System.nanoTime() < deadline) {
+                Thread.sleep(10)
+            }
+            return WeakReference(controller)
+        }
+
+        val (releasedControllerRef, releasedHostRef) = createAndCloseViaRelease()
+        assertTrue(disposedLatch.await(2, TimeUnit.SECONDS))
+        val releaseDrainDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (coordinator.trackedWorkerCountForTest != 0 && System.nanoTime() < releaseDrainDeadline) {
+            Thread.sleep(10)
+        }
+        assertEquals(0, coordinator.trackedWorkerCountForTest, "completed release worker must remove itself without a subsequent playback")
+
+        val disposedControllerRef = createAndCloseViaDispose()
+        assertEquals(0, coordinator.trackedWorkerCountForTest, "completed dispose worker must remove itself without a subsequent playback")
+
+        repeat(8) {
+            System.gc()
+            if (releasedControllerRef.get() == null && releasedHostRef.get() == null && disposedControllerRef.get() == null) {
+                return@repeat
+            }
+            Thread.sleep(25)
+        }
+        assertNull(releasedControllerRef.get(), "coordinator must not retain closed controller after releaseBeforeNavigation")
+        assertNull(releasedHostRef.get(), "coordinator must not retain closed host after releaseBeforeNavigation")
+        assertNull(disposedControllerRef.get(), "coordinator must not retain closed controller after dispose")
     }
 }
 

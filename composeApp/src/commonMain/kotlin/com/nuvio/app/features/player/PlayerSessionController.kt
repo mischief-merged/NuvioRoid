@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
+import kotlin.concurrent.Volatile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -61,9 +62,33 @@ internal data class ActivePlayerSession(
 internal object ActivePlayerSessionRegistry {
     private val _isActive = MutableStateFlow(false)
     val isActive: StateFlow<Boolean> = _isActive.asStateFlow()
+    @Volatile
+    private var boundController: PlayerSessionController? = null
 
     fun setActive(active: Boolean) {
         _isActive.value = active
+    }
+
+    fun bindController(controller: PlayerSessionController) {
+        boundController = controller
+    }
+
+    fun unbindController(controller: PlayerSessionController) {
+        if (boundController === controller) {
+            boundController = null
+        }
+    }
+
+    fun closeActiveSessionBeforeQuit(onCompleted: () -> Unit) {
+        val controller = boundController
+        if (controller == null || !controller.hasActiveSession) {
+            onCompleted()
+            return
+        }
+        controller.closeActiveSession(
+            onClosed = onCompleted,
+            onFailed = onCompleted,
+        )
     }
 }
 
@@ -140,6 +165,7 @@ internal class PlayerSessionController(
     private var boundControls by mutableStateOf<PlayerSessionControls?>(null)
     private var closingLaunchId: Long? = null
     private val pendingCloseCallbacks = mutableListOf<() -> Unit>()
+    private val pendingCloseFailureCallbacks = mutableListOf<() -> Unit>()
     private var confirmedReplacementCallback: (() -> Unit)? = null
 
     val hasActiveSession: Boolean
@@ -415,13 +441,17 @@ internal class PlayerSessionController(
         }
     }
 
-    fun closeActiveSession(onClosed: () -> Unit = {}) {
+    fun closeActiveSession(
+        onClosed: () -> Unit = {},
+        onFailed: () -> Unit = {},
+    ) {
         val current = activeSession ?: run {
             onClosed()
             return
         }
         prepareClosingState(current.launchId)
         pendingCloseCallbacks += onClosed
+        pendingCloseFailureCallbacks += onFailed
         requestSessionClose(current)
     }
 
@@ -429,13 +459,17 @@ internal class PlayerSessionController(
         if (closingLaunchId != launchId) return
         closingLaunchId = null
         pendingCloseCallbacks.clear()
+        val failureCallbacks = pendingCloseFailureCallbacks.toList()
+        pendingCloseFailureCallbacks.clear()
         confirmedReplacementCallback = null
+        failureCallbacks.forEach { it.invoke() }
     }
 
     private fun prepareClosingState(launchId: Long) {
         if (closingLaunchId != launchId) {
             closingLaunchId = launchId
             pendingCloseCallbacks.clear()
+            pendingCloseFailureCallbacks.clear()
             confirmedReplacementCallback = null
         }
     }
@@ -468,6 +502,7 @@ internal class PlayerSessionController(
             closingLaunchId = null
             closeCallbacks = pendingCloseCallbacks.toList()
             pendingCloseCallbacks.clear()
+            pendingCloseFailureCallbacks.clear()
             replacementCallback = confirmedReplacementCallback
             confirmedReplacementCallback = null
         } else {

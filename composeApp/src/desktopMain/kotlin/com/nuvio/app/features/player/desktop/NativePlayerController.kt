@@ -165,6 +165,7 @@ internal class NativePlayerController(
     private var createWaitInFlight: Thread? = null
     private val releaseCallbacks = mutableListOf<ReleaseCallback>()
     private var releaseInFlight: Thread? = null
+    private var releaseWatchdog: Thread? = null
     private var releaseTimedOut: Boolean = false
     private var terminalReleaseFailure: String? = null
     private var certificateFailurePending: Any? = null
@@ -192,6 +193,10 @@ internal class NativePlayerController(
             }
             if (current) handlePlayerEvent(type, value, token)
         }
+    }
+
+    init {
+        lifecycleCoordinator?.registerController(this)
     }
 
     fun attach(
@@ -465,6 +470,7 @@ internal class NativePlayerController(
             } finally {
                 synchronized(lifecycleLock) {
                     createsInFlight.remove(Thread.currentThread())
+                    lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
                 }
             }
         }, "nuvio-player-create").apply { isDaemon = true }
@@ -1063,50 +1069,59 @@ internal class NativePlayerController(
                 else -> {
                     releaseCallbacks += callback
                     active ?: Thread({
-                    awaitThreadCompletion(disposeInFlight, "native teardown")
-                    awaitInFlightCreates()
-                    // A create worker publishes/configures its result on the EDT before leaving
-                    // createsInFlight. Release must drain those already-queued callbacks before
-                    // taking the final disposal snapshot: a stale publication can reject its
-                    // handle and start a tracked disposal after the create thread has exited.
-                    awaitSwingCallbacksQueuedByCreates()
-                    awaitThreadCompletion(disposeInFlight, "native teardown queued by create")
-                    var failureMessage = synchronized(lifecycleLock) { terminalReleaseFailure }
-                    val current = if (failureMessage == null) detachPlayerHandle() else 0L
-                    if (current != 0L) {
-                        log.d { "pre-navigation dispose started handle=$current" }
-                        runCatching { nativeDispose(current) }
-                            .onSuccess { log.d { "pre-navigation dispose completed handle=$current" } }
-                            .onFailure { error ->
-                                failureMessage = "Native player shutdown failed. Quit Nuvio before removing the player."
-                                log.w(error) { "pre-navigation dispose failed handle=$current" }
+                        try {
+                            awaitThreadCompletion(disposeInFlight, "native teardown")
+                            awaitInFlightCreates()
+                            // A create worker publishes/configures its result on the EDT before leaving
+                            // createsInFlight. Release must drain those already-queued callbacks before
+                            // taking the final disposal snapshot: a stale publication can reject its
+                            // handle and start a tracked disposal after the create thread has exited.
+                            awaitSwingCallbacksQueuedByCreates()
+                            awaitThreadCompletion(disposeInFlight, "native teardown queued by create")
+                            var failureMessage = synchronized(lifecycleLock) { terminalReleaseFailure }
+                            val current = if (failureMessage == null) detachPlayerHandle() else 0L
+                            if (current != 0L) {
+                                log.d { "pre-navigation dispose started handle=$current" }
+                                runCatching { nativeDispose(current) }
+                                    .onSuccess { log.d { "pre-navigation dispose completed handle=$current" } }
+                                    .onFailure { error ->
+                                        failureMessage = "Native player shutdown failed. Quit Nuvio before removing the player."
+                                        log.w(error) { "pre-navigation dispose failed handle=$current" }
+                                    }
                             }
-                    }
-                    val callbacks = synchronized(lifecycleLock) {
-                        releaseInFlight = null
-                        releaseTimedOut = false
-                        if (failureMessage != null) terminalReleaseFailure = failureMessage
-                        releaseCallbacks.toList().also { releaseCallbacks.clear() }
-                    }
-                    SwingUtilities.invokeLater {
-                        callbacks.forEach { pending ->
-                            val invoke = if (failureMessage == null) {
-                                { pending.onReleased() }
-                            } else {
-                                { pending.onFailed(failureMessage) }
+                            val callbacks = synchronized(lifecycleLock) {
+                                releaseInFlight = null
+                                releaseTimedOut = false
+                                if (failureMessage != null) terminalReleaseFailure = failureMessage
+                                releaseCallbacks.toList().also { releaseCallbacks.clear() }
                             }
-                            runCatching(invoke)
-                                .onFailure { error -> log.w(error) { "release callback failed" } }
+                            SwingUtilities.invokeLater {
+                                callbacks.forEach { pending ->
+                                    val invoke = if (failureMessage == null) {
+                                        { pending.onReleased() }
+                                    } else {
+                                        { pending.onFailed(failureMessage) }
+                                    }
+                                    runCatching(invoke)
+                                        .onFailure { error -> log.w(error) { "release callback failed" } }
+                                }
+                            }
+                        } finally {
+                            val watchdogToStop = synchronized(lifecycleLock) {
+                                releaseWatchdog.also { releaseWatchdog = null }
+                            }
+                            watchdogToStop?.interrupt()
+                            lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
+                            lifecycleCoordinator?.unregisterController(this)
                         }
+                    }, "nuvio-player-release").apply {
+                        isDaemon = true
+                        releaseInFlight = this
+                        releaseTimedOut = false
+                        shouldStart = true
                     }
-                }, "nuvio-player-release").apply {
-                    isDaemon = true
-                    releaseInFlight = this
-                    releaseTimedOut = false
-                    shouldStart = true
                 }
             }
-        }
         }
         if (immediateFailure != null) {
             SwingUtilities.invokeLater {
@@ -1116,18 +1131,24 @@ internal class NativePlayerController(
             return
         }
         if (shouldStart) {
+            lifecycleCoordinator?.registerTeardown(this, worker, allowUnstarted = true)
             worker.start()
-            lifecycleCoordinator?.registerTeardown(this, worker)
-            startReleaseWatchdog(worker)
+            val startedWatchdog = startReleaseWatchdog(worker)
+            synchronized(lifecycleLock) {
+                if (releaseInFlight === worker && worker.isAlive) {
+                    releaseWatchdog = startedWatchdog
+                } else {
+                    startedWatchdog.interrupt()
+                }
+            }
         }
     }
 
-    private fun startReleaseWatchdog(worker: Thread) {
+    private fun startReleaseWatchdog(worker: Thread): Thread =
         Thread({
             try {
                 Thread.sleep(releaseTimeoutMs)
             } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
                 return@Thread
             }
             val callbacks = synchronized(lifecycleLock) {
@@ -1147,7 +1168,6 @@ internal class NativePlayerController(
             isDaemon = true
             start()
         }
-    }
 
     fun dispose() {
         fallbackHideTimer?.dispose()
@@ -1168,6 +1188,12 @@ internal class NativePlayerController(
         if (!accepted) return
         host.onPeerReady = null
         disposePlayerHandle()
+        val canUnregisterNow = synchronized(lifecycleLock) {
+            handle == 0L && disposeInFlight == null && createsInFlight.isEmpty()
+        }
+        if (canUnregisterNow) {
+            lifecycleCoordinator?.unregisterController(this)
+        }
     }
 
     private fun cancelPendingAttachment() {
@@ -1254,18 +1280,32 @@ internal class NativePlayerController(
     /** Must be called while holding [lifecycleLock]. */
     private fun startTrackedDisposeLocked(current: Long) {
         val prior = disposeInFlight?.takeIf { it.isAlive }
-        disposeInFlight = Thread(
+        val worker = Thread(
             {
-                awaitThreadCompletion(prior, "prior native teardown")
-                runCatching { nativeDispose(current) }
-                    .onFailure { error -> recordTerminalDisposeFailure(error, "native", current) }
+                try {
+                    awaitThreadCompletion(prior, "prior native teardown")
+                    runCatching { nativeDispose(current) }
+                        .onFailure { error -> recordTerminalDisposeFailure(error, "native", current) }
+                } finally {
+                    val shouldUnregisterController = synchronized(lifecycleLock) {
+                        if (disposeInFlight === Thread.currentThread()) {
+                            disposeInFlight = null
+                        }
+                        handle == 0L && pendingSource == null && createsInFlight.isEmpty()
+                    }
+                    lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
+                    if (shouldUnregisterController) {
+                        lifecycleCoordinator?.unregisterController(this)
+                    }
+                }
             },
             "nuvio-player-dispose",
         ).apply {
             isDaemon = true
-            start()
         }
-        lifecycleCoordinator?.registerTeardown(this, disposeInFlight)
+        disposeInFlight = worker
+        lifecycleCoordinator?.registerTeardown(this, worker, allowUnstarted = true)
+        worker.start()
     }
 
     private fun disposePlayerHandle() {

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -22,6 +23,7 @@ import androidx.compose.ui.zIndex
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.core.ui.PlatformBackHandler
 import com.nuvio.app.features.party.PartyMedia
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.player.ExternalPlayerIntentResult
 import com.nuvio.app.features.player.ExternalPlayerPlatform
 import com.nuvio.app.features.player.MiniPlayerControlsHeight
@@ -61,6 +63,12 @@ internal fun BoxScope.PlayerSessionHost(
     openExternalStreamUrl: (String) -> Boolean,
     onOpenPartyMedia: (PartyMedia) -> Unit,
 ) {
+    DisposableEffect(controller) {
+        ActivePlayerSessionRegistry.bindController(controller)
+        onDispose {
+            ActivePlayerSessionRegistry.unbindController(controller)
+        }
+    }
     val session = controller.activeSession ?: return
     key(session.launchId) {
         val launch = session.launch

@@ -18,6 +18,8 @@ import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
 import com.nuvio.app.PlayerSessionHost
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
+import com.nuvio.app.performDesktopQuit
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaVideo
@@ -46,6 +48,9 @@ import com.nuvio.app.navigation.NuvioNavigator
 import com.nuvio.app.navigation.SettingsPageRoute
 import com.nuvio.app.navigation.TabsRoute
 import com.nuvio.app.openPlayerExitTarget
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -951,6 +956,87 @@ class MiniPlayerSessionTest {
         assertEquals(2, backend.createCount)
         assertEquals(2, backend.disposeCount)
         assertEquals(listOf(1L, 2L), backend.disposedHandles.toList())
+    }
+
+    @Test
+    fun desktop_quit_flushes_progress_and_completes_native_disposal_before_exit_application_runs() {
+        val coordinator = NativePlayerLifecycleCoordinator()
+        val backend = CountingNativePlayerBackend(
+            onDisposeHook = {
+                Thread.sleep(75L)
+            },
+        )
+        val hooks = backend.toDesktopHooks(coordinator = coordinator)
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        var windowMounted by mutableStateOf(true)
+        sessionController.open(launch = sampleSeriesLaunch(), launchId = 751L)
+
+        compose.setContent {
+            if (windowMounted) {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            PlayerSessionHost(
+                                controller = sessionController,
+                                navController = navigator,
+                                externalPlayerId = null,
+                                externalPlayerNotConfiguredText = "",
+                                externalPlayerFailedText = "",
+                                onExternalPlayerLaunch = {},
+                                launchExternalPlayer = { false },
+                                openExternalStreamUrl = { false },
+                                onOpenPartyMedia = {},
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        compose.waitUntil(5_000L) { backend.createCount == 1 }
+        compose.runOnIdle {
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 612_000L
+                durationMs = 1_800_000L
+            }
+        }
+        compose.mainClock.advanceTimeBy(300L)
+        compose.waitForIdle()
+
+        val exitCalled = CountDownLatch(1)
+        val servicesShutDown = AtomicBoolean(false)
+        var disposeCountAtExit = -1
+        var activeHandlesAtExit = -1
+        var trackedWorkersAtExit = -1
+        var flushedPositionAtExit: Long? = null
+
+        compose.runOnIdle {
+            sessionController.minimize()
+            assertTrue(sessionController.isMinimized)
+            performDesktopQuit(
+                coordinator = coordinator,
+                shutdownServices = { servicesShutDown.set(true) },
+            ) {
+                disposeCountAtExit = backend.disposeCount
+                activeHandlesAtExit = backend.activeHandleCount
+                trackedWorkersAtExit = coordinator.trackedWorkerCountForTest
+                flushedPositionAtExit = WatchProgressRepository.progressForVideo(episodes[0].id)?.lastPositionMs
+                windowMounted = false
+                exitCalled.countDown()
+            }
+        }
+
+        assertTrue(exitCalled.await(5, TimeUnit.SECONDS), "performDesktopQuit must invoke exitApplication after native cleanup")
+        compose.waitForIdle()
+
+        assertTrue(servicesShutDown.get())
+        assertEquals(1, disposeCountAtExit, "native disposal must already be complete when exitApplication runs")
+        assertEquals(0, activeHandlesAtExit, "no active native handles may remain when exitApplication runs")
+        assertEquals(0, trackedWorkersAtExit, "no teardown workers may remain in flight when exitApplication runs")
+        assertEquals(612_000L, flushedPositionAtExit, "watch progress must already be flushed when exitApplication runs")
+        assertEquals(1, backend.disposeCount, "window unmount after performDesktopQuit must not double-dispose")
     }
 
     @Test
