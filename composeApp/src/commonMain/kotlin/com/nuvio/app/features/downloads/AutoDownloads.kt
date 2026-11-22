@@ -316,7 +316,7 @@ internal object AutoDownloads : AutoDownloadController {
     }
 
     override fun undoKeepDownload(profileId: Int, downloadId: String) {
-        scope.launch { runCatching { store.undoKeep(profileId, downloadId) } }
+        scope.launch { runCatching { deleteAfterWatching.undoKeep(profileId, downloadId) } }
     }
 
     override fun keepDownload(profileId: Int, downloadId: String) {

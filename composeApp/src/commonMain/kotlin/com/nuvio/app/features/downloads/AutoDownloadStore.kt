@@ -36,6 +36,8 @@ private data class StoredAutoDownloads(
     val removals: List<AutoDownloadRemoval> = emptyList(),
     /** Downloads the user chose to keep. They are never removed after watching. */
     val keptDownloadIds: Set<String> = emptySet(),
+    /** Removals set aside by Keep so Undo Keep can put them back. */
+    val keptRemovals: List<AutoDownloadRemoval> = emptyList(),
     /** Episodes removed after watching, newest last. Older than a week is dropped when one is added. */
     val recentlyDeleted: List<AutoDownloadDeleted> = emptyList(),
 )
@@ -68,6 +70,7 @@ internal data class AutoDownloadRemoval(
  */
 internal class AutoDownloadStore(
     private val payloads: AutoDownloadPayloads,
+    private val nowEpochMs: () -> Long = { DownloadsClock.nowEpochMs() },
     private val activeProfileId: () -> Int,
 ) {
     private val lock = WatchedRemovalGuard.lock
@@ -148,23 +151,49 @@ internal class AutoDownloadStore(
         true
     }
 
-    /** Keeps a download for good: its scheduled removal is dropped and none is scheduled again. */
+    /** Keeps a download for good: its scheduled removal is set aside and none is scheduled again. */
     fun keep(profileId: Int, downloadId: String): Boolean = WatchedRemovalGuard.change {
         if (ensureLoaded() != profileId) return@change false
+        val scheduled = state.removals.firstOrNull { it.downloadId == downloadId }
         save(
             profileId,
             state.copy(
                 removals = state.removals.filterNot { it.downloadId == downloadId },
                 keptDownloadIds = state.keptDownloadIds + downloadId,
+                keptRemovals = if (scheduled != null) {
+                    state.keptRemovals.filterNot { it.downloadId == downloadId } + scheduled
+                } else {
+                    state.keptRemovals
+                },
             ),
         )
         true
     }
 
-    /** Undoing Keep permits a new schedule the next time the download is finished. */
-    fun undoKeep(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
+    /** Undoing Keep puts back a removal Keep set aside, with a fresh hold when its time has passed. */
+    fun undoKeep(
+        profileId: Int,
+        downloadId: String,
+        nowEpochMs: Long = this.nowEpochMs(),
+        holdMs: Long = DeleteAfterWatching.DefaultHoldMs,
+    ): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false
-        save(profileId, state.copy(keptDownloadIds = state.keptDownloadIds - downloadId))
+        val kept = state.keptRemovals.firstOrNull { it.downloadId == downloadId }
+        val restored = kept?.copy(
+            dueAtEpochMs = if (kept.dueAtEpochMs > nowEpochMs) kept.dueAtEpochMs else nowEpochMs + holdMs,
+        )
+        save(
+            profileId,
+            state.copy(
+                removals = if (restored != null) {
+                    state.removals.filterNot { it.downloadId == downloadId } + restored
+                } else {
+                    state.removals
+                },
+                keptDownloadIds = state.keptDownloadIds - downloadId,
+                keptRemovals = state.keptRemovals.filterNot { it.downloadId == downloadId },
+            ),
+        )
         true
     }
 
@@ -217,6 +246,7 @@ internal class AutoDownloadStore(
             state.copy(
                 rules = state.rules.filterNot { it.key == ruleKey },
                 removals = state.removals.filterNot { it.ruleKey == ruleKey },
+                keptRemovals = state.keptRemovals.filterNot { it.ruleKey == ruleKey },
             ),
         )
         true
@@ -280,6 +310,9 @@ internal class AutoDownloadStore(
         removals = removals
             .distinctBy { it.downloadId }
             .filter { it.downloadId !in keptDownloadIds && allowsRemoval(it.ruleKey) },
+        keptRemovals = keptRemovals
+            .distinctBy { it.downloadId }
+            .filter { it.downloadId in keptDownloadIds && allowsRemoval(it.ruleKey) },
     )
 
     companion object {

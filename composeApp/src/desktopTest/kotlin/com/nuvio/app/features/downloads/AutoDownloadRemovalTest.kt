@@ -541,4 +541,40 @@ class AutoDownloadRemovalTest {
         assertTrue(own.exists())
         assertEquals(DownloadStatus.Completed, item(2)?.status)
     }
+
+    @Test
+    fun undo_keep_restores_removal_that_still_uses_only_system_trash() {
+        var now = 0L
+        val store = AutoDownloadStore(MemoryAutoDownloadPayloads(), nowEpochMs = { now }) { 1 }
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        val feature = DeleteAfterWatching(
+            store = store,
+            downloads = { DownloadsRepository.uiState.value.items },
+            isWatchedToTheEnd = { true },
+            isInPlayer = { false },
+            hasLaterEpisode = { _, _ -> true },
+            removeDownload = DownloadsRepository::removeWatchedAutoDownload,
+            nowEpochMs = { now },
+        )
+        val file = download(1, automatic = false)
+        val id = item(1)!!.id
+        assertTrue(feature.onLocalPlaybackCompleted(1, item(1)!!))
+        feature.keep(1, id)
+        now = DeleteAfterWatching.DefaultHoldMs + 1_000L
+        feature.undoKeep(1, id)
+        assertTrue(feature.runDue(1).isEmpty())
+
+        now += DeleteAfterWatching.DefaultHoldMs
+        val realTrash = trash
+        trash = DesktopDownloadsTrash(downloadsDir = { downloadsDir }, systemTrash = null)
+        assertEquals(AutoDownloadRemovalOutcome.NotMoved, feature.runDue(1).values.single())
+        assertTrue(file.exists())
+        assertTrue(heldFiles().isEmpty())
+
+        trash = realTrash
+        assertEquals(AutoDownloadRemovalOutcome.Removed, feature.runDue(1).values.single())
+        assertFalse(file.exists())
+        assertTrue(heldFiles().isEmpty())
+        assertTrue(systemTrashDir.resolve(file.fileName).exists())
+    }
 }

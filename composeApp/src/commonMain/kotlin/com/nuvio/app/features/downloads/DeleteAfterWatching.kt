@@ -57,6 +57,10 @@ internal class DeleteAfterWatching(
         store.keep(profileId, downloadId)
     }
 
+    fun undoKeep(profileId: Int, downloadId: String) {
+        store.undoKeep(profileId, downloadId, nowEpochMs(), holdMs)
+    }
+
     /** Removes the download now, at the user's request. Null when no removal is scheduled for it. */
     fun deleteNow(profileId: Int, downloadId: String): AutoDownloadRemovalOutcome? {
         val removal = store.removals(profileId).firstOrNull { it.downloadId == downloadId } ?: return null

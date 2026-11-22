@@ -25,7 +25,7 @@ class DeleteAfterWatchingTest {
     private val removeCalls = mutableListOf<Pair<String, String?>>()
     private var beforeFinalStep: () -> Unit = {}
 
-    private var store = AutoDownloadStore(payloads) { activeProfile }
+    private var store = AutoDownloadStore(payloads, nowEpochMs = { now }) { activeProfile }
     private var feature = feature()
 
     private fun feature() = DeleteAfterWatching(
@@ -48,7 +48,7 @@ class DeleteAfterWatchingTest {
 
     /** What a restart of the app leaves: the stored payloads and nothing else. */
     private fun restart() {
-        store = AutoDownloadStore(payloads) { activeProfile }
+        store = AutoDownloadStore(payloads, nowEpochMs = { now }) { activeProfile }
         feature = feature()
     }
 
@@ -405,6 +405,104 @@ class DeleteAfterWatchingTest {
         now += 100 * hour
         assertEquals(emptyMap(), feature.runDue(1))
         assertEquals(emptyList(), removeCalls)
+    }
+
+    @Test
+    fun keep_then_undo_keep_restores_the_scheduled_removal() {
+        optIn()
+        assertTrue(watch(1))
+        val due = store.removals(1).single().dueAtEpochMs
+        now += 5 * hour
+
+        feature.keep(1, item(1).id)
+        assertEquals(emptyList(), store.removals(1))
+        restart()
+        assertTrue(store.undoKeep(1, item(1).id))
+
+        assertEquals(listOf(AutoDownloadRemoval(item(1).id, ruleKey, due)), store.removals(1))
+        assertEquals(store.removals(1), store.removals.value)
+        now = due - 1
+        assertEquals(emptyMap(), feature.runDue(1))
+        now = due
+        assertEquals(AutoDownloadRemovalOutcome.Removed, feature.runDue(1).values.single())
+    }
+
+    @Test
+    fun undo_keep_after_the_due_time_gives_a_fresh_delay_and_never_removes_at_once() {
+        optIn()
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        assertTrue(watch(1))
+        assertTrue(watch(3))
+        val originalDue = store.removals(1).first().dueAtEpochMs
+
+        feature.keep(1, item(1).id)
+        feature.keep(1, item(3).id)
+        now = originalDue
+        feature.undoKeep(1, item(1).id)
+        assertEquals(AutoDownloadRemoval(item(1).id, ruleKey, now + 24 * hour), store.removals(1).single())
+        assertEquals(emptyMap(), feature.runDue(1))
+        assertEquals(emptyList(), removeCalls)
+
+        now = originalDue + 6 * hour
+        restart()
+        feature.undoKeep(1, item(3).id)
+        assertEquals(
+            listOf(
+                AutoDownloadRemoval(item(1).id, ruleKey, originalDue + 24 * hour),
+                AutoDownloadRemoval(item(3).id, null, now + 24 * hour),
+            ),
+            store.removals(1),
+        )
+        assertEquals(emptyMap(), feature.runDue(1))
+        assertEquals(emptyList(), removeCalls)
+
+        now = originalDue + 24 * hour
+        assertEquals(mapOf(item(1).id to AutoDownloadRemovalOutcome.Removed), feature.runDue(1))
+        assertEquals(listOf(item(3).id), store.removals(1).map { it.downloadId })
+
+        now += 6 * hour
+        assertEquals(mapOf(item(3).id to AutoDownloadRemovalOutcome.Removed), feature.runDue(1))
+    }
+
+    @Test
+    fun turning_off_removal_while_kept_leaves_nothing_to_restore_on_undo_keep() {
+        optIn()
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        assertTrue(watch(1))
+        assertTrue(watch(3))
+        feature.keep(1, item(1).id)
+        feature.keep(1, item(3).id)
+
+        store.update(1, ruleKey) { it.copy(deleteAfterWatching = false) }
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AutomaticOnly)
+        optIn()
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+        feature.undoKeep(1, item(1).id)
+        feature.undoKeep(1, item(3).id)
+
+        assertEquals(emptyList(), store.removals(1))
+        now += 48 * hour
+        assertEquals(emptyMap(), feature.runDue(1))
+    }
+
+    @Test
+    fun old_saved_data_without_a_saved_schedule_still_loads_and_undoes_keep() {
+        payloads.saved[1] = """{
+            "rules":[{"parentMetaType":"series","parentMetaId":"tt1","title":"Show","deleteAfterWatching":true}],
+            "removals":[{"downloadId":"tt1-1-1","ruleKey":"$ruleKey","dueAtEpochMs":42}],
+            "keptDownloadIds":["tt1-1-2"]
+        }"""
+        restart()
+
+        assertTrue(payloads.unreadable.isEmpty())
+        assertEquals(listOf(AutoDownloadRemoval("tt1-1-1", ruleKey, 42)), store.removals(1))
+        assertTrue(store.isKept(1, "tt1-1-2"))
+
+        assertTrue(store.undoKeep(1, "tt1-1-2"))
+        assertFalse(store.isKept(1, "tt1-1-2"))
+        assertEquals(listOf(AutoDownloadRemoval("tt1-1-1", ruleKey, 42)), store.removals(1))
+        assertTrue(watch(2))
+        assertEquals(now + 24 * hour, store.removals(1).first { it.downloadId == "tt1-1-2" }.dueAtEpochMs)
     }
 
     @Test
