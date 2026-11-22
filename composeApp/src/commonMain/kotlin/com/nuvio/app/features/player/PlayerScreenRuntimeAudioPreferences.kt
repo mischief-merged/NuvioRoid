@@ -67,6 +67,7 @@ internal fun PlayerScreenRuntime.refreshAudioTracksIfChanged() {
         refreshTracks()
         return
     }
+    if (args.isMinimized) return
     val tracks = controller.getAudioTracks()
     // The engine caches its track list, so the same instance means nothing changed.
     if (tracks !== audioTracks && tracks != audioTracks) {

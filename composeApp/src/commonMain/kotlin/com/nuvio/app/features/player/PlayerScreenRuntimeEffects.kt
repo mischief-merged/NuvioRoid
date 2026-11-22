@@ -493,6 +493,11 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     SideEffect {
         PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
     }
+    LaunchedEffect(args.isMinimized) {
+        if (!args.isMinimized) {
+            refreshAudioTracksIfChanged()
+        }
+    }
 
     DisposableEffect(Unit) {
         PlayerStreamsRepository.setPlaybackInFocus(!args.isMinimized && !isInPipForSearch)

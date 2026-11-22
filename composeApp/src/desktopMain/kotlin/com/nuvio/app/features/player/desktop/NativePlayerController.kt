@@ -36,6 +36,10 @@ import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.inferForcedSubtitleTrack
 import com.nuvio.app.features.player.toStorageHexString
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -174,6 +178,8 @@ internal class NativePlayerController(
     private var pictureInPictureActive = false
     private var remoteCommandsEnabled = remoteCommandsEnabledByDefault
     private var miniPlayerMode = false
+    private val _manualRefreshTick = MutableStateFlow(0L)
+    val manualRefreshTick: StateFlow<Long> = _manualRefreshTick.asStateFlow()
     @Volatile
     private var lastKnownVideoSize: IntSize = IntSize.Zero
     @Volatile
@@ -992,6 +998,7 @@ internal class NativePlayerController(
         val current = handle
         if (current != 0L) {
             backend.seekBy(current, offsetMs)
+            _manualRefreshTick.update { it + 1L }
         }
     }
 
@@ -1326,28 +1333,33 @@ internal class NativePlayerController(
     override fun play() {
         log.d { "play handle=$handle" }
         handle.takeIf { it != 0L }?.let { backend.setPaused(it, false) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun pause() {
         log.d { "pause handle=$handle" }
         handle.takeIf { it != 0L }?.let { backend.setPaused(it, true) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun seekTo(positionMs: Long) {
         log.d { "seekTo positionMs=$positionMs handle=$handle" }
         handle.takeIf { it != 0L }?.let { nativeSeekTo(it, positionMs) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun trySeekTo(positionMs: Long): Boolean {
         val current = handle.takeIf { it != 0L } ?: return false
         log.d { "trySeekTo positionMs=$positionMs handle=$current" }
         nativeSeekTo(current, positionMs)
+        _manualRefreshTick.update { it + 1L }
         return true
     }
 
     override fun seekBy(offsetMs: Long) {
         log.d { "seekBy offsetMs=$offsetMs handle=$handle" }
         handle.takeIf { it != 0L }?.let { backend.seekBy(it, offsetMs) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun retry() {

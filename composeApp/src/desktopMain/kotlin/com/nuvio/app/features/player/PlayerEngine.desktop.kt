@@ -38,6 +38,7 @@ import com.nuvio.app.features.autosync.DesktopAutoSyncMpvPlatform
 import com.nuvio.app.features.autosync.withAutoSyncMessage
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 
 internal data class DesktopNativePlayerHooks(
     val createController: (NativePlayerHost, Boolean) -> NativePlayerController = { host, enableRemoteCommands ->
@@ -346,9 +347,22 @@ private fun NativePlayerSurface(
     LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
         val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
         val includeVideoSize = !isInMiniPlayer
+        var observedRefreshTick = controller.manualRefreshTick.value
         while (true) {
-            if (!controller.isReleasing) {
-                onSnapshot(controller.snapshot(includeVideoSize = includeVideoSize))
+            val snapshot = if (!controller.isReleasing) {
+                controller.snapshot(includeVideoSize = includeVideoSize).also(onSnapshot)
+            } else {
+                null
+            }
+            if (
+                isInMiniPlayer &&
+                !playWhenReady &&
+                snapshot != null &&
+                !snapshot.isLoading &&
+                !snapshot.isPlaying
+            ) {
+                observedRefreshTick = controller.manualRefreshTick.first { it != observedRefreshTick }
+                continue
             }
             delay(pollIntervalMs)
         }
