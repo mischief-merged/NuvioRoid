@@ -453,6 +453,10 @@ internal class StartupSubtitlePreparer(
                         signalUpdated()
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // A subtitle lookup that fails leaves playback with no subtitle file. It does not stop the source.
             } finally {
                 incomingBatches.close()
                 addonDone.complete(Unit)
