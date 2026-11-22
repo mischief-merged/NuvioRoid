@@ -57,6 +57,8 @@
 
 Every row is described, with its branch and what was tested, in **[FORK.md](FORK.md)**.
 
+See **[CHANGELOG.md](CHANGELOG.md)** for what changed in each release and what is currently unreleased.
+
 ## 📦 Download
 
 **macOS (Apple silicon):** [**Download NuvioRoid 1.1.36.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.36.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
@@ -91,6 +93,8 @@ Package a macOS app:
 ```
 
 The app is built with Kotlin Multiplatform and Compose Multiplatform. The `nuvioroid` branch carries the NuvioRoid name and icon; `downloads-suite` is the same code under the original name, and each change lives on its own `pr/` or `fix/` branch.
+
+See **[docs/RELEASING.md](docs/RELEASING.md)** for version numbering and the release process.
 
 ## 🙏 Credits
 
