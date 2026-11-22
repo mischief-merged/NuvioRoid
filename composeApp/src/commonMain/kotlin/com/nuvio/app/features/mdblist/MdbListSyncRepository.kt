@@ -131,7 +131,6 @@ class MdbListSyncRepository(
         val authorization = auth.state.value
         if (!authorization.isAuthenticated) {
             clearPublished()
-            storage.remove(scope.profileId) { checkScope(scope, requireAuthorization = false) }
             return null
         }
         val accountId = authorization.user?.id ?: return null
@@ -181,6 +180,8 @@ class MdbListSyncRepository(
 
     private fun matchesCurrent(scope: MdbListAuthScope?): Boolean =
         scope != null && scope.profileId == activeProfileId.value && auth.isCurrent(scope)
+
+    internal fun dropMemory() = clearPublished()
 
     private fun clearPublished() {
         mutableProjection.value = MdbListProgressState()

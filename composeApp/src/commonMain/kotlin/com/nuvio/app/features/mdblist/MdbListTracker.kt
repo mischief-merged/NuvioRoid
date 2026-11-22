@@ -86,6 +86,21 @@ object MdbListTracker : TrackingAuthProvider {
         authenticated.value = false
     }
 
+    /** Explicit sign-out. Clears saved auth and leaves the sync snapshot on disk. */
+    fun clearAuthSecrets() {
+        account.stopPolling()
+        store.clearAllProfiles()
+        authenticated.value = false
+    }
+
+    /** Another account signed in. Forgets the in-memory auth and does not delete the saved copy. */
+    fun dropAuthMemory() {
+        account.stopPolling()
+        store.dropMemory()
+        sync.dropMemory()
+        authenticated.value = false
+    }
+
     override fun removeStoredProfile(profileId: Int) {
         store.removeProfile(profileId)
         val scope = store.scope()

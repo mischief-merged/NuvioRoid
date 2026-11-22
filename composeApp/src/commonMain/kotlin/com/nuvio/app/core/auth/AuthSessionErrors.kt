@@ -7,8 +7,6 @@ private val invalidSessionMarkers = listOf(
     "session not found",
     "session_not_found",
     "invalid session",
-    "invalid token",
-    "invalid jwt",
     "user not found",
     "user does not exist",
 )
@@ -36,7 +34,8 @@ internal inline fun <reified T : Throwable> Throwable.findCause(): T? {
 internal fun shouldClearLocalSessionAfterValidationError(error: Throwable): Boolean {
     if (error.isTransientKeepSessionError()) return false
     if (error.isJwtExpiredError()) return false
-    return error.isInvalidSessionError()
+    if (error.isTransientHttpStatus()) return false
+    return error.isDefinitiveSessionFailure()
 }
 
 internal fun Throwable.isTransientKeepSessionError(): Boolean {
@@ -65,14 +64,25 @@ internal fun Throwable.isTransientKeepSessionError(): Boolean {
 
 internal fun Throwable.isJwtExpiredError(): Boolean = "jwt expired" in authMessages()
 
-internal fun Throwable.isInvalidSessionError(): Boolean {
-    if (findCause<RestException>()?.statusCode == 401) return true
-    val messages = authMessages()
-    return invalidSessionMarkers.any(messages::contains) || isDeletedAccountError()
+internal fun Throwable.isTransientHttpStatus(): Boolean {
+    val status = findCause<RestException>()?.statusCode ?: return false
+    return status == 408 || status == 429 || status >= 500
 }
+
+/** A session is gone only when the server says so. A bare 401 is not enough. */
+internal fun Throwable.isDefinitiveSessionFailure(): Boolean {
+    if (isTransientKeepSessionError() || isTransientHttpStatus()) return false
+    if (isInvalidRefreshError()) return true
+    if (isDeletedAccountError()) return true
+    val messages = authMessages()
+    return invalidSessionMarkers.any(messages::contains)
+}
+
+internal fun Throwable.isInvalidSessionError(): Boolean = isDefinitiveSessionFailure()
 
 internal fun Throwable.isInvalidRefreshError(): Boolean {
     val statusCode = findCause<RestException>()?.statusCode ?: return false
+    if (statusCode == 408 || statusCode == 429 || statusCode >= 500) return false
     if (statusCode !in setOf(400, 401, 403)) return false
     val messages = authMessages()
     return invalidRefreshMarkers.any(messages::contains)

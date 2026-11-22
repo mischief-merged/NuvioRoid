@@ -102,6 +102,13 @@ class MdbListAuthStore(
         publish()
     }
 
+    /** Forgets the in-memory account. The saved payload stays where it is. */
+    fun dropMemory() = synchronized(lock) {
+        currentScope = currentScope.copy(generation = currentScope.generation + 1)
+        stored = MdbListStoredAuth()
+        publish()
+    }
+
     private fun mutate(
         scope: MdbListAuthScope,
         advanceGeneration: Boolean = false,

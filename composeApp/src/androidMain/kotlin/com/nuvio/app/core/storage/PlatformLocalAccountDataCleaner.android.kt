@@ -3,45 +3,15 @@ package com.nuvio.app.core.storage
 import android.content.Context
 
 internal actual object PlatformLocalAccountDataCleaner {
-    private val preferenceNames = listOf(
-        "episode_shuffle",
-        "nuvio_addons",
-        "nuvio_library",
-        "nuvio_library_display_settings",
-        "nuvio_home_catalog_settings",
-        "nuvio_player_settings",
-        "torrent_settings",
-        "nuvio_profile_cache",
-        "nuvio_avatar_cache",
-        "nuvio_profile_pin_cache",
-        "nuvio_theme_settings",
-        "nuvio_poster_card_style",
-        "nuvio_debrid_settings",
-        "nuvio_mdblist_settings",
-        "nuvio_mdblist_auth",
-        "nuvio_mdblist_sync",
-        "nuvio_auth",
+    private val wholeSecretStores = listOf(
         "nuvio_trakt_auth",
         "nuvio_simkl_auth",
-        "nuvio_simkl_sync",
-        "nuvio_trakt_library",
-        "nuvio_trakt_settings",
-        "nuvio_watched",
-        "nuvio_stream_link_cache",
-        "nuvio_stream_badge_settings",
-        "nuvio_continue_watching_preferences",
-        "nuvio_cw_enrichment",
-        "nuvio_episode_release_notifications",
-        "nuvio_episode_release_notifications_platform",
-        "nuvio_watch_progress",
-        "nuvio_discover_selection",
-        "nuvio_collection_mobile_settings",
-        "nuvio_collections",
-        "nuvio_plugins",
-        "nuvio_member_access",
+        "nuvio_mdblist_auth",
+        "nuvio_addons",
     )
 
     private var appContext: Context? = null
+    private var memoryOwner: String? = null
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
@@ -49,12 +19,40 @@ internal actual object PlatformLocalAccountDataCleaner {
 
     actual fun wipe() {
         val context = appContext ?: return
-        preferenceNames.forEach { name ->
-            context.getSharedPreferences(name, Context.MODE_PRIVATE)
-                .edit()
-                .clear()
-                .apply()
+        wholeSecretStores.forEach { name ->
+            val editor = context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear()
+            if (!editor.commit()) error("Unable to clear saved secrets")
         }
-        context.filesDir.resolve("nuvio_plugin_scrapers").deleteRecursively()
+        removeMatching("nuvio_debrid_settings") { key ->
+            "api_key" in key || "pending_device_authorization" in key
+        }
+        removeMatching("nuvio_servers") { key -> key.startsWith("credential.") }
     }
+
+    /** Records the owner. Does not move or delete files. A phone build has no dated folder. */
+    fun prepareAccount(accountId: String): AccountDataPrep {
+        val preferences = appContext?.getSharedPreferences("nuvio_account_owner", Context.MODE_PRIVATE)
+        val recorded = preferences?.getString(OWNER_KEY, null)?.takeIf { it.isNotBlank() } ?: memoryOwner
+        val result = when {
+            recorded.isNullOrBlank() -> AccountDataPrep.Adopted
+            recorded == accountId -> AccountDataPrep.Reused
+            else -> AccountDataPrep.Moved
+        }
+        memoryOwner = accountId
+        preferences?.edit()?.putString(OWNER_KEY, accountId)?.commit()
+        return result
+    }
+
+    private fun removeMatching(name: String, predicate: (String) -> Boolean) {
+        val context = appContext ?: return
+        val preferences = context.getSharedPreferences(name, Context.MODE_PRIVATE)
+        val editor = preferences.edit()
+        preferences.all.keys.filter(predicate).forEach(editor::remove)
+        if (!editor.commit()) error("Unable to clear saved secrets")
+    }
+
+    private const val OWNER_KEY = "account_id"
 }
+
+internal fun prepareAndroidAccountOwner(accountId: String): AccountDataPrep =
+    PlatformLocalAccountDataCleaner.prepareAccount(accountId)

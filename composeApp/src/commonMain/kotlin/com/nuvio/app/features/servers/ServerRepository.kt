@@ -77,6 +77,11 @@ open class ServerConnectionRepository internal constructor(
         ServerMatcher.shared.clear()
     }
 
+    /** Forgets tokens held in memory. The next read loads them from disk again. */
+    fun dropCredentialMemory() {
+        synchronized(lock) { tokens.clear() }
+    }
+
     fun removeProfile(profileId: Int) {
         readConnections(profileId).forEach { deleteCredential(it.credentialRef) }
         runCatching { writeValue(connectionsKey(profileId), null) }

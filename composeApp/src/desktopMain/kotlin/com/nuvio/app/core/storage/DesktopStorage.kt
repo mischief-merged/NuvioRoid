@@ -8,7 +8,6 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
-import java.util.Comparator
 import java.util.Locale
 import java.util.Properties
 import java.util.ServiceLoader
@@ -53,20 +52,55 @@ internal object DesktopStorage {
     private val wipePending: Path get() = rootDir.resolve("credential-wipe-pending")
 
     fun prepareCredentials() {
-        if (Files.exists(wipePending)) LocalAccountDataCleaner.wipe()
-        DesktopCredentials.storeNames.forEach { store(it).freshEntries() }
-        com.nuvio.app.core.network.DesktopSessionSettings().migrate()
+        if (Files.exists(wipePending)) {
+            runCatching { LocalAccountDataCleaner.wipe() }.onFailure { DesktopCredentials.warning() }
+        }
+        DesktopCredentials.storeNames.forEach { name ->
+            runCatching { store(name).freshEntries() }.onFailure { DesktopCredentials.warning() }
+        }
+        runCatching { com.nuvio.app.core.network.DesktopSessionSettings().migrate() }
+            .onFailure { DesktopCredentials.warning() }
     }
 
     fun wipe() {
-        wipeCredentialsAndFiles(rootDir,
+        wipeCredentialsAndFiles(
+            rootDir,
             clearLegacy = { com.nuvio.app.core.network.clearLegacyAccountSessions() },
-            clearStore = { store(it).clearCredentials() },
+            clearStore = { clearExplicitSecrets(it) },
         )
+        dropStoreCache()
+    }
+
+    internal fun dropStoreCache() {
         synchronized(stores) {
             stores.values.forEach(Store::clearInMemory)
             stores.clear()
         }
+    }
+
+    /** Stores whose secrets an explicit sign-out clears. Non-secret files are not in this list. */
+    internal val explicitSignOutStores = listOf(
+        ACCOUNT_SESSION_STORE,
+        "nuvio_trakt_auth",
+        "nuvio_simkl_auth",
+        "nuvio_mdblist_auth",
+        "nuvio_addons",
+        "nuvio_debrid_settings",
+        "server_credentials",
+    )
+
+    internal fun clearExplicitSecrets(name: String) = clearExplicitSecrets(store(name), name)
+
+    internal fun clearExplicitSecrets(store: Store, name: String) {
+        val wholeStore = name != "nuvio_debrid_settings" && name != "server_credentials"
+        store.removeWhere(skipAccessCheck = true) { key ->
+            when (name) {
+                "nuvio_debrid_settings" -> "api_key" in key || "pending_device_authorization" in key
+                "server_credentials" -> key.startsWith("credential.")
+                else -> true
+            }
+        }
+        if (wholeStore) store.clearCredentials()
     }
 
     internal fun wipeCredentialsAndFiles(root: Path, clearLegacy: () -> Unit, clearStore: (String) -> Unit) {
@@ -77,7 +111,9 @@ internal object DesktopStorage {
         java.nio.channels.FileChannel.open(root, java.nio.file.StandardOpenOption.READ).use { it.force(true) }
         var failure: Throwable? = null
         runCatching(clearLegacy).onFailure { failure = it }
-        runCatching { clearStore(ACCOUNT_SESSION_STORE) }.onFailure { if (failure == null) failure = it }
+        explicitSignOutStores.forEach { name ->
+            runCatching { clearStore(name) }.onFailure { if (failure == null) failure = it }
+        }
         if (failure != null) throw SecureStorageUnavailable()
         removeAccountSessionFiles(root)
         Files.delete(pending)
@@ -104,25 +140,6 @@ internal object DesktopStorage {
                 throw SecureStorageUnavailable()
             }
             if (Files.exists(path)) throw SecureStorageUnavailable()
-        }
-    }
-
-    /**
-     * Folders a full data-folder sweep never touches: downloaded videos and the move journals that may
-     * still name copies of them. Sign-out and a lost session no longer run that sweep; they only drop
-     * the account session.
-     */
-    internal val KeptOnWipe = setOf("downloads", "moves")
-
-    /** Deletes everything under [root] except the top-level entries named in [keep] and what is inside them. Never follows a link. */
-    internal fun wipeFolder(root: Path, keep: Set<String>) {
-        if (!Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return
-        val kept = keep.map { root.resolve(it) }
-        Files.walk(root).use { stream ->
-            stream
-                .sorted(Comparator.reverseOrder())
-                .filter { it != root && kept.none { k -> it.startsWith(k) } }
-                .forEach { path -> runCatching { Files.deleteIfExists(path) } }
         }
     }
 
@@ -273,20 +290,31 @@ internal object DesktopStorage {
 
         fun remove(key: String) = removeAll(listOf(key))
 
-        fun removeAll(keys: Iterable<String>) = exclusive {
-            val removed = keys.toSet()
-            reload()
+        fun removeAll(keys: Iterable<String>) = removeMatching(skipAccessCheck = false) { it in keys }
+
+        /** Removes matching keys while a sign-out marker is present. Readers stay blocked; this wipe does not. */
+        fun removeWhere(skipAccessCheck: Boolean, predicate: (String) -> Boolean) =
+            removeMatching(skipAccessCheck, predicate)
+
+        private fun removeMatching(skipAccessCheck: Boolean, predicate: (String) -> Boolean) = exclusive {
+            reload(skipAccessCheck)
+            val removedKeys = properties.stringPropertyNames().filter(predicate).toMutableSet()
+            val recovery = listOf(file, previousFile, temporaryFile).map { it.resolveSibling("${it.fileName}.secure-tmp") }
+            (listOf(previousFile, temporaryFile) + recovery).forEach { source ->
+                val copy = Properties()
+                if (read(source, copy)) removedKeys += copy.stringPropertyNames().filter(predicate)
+            }
+            if (removedKeys.isEmpty()) return@exclusive
             val references = mutableSetOf<String>()
-            removed.forEach { key -> properties.getProperty(key)?.let(references::add) }
-            val changed = removed.fold(false) { changed, key -> (properties.remove(key) != null) || changed }
+            removedKeys.forEach { key -> properties.getProperty(key)?.let(references::add) }
+            val changed = removedKeys.fold(false) { changed, key -> (properties.remove(key) != null) || changed }
             if (changed) persist()
             // A removed credential must not be restored from a previous copy.
-            val recovery = listOf(file, previousFile, temporaryFile).map { it.resolveSibling("${it.fileName}.secure-tmp") }
             (listOf(previousFile, temporaryFile) + recovery).forEach { source ->
                 val copy = Properties()
                 if (read(source, copy)) {
                     var dirty = false
-                    removed.filter(protectedKey).forEach { key ->
+                    removedKeys.filter(protectedKey).forEach { key ->
                         copy.remove(key)?.let { references.add(it.toString()); dirty = true }
                     }
                     if (dirty) replaceCopy(source, copy)
@@ -329,8 +357,8 @@ internal object DesktopStorage {
             reload()
         }
 
-        private fun reload() {
-            checkAccess()
+        private fun reload(skipAccessCheck: Boolean = false) {
+            if (!skipAccessCheck) checkAccess()
             loaded = true
             properties.clear()
             fileIsGood = false

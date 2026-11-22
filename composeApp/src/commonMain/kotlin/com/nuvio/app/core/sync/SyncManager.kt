@@ -269,6 +269,19 @@ internal class ProfileSyncRequestGate {
 
 object SyncManager {
     private val log = Logger.withTag("SyncManager")
+
+    @Volatile
+    internal var syncPaused: Boolean = false
+        private set
+
+    internal fun pauseUntilOnline() {
+        syncPaused = true
+        cancelAccountSync()
+    }
+
+    internal fun resumeSync() {
+        syncPaused = false
+    }
     private val syncRequestGate = ProfileSyncRequestGate()
     private val accountScopeLock = SynchronizedObject()
     private var accountScopeJob: Job = SupervisorJob()
@@ -310,6 +323,7 @@ object SyncManager {
     )
 
     fun pullAllForProfile(profileId: Int) {
+        if (syncPaused) return
         startFullProfilePull(profileId = profileId, reason = "requested")
     }
 
@@ -339,6 +353,7 @@ object SyncManager {
     }
 
     fun requestForegroundPull(profileId: Int, force: Boolean = false) {
+        if (syncPaused) return
         val authState = AuthRepository.state.value
         if (authState !is AuthState.Authenticated || authState.isAnonymous) return
 
@@ -362,6 +377,7 @@ object SyncManager {
                     if (!force) {
                         delay(FOREGROUND_PULL_DELAY_MS)
                     }
+                    if (syncPaused) return@launch
                     if (!force && hasRecentActivityPull(profileId)) return@launch
                     if (ProfileRepository.activeProfileId != profileId) return@launch
                     startActivityProfilePull(profileId = profileId, reason = "foreground")
@@ -394,6 +410,7 @@ object SyncManager {
         profileId: Int,
         reason: String,
     ) {
+        if (syncPaused) return
         val authState = AuthRepository.state.value
         if (authState !is AuthState.Authenticated || authState.isAnonymous) return
         if (ProfileRepository.activeProfileId != profileId) return
@@ -404,6 +421,7 @@ object SyncManager {
             profileId = profileId,
             kind = ProfileSyncRequestKind.Full,
         ) {
+            if (syncPaused) return@launch
             val currentAuthState = AuthRepository.state.value
             if (currentAuthState !is AuthState.Authenticated || currentAuthState.isAnonymous) return@launch
             if (ProfileRepository.activeProfileId != profileId) return@launch
@@ -469,6 +487,7 @@ object SyncManager {
         pullLibrary: Boolean = true,
         pullWatchActivity: Boolean = true,
     ) {
+        if (syncPaused) return
         val authState = AuthRepository.state.value
         if (authState !is AuthState.Authenticated || authState.isAnonymous) return
         if (ProfileRepository.activeProfileId != profileId) return
@@ -478,6 +497,7 @@ object SyncManager {
             profileId = profileId,
             kind = ProfileSyncRequestKind.Activity,
         ) {
+            if (syncPaused) return@launch
             val currentAuthState = AuthRepository.state.value
             if (currentAuthState !is AuthState.Authenticated || currentAuthState.isAnonymous) return@launch
             if (ProfileRepository.activeProfileId != profileId) return@launch
@@ -513,6 +533,10 @@ object SyncManager {
     }
 
     fun startPeriodicNuvioSyncPull(profileId: Int) {
+        if (syncPaused) {
+            stopPeriodicNuvioSyncPull()
+            return
+        }
         val authState = AuthRepository.state.value
         if (authState !is AuthState.Authenticated || authState.isAnonymous) {
             stopPeriodicNuvioSyncPull()
@@ -526,6 +550,7 @@ object SyncManager {
             while (isActive) {
                 delay(PERIODIC_NUVIO_SYNC_PULL_INTERVAL_MS)
 
+                if (syncPaused) continue
                 val currentAuthState = AuthRepository.state.value
                 if (currentAuthState !is AuthState.Authenticated || currentAuthState.isAnonymous) {
                     continue

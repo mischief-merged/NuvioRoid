@@ -51,6 +51,7 @@ object SupabaseProvider {
         ) {
             httpEngine = cachedEngine
             httpConfig {
+                installRetainedAuthGuard()
                 install(BackendRateLimitPlugin) {
                     coordinator = rateLimitCoordinator
                 }
