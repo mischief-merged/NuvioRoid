@@ -83,6 +83,7 @@ internal class AutoDownloadStore(
     private val lock = WatchedRemovalGuard.lock
     private val keepSignalLock = SynchronizedObject()
     private val pendingKeeps = mutableMapOf<Pair<Int, String>, Int>()
+    private val activeRemovalSnapshots = mutableMapOf<Pair<Int, String>, Int>()
     private val acceptedKeepEpochs = mutableMapOf<Pair<Int, String>, Long>()
     // Every field is written, also one that has its default value, so that a rule keeps what it
     // was saved with when a default changes later.
@@ -143,21 +144,84 @@ internal class AutoDownloadStore(
         if (ensureLoaded() != profileId) emptyList() else state.removals
     }
 
-    /** Scheduled removals for [profileId] paired with each download's Keep counter at read time. */
-    fun scheduledRemovals(profileId: Int): List<ScheduledAutoDownloadRemoval> = synchronized(lock) {
-        if (ensureLoaded() != profileId) return emptyList()
-        synchronized(keepSignalLock) {
-            state.removals.map { removal ->
-                ScheduledAutoDownloadRemoval(
-                    removal = removal,
-                    keepEpoch = acceptedKeepEpochs[profileId to removal.downloadId] ?: 0L,
-                )
+    /** Runs [block] with [downloadId]'s scheduled removal snapshot, tracking it until [block] finishes. */
+    fun <T> withScheduledRemoval(
+        profileId: Int,
+        downloadId: String,
+        block: (ScheduledAutoDownloadRemoval) -> T,
+    ): T? {
+        val scheduled = synchronized(lock) {
+            if (ensureLoaded() != profileId) return@synchronized null
+            val removal = state.removals.firstOrNull { it.downloadId == downloadId } ?: return@synchronized null
+            synchronized(keepSignalLock) { acquireSnapshot(profileId, removal) }
+        } ?: return null
+        return try {
+            block(scheduled)
+        } finally {
+            releaseScheduledRemoval(profileId, scheduled)
+        }
+    }
+
+    /** Runs [transform] for each due removal of [profileId], tracking each snapshot until it finishes. */
+    fun <T> mapDueScheduledRemovals(
+        profileId: Int,
+        nowEpochMs: Long,
+        transform: (ScheduledAutoDownloadRemoval) -> T,
+    ): Map<String, T> {
+        val due = synchronized(lock) {
+            if (ensureLoaded() != profileId) return@synchronized emptyList()
+            val matching = state.removals.filter { it.dueAtEpochMs <= nowEpochMs }
+            if (matching.isEmpty()) return@synchronized emptyList()
+            synchronized(keepSignalLock) {
+                matching.map { acquireSnapshot(profileId, it) }
             }
+        }
+        if (due.isEmpty()) return emptyMap()
+        val results = LinkedHashMap<String, T>(due.size)
+        var index = 0
+        try {
+            while (index < due.size) {
+                val scheduled = due[index]
+                try {
+                    results[scheduled.removal.downloadId] = transform(scheduled)
+                } finally {
+                    index++
+                    releaseScheduledRemoval(profileId, scheduled)
+                }
+            }
+        } finally {
+            while (index < due.size) {
+                releaseScheduledRemoval(profileId, due[index])
+                index++
+            }
+        }
+        return results
+    }
+
+    private fun acquireSnapshot(profileId: Int, removal: AutoDownloadRemoval): ScheduledAutoDownloadRemoval {
+        val key = profileId to removal.downloadId
+        activeRemovalSnapshots[key] = (activeRemovalSnapshots[key] ?: 0) + 1
+        return ScheduledAutoDownloadRemoval(
+            removal = removal,
+            keepEpoch = acceptedKeepEpochs[key] ?: 0L,
+        )
+    }
+
+    private fun releaseScheduledRemoval(profileId: Int, scheduled: ScheduledAutoDownloadRemoval) {
+        val key = profileId to scheduled.removal.downloadId
+        synchronized(keepSignalLock) {
+            val remaining = (activeRemovalSnapshots[key] ?: 1) - 1
+            if (remaining <= 0) activeRemovalSnapshots.remove(key) else activeRemovalSnapshots[key] = remaining
+            pruneKeepEpochIfIdle(key)
         }
     }
 
     fun hasPendingKeep(profileId: Int, downloadId: String): Boolean = synchronized(keepSignalLock) {
         (pendingKeeps[profileId to downloadId] ?: 0) > 0
+    }
+
+    internal fun trackedKeepEpochCount(): Int = synchronized(keepSignalLock) {
+        acceptedKeepEpochs.size
     }
 
     fun isKept(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
@@ -217,7 +281,9 @@ internal class AutoDownloadStore(
                             ),
                         )
                         synchronized(keepSignalLock) {
-                            acceptedKeepEpochs[key] = (acceptedKeepEpochs[key] ?: 0L) + 1L
+                            if ((activeRemovalSnapshots[key] ?: 0) > 0) {
+                                acceptedKeepEpochs[key] = (acceptedKeepEpochs[key] ?: 0L) + 1L
+                            }
                             decrementPendingKeep(key)
                             settled = true
                         }
@@ -244,19 +310,27 @@ internal class AutoDownloadStore(
     private fun decrementPendingKeep(key: Pair<Int, String>) {
         val remaining = (pendingKeeps[key] ?: 1) - 1
         if (remaining <= 0) pendingKeeps.remove(key) else pendingKeeps[key] = remaining
+        pruneKeepEpochIfIdle(key)
+    }
+
+    private fun pruneKeepEpochIfIdle(key: Pair<Int, String>) {
+        if ((activeRemovalSnapshots[key] ?: 0) == 0 && (pendingKeeps[key] ?: 0) == 0) {
+            acceptedKeepEpochs.remove(key)
+        }
     }
 
     /** Undoing Keep puts back a removal Keep set aside, with a fresh hold when its time has passed. */
     fun undoKeep(
         profileId: Int,
         downloadId: String,
-        nowEpochMs: Long = this.nowEpochMs(),
+        nowEpochMs: () -> Long = this.nowEpochMs,
         holdMs: Long = DeleteAfterWatching.DefaultHoldMs,
     ): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false
+        val now = nowEpochMs()
         val kept = state.keptRemovals.firstOrNull { it.downloadId == downloadId }
         val restored = kept?.copy(
-            dueAtEpochMs = if (kept.dueAtEpochMs > nowEpochMs) kept.dueAtEpochMs else nowEpochMs + holdMs,
+            dueAtEpochMs = if (kept.dueAtEpochMs > now) kept.dueAtEpochMs else now + holdMs,
         )
         save(
             profileId,

@@ -58,21 +58,21 @@ internal class DeleteAfterWatching(
     }
 
     fun undoKeep(profileId: Int, downloadId: String) {
-        store.undoKeep(profileId, downloadId, nowEpochMs(), holdMs)
+        store.undoKeep(profileId, downloadId, nowEpochMs, holdMs)
     }
 
     /** Removes the download now, at the user's request. Null when no removal is scheduled for it. */
-    fun deleteNow(profileId: Int, downloadId: String): AutoDownloadRemovalOutcome? {
-        val scheduled = store.scheduledRemovals(profileId).firstOrNull { it.removal.downloadId == downloadId } ?: return null
-        return process(profileId, scheduled, askedByUser = true)
-    }
+    fun deleteNow(profileId: Int, downloadId: String): AutoDownloadRemovalOutcome? =
+        store.withScheduledRemoval(profileId, downloadId) { scheduled ->
+            process(profileId, scheduled, askedByUser = true)
+        }
 
     /** Handles every removal whose time has come. */
     fun runDue(profileId: Int): Map<String, AutoDownloadRemovalOutcome> {
         val now = nowEpochMs()
-        return store.scheduledRemovals(profileId)
-            .filter { it.removal.dueAtEpochMs <= now }
-            .associate { it.removal.downloadId to process(profileId, it, askedByUser = false) }
+        return store.mapDueScheduledRemovals(profileId, now) { scheduled ->
+            process(profileId, scheduled, askedByUser = false)
+        }
     }
 
     private fun process(profileId: Int, scheduled: ScheduledAutoDownloadRemoval, askedByUser: Boolean): AutoDownloadRemovalOutcome {
