@@ -48,6 +48,7 @@ internal data class DesktopNativePlayerHooks(
         )
     },
     val forceHostReady: Boolean = false,
+    val renderSwingPanel: Boolean = true,
     val attachDelayMs: Long = 16L,
 )
 
@@ -362,21 +363,25 @@ private fun NativePlayerSurface(
         // SwingPanel keeps the stable AWT host. PiP moves only the native player
         // surface to the independent window, so Compose never loses its host peer.
         CompositionLocalProvider(LocalDensity provides platformDensity) {
-            SwingPanel(
-                factory = { host },
-                modifier = if (isInPip) {
-                    Modifier
-                        .align(Alignment.BottomEnd)
-                        .requiredSize(1.dp)
-                } else if (hostFirstPaintComplete.value) {
-                    Modifier.fillMaxSize()
-                } else {
-                    Modifier
-                        .align(Alignment.BottomEnd)
-                        .requiredSize(1.dp)
-                },
-                background = Color.Black,
-            )
+            if (nativeHooks.renderSwingPanel) {
+                SwingPanel(
+                    factory = { host },
+                    modifier = if (isInPip) {
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .requiredSize(1.dp)
+                    } else if (hostFirstPaintComplete.value) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .requiredSize(1.dp)
+                    },
+                    background = Color.Black,
+                )
+            } else {
+                Box(modifier = Modifier.fillMaxSize())
+            }
         }
     }
 }

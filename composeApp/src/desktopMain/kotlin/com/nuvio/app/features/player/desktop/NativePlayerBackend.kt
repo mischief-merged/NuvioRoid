@@ -119,6 +119,77 @@ internal interface NativePlayerBackend {
     )
 }
 
+internal object NoOpNativePlayerBackend : NativePlayerBackend {
+    override fun controlsPageUrl(): String = "about:blank"
+    override fun create(
+        hostViewPtr: Long,
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        controlsPageUrl: String,
+        decoderPriority: Int,
+        nvidiaRtxSuperResolutionEnabled: Boolean,
+        nvidiaRtxHdrEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long = 0L
+
+    override fun dispose(handle: Long) = Unit
+    override fun updateControls(handle: Long, controlsJson: String) = Unit
+    override fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String) = Unit
+    override fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean) = Unit
+    override fun setMiniPlayerMode(handle: Long, inMiniPlayer: Boolean) = Unit
+    override fun requestFocus(handle: Long) = Unit
+    override fun beginWindowDrag(handle: Long) = Unit
+    override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean = true
+    override fun layoutNativeSubviews(handle: Long) = Unit
+    override fun setPaused(handle: Long, paused: Boolean) = Unit
+    override fun seekTo(handle: Long, positionMs: Long) = Unit
+    override fun seekBy(handle: Long, offsetMs: Long) = Unit
+    override fun setSpeed(handle: Long, speed: Float) = Unit
+    override fun setVolume(handle: Long, level: Float) = Unit
+    override fun setResizeMode(handle: Long, mode: Int) = Unit
+    override fun durationMs(handle: Long): Long = 0L
+    override fun positionMs(handle: Long): Long = 0L
+    override fun bufferedPositionMs(handle: Long): Long = 0L
+    override fun isLoading(handle: Long): Boolean = false
+    override fun isEnded(handle: Long): Boolean = false
+    override fun isPaused(handle: Long): Boolean = false
+    override fun speed(handle: Long): Float = 1f
+    override fun audioTracksJson(handle: Long): String = "[]"
+    override fun subtitleTracksJson(handle: Long): String = "[]"
+    override fun stringProperty(handle: Long, name: String): String = ""
+    override fun selectAudioTrack(handle: Long, trackId: Int) = Unit
+    override fun setAudioLanguages(handle: Long, languages: String) = Unit
+    override fun selectSubtitleTrack(handle: Long, trackId: Int) = Unit
+    override fun addSubtitleUrl(handle: Long, url: String) = Unit
+    override fun clearExternalSubtitles(handle: Long) = Unit
+    override fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int) = Unit
+    override fun setSubtitleVisible(handle: Long, visible: Boolean) = Unit
+    override fun setSubtitleDelayMs(handle: Long, delayMs: Int) = Unit
+    override fun applySubtitleStyle(
+        handle: Long,
+        textColor: String,
+        backgroundColor: String,
+        outlineColor: String,
+        outlineSize: Float,
+        bold: Boolean,
+        fontSize: Float,
+        subPos: Int,
+        useLibass: Boolean,
+        stripSdh: Boolean,
+    ) = Unit
+
+    override fun setSubtitleAppearance(
+        handle: Long,
+        font: String,
+        fontsDir: String,
+        shadowColor: String,
+        shadowOffset: Float,
+        shadowBlur: Float,
+    ) = Unit
+}
+
 internal object RealNativePlayerBackend : NativePlayerBackend {
     override fun controlsPageUrl(): String = NativePlayerBridge.controlsPageUrl
 

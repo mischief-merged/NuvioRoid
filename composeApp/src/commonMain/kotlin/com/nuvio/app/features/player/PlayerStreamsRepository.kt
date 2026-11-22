@@ -56,6 +56,12 @@ object PlayerStreamsRepository {
     val episodeStreamsState: StateFlow<StreamsUiState> = _episodeStreamsState.asStateFlow()
     private var episodeStreamsJob: Job? = null
     private var episodeStreamsRequestKey: String? = null
+    internal var episodeStreamsProviderForTest: ((
+        type: String,
+        videoId: String,
+        season: Int?,
+        episode: Int?,
+    ) -> StreamsUiState?)? = null
 
     fun loadSources(
         type: String,
@@ -86,6 +92,13 @@ object PlayerStreamsRepository {
         episode: Int? = null,
         forceRefresh: Boolean = false,
     ) {
+        episodeStreamsProviderForTest?.invoke(type, videoId, season, episode)?.let { provided ->
+            episodeStreamsJob?.cancel()
+            episodeStreamsJob = null
+            episodeStreamsRequestKey = "$type::$videoId::$season::$episode"
+            _episodeStreamsState.value = provided
+            return
+        }
         fetchStreams(
             panelName = "episodeStreams",
             type = type,
@@ -164,6 +177,7 @@ object PlayerStreamsRepository {
     }
 
     fun clearAll() {
+        episodeStreamsProviderForTest = null
         PluginRepository.setLocalPluginSearchPaused(true)
         sourceJob?.cancel()
         sourceRequestKey = null

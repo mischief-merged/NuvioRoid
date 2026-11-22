@@ -116,12 +116,12 @@ internal class NativePlayerController(
 ) : PlayerEngineController {
     private val usesInjectedCreateStub = nativeCreate != null && backend === RealNativePlayerBackend
     private val backend: NativePlayerBackend =
-        backend.withTestCommandOverrides(nativeSeekBy, nativeUpdateControls)
-    private val nativeCreate: NativePlayerCreate = nativeCreate ?: backend::create
-    private val nativeDispose: (Long) -> Unit = nativeDispose ?: backend::dispose
-    private val nativeSeekTo: (Long, Long) -> Unit = nativeSeekTo ?: backend::seekTo
-    private val controlsPageUrlProvider: () -> String =
-        if (usesInjectedCreateStub) ({ "about:blank" }) else backend::controlsPageUrl
+        (if (usesInjectedCreateStub) NoOpNativePlayerBackend else backend)
+            .withTestCommandOverrides(nativeSeekBy, nativeUpdateControls)
+    private val nativeCreate: NativePlayerCreate = nativeCreate ?: this.backend::create
+    private val nativeDispose: (Long) -> Unit = nativeDispose ?: this.backend::dispose
+    private val nativeSeekTo: (Long, Long) -> Unit = nativeSeekTo ?: this.backend::seekTo
+    private val controlsPageUrlProvider: () -> String = this.backend::controlsPageUrl
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
         val log = Logger.withTag("NativePlayerControls")
