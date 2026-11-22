@@ -1,8 +1,11 @@
 package com.nuvio.app.features.downloads
 
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.nuvio.app.AppScreenTab
@@ -18,6 +21,8 @@ import com.nuvio.app.core.ui.dispatchPlatformLocalBack
 import com.nuvio.app.navigation.DownloadsRoute
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.downloads_delete_description
+import nuvio.composeapp.generated.resources.downloads_delete_title
 import nuvio.composeapp.generated.resources.downloads_section_shows
 import nuvio.composeapp.generated.resources.episodes_season
 import org.jetbrains.compose.resources.StringResource
@@ -155,6 +160,87 @@ class DownloadsShowEscapeTest {
         compose.waitForIdle()
 
         assertEquals(1, rootBackCalls)
+    }
+
+    @Test
+    fun escape_on_downloads_show_page_with_delete_dialog_dismisses_dialog_before_leaving_show() {
+        backend.payload = """{"items":[${completedEpisode()}]}"""
+        DownloadsRepository.ensureLoaded()
+        var rootBackCalls = 0
+
+        compose.setContent {
+            NuvioTheme {
+                DesktopKeyboardShortcutHost()
+                PlatformEscapeShortcut { rootBackCalls += 1 }
+                DownloadsScreenContent(
+                    onBack = { rootBackCalls += 1 },
+                    onOpenDownload = {},
+                    showAutoDownloads = false,
+                )
+            }
+        }
+        compose.waitForIdle()
+
+        // Open the show page and open the Delete confirmation dialog.
+        compose.onNodeWithText("Pantheon").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText(text(Res.string.episodes_season, 2)).assertIsDisplayed()
+
+        val deleteButtonDesc = text(Res.string.downloads_delete_description, "Pantheon S02E03")
+        val deleteDialogTitle = text(Res.string.downloads_delete_title, "Pantheon S02E03")
+        compose.onNodeWithContentDescription(deleteButtonDesc).performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText(deleteDialogTitle).assertIsDisplayed()
+
+        // First Escape dismisses the Delete dialog while staying on the show page.
+        assertTrue(sendAwtEscape())
+        compose.waitForIdle()
+        compose.onAllNodesWithText(deleteDialogTitle).assertCountEquals(0)
+        compose.onNodeWithText(text(Res.string.episodes_season, 2)).assertIsDisplayed()
+        assertEquals(0, rootBackCalls)
+
+        // Second Escape returns from the show page to the downloads list.
+        Thread.sleep(350)
+        assertTrue(sendAwtEscape())
+        compose.waitForIdle()
+        compose.onNodeWithText(text(Res.string.downloads_section_shows)).assertIsDisplayed()
+        assertEquals(0, rootBackCalls)
+
+        // Third Escape leaves Downloads via root back.
+        Thread.sleep(350)
+        assertTrue(sendAwtEscape())
+        compose.waitForIdle()
+        assertEquals(1, rootBackCalls)
+    }
+
+    @Test
+    fun modal_handlers_take_priority_over_local_page_handlers() {
+        val order = mutableListOf<String>()
+        val root: () -> Unit = { order += "root" }
+        val pageBefore: () -> Unit = { order += "pageBefore" }
+        val modal: () -> Unit = { order += "modal" }
+        val pageAfter: () -> Unit = { order += "pageAfter" }
+
+        DesktopEscapeShortcut.register(root)
+        DesktopEscapeShortcut.registerLocal(pageBefore)
+        DesktopEscapeShortcut.registerModal(modal)
+        DesktopEscapeShortcut.registerLocal(pageAfter)
+        try {
+            assertTrue(DesktopEscapeShortcut.dispatchBack())
+            DesktopEscapeShortcut.unregisterModal(modal)
+            assertTrue(DesktopEscapeShortcut.dispatchBack())
+            DesktopEscapeShortcut.unregisterLocal(pageAfter)
+            assertTrue(DesktopEscapeShortcut.dispatchBack())
+            DesktopEscapeShortcut.unregisterLocal(pageBefore)
+            assertTrue(DesktopEscapeShortcut.dispatchBack())
+
+            assertEquals(listOf("modal", "pageAfter", "pageBefore", "root"), order)
+        } finally {
+            DesktopEscapeShortcut.unregisterModal(modal)
+            DesktopEscapeShortcut.unregisterLocal(pageAfter)
+            DesktopEscapeShortcut.unregisterLocal(pageBefore)
+            DesktopEscapeShortcut.unregister(root)
+        }
     }
 
     @Test

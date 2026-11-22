@@ -13,6 +13,7 @@ internal object DesktopEscapeShortcut {
     @Volatile
     var onBack: (() -> Unit)? = null
 
+    private val modalHandlers = mutableListOf<() -> Unit>()
     private val localHandlers = mutableListOf<() -> Unit>()
 
     fun register(handler: () -> Unit) {
@@ -21,6 +22,19 @@ internal object DesktopEscapeShortcut {
 
     fun unregister(handler: () -> Unit) {
         if (onBack === handler) onBack = null
+    }
+
+    fun registerModal(handler: () -> Unit) {
+        synchronized(modalHandlers) {
+            modalHandlers.removeAll { it === handler }
+            modalHandlers.add(handler)
+        }
+    }
+
+    fun unregisterModal(handler: () -> Unit) {
+        synchronized(modalHandlers) {
+            modalHandlers.removeAll { it === handler }
+        }
     }
 
     fun registerLocal(handler: () -> Unit) {
@@ -36,8 +50,13 @@ internal object DesktopEscapeShortcut {
         }
     }
 
-    /** Runs the innermost active local back handler, returning true if one handled back. */
+    /** Runs the innermost active modal or local back handler, returning true if one handled back. */
     fun dispatchLocalBack(): Boolean {
+        val modal = synchronized(modalHandlers) { modalHandlers.lastOrNull() }
+        if (modal != null) {
+            modal()
+            return true
+        }
         val local = synchronized(localHandlers) { localHandlers.lastOrNull() } ?: return false
         local()
         return true

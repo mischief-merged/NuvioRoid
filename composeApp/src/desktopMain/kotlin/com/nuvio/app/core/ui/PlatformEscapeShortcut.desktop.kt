@@ -14,4 +14,22 @@ internal actual fun PlatformEscapeShortcut(handler: () -> Unit) {
     }
 }
 
+@Composable
+internal actual fun PlatformModalBackHandler(
+    dismissOnBackPress: Boolean,
+    onDismiss: () -> Unit,
+) {
+    val currentDismissOnBackPress = rememberUpdatedState(dismissOnBackPress)
+    val currentOnDismiss = rememberUpdatedState(onDismiss)
+    DisposableEffect(Unit) {
+        val handler: () -> Unit = {
+            if (currentDismissOnBackPress.value) {
+                currentOnDismiss.value()
+            }
+        }
+        DesktopEscapeShortcut.registerModal(handler)
+        onDispose { DesktopEscapeShortcut.unregisterModal(handler) }
+    }
+}
+
 internal actual fun dispatchPlatformLocalBack(): Boolean = DesktopEscapeShortcut.dispatchLocalBack()

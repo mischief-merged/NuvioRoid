@@ -65,6 +65,7 @@ import com.nuvio.app.core.ui.NuvioScreenHeader
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.core.ui.PlatformBackHandler
+import com.nuvio.app.core.ui.PlatformModalBackHandler
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.LocalOpenSettingsPage
 import com.nuvio.app.features.settings.SettingsPage
@@ -449,6 +450,7 @@ internal fun DownloadsScreenContent(
     locatePick?.let { (item, path) ->
         val adopted = stringResource(Res.string.downloads_locate_adopted)
         val refused = stringResource(Res.string.downloads_locate_refused)
+        PlatformModalBackHandler(onDismiss = { locatePick = null })
         AlertDialog(
             onDismissRequest = { locatePick = null },
             title = { Text(stringResource(Res.string.downloads_locate_confirm_title)) },

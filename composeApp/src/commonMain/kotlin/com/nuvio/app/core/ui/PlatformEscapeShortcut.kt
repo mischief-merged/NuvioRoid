@@ -11,5 +11,15 @@ import androidx.compose.runtime.Composable
 @Composable
 internal expect fun PlatformEscapeShortcut(handler: () -> Unit)
 
-/** Runs the innermost active local [PlatformBackHandler] on desktop; returns false when none is active. */
+/**
+ * Registers an open modal dialog ahead of page-level back handlers on desktop so Escape and
+ * gamepad Back dismiss (or are consumed by) the dialog instead of navigating the page behind it.
+ */
+@Composable
+internal expect fun PlatformModalBackHandler(
+    dismissOnBackPress: Boolean = true,
+    onDismiss: () -> Unit,
+)
+
+/** Runs the innermost active modal or local [PlatformBackHandler] on desktop; returns false when none is active. */
 internal expect fun dispatchPlatformLocalBack(): Boolean
