@@ -240,9 +240,19 @@ fun main(args: Array<String>) {
                     }
             }
             LaunchedEffect(geometryWrites) {
+                // Wakes only while a position is waiting, then waits until the window has stayed still.
+                // A failed save is tried again after the same quiet interval. Closing still writes once.
                 while (isActive) {
-                    delay(50)
-                    geometryWrites.flushIfDue()
+                    geometryWrites.wakeups().receive()
+                    while (isActive) {
+                        val wait = geometryWrites.millisUntilDue() ?: break
+                        if (wait > 0L) {
+                            delay(wait)
+                            continue
+                        }
+                        if (geometryWrites.flushIfDue()) break
+                        delay(geometryWrites.quietMs)
+                    }
                 }
             }
             DisposableEffect(geometryWrites) {

@@ -1,6 +1,8 @@
 package com.nuvio.app.features.player.desktop
 
 import com.nuvio.app.core.storage.DesktopStorage
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 
 /**
  * Persists desktop window mode/geometry across launches:
@@ -83,34 +85,45 @@ internal object DesktopWindowModeStorage {
 /**
  * Holds window position and size until the window has stayed still for [quietMs], then asks for
  * one save. A drag therefore writes once, when it ends, and closing the window writes whatever is
- * still waiting.
+ * still waiting. A save that fails stays waiting, so a later attempt can write it.
  */
 internal class WindowGeometryWrites(
-    private val quietMs: Long = 300L,
+    val quietMs: Long = 300L,
     private val clock: () -> Long = System::currentTimeMillis,
     private val persist: (wasMaximized: Boolean?, geometry: DesktopWindowGeometry?) -> Unit,
 ) {
+    private val wakeups = Channel<Unit>(Channel.CONFLATED)
     private var pendingMax: Boolean? = null
     private var pendingGeometry: DesktopWindowGeometry? = null
     private var notedAt = 0L
     private var dirty = false
 
-    /** How many times a save was asked for. */
+    /** How many times a save was written. */
     var writes: Int = 0
         private set
+
+    /** Wakes when a position is waiting. Nothing is sent while the window is still. */
+    internal fun wakeups(): ReceiveChannel<Unit> = wakeups
 
     fun note(wasMaximized: Boolean?, geometry: DesktopWindowGeometry?, now: Long = clock()) {
         if (wasMaximized != null) pendingMax = wasMaximized
         if (geometry != null) pendingGeometry = geometry
         notedAt = now
         dirty = true
+        wakeups.trySend(Unit)
+    }
+
+    /** Milliseconds until a save is due. Null when nothing is waiting, so the saver can sleep. */
+    fun millisUntilDue(now: Long = clock()): Long? {
+        if (!dirty) return null
+        val remaining = quietMs - (now - notedAt)
+        return if (remaining <= 0L) 0L else remaining
     }
 
     /** Saves when [quietMs] has passed since the latest [note]. */
     fun flushIfDue(now: Long = clock()): Boolean {
         if (!dirty || now - notedAt < quietMs) return false
-        write()
-        return true
+        return write()
     }
 
     /** Saves immediately. Used when the window is closing, so the last position is not dropped. */
@@ -119,9 +132,16 @@ internal class WindowGeometryWrites(
         write()
     }
 
-    private fun write() {
-        dirty = false
-        writes++
-        persist(pendingMax, pendingGeometry)
+    /** False when the save failed. The position stays waiting for another attempt. */
+    private fun write(): Boolean {
+        if (!dirty) return false
+        return try {
+            persist(pendingMax, pendingGeometry)
+            dirty = false
+            writes++
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 }

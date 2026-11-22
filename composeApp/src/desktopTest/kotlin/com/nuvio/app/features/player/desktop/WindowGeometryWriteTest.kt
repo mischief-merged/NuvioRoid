@@ -5,6 +5,7 @@ import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -99,6 +100,58 @@ class WindowGeometryWriteTest {
             assertEquals(2, persists())
             assertEquals(geometry(1_000), DesktopWindowModeStorage.readSnapshot(store).second)
         }
+    }
+
+    @Test
+    fun nothing_is_due_until_the_window_moves() {
+        val writes = WindowGeometryWrites { _, _ -> }
+
+        assertNull(writes.millisUntilDue(0))
+
+        writes.note(wasMaximized = false, geometry = geometry(1), now = 10)
+
+        assertEquals(300L, writes.millisUntilDue(10))
+        assertEquals(0L, writes.millisUntilDue(310))
+    }
+
+    @Test
+    fun a_failed_save_stays_pending_and_the_next_flush_writes_once() {
+        var attempts = 0
+        var persists = 0
+        val writes = WindowGeometryWrites { _, _ ->
+            attempts += 1
+            if (attempts == 1) error("full disk")
+            persists += 1
+        }
+        writes.note(wasMaximized = false, geometry = geometry(4), now = 1_000)
+
+        runCatching { writes.flushIfDue(1_300) }
+
+        assertEquals(0, persists)
+        assertEquals(0, writes.writes)
+        assertTrue(writes.flushIfDue(1_600))
+        assertEquals(1, persists)
+        assertEquals(1, writes.writes)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun closing_after_a_failed_save_writes_once() {
+        var attempts = 0
+        var persists = 0
+        val writes = WindowGeometryWrites { _, _ ->
+            attempts += 1
+            if (attempts == 1) error("full disk")
+            persists += 1
+        }
+        writes.note(wasMaximized = true, geometry = geometry(9), now = 0)
+
+        runCatching { writes.flushNow() }
+
+        assertEquals(0, writes.writes)
+        writes.flushNow()
+        assertEquals(1, persists)
+        assertEquals(1, writes.writes)
     }
 
     private fun geometry(x: Long) = DesktopWindowGeometry(x = x.toFloat(), y = 40f, width = 1280f, height = 720f)
