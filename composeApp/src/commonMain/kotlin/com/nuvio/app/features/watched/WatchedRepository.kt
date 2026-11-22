@@ -24,6 +24,7 @@ import com.nuvio.app.features.watching.sync.SupabaseWatchedSyncAdapter
 import com.nuvio.app.features.watching.sync.WatchedDeltaEvent
 import com.nuvio.app.features.watching.sync.WatchedSyncAdapter
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.LocallyFinishedEpisodeAlias
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
@@ -899,6 +900,21 @@ object WatchedRepository {
         ensureLoaded()
         if (items.isEmpty()) return
         val source = activeSource
+        val aliasesByItem = items.map { watchedItem ->
+            val season = watchedItem.season
+            val episode = watchedItem.episode
+            val aliasParentIds = if (season != null && episode != null) {
+                WatchProgressRepository.locallyFinishedParentAliases(
+                    parentMetaId = watchedItem.id,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                    videoId = watchedItem.videoId,
+                ) + watchedItem.id.trim()
+            } else {
+                setOf(watchedItem.id.trim())
+            }.filterTo(linkedSetOf()) { it.isNotEmpty() }
+            watchedItem to aliasParentIds
+        }
         val (removedItems, removedExtraKeys) = itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
             val targetItems = source.providerId
                 ?.let { providerId -> providerItems.getOrPut(providerId, ::mutableMapOf) }
@@ -907,14 +923,15 @@ object WatchedRepository {
                 ?.let { providerId -> dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf) }
                 ?: dirtyNuvioKeys
             var extraKeysChanged = false
-            val removed = items.mapNotNull { watchedItem ->
-                val keys = watchedItemKeys(
-                    type = watchedItem.type,
-                    id = watchedItem.id,
-                    season = watchedItem.season,
-                    episode = watchedItem.episode,
-                )
-                val matchingKey = keys.firstOrNull(targetItems::containsKey)
+            val removed = aliasesByItem.flatMap { (watchedItem, aliasParentIds) ->
+                val keys = aliasParentIds.flatMapTo(linkedSetOf()) { parentId ->
+                    watchedItemKeys(
+                        type = watchedItem.type,
+                        id = parentId,
+                        season = watchedItem.season,
+                        episode = watchedItem.episode,
+                    )
+                }
                 source.providerId?.let { providerId ->
                     providerExtraWatchedKeys[providerId]?.let { extraKeys ->
                         val updated = extraKeys - keys
@@ -924,13 +941,15 @@ object WatchedRepository {
                         }
                     }
                 }
-                matchingKey?.let(targetItems::remove)?.let { storeItem ->
-                    if (watchedItem.videoId != null && storeItem.videoId == null) {
-                        storeItem.copy(videoId = watchedItem.videoId)
-                    } else {
-                        storeItem
-                    }
-                }?.also { dirtyKeys.remove(matchingKey) }
+                keys.mapNotNull { matchingKey ->
+                    targetItems.remove(matchingKey)?.let { storeItem ->
+                        if (watchedItem.videoId != null && storeItem.videoId == null) {
+                            storeItem.copy(videoId = watchedItem.videoId)
+                        } else {
+                            storeItem
+                        }
+                    }?.also { dirtyKeys.remove(matchingKey) }
+                }
             }
             removed to extraKeysChanged
         }
@@ -945,7 +964,9 @@ object WatchedRepository {
             }
             if (syncRemote) pushDeleteToServer(items = items.toList(), source = source)
         }
-        onItemsUnwatched(items)
+        val unwatchedTargets = (items + removedItems)
+            .distinctBy { listOf(it.id, it.type, it.season, it.episode, it.videoId) }
+        onItemsUnwatched(unwatchedTargets)
     }
 
     private fun onItemsUnwatched(items: Collection<WatchedItem>) {
@@ -953,17 +974,32 @@ object WatchedRepository {
             val season = item.season
             val episode = item.episode
             if (season != null && episode != null) {
-                WatchProgressRepository.clearLocallyFinishedEpisode(
-                    parentMetaId = item.id,
-                    seasonNumber = season,
-                    episodeNumber = episode,
-                )
-                AutoDownloads.cancelPendingRemovals(
+                val clearedAliases = WatchProgressRepository.clearLocallyFinishedEpisode(
                     parentMetaId = item.id,
                     seasonNumber = season,
                     episodeNumber = episode,
                     videoId = item.videoId,
                 )
+                val cancelTargets = buildSet {
+                    val trimmedId = item.id.trim()
+                    if (trimmedId.isNotEmpty()) {
+                        add(LocallyFinishedEpisodeAlias(trimmedId, season, episode))
+                    }
+                    addAll(clearedAliases)
+                }
+                cancelTargets
+                    .groupBy(
+                        keySelector = { it.seasonNumber to it.episodeNumber },
+                        valueTransform = { it.parentMetaId },
+                    )
+                    .forEach { (seasonEpisode, parentMetaIds) ->
+                        AutoDownloads.cancelPendingRemovals(
+                            parentMetaIds = parentMetaIds,
+                            seasonNumber = seasonEpisode.first,
+                            episodeNumber = seasonEpisode.second,
+                            videoId = item.videoId,
+                        )
+                    }
             } else if (!item.type.isSeriesLikeWatchingContentType()) {
                 AutoDownloads.cancelPendingRemovals(
                     parentMetaId = item.id,

@@ -69,28 +69,48 @@ internal class DeleteAfterWatching(
         episodeNumber: Int? = null,
         videoId: String? = null,
         onlyNonEpisode: Boolean = false,
+    ): Boolean = cancelForContent(
+        profileId = profileId,
+        parentMetaIds = listOf(parentMetaId),
+        seasonNumber = seasonNumber,
+        episodeNumber = episodeNumber,
+        videoId = videoId,
+        onlyNonEpisode = onlyNonEpisode,
+    )
+
+    /** Cancels scheduled or kept-aside removals for downloads matching any alias of unwatched or cleared content. */
+    fun cancelForContent(
+        profileId: Int,
+        parentMetaIds: Collection<String>,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
     ): Boolean {
-        val normalizedParent = parentMetaId.trim()
+        val normalizedParents = parentMetaIds
+            .map { it.trim() }
+            .filterTo(linkedSetOf()) { it.isNotEmpty() }
         val normalizedVideoId = videoId?.trim()?.takeIf { it.isNotEmpty() }
-        if (normalizedParent.isBlank() && normalizedVideoId == null) return false
+        if (normalizedParents.isEmpty() && normalizedVideoId == null) return false
         val matchingIds = downloads().mapNotNullTo(mutableSetOf()) { item ->
+            val itemParent = item.parentMetaId.trim()
             val matches = when {
                 onlyNonEpisode ->
-                    normalizedParent.isNotBlank() &&
-                        item.parentMetaId.trim() == normalizedParent &&
+                    normalizedParents.isNotEmpty() &&
+                        itemParent in normalizedParents &&
                         item.seasonNumber == null &&
                         item.episodeNumber == null
                 seasonNumber != null && episodeNumber != null ->
-                    (normalizedParent.isNotBlank() &&
-                        item.parentMetaId.trim() == normalizedParent &&
+                    (normalizedParents.isNotEmpty() &&
+                        itemParent in normalizedParents &&
                         item.seasonNumber == seasonNumber &&
                         item.episodeNumber == episodeNumber) ||
                         (normalizedVideoId != null && item.videoId.trim() == normalizedVideoId)
                 normalizedVideoId != null ->
                     item.videoId.trim() == normalizedVideoId &&
-                        (normalizedParent.isBlank() || item.parentMetaId.trim() == normalizedParent)
+                        (normalizedParents.isEmpty() || itemParent in normalizedParents)
                 else ->
-                    normalizedParent.isNotBlank() && item.parentMetaId.trim() == normalizedParent
+                    normalizedParents.isNotEmpty() && itemParent in normalizedParents
             }
             item.id.takeIf { matches }
         }

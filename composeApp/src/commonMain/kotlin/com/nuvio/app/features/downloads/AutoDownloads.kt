@@ -388,23 +388,44 @@ internal object AutoDownloads : AutoDownloadController {
         videoId: String? = null,
         onlyNonEpisode: Boolean = false,
     ) {
+        cancelPendingRemovals(
+            parentMetaIds = listOf(parentMetaId),
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            videoId = videoId,
+            onlyNonEpisode = onlyNonEpisode,
+        )
+    }
+
+    /** Cancels pending watched removals matching any alias of unwatched or cleared content. */
+    fun cancelPendingRemovals(
+        parentMetaIds: Collection<String>,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
         if (!isAvailable) return
+        val normalizedParents = parentMetaIds
+            .map { it.trim() }
+            .filterTo(linkedSetOf()) { it.isNotEmpty() }
+        val normalizedVideoId = videoId?.trim()?.takeIf { it.isNotEmpty() }
+        if (normalizedParents.isEmpty() && normalizedVideoId == null) return
         val profileId = ProfileRepository.activeProfileId
         runCatching {
             val cancelled = deleteAfterWatching.cancelForContent(
                 profileId = profileId,
-                parentMetaId = parentMetaId,
+                parentMetaIds = normalizedParents,
                 seasonNumber = seasonNumber,
                 episodeNumber = episodeNumber,
-                videoId = videoId,
+                videoId = normalizedVideoId,
                 onlyNonEpisode = onlyNonEpisode,
             )
             if (cancelled) {
-                val normalizedParent = parentMetaId.trim()
                 scope.launch {
                     runCatching {
                         store.currentRules()
-                            .filter { it.parentMetaId.trim() == normalizedParent }
+                            .filter { it.parentMetaId.trim() in normalizedParents }
                             .forEach { engine.refreshStatus(profileId, it.key) }
                     }
                 }

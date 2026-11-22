@@ -75,7 +75,12 @@ private data class PendingWatchProgressPayload(
     val deltaCursorEventId: Long,
     val deltaInitialized: Boolean,
     val dirtyProgressKeys: Set<String>,
-    val locallyFinishedEpisodeKeys: Set<String> = emptySet(),
+    val locallyFinishedEpisodeGroups: List<Set<String>> = emptyList(),
+)
+
+private data class ClearedLocallyFinishedResult(
+    val changed: Boolean,
+    val aliases: Set<LocallyFinishedEpisodeAlias>,
 )
 
 private data class MetadataProviderReadiness(
@@ -265,7 +270,7 @@ object WatchProgressRepository {
     private val entriesLock = SynchronizedObject()
     private var entriesByProgressKey: MutableMap<String, WatchProgressEntry> = mutableMapOf()
     private var dirtyProgressKeys: MutableSet<String> = mutableSetOf()
-    private var locallyFinishedEpisodeKeys: MutableSet<String> = mutableSetOf()
+    private var locallyFinishedEpisodeGroups: MutableList<Set<String>> = mutableListOf()
     private var metadataResolutionJob: Job? = null
     private val metadataResolutionRetryCoordinator = MetadataResolutionRetryCoordinator()
     private val metadataEnrichmentLock = SynchronizedObject()
@@ -377,7 +382,7 @@ object WatchProgressRepository {
             deltaInitialized = pending.deltaInitialized
             replaceLocalEntries(pending.entries)
             replaceDirtyProgressKeys(pending.dirtyProgressKeys)
-            replaceLocallyFinishedEpisodeKeys(pending.locallyFinishedEpisodeKeys)
+            replaceLocallyFinishedEpisodeGroups(pending.locallyFinishedEpisodeGroups)
         } else if (payload.isNotEmpty()) {
             val storedPayload = WatchProgressCodec.decodePayload(payload)
             lastSuccessfulPushEpochMs = storedPayload.lastSuccessfulPushEpochMs
@@ -385,7 +390,7 @@ object WatchProgressRepository {
             deltaInitialized = storedPayload.deltaInitialized
             replaceLocalEntries(storedPayload.entries)
             replaceDirtyProgressKeys(storedPayload.dirtyProgressKeys)
-            replaceLocallyFinishedEpisodeKeys(storedPayload.locallyFinishedEpisodeKeys)
+            replaceLocallyFinishedEpisodeGroups(storedPayload.locallyFinishedEpisodeGroups)
         } else {
             lastSuccessfulPushEpochMs = 0L
             deltaCursorEventId = 0L
@@ -1204,13 +1209,37 @@ object WatchProgressRepository {
         if (videoIds.isEmpty()) return
         remoteWriteDeduplicator.clear()
 
-        activeProgressProvider()?.let { provider ->
-            val entriesToRemove = currentEntries().filter { entry ->
-                entry.videoId in videoIds &&
-                    (parentMetaId == null || entry.parentMetaId == parentMetaId)
+        val initialAliases = resolveClearProgressAliases(videoIds = videoIds, parentMetaId = parentMetaId)
+        val matchingParentIds = buildSet {
+            parentMetaId?.trim()?.takeIf { it.isNotEmpty() }?.let { normalizedParent ->
+                add(normalizedParent)
+                videoIds.forEach { videoId ->
+                    activeProgressProvider()
+                        ?.normalizeParentContentId(normalizedParent, videoId)
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?.let(::add)
+                }
             }
+            initialAliases.forEach { add(it.parentMetaId) }
+        }
+        val matchesClearedEntry: (WatchProgressEntry) -> Boolean = { entry ->
+            val matchesVideo = entry.videoId in videoIds &&
+                (parentMetaId == null || entry.parentMetaId.trim() in matchingParentIds)
+            val matchesAlias = entry.seasonNumber != null &&
+                entry.episodeNumber != null &&
+                LocallyFinishedEpisodeAlias(
+                    parentMetaId = entry.parentMetaId.trim(),
+                    seasonNumber = entry.seasonNumber,
+                    episodeNumber = entry.episodeNumber,
+                ) in initialAliases
+            matchesVideo || matchesAlias
+        }
+
+        activeProgressProvider()?.let { provider ->
+            val entriesToRemove = currentEntries().filter(matchesClearedEntry)
             val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove) +
-                removeLocalEntriesForVideoIds(videoIds = videoIds, parentMetaId = parentMetaId)
+                removeLocalEntriesMatching(matchesClearedEntry)
             val removedAll = entriesToRemove + locallyRemovedEntries
             val clearedLocalFinish = clearLocallyFinishedForClearedProgress(
                 removedEntries = removedAll,
@@ -1218,7 +1247,7 @@ object WatchProgressRepository {
                 parentMetaId = parentMetaId,
             )
             provider.applyOptimisticRemoval(entriesToRemove)
-            if (locallyRemovedEntries.isNotEmpty() || clearedLocalFinish) persist()
+            if (locallyRemovedEntries.isNotEmpty() || clearedLocalFinish.changed) persist()
             publish()
             if (entriesToRemove.isNotEmpty()) {
                 syncScope.launch {
@@ -1229,14 +1258,12 @@ object WatchProgressRepository {
                 removedEntries = removedAll,
                 videoIds = videoIds,
                 parentMetaId = parentMetaId,
+                clearedAliases = initialAliases + clearedLocalFinish.aliases,
             )
             return
         }
 
-        val removedEntries = removeLocalEntriesForVideoIds(
-            videoIds = videoIds,
-            parentMetaId = parentMetaId,
-        )
+        val removedEntries = removeLocalEntriesMatching(matchesClearedEntry)
         val clearedLocalFinish = clearLocallyFinishedForClearedProgress(
             removedEntries = removedEntries,
             videoIds = videoIds,
@@ -1246,13 +1273,14 @@ object WatchProgressRepository {
             publish()
             persist()
             pushDeleteToServer(removedEntries)
-        } else if (clearedLocalFinish) {
+        } else if (clearedLocalFinish.changed) {
             persist()
         }
         cancelPendingRemovalsForClearedProgress(
             removedEntries = removedEntries,
             videoIds = videoIds,
             parentMetaId = parentMetaId,
+            clearedAliases = initialAliases + clearedLocalFinish.aliases,
         )
     }
 
@@ -1266,8 +1294,20 @@ object WatchProgressRepository {
         if (normalizedContentId.isBlank()) return
         remoteWriteDeduplicator.clear()
 
+        val seedParentIds = seedParentIdsFor(
+            parentMetaId = normalizedContentId,
+            videoId = null,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        val clearedLocalFinish = removeLocallyFinishedEpisodes(
+            parentMetaIds = seedParentIds,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        val targetParentIds = seedParentIds + clearedLocalFinish.aliases.map { it.parentMetaId }
         val matchesTarget: (WatchProgressEntry) -> Boolean = { entry ->
-            if (entry.parentMetaId != normalizedContentId) {
+            if (entry.parentMetaId.trim() !in targetParentIds) {
                 false
             } else if (seasonNumber != null && episodeNumber != null) {
                 entry.seasonNumber == seasonNumber && entry.episodeNumber == episodeNumber
@@ -1276,31 +1316,27 @@ object WatchProgressRepository {
             }
         }
         val entriesToRemove = currentEntries().filter(matchesTarget)
-        val clearedLocalFinish = removeLocallyFinishedEpisodes(
-            parentMetaId = normalizedContentId,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-        )
 
         activeProgressProvider()?.let { provider ->
             val matchingLocalEntries = localEntriesSnapshot().filter(matchesTarget)
             val locallyRemovedEntries = removeStoredLocalEntries(entriesToRemove + matchingLocalEntries)
             if (entriesToRemove.isNotEmpty() || locallyRemovedEntries.isNotEmpty()) {
                 provider.applyOptimisticRemoval(entriesToRemove)
-                if (locallyRemovedEntries.isNotEmpty() || clearedLocalFinish) persist()
+                if (locallyRemovedEntries.isNotEmpty() || clearedLocalFinish.changed) persist()
                 publish()
                 if (entriesToRemove.isNotEmpty()) {
                     syncScope.launch {
                         removeProviderProgress(provider, entriesToRemove, "remove playback progress")
                     }
                 }
-            } else if (clearedLocalFinish) {
+            } else if (clearedLocalFinish.changed) {
                 persist()
             }
-            AutoDownloads.cancelPendingRemovals(
-                parentMetaId = normalizedContentId,
+            cancelPendingRemovalsForAliases(
+                parentMetaIds = targetParentIds,
                 seasonNumber = seasonNumber,
                 episodeNumber = episodeNumber,
+                clearedAliases = clearedLocalFinish.aliases,
             )
             return
         }
@@ -1312,13 +1348,14 @@ object WatchProgressRepository {
             publish()
             persist()
             pushDeleteToServer(entriesToRemove)
-        } else if (clearedLocalFinish) {
+        } else if (clearedLocalFinish.changed) {
             persist()
         }
-        AutoDownloads.cancelPendingRemovals(
-            parentMetaId = normalizedContentId,
+        cancelPendingRemovalsForAliases(
+            parentMetaIds = targetParentIds,
             seasonNumber = seasonNumber,
             episodeNumber = episodeNumber,
+            clearedAliases = clearedLocalFinish.aliases,
         )
     }
 
@@ -1349,21 +1386,69 @@ object WatchProgressRepository {
     ): Boolean {
         ensureLoaded()
         val key = localFinishedEpisodeKey(parentMetaId, seasonNumber, episodeNumber)
-        return synchronized(entriesLock) { key in locallyFinishedEpisodeKeys }
+        return synchronized(entriesLock) { locallyFinishedEpisodeGroups.any { key in it } }
     }
 
-    /** Clears the device-local finished mark when an episode (or show) is unwatched. */
+    /** Returns every parent ID recorded together as an alias for this finished episode. */
+    internal fun locallyFinishedParentAliases(
+        parentMetaId: String,
+        seasonNumber: Int,
+        episodeNumber: Int,
+        videoId: String? = null,
+    ): Set<String> {
+        ensureLoaded()
+        val seedParents = seedParentIdsFor(
+            parentMetaId = parentMetaId,
+            videoId = videoId,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        if (seedParents.isEmpty()) return emptySet()
+        val seedKeys = seedParents.mapTo(mutableSetOf()) { parent ->
+            localFinishedEpisodeKey(parent, seasonNumber, episodeNumber)
+        }
+        val groupParents = synchronized(entriesLock) {
+            locallyFinishedEpisodeGroups
+                .filter { group -> group.any { it in seedKeys } }
+                .flatMap { group -> group.mapNotNull { parseLocalFinishedEpisodeKey(it)?.parentMetaId } }
+        }
+        return seedParents + groupParents
+    }
+
+    /**
+     * Clears the device-local finished mark and every alias recorded for that episode when an
+     * episode (or show) is unwatched. Returns every cleared episode alias.
+     */
     internal fun clearLocallyFinishedEpisode(
         parentMetaId: String,
         seasonNumber: Int? = null,
         episodeNumber: Int? = null,
-    ) {
+        videoId: String? = null,
+    ): Set<LocallyFinishedEpisodeAlias> {
         ensureLoaded()
-        val normalizedParent = parentMetaId.trim()
-        if (normalizedParent.isBlank()) return
+        val seedParents = seedParentIdsFor(
+            parentMetaId = parentMetaId,
+            videoId = videoId,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        if (seedParents.isEmpty()) return emptySet()
         remoteWriteDeduplicator.clear()
-        if (removeLocallyFinishedEpisodes(normalizedParent, seasonNumber, episodeNumber)) {
+        val result = removeLocallyFinishedEpisodes(
+            parentMetaIds = seedParents,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        if (result.changed) {
             persist()
+        }
+        return buildSet {
+            addAll(result.aliases)
+            if (seasonNumber != null && episodeNumber != null) {
+                seedParents.forEach { parent ->
+                    add(LocallyFinishedEpisodeAlias(parent, seasonNumber, episodeNumber))
+                }
+            }
         }
     }
 
@@ -1464,7 +1549,11 @@ object WatchProgressRepository {
                 upsertStoredProfileProgress(
                     profileId = targetProfileId,
                     entry = resolvedEntry,
-                    finishedEpisodeKeys = locallyFinishedKeysForCompletion(resolvedEntry, session.parentMetaId),
+                    finishedEpisodeKeys = locallyFinishedKeysForCompletion(
+                        entry = resolvedEntry,
+                        effectiveParentMetaId = effectiveParentMetaId,
+                        sessionParentMetaId = session.parentMetaId,
+                    ),
                 )
             } else {
                 resolvedEntry
@@ -1493,7 +1582,13 @@ object WatchProgressRepository {
 
         upsertLocalEntry(entry)
         markProgressDirty(entry)
-        markLocallyFinishedEpisodes(locallyFinishedKeysForCompletion(entry, session.parentMetaId))
+        markLocallyFinishedEpisodeGroup(
+            locallyFinishedKeysForCompletion(
+                entry = entry,
+                effectiveParentMetaId = effectiveParentMetaId,
+                sessionParentMetaId = session.parentMetaId,
+            ),
+        )
         progressProvider?.applyOptimisticProgress(entry)
         publish()
         if (persist) persist()
@@ -1541,7 +1636,10 @@ object WatchProgressRepository {
                 deltaCursorEventId = storedPayload.deltaCursorEventId,
                 deltaInitialized = storedPayload.deltaInitialized,
                 dirtyProgressKeys = storedPayload.dirtyProgressKeys + progressKey,
-                locallyFinishedEpisodeKeys = storedPayload.locallyFinishedEpisodeKeys + finishedEpisodeKeys,
+                locallyFinishedEpisodeGroups = mergeLocallyFinishedEpisodeGroup(
+                    existingGroups = storedPayload.locallyFinishedEpisodeGroups,
+                    newGroup = finishedEpisodeKeys,
+                ),
             ),
         )
         return resolvedEntry
@@ -1611,7 +1709,7 @@ object WatchProgressRepository {
             deltaCursorEventId = deltaCursorEventId,
             deltaInitialized = deltaInitialized,
             dirtyProgressKeys = dirtyProgressKeysSnapshot(),
-            locallyFinishedEpisodeKeys = locallyFinishedEpisodeKeysSnapshot(),
+            locallyFinishedEpisodeGroups = locallyFinishedEpisodeGroupsSnapshot(),
         )
         val pending = synchronized(persistLock) {
             persistSequence += 1
@@ -1626,7 +1724,7 @@ object WatchProgressRepository {
                 deltaCursorEventId = pending.deltaCursorEventId,
                 deltaInitialized = pending.deltaInitialized,
                 dirtyProgressKeys = pending.dirtyProgressKeys,
-                locallyFinishedEpisodeKeys = pending.locallyFinishedEpisodeKeys,
+                locallyFinishedEpisodeGroups = pending.locallyFinishedEpisodeGroups,
             )
             synchronized(persistLock) {
                 if (pending.sequence <= persistedSequence) return@synchronized
@@ -1707,7 +1805,7 @@ object WatchProgressRepository {
                 deltaCursorEventId = storedPayload.deltaCursorEventId,
                 deltaInitialized = storedPayload.deltaInitialized,
                 dirtyProgressKeys = remainingDirtyKeys,
-                locallyFinishedEpisodeKeys = storedPayload.locallyFinishedEpisodeKeys,
+                locallyFinishedEpisodeGroups = storedPayload.locallyFinishedEpisodeGroups,
             ),
         )
     }
@@ -1774,23 +1872,25 @@ object WatchProgressRepository {
         synchronized(entriesLock) {
             entriesByProgressKey.clear()
             dirtyProgressKeys.clear()
-            locallyFinishedEpisodeKeys.clear()
+            locallyFinishedEpisodeGroups.clear()
         }
     }
 
-    private fun locallyFinishedEpisodeKeysSnapshot(): Set<String> =
+    private fun locallyFinishedEpisodeGroupsSnapshot(): List<Set<String>> =
         synchronized(entriesLock) {
-            locallyFinishedEpisodeKeys.toSet()
+            locallyFinishedEpisodeGroups.map { it.toSet() }
         }
 
-    private fun replaceLocallyFinishedEpisodeKeys(keys: Collection<String>) {
+    private fun replaceLocallyFinishedEpisodeGroups(groups: Collection<Set<String>>) {
+        val normalized = normalizeLocallyFinishedEpisodeGroups(groups)
         synchronized(entriesLock) {
-            locallyFinishedEpisodeKeys = keys.toMutableSet()
+            locallyFinishedEpisodeGroups = normalized.toMutableList()
         }
     }
 
     private fun locallyFinishedKeysForCompletion(
         entry: WatchProgressEntry,
+        effectiveParentMetaId: String,
         sessionParentMetaId: String,
     ): Set<String> {
         if (!entry.normalizedCompletion().isCompleted) return emptySet()
@@ -1800,35 +1900,143 @@ object WatchProgressRepository {
             if (entry.parentMetaId.isNotBlank()) {
                 add(localFinishedEpisodeKey(entry.parentMetaId, season, episode))
             }
+            if (effectiveParentMetaId.isNotBlank()) {
+                add(localFinishedEpisodeKey(effectiveParentMetaId, season, episode))
+            }
             if (sessionParentMetaId.isNotBlank()) {
                 add(localFinishedEpisodeKey(sessionParentMetaId, season, episode))
             }
         }
     }
 
-    private fun markLocallyFinishedEpisodes(keys: Collection<String>) {
+    private fun markLocallyFinishedEpisodeGroup(keys: Set<String>) {
         if (keys.isEmpty()) return
         synchronized(entriesLock) {
-            locallyFinishedEpisodeKeys += keys
+            locallyFinishedEpisodeGroups = mergeLocallyFinishedEpisodeGroup(
+                existingGroups = locallyFinishedEpisodeGroups,
+                newGroup = keys,
+            ).toMutableList()
+        }
+    }
+
+    private fun seedParentIdsFor(
+        parentMetaId: String,
+        videoId: String?,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+    ): Set<String> {
+        val normalizedParent = parentMetaId.trim()
+        if (normalizedParent.isEmpty()) return emptySet()
+        return buildSet {
+            add(normalizedParent)
+            activeProgressProvider()
+                ?.normalizeParentContentId(normalizedParent, videoId)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(::add)
+            if (!videoId.isNullOrBlank()) {
+                parseEpisodeFromPlaybackVideoId(videoId, parentMetaId = null)?.let { (vidParent, vidSeason, vidEpisode) ->
+                    if ((seasonNumber == null || vidSeason == seasonNumber) &&
+                        (episodeNumber == null || vidEpisode == episodeNumber)
+                    ) {
+                        add(vidParent)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resolveClearProgressAliases(
+        videoIds: Collection<String>,
+        parentMetaId: String?,
+    ): Set<LocallyFinishedEpisodeAlias> {
+        val seedKeys = buildClearProgressSeedKeys(
+            removedEntries = emptyList(),
+            videoIds = videoIds,
+            parentMetaId = parentMetaId,
+        )
+        if (seedKeys.isEmpty()) return emptySet()
+        return synchronized(entriesLock) {
+            locallyFinishedEpisodeGroups
+                .filter { group -> group.any { it in seedKeys } }
+                .flatMapTo(linkedSetOf()) { group ->
+                    group.mapNotNull(::parseLocalFinishedEpisodeKey)
+                }
+        }
+    }
+
+    private fun buildClearProgressSeedKeys(
+        removedEntries: Collection<WatchProgressEntry>,
+        videoIds: Collection<String>,
+        parentMetaId: String?,
+    ): Set<String> = buildSet {
+        removedEntries.forEach { entry ->
+            val season = entry.seasonNumber ?: return@forEach
+            val episode = entry.episodeNumber ?: return@forEach
+            if (entry.parentMetaId.isNotBlank()) {
+                seedParentIdsFor(entry.parentMetaId, entry.videoId, season, episode).forEach { parent ->
+                    add(localFinishedEpisodeKey(parent, season, episode))
+                }
+            }
+        }
+        videoIds.forEach { videoId ->
+            parseEpisodeFromPlaybackVideoId(videoId, parentMetaId)?.let { (parent, season, episode) ->
+                seedParentIdsFor(parent, videoId, season, episode).forEach { seedParent ->
+                    add(localFinishedEpisodeKey(seedParent, season, episode))
+                }
+            }
+            parseEpisodeFromPlaybackVideoId(videoId, parentMetaId = null)?.let { (parent, season, episode) ->
+                seedParentIdsFor(parent, videoId, season, episode).forEach { seedParent ->
+                    add(localFinishedEpisodeKey(seedParent, season, episode))
+                }
+            }
         }
     }
 
     private fun removeLocallyFinishedEpisodes(
-        parentMetaId: String,
+        parentMetaIds: Collection<String>,
         seasonNumber: Int? = null,
         episodeNumber: Int? = null,
-    ): Boolean {
-        val normalizedParent = parentMetaId.trim()
-        if (normalizedParent.isBlank()) return false
-        return synchronized(entriesLock) {
-            if (seasonNumber != null && episodeNumber != null) {
-                locallyFinishedEpisodeKeys.remove(
-                    localFinishedEpisodeKey(normalizedParent, seasonNumber, episodeNumber),
-                )
-            } else {
-                val prefix = "$normalizedParent|"
-                locallyFinishedEpisodeKeys.removeAll { it.startsWith(prefix) }
+    ): ClearedLocallyFinishedResult {
+        val normalizedParents = parentMetaIds
+            .map { it.trim() }
+            .filterTo(linkedSetOf()) { it.isNotEmpty() }
+        if (normalizedParents.isEmpty()) {
+            return ClearedLocallyFinishedResult(changed = false, aliases = emptySet())
+        }
+        val seedKeys = if (seasonNumber != null && episodeNumber != null) {
+            normalizedParents.mapTo(mutableSetOf()) { parent ->
+                localFinishedEpisodeKey(parent, seasonNumber, episodeNumber)
             }
+        } else {
+            emptySet()
+        }
+        return synchronized(entriesLock) {
+            val removedKeys = linkedSetOf<String>()
+            val remaining = mutableListOf<Set<String>>()
+            var changed = false
+            locallyFinishedEpisodeGroups.forEach { group ->
+                val matches = if (seasonNumber != null && episodeNumber != null) {
+                    group.any { it in seedKeys }
+                } else {
+                    group.any { key ->
+                        parseLocalFinishedEpisodeKey(key)?.parentMetaId in normalizedParents
+                    }
+                }
+                if (matches) {
+                    changed = true
+                    removedKeys += group
+                } else {
+                    remaining += group
+                }
+            }
+            if (changed) {
+                locallyFinishedEpisodeGroups = remaining
+            }
+            ClearedLocallyFinishedResult(
+                changed = changed,
+                aliases = removedKeys.mapNotNullTo(linkedSetOf(), ::parseLocalFinishedEpisodeKey),
+            )
         }
     }
 
@@ -1836,24 +2044,34 @@ object WatchProgressRepository {
         removedEntries: Collection<WatchProgressEntry>,
         videoIds: Collection<String>,
         parentMetaId: String?,
-    ): Boolean {
-        val keysToRemove = buildSet {
-            removedEntries.forEach { entry ->
-                val season = entry.seasonNumber ?: return@forEach
-                val episode = entry.episodeNumber ?: return@forEach
-                if (entry.parentMetaId.isNotBlank()) {
-                    add(localFinishedEpisodeKey(entry.parentMetaId, season, episode))
-                }
-            }
-            videoIds.forEach { videoId ->
-                parseEpisodeFromPlaybackVideoId(videoId, parentMetaId)?.let { (parent, season, episode) ->
-                    add(localFinishedEpisodeKey(parent, season, episode))
-                }
-            }
+    ): ClearedLocallyFinishedResult {
+        val seedKeys = buildClearProgressSeedKeys(
+            removedEntries = removedEntries,
+            videoIds = videoIds,
+            parentMetaId = parentMetaId,
+        )
+        if (seedKeys.isEmpty()) {
+            return ClearedLocallyFinishedResult(changed = false, aliases = emptySet())
         }
-        if (keysToRemove.isEmpty()) return false
         return synchronized(entriesLock) {
-            locallyFinishedEpisodeKeys.removeAll(keysToRemove)
+            val removedKeys = linkedSetOf<String>()
+            val remaining = mutableListOf<Set<String>>()
+            var changed = false
+            locallyFinishedEpisodeGroups.forEach { group ->
+                if (group.any { it in seedKeys }) {
+                    changed = true
+                    removedKeys += group
+                } else {
+                    remaining += group
+                }
+            }
+            if (changed) {
+                locallyFinishedEpisodeGroups = remaining
+            }
+            ClearedLocallyFinishedResult(
+                changed = changed,
+                aliases = removedKeys.mapNotNullTo(linkedSetOf(), ::parseLocalFinishedEpisodeKey),
+            )
         }
     }
 
@@ -1861,10 +2079,26 @@ object WatchProgressRepository {
         removedEntries: Collection<WatchProgressEntry>,
         videoIds: Collection<String>,
         parentMetaId: String?,
+        clearedAliases: Set<LocallyFinishedEpisodeAlias>,
     ) {
+        val aliasParentsByEpisode = clearedAliases.groupBy(
+            keySelector = { it.seasonNumber to it.episodeNumber },
+            valueTransform = { it.parentMetaId },
+        )
         removedEntries.forEach { entry ->
-            AutoDownloads.cancelPendingRemovals(
+            val episodeParents = if (entry.seasonNumber != null && entry.episodeNumber != null) {
+                aliasParentsByEpisode[entry.seasonNumber to entry.episodeNumber].orEmpty()
+            } else {
+                emptyList()
+            }
+            val parents = seedParentIdsFor(
                 parentMetaId = entry.parentMetaId,
+                videoId = entry.videoId,
+                seasonNumber = entry.seasonNumber,
+                episodeNumber = entry.episodeNumber,
+            ) + episodeParents
+            AutoDownloads.cancelPendingRemovals(
+                parentMetaIds = parents,
                 seasonNumber = entry.seasonNumber,
                 episodeNumber = entry.episodeNumber,
                 videoId = entry.videoId,
@@ -1872,13 +2106,58 @@ object WatchProgressRepository {
         }
         videoIds.forEach { videoId ->
             val parsed = parseEpisodeFromPlaybackVideoId(videoId, parentMetaId)
+            val episodeParents = if (parsed != null) {
+                aliasParentsByEpisode[parsed.second to parsed.third].orEmpty()
+            } else {
+                emptyList()
+            }
+            val parents = buildSet {
+                val baseParent = parsed?.first ?: parentMetaId.orEmpty()
+                addAll(seedParentIdsFor(baseParent, videoId, parsed?.second, parsed?.third))
+                parseEpisodeFromPlaybackVideoId(videoId, parentMetaId = null)?.first?.let(::add)
+                addAll(episodeParents)
+            }
             AutoDownloads.cancelPendingRemovals(
-                parentMetaId = parsed?.first ?: parentMetaId.orEmpty(),
+                parentMetaIds = parents,
                 seasonNumber = parsed?.second,
                 episodeNumber = parsed?.third,
                 videoId = videoId,
             )
         }
+        aliasParentsByEpisode.forEach { (seasonEpisode, parents) ->
+            AutoDownloads.cancelPendingRemovals(
+                parentMetaIds = parents,
+                seasonNumber = seasonEpisode.first,
+                episodeNumber = seasonEpisode.second,
+            )
+        }
+    }
+
+    private fun cancelPendingRemovalsForAliases(
+        parentMetaIds: Collection<String>,
+        seasonNumber: Int?,
+        episodeNumber: Int?,
+        clearedAliases: Set<LocallyFinishedEpisodeAlias>,
+    ) {
+        AutoDownloads.cancelPendingRemovals(
+            parentMetaIds = parentMetaIds,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
+        clearedAliases
+            .groupBy(
+                keySelector = { it.seasonNumber to it.episodeNumber },
+                valueTransform = { it.parentMetaId },
+            )
+            .forEach { (seasonEpisode, parents) ->
+                if (seasonEpisode.first != seasonNumber || seasonEpisode.second != episodeNumber) {
+                    AutoDownloads.cancelPendingRemovals(
+                        parentMetaIds = parents,
+                        seasonNumber = seasonEpisode.first,
+                        episodeNumber = seasonEpisode.second,
+                    )
+                }
+            }
     }
 
     private fun dirtyProgressKeysSnapshot(): Set<String> =
@@ -1968,18 +2247,12 @@ object WatchProgressRepository {
             entriesByProgressKey.remove(progressKey)
         }
 
-    private fun removeLocalEntriesForVideoIds(
-        videoIds: Collection<String>,
-        parentMetaId: String?,
+    private fun removeLocalEntriesMatching(
+        predicate: (WatchProgressEntry) -> Boolean,
     ): List<WatchProgressEntry> =
         synchronized(entriesLock) {
-            if (videoIds.isEmpty()) return@synchronized emptyList()
-            val ids = videoIds.toSet()
             val keysToRemove = entriesByProgressKey
-                .filterValues { entry ->
-                    entry.videoId in ids &&
-                        (parentMetaId == null || entry.parentMetaId == parentMetaId)
-                }
+                .filterValues(predicate)
                 .keys
                 .toList()
             dirtyProgressKeys.removeAll(keysToRemove.toSet())
