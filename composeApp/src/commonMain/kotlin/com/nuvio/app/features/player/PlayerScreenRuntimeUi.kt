@@ -42,6 +42,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.LocalFold
 import com.nuvio.app.features.p2p.P2pStreamingState
+import com.nuvio.app.core.ui.dispatchPlatformLocalBack
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.p2p.formatP2pMegabytes
 import com.nuvio.app.features.p2p.formatP2pSpeed
@@ -1349,28 +1350,113 @@ internal fun PlayerScreenRuntime.handlePlayerControllerCommand(command: PlayerCo
             true
         }
         PlayerCommand.Back -> {
-            requestBack()
+            if (!dismissOpenPlayerOverlay()) {
+                requestBack()
+            }
             true
         }
         PlayerCommand.Subtitles -> {
             refreshTracks()
+            showAudioModal = false
+            showSourcesPanel = false
+            showEpisodesPanel = false
+            showChaptersPanel = false
             showSubtitleModal = true
             true
         }
         PlayerCommand.Audio -> {
             refreshTracks()
+            showSubtitleModal = false
+            showSourcesPanel = false
+            showEpisodesPanel = false
+            showChaptersPanel = false
             showAudioModal = true
             true
         }
         PlayerCommand.Episodes -> {
-            prepareEpisodesForPlayerControls()
+            if (!isSeries) return false
+            showAudioModal = false
+            showSubtitleModal = false
+            openEpisodesPanel()
             true
         }
         PlayerCommand.Sources -> {
-            prepareSourcesForPlayerControls()
+            if (activeVideoId == null) return false
+            showAudioModal = false
+            showSubtitleModal = false
+            openSourcesPanel()
             true
         }
     }
+
+/**
+ * Dismisses any open player modal, dialog, or side panel before exiting playback.
+ * Returns true if an overlay was dismissed (so the Back press is consumed).
+ */
+internal fun PlayerScreenRuntime.dismissOpenPlayerOverlay(): Boolean {
+    if (dispatchPlatformLocalBack()) return true
+    if (showSwitchEngineConfirm) {
+        showSwitchEngineConfirm = false
+        return true
+    }
+    if (pendingP2pSwitch != null) {
+        pendingP2pSwitch = null
+        return true
+    }
+    if (playerControlsPendingP2pSwitch != null) {
+        playerControlsPendingP2pSwitch = null
+        return true
+    }
+    if (showSubmitIntroModal) {
+        showSubmitIntroModal = false
+        return true
+    }
+    if (showAudioModal) {
+        showAudioModal = false
+        return true
+    }
+    if (showSubtitleModal) {
+        showSubtitleModal = false
+        return true
+    }
+    if (showVideoSettingsModal) {
+        showVideoSettingsModal = false
+        return true
+    }
+    if (showStreamInfo) {
+        showStreamInfo = false
+        return true
+    }
+    if (showPartyPanel) {
+        showPartyPanel = false
+        return true
+    }
+    if (showSourcesPanel) {
+        showSourcesPanel = false
+        PlayerStreamsRepository.stopSourcesLoading()
+        controlsVisible = true
+        return true
+    }
+    if (showEpisodesPanel) {
+        showEpisodesPanel = false
+        episodeStreamsPanelState = EpisodeStreamsPanelState()
+        PlayerStreamsRepository.clearEpisodeStreams()
+        controlsVisible = true
+        return true
+    }
+    if (showChaptersPanel) {
+        showChaptersPanel = false
+        controlsVisible = true
+        return true
+    }
+    if (showNextEpisodeCard) {
+        showNextEpisodeCard = false
+        nextEpisodeCardDismissed = true
+        cancelNextEpisodeAutoPlay()
+        return true
+    }
+    return false
+}
 
 /** Seeks through the current engine, showing the same +/-10s feedback as the keyboard shortcut. */
 private fun PlayerScreenRuntime.seekPlayerBy(offsetMs: Long): Boolean {
