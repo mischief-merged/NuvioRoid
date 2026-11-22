@@ -124,7 +124,9 @@ internal fun matchesActivePlaybackTarget(
  * picture in picture keeps the player mounted while the main window navigates freely.
  */
 @Stable
-internal class PlayerSessionController {
+internal class PlayerSessionController(
+    private val onExitPictureInPicture: () -> Unit = ::exitPlayerPictureInPicture,
+) {
     var activeSession by mutableStateOf<ActivePlayerSession?>(null)
         private set
 
@@ -186,16 +188,40 @@ internal class PlayerSessionController {
 
     fun minimize(): Boolean {
         val current = activeSession ?: return false
-        if (current.mode == PlayerPresentationMode.Mini) return true
-        activeSession = current.copy(mode = PlayerPresentationMode.Mini)
+        val wasPip = current.mode == PlayerPresentationMode.PictureInPicture
+        if (current.mode != PlayerPresentationMode.Mini) {
+            activeSession = current.copy(mode = PlayerPresentationMode.Mini)
+        }
+        if (wasPip) {
+            onExitPictureInPicture()
+        }
         return true
     }
 
     fun restoreFullScreen(): Boolean {
         val current = activeSession ?: return false
-        if (current.mode == PlayerPresentationMode.Full) return true
-        activeSession = current.copy(mode = PlayerPresentationMode.Full)
+        val wasPip = current.mode == PlayerPresentationMode.PictureInPicture
+        if (current.mode != PlayerPresentationMode.Full) {
+            activeSession = current.copy(mode = PlayerPresentationMode.Full)
+        }
+        if (wasPip) {
+            onExitPictureInPicture()
+        }
         return true
+    }
+
+    fun setPictureInPicture(enabled: Boolean): Boolean {
+        val current = activeSession ?: return false
+        if (enabled) {
+            if (current.mode == PlayerPresentationMode.PictureInPicture) return true
+            activeSession = current.copy(mode = PlayerPresentationMode.PictureInPicture)
+            return true
+        }
+        if (current.mode == PlayerPresentationMode.PictureInPicture) {
+            activeSession = current.copy(mode = PlayerPresentationMode.Full)
+            return true
+        }
+        return false
     }
 
     fun matchesActiveTarget(

@@ -128,10 +128,12 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
         }
     }
 
+    val isInPip = rememberIsInPictureInPicture()
+
     BoxWithConstraints(
         modifier = args.modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(if (isDesktop && isInPip) Color.Transparent else Color.Black)
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     while (true) {
@@ -149,7 +151,6 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
     ) {
         val density = LocalDensity.current
         val horizontalSafePadding = playerHorizontalSafePadding()
-        val isInPip = rememberIsInPictureInPicture()
         val dockPartyPanel = LocalFold.current == null && !isInPip && maxWidth > maxHeight
         val partyPanelWidth = if (dockPartyPanel) minOf(420.dp, maxWidth * 0.45f) else 420.dp
         val animatedPartyPanelInset by animateDpAsState(

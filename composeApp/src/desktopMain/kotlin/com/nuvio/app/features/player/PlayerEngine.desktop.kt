@@ -1,15 +1,9 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -326,7 +320,7 @@ private fun NativePlayerSurface(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .background(if (isInPip) Color.Transparent else Color.Black),
         contentAlignment = Alignment.Center,
     ) {
         // SwingPanel keeps the stable AWT host. PiP moves only the native player
@@ -347,34 +341,6 @@ private fun NativePlayerSurface(
                 },
                 background = Color.Black,
             )
-        }
-
-        // Placeholder overlay shown when video has moved to PiP window
-        if (isInPip) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(24.dp),
-                ) {
-                    Text(
-                        text = playerControlsState.pipPlaceholderTitle,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color.White,
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = { DesktopPlayerPictureInPicture.clear() },
-                    ) {
-                        Text(playerControlsState.pipRestoreLabel)
-                    }
-                }
-            }
         }
     }
 }

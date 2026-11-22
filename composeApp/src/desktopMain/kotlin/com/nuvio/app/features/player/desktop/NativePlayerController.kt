@@ -1849,7 +1849,11 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
             if (DesktopHostOs.current == DesktopHostOs.WINDOWS ||
                 DesktopHostOs.current == DesktopHostOs.MACOS
             ) {
-                pipLabel
+                if (DesktopPlayerPictureInPicture.isEnabled && pipRestoreLabel.isNotBlank()) {
+                    pipRestoreLabel
+                } else {
+                    pipLabel
+                }
             } else {
                 ""
             },

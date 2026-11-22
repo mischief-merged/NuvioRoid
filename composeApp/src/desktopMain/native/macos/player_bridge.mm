@@ -3104,8 +3104,7 @@ static void nuvioMpvWakeup(void *ctx) {
         return event;
     }
 
-    NSWindow *hostWindow = _hostView.window;
-    if (!NSApp.isActive || (hostWindow && NSApp.keyWindow && NSApp.keyWindow != hostWindow)) {
+    if (!NSApp.isActive) {
         return event;
     }
 

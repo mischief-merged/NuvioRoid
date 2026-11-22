@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,6 +37,7 @@ import com.nuvio.app.features.player.PlayerPresentationMode
 import com.nuvio.app.features.player.PlayerScreen
 import com.nuvio.app.features.player.PlayerSessionController
 import com.nuvio.app.features.player.ReplacePlaybackDialog
+import com.nuvio.app.features.player.rememberIsInPictureInPicture
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import com.nuvio.app.navigation.EpisodeDetailRoute
 import com.nuvio.app.navigation.NuvioNavigator
@@ -121,6 +123,22 @@ internal fun BoxScope.PlayerSessionHost(
             enabled = session.mode == PlayerPresentationMode.Full && systemBackHandler != null,
             onBack = { systemBackHandler?.invoke() },
         )
+
+        val isInPip = rememberIsInPictureInPicture()
+        val wasInPip = remember { mutableStateOf(isInPip) }
+        val latestRestoreInitialFullscreen = rememberUpdatedState(restoreInitialFullscreen)
+        val latestOpenPendingExitTarget = rememberUpdatedState(openPendingExitTarget)
+        LaunchedEffect(isInPip) {
+            if (isInPip) {
+                latestRestoreInitialFullscreen.value()
+                if (controller.setPictureInPicture(true)) {
+                    latestOpenPendingExitTarget.value()
+                }
+            } else if (wasInPip.value) {
+                controller.setPictureInPicture(false)
+            }
+            wasInPip.value = isInPip
+        }
 
         LaunchedEffect(launch.videoId) {
             launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }

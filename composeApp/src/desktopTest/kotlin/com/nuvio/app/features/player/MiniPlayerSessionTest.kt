@@ -476,6 +476,146 @@ class MiniPlayerSessionTest {
         }
     }
 
+    @Test
+    fun picture_in_picture_frees_main_window_and_restores_full_player_without_reload() {
+        var exitPipCalls = 0
+        val harness = startSessionHarness(
+            onExitPictureInPicture = { exitPipCalls += 1 },
+        )
+        val initialRuntime = harness.runtime
+        val initialLaunchId = harness.sessionController.activeSession?.launchId
+
+        compose.runOnIdle {
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 510_000L,
+                    durationMs = 1_800_000L,
+                ),
+            )
+            assertTrue(harness.sessionController.setPictureInPicture(true))
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isPictureInPicture)
+            assertFalse(harness.sessionController.isFullScreen)
+            assertFalse(harness.sessionController.isMinimized)
+            assertTrue(harness.sessionController.hasActiveSession)
+            assertTrue(ActivePlayerSessionRegistry.isActive.value)
+
+            // Main window navigation works freely while video floats in PiP.
+            harness.navigator.navigate(DetailRoute(type = "series", id = "tt313131", title = "Another Show"))
+            harness.navigator.navigate(DownloadsRoute("Downloads"))
+
+            // Watch progress continues saving during PiP.
+            harness.runtime.lastProgressPersistEpochMs = 0L
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 545_000L,
+                    durationMs = 1_800_000L,
+                ),
+            )
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertEquals(DownloadsRoute("Downloads"), harness.navigator.currentRoute)
+            assertEquals(
+                545_000L,
+                WatchProgressRepository.progressForVideo(episodes[0].id)?.lastPositionMs,
+            )
+            assertSame(initialRuntime, harness.runtime)
+            assertEquals(0, harness.controller.releaseCalls)
+            assertEquals(0, harness.disposedCount)
+
+            // Closing/restoring from the PiP window returns to Full mode at the same position.
+            assertTrue(harness.sessionController.setPictureInPicture(false))
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isFullScreen)
+            assertFalse(harness.sessionController.isPictureInPicture)
+            assertEquals(initialLaunchId, harness.sessionController.activeSession?.launchId)
+            assertSame(initialRuntime, harness.runtime)
+            assertEquals(545_000L, harness.runtime.playbackSnapshot.positionMs)
+            assertEquals(0, exitPipCalls)
+
+            // Re-enter PiP and reopen the same episode from the main window: exits PiP cleanly.
+            assertTrue(harness.sessionController.setPictureInPicture(true))
+            assertTrue(
+                harness.sessionController.reopenIfMatching(
+                    videoId = episodes[0].id,
+                    parentMetaId = testSeriesId,
+                    seasonNumber = 1,
+                    episodeNumber = 1,
+                ),
+            )
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isFullScreen)
+            assertFalse(harness.sessionController.isPictureInPicture)
+            assertEquals(1, exitPipCalls)
+            assertEquals(0, harness.controller.releaseCalls)
+        }
+    }
+
+    @Test
+    fun starting_another_title_during_picture_in_picture_asks_before_replacing() {
+        val harness = startSessionHarness()
+        val events = mutableListOf<String>()
+
+        compose.runOnIdle {
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 390_000L,
+                    durationMs = 1_500_000L,
+                ),
+            )
+            harness.sessionController.setPictureInPicture(true)
+            harness.sessionController.launchOrAskToReplace(
+                incomingTitle = "Different Show",
+                videoId = "tt7777777:1:1",
+                parentMetaId = "tt7777777",
+                seasonNumber = 1,
+                episodeNumber = 1,
+            ) {
+                events += "open-replacement"
+            }
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(harness.sessionController.isPictureInPicture)
+            assertEquals("Series (S1 E1)", harness.sessionController.pendingReplacement?.currentTitle)
+            assertEquals("Different Show (S1 E1)", harness.sessionController.pendingReplacement?.incomingTitle)
+            assertEquals(emptyList(), events)
+            assertEquals(0, harness.controller.releaseCalls)
+
+            harness.sessionController.confirmPendingReplacement()
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertEquals(1, harness.controller.releaseCalls)
+            assertEquals(listOf("open-replacement"), events)
+            assertEquals(
+                390_000L,
+                WatchProgressRepository.progressForVideo(episodes[0].id)?.lastPositionMs,
+            )
+        }
+    }
+
     private class RecordingEngineController : PlayerEngineController {
         var playCalls = 0
         var pauseCalls = 0
@@ -525,9 +665,13 @@ class MiniPlayerSessionTest {
         var disposedCount = 0
     }
 
-    private fun startSessionHarness(): SessionHarness {
+    private fun startSessionHarness(
+        onExitPictureInPicture: () -> Unit = {},
+    ): SessionHarness {
         WatchProgressRepository.clearLocalState()
-        val sessionController = PlayerSessionController()
+        val sessionController = PlayerSessionController(
+            onExitPictureInPicture = onExitPictureInPicture,
+        )
         val backStack = NavBackStack<NavKey>(
             TabsRoute,
             DetailRoute(type = "series", id = testSeriesId, title = "Series"),
