@@ -34,15 +34,19 @@ import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
 internal fun DownloadPoster(
     item: DownloadItem,
     modifier: Modifier = Modifier,
+    patternOverride: String? = null,
+    hideWhenMissing: Boolean = false,
 ) {
-    val pattern = rememberLibraryPosterPattern()
+    val pattern = patternOverride ?: rememberLibraryPosterPattern()
     val originalPoster = item.posterArtwork()
     val customPoster = remember(item.parentMetaId, item.parentMetaType, pattern) {
         item.customPosterUrl(pattern)
     }
+    val resolvedPoster = customPoster ?: originalPoster
+    if (hideWhenMissing && resolvedPoster == null) return
     NuvioPosterCard(
         title = item.title,
-        imageUrl = customPoster ?: originalPoster,
+        imageUrl = resolvedPoster,
         fallbackImageUrl = originalPoster,
         modifier = modifier.width(NuvioTokens.Space.s48),
         showTitleBelow = false,
@@ -100,7 +104,7 @@ private fun rememberLibraryPosterPattern(): String {
     return if (CustomPosterScreen.LIBRARY in screens) pattern else ""
 }
 
-private fun DownloadItem.customPosterUrl(pattern: String): String? {
+internal fun DownloadItem.customPosterUrl(pattern: String): String? {
     if (pattern.isBlank()) return null
     return CustomPosterUrlResolver.resolve(
         pattern = pattern,
@@ -108,3 +112,6 @@ private fun DownloadItem.customPosterUrl(pattern: String): String? {
         type = if (parentMetaType.equals("movie", ignoreCase = true)) "movie" else "series",
     )
 }
+
+internal fun DownloadItem.resolvedPosterUrl(pattern: String): String? =
+    customPosterUrl(pattern) ?: posterArtwork()

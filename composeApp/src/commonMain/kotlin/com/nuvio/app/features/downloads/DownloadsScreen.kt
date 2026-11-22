@@ -151,6 +151,8 @@ internal fun DownloadsScreenContent(
     rechecks: DownloadRechecks? = null,
     /** Whether downloads wait because the connection is limited. */
     connectionHold: ConnectionHold = LimitedConnections.hold,
+    /** Overrides the library custom poster pattern. Null reads from CustomPosterUrlRepository. */
+    posterPatternOverride: String? = null,
 ) {
     val uiState by remember {
         DownloadsRepository.ensureLoaded()
@@ -405,6 +407,7 @@ internal fun DownloadsScreenContent(
                 episodeLinks = episodeLinks,
                 unreachable = folderStateNow.unreachable,
                 onCheckAgain = checkAgain,
+                posterPatternOverride = posterPatternOverride,
             )
         } else {
             val goodCopies = uiState.completedItems.mapTo(mutableSetOf()) { it.logicalContentKey }
@@ -612,6 +615,7 @@ private fun LazyListScope.downloadsRootContent(
     episodeLinks: DownloadEpisodeLinks?,
     unreachable: List<DownloadLocationInfo> = emptyList(),
     onCheckAgain: ((DownloadItem) -> Unit)?,
+    posterPatternOverride: String? = null,
 ) {
     uiState.storeProblem?.let { problem ->
         item(key = "store-problem") {
@@ -687,6 +691,7 @@ private fun LazyListScope.downloadsRootContent(
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
                 newCopyReady = item.isPlaceholder && item.logicalContentKey in goodCopies,
+                posterPatternOverride = posterPatternOverride,
             )
         }
     }
@@ -711,6 +716,7 @@ private fun LazyListScope.downloadsRootContent(
                 onRetry = { DownloadsRepository.retryDownload(item.id) },
                 onDelete = { onDeleteDownload(item.id) },
                 onCheckAgain = onCheckAgain,
+                posterPatternOverride = posterPatternOverride,
             )
         }
     }
@@ -751,9 +757,11 @@ private fun LazyListScope.downloadsRootContent(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    if (item.posterArtwork() != null) {
-                        DownloadPoster(item = item)
-                    }
+                    DownloadPoster(
+                        item = item,
+                        patternOverride = posterPatternOverride,
+                        hideWhenMissing = true,
+                    )
                     Column(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -925,6 +933,7 @@ private fun DownloadRow(
     onCheckAgain: ((DownloadItem) -> Unit)? = null,
     /** A marked file has a good new copy beside it: offers to replace it with that copy (the file goes to the trash). */
     newCopyReady: Boolean = false,
+    posterPatternOverride: String? = null,
 ) {
     val extras = clock.extras
     val location = extras?.folderState?.location(extras.locationIdOf(item))
@@ -1009,9 +1018,13 @@ private fun DownloadRow(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.Top,
             ) {
-                if (!item.isEpisode && item.posterArtwork() != null) {
-                    DownloadPoster(item = item)
-                } else if (item.isEpisode && item.landscapeArtwork() != null) {
+                if (!item.isEpisode) {
+                    DownloadPoster(
+                        item = item,
+                        patternOverride = posterPatternOverride,
+                        hideWhenMissing = true,
+                    )
+                } else if (item.landscapeArtwork() != null) {
                     DownloadThumbnail(
                         imageUrl = item.landscapeArtwork(),
                         watchProgress = if (item.status == DownloadStatus.Completed) watchStatus.progress else 0f,
