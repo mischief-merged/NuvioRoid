@@ -9,7 +9,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Signing out, a lost session or deleting the account wipes the app's data, never the user's downloaded videos. */
+/** Signing out or deleting the account wipes the app's data, never the user's downloaded videos or a sign-out copy. */
 class AppDataWipeKeepsDownloadsTest {
     private val root = Files.createTempDirectory("nuvio-wipe").toRealPath()
 

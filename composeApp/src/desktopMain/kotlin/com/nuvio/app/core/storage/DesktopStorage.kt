@@ -39,16 +39,34 @@ internal object DesktopStorage {
     }
 
     /**
-     * What a wipe of the app's data (sign-out, a lost session, account deletion) never touches: the app's own
-     * downloads folder, which holds the user's downloaded videos, and the move journals that may still name
-     * copies of them. Settings and lists go; the files stay where they are.
+     * What a wipe never touches: the downloads folder (the videos), the move journals, and any
+     * `signed-out-<date>` folder. That dated folder is a copy made before sign-out. A lost session
+     * does not wipe the data folder at all.
      */
     internal val KeptOnWipe = setOf("downloads", "moves")
 
-    /** Deletes everything under [root] except the top-level entries named in [keep] and what is inside them. Never follows a link. */
+    /** `signed-out-yyyyMMdd-HHmmss`, with `-2`, `-3`, … when that second already has a copy. */
+    private val signedOutCopyName = Regex("signed-out-\\d{8}-\\d{6}(-\\d+)?")
+
+    internal fun isSignedOutCopyName(name: String): Boolean = signedOutCopyName.matches(name)
+
+    /**
+     * Deletes everything under [root] except the top-level entries named in [keep], what is inside
+     * them, and every dated sign-out copy. Never follows a link. If the folder cannot be listed,
+     * nothing is deleted.
+     */
     internal fun wipeFolder(root: Path, keep: Set<String>) {
         if (!Files.isDirectory(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return
-        val kept = keep.map { root.resolve(it) }
+        val keepNames = keep.toMutableSet()
+        Files.newDirectoryStream(root).use { stream ->
+            stream.forEach { child ->
+                val name = child.fileName.toString()
+                if (isSignedOutCopyName(name) && Files.isDirectory(child, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    keepNames.add(name)
+                }
+            }
+        }
+        val kept = keepNames.map { root.resolve(it) }
         Files.walk(root).use { stream ->
             stream
                 .sorted(Comparator.reverseOrder())

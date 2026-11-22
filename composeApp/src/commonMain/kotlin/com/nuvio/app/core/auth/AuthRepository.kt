@@ -151,6 +151,15 @@ object AuthRepository {
     }
 
     suspend fun signOut(): Result<Unit> {
+        val snapshot = AccountFiles.beforeSignOut()
+        if (snapshot.isFailure) {
+            val failure = snapshot.exceptionOrNull()!!
+            if (failure is CancellationException) throw failure
+            log.e(failure) { "Sign-out stopped because the local copy could not be made" }
+            _error.value = runCatching { getString(Res.string.auth_sign_out_failed) }
+                .getOrDefault("Sign out failed")
+            return Result.failure(failure)
+        }
         _error.value = null
         val anonymousRead = runCatching { AuthStorage.loadAnonymousUserId() }
         val wasAnonymous = anonymousRead.getOrNull() != null
@@ -249,7 +258,7 @@ object AuthRepository {
         val notice = runCatching { getString(Res.string.auth_notice_signed_out) }.getOrNull()
         AuthStorage.clearAnonymousUserId()
         validatedRemoteUserId = null
-        val localCleanup = runCatching { LocalAccountDataCleaner.wipe() }
+        val localCleanup = runCatching { AccountFiles.onLostSession() }
         AuthStorage.saveFlag(KEY_HAD_ACCOUNT_SESSION, false)
         AuthStorage.saveFlag(KEY_SIGNED_OUT_NOTICE, true)
         _error.value = notice
