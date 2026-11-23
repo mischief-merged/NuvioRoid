@@ -2695,6 +2695,12 @@ static constexpr uint64_t kObserveAoUserdata = 2;
     _allowUnverified = YES;
     _certificateFailureSeen = NO;
     [self showTrustBanner];
+    {
+        // The reload drops the subtitle tracks added at startup, so the next file-loaded event adds them again.
+        std::lock_guard<std::mutex> guard(_startupSubtitleLock);
+        _fileLoaded = NO;
+        _startupSubtitlesApplied = NO;
+    }
     char start[64];
     snprintf(start, sizeof(start), "start=%.3f", fmax(_initialStartSeconds, _cachedPositionSeconds.load()));
     const char *load[] = {"loadfile", _playbackSource.UTF8String, "replace", "-1", start, nullptr};
