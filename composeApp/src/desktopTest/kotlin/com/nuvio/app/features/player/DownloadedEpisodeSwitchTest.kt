@@ -124,6 +124,33 @@ class DownloadedEpisodeSwitchTest {
         }
     }
 
+    @Test
+    fun a_downloaded_file_that_goes_away_while_subtitles_prepare_leaves_the_current_episode_playing() = runBlocking {
+        val preparations = AtomicInteger(0)
+        val started = CountDownLatch(1)
+        val gate = CompletableDeferred<Unit>()
+        val parent = SupervisorJob()
+        val scope = CoroutineScope(parent + Dispatchers.Default)
+        try {
+            val runtime = runtime(scope, targetEpisode = 6, preparations, started, gate)
+            runtime.playNextEpisode()
+            assertTrue(started.await(5, TimeUnit.SECONDS))
+            runtime.playableDownloadedUri = { null }
+            gate.complete(Unit)
+            val deadline = System.nanoTime() + 5_000_000_000L
+            while (runtime.downloadedEpisodeSwitch?.job?.isActive == true && System.nanoTime() < deadline) {
+                Thread.sleep(20)
+            }
+            assertFalse(runtime.downloadedEpisodeSwitch?.job?.isActive == true)
+            assertEquals("https://example.com/5.mp4", runtime.activeSourceUrl)
+            assertEquals("show:1:5", runtime.activeVideoId)
+            assertEquals(1, preparations.get())
+        } finally {
+            gate.complete(Unit)
+            parent.cancel()
+        }
+    }
+
     private fun runtime(
         scope: CoroutineScope,
         targetEpisode: Int,

@@ -552,6 +552,9 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
     val job = scope.launch(start = CoroutineStart.LAZY) {
         val prepared = prepareDownloadedSubtitles(localFileUri)
         if (!isStillValid()) return@launch
+        // The file can be removed or moved while the subtitles are prepared. Then the episode on screen
+        // keeps playing, and the subtitles prepared for the old address are never used with another one.
+        if (playableDownloadedUri(downloadItem) != localFileUri) return@launch
         restartSourceFailoverAfterUserChoice(newVideo = true)
         resetEpisodePanelAndNextEpisodeState()
         flushProgressForEpisodeChange(episode)
