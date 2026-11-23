@@ -21,7 +21,7 @@ class PlaybackTrustLifecycleTest {
         val prompts = AtomicInteger()
         var displayable = true
         val controller = NativePlayerController(NativePlayerHost(),
-            nativeCreate = { _, _, _, _, _, _, _, _, sink -> oldSink = sink; started.countDown(); finish.await(); 41L },
+            nativeCreate = { _, _, _, _, _, _, _, _, _, sink -> oldSink = sink; started.countDown(); finish.await(); 41L },
             nativeDispose = { disposed.countDown() }, isHostDisplayable = { displayable }, resolveHostView = { 1L },
             networkIdentity = { "session:1" }, confirmUnverified = { prompts.incrementAndGet(); false })
         try {

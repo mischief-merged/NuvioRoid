@@ -25,7 +25,7 @@ internal object WebviewImages {
     private val images = BoundedCache<String, String>(64)
     private val rejected = ConcurrentHashMap<String, Long>()
     private val client by lazy { guardedHttpClient().callTimeout(30, TimeUnit.SECONDS).build() }
-    private val loader = WebviewImageLoader(images, ::encode, ::rememberRejection)
+    private val loader = WebviewImageLoader(images, ::rememberRejection, ::encode)
 
     private fun rememberRejection(url: String) {
         if (!url.startsWith("http", ignoreCase = true)) return
@@ -93,8 +93,8 @@ internal object WebviewImages {
 
 internal class WebviewImageLoader(
     private val images: BoundedCache<String, String>,
-    private val encode: (String) -> String?,
     private val onRejected: (String) -> Unit = {},
+    private val encode: (String) -> String?,
 ) : AutoCloseable {
     private val loading = ConcurrentHashMap.newKeySet<String>()
     private val workers = ThreadPoolExecutor(0, 2, 30, TimeUnit.SECONDS, SynchronousQueue(),
