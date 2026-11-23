@@ -9,6 +9,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -115,6 +116,7 @@ class MacosNativeMiniPlayerBridgeTest {
 
         var handle = 0L
         var fullModeHandle = 0L
+        val stateSyncLatchRef = AtomicReference<CountDownLatch?>(null)
         try {
             val streamUrl = "http://127.0.0.1:${server.localPort}/episode.y4m"
             handle = NativePlayerBridge.createHeadlessMacosForTest(
@@ -123,7 +125,11 @@ class MacosNativeMiniPlayerBridgeTest {
                 playWhenReady = true,
                 initialPositionMs = 0L,
                 inMiniPlayer = true,
-                eventSink = NativePlayerEventSink { _, _ -> },
+                eventSink = NativePlayerEventSink { type, _ ->
+                    if (type == "stateSynchronized") {
+                        stateSyncLatchRef.get()?.countDown()
+                    }
+                },
             )
             assertTrue(handle != 0L, "expected native MpvWebPlayer handle")
 
@@ -232,6 +238,45 @@ class MacosNativeMiniPlayerBridgeTest {
                 assertIs<PlaybackStallDetector.Step.Continue>(step, "buffer growth at ${nowMs}ms must not stall at 20s")
                 stallState = step.state
             }
+
+            // Pausing while minimized turns the native 2.0 s sync timer completely off (0.0 s) and signals completion.
+            val pauseLatch = CountDownLatch(1)
+            stateSyncLatchRef.set(pauseLatch)
+            RealNativePlayerBackend.setPaused(handle, true)
+            assertTrue(pauseLatch.await(3, TimeUnit.SECONDS), "expected stateSynchronized after native pause")
+            assertTrue(RealNativePlayerBackend.isPaused(handle))
+            assertEquals(
+                0.0,
+                NativePlayerBridge.activeSyncTimerIntervalSecondsForTest(handle),
+                0.01,
+                "paused mini player must turn off the native periodic sync timer",
+            )
+            assertEquals(0.0, NativePlayerBridge.lastNowPlayingRateForTest(handle), 0.01)
+
+            // Seeking while paused in mini mode updates cached position before firing stateSynchronized and keeps sync off.
+            val positionBeforeSeekMs = RealNativePlayerBackend.positionMs(handle)
+            val seekLatch = CountDownLatch(1)
+            stateSyncLatchRef.set(seekLatch)
+            RealNativePlayerBackend.seekBy(handle, 10_000L)
+            assertTrue(seekLatch.await(3, TimeUnit.SECONDS), "expected stateSynchronized after paused native seek")
+            val positionAtSyncSignalMs = RealNativePlayerBackend.positionMs(handle)
+            assertTrue(
+                positionAtSyncSignalMs >= positionBeforeSeekMs + 9_000L,
+                "expected cached position to advance by ~10s before stateSynchronized (was ${positionBeforeSeekMs}ms, got ${positionAtSyncSignalMs}ms)",
+            )
+            assertEquals(
+                0.0,
+                NativePlayerBridge.activeSyncTimerIntervalSecondsForTest(handle),
+                0.01,
+                "paused seek must leave native periodic sync off",
+            )
+
+            // Resuming playback in mini mode restarts the 2.0 s periodic sync timer.
+            val resumeLatch = CountDownLatch(1)
+            stateSyncLatchRef.set(resumeLatch)
+            RealNativePlayerBackend.setPaused(handle, false)
+            assertTrue(resumeLatch.await(3, TimeUnit.SECONDS), "expected stateSynchronized after native resume")
+            assertEquals(2.0, NativePlayerBridge.activeSyncTimerIntervalSecondsForTest(handle), 0.05)
 
             // Reopening from mini mode restores 0.5 s sync and triggers initial focus on the player.
             RealNativePlayerBackend.setMiniPlayerMode(handle, false)

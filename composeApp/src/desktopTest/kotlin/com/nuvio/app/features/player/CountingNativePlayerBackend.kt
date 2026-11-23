@@ -21,6 +21,7 @@ internal class CountingNativePlayerBackend(
     data class HandleState(
         val handle: Long,
         val sourceUrl: String,
+        @Volatile var hostViewPtr: Long = 1L,
         @Volatile var paused: Boolean,
         @Volatile var loading: Boolean = false,
         @Volatile var ended: Boolean = false,
@@ -40,16 +41,22 @@ internal class CountingNativePlayerBackend(
     private val handleCounter = AtomicLong(0L)
     private val activeHandleIds = LinkedHashSet<Long>()
     private val stateLock = Any()
+    private val deferredSeekOps: MutableList<() -> Unit> = Collections.synchronizedList(mutableListOf())
 
     val statesByHandle = ConcurrentHashMap<Long, HandleState>()
     val events: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val createdSources: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    val createdHostViewPtrs: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     val createdInMiniPlayerModes: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
+    val reparentedHandles: MutableList<Pair<Long, Long>> = Collections.synchronizedList(mutableListOf())
     val focusedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     val disposedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     val snapshotQueries = AtomicInteger(0)
     val audioTrackQueries = AtomicInteger(0)
     val videoDimensionQueries = AtomicInteger(0)
+
+    @Volatile
+    var deferSeekExecution: Boolean = false
 
     @Volatile
     var maxConcurrentHandles: Int = 0
@@ -78,8 +85,17 @@ internal class CountingNativePlayerBackend(
         }
     }
 
+    fun completeDeferredSeeks() {
+        val pending = synchronized(deferredSeekOps) {
+            deferredSeekOps.toList().also { deferredSeekOps.clear() }
+        }
+        pending.forEach { it.invoke() }
+    }
+
     fun toDesktopHooks(
         coordinator: NativePlayerLifecycleCoordinator = NativePlayerLifecycleCoordinator(),
+        resolveComponentView: (java.awt.Component) -> Long = { 2L },
+        onControllerCreated: (NativePlayerHost, NativePlayerController) -> Unit = { _, _ -> },
     ): DesktopNativePlayerHooks = DesktopNativePlayerHooks(
         createController = { host: NativePlayerHost, enableRemoteCommands: Boolean ->
             NativePlayerController(
@@ -87,9 +103,13 @@ internal class CountingNativePlayerBackend(
                 backend = this,
                 isHostDisplayable = { true },
                 resolveHostView = { 1L },
+                isComponentDisplayable = { true },
+                resolveComponentView = { component ->
+                    if (component === host) 1L else resolveComponentView(component)
+                },
                 lifecycleCoordinator = coordinator,
                 remoteCommandsEnabledByDefault = enableRemoteCommands,
-            )
+            ).also { controller -> onControllerCreated(host, controller) }
         },
         forceHostReady = true,
         renderSwingPanel = false,
@@ -116,6 +136,7 @@ internal class CountingNativePlayerBackend(
         val state = HandleState(
             handle = handle,
             sourceUrl = sourceUrl,
+            hostViewPtr = hostViewPtr,
             paused = !playWhenReady,
             loading = false,
             ended = false,
@@ -132,6 +153,7 @@ internal class CountingNativePlayerBackend(
             }
         }
         createdSources += sourceUrl
+        createdHostViewPtrs += hostViewPtr
         createdInMiniPlayerModes += inMiniPlayer
         if (!inMiniPlayer) {
             focusedHandles += handle
@@ -182,7 +204,11 @@ internal class CountingNativePlayerBackend(
         }
     }
     override fun beginWindowDrag(handle: Long) = Unit
-    override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean = true
+    override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean {
+        statesByHandle[handle]?.hostViewPtr = hostViewPtr
+        reparentedHandles += handle to hostViewPtr
+        return true
+    }
     override fun layoutNativeSubviews(handle: Long) = Unit
 
     override fun setPaused(handle: Long, paused: Boolean) {
@@ -191,30 +217,52 @@ internal class CountingNativePlayerBackend(
             if (remoteCommandsEnabled) {
                 nowPlayingPositionMs = positionMs
             }
+            eventSink.onPlayerEvent("stateSynchronized", 0.0)
         }
     }
 
     override fun seekTo(handle: Long, positionMs: Long) {
-        statesByHandle[handle]?.apply {
-            val clamped = positionMs.coerceAtLeast(0L)
-            this.positionMs = clamped
-            if (remoteCommandsEnabled) {
-                nowPlayingPositionMs = clamped
+        val applySeek: () -> Unit = {
+            statesByHandle[handle]?.apply {
+                val clamped = positionMs.coerceAtLeast(0L)
+                this.positionMs = clamped
+                if (remoteCommandsEnabled) {
+                    nowPlayingPositionMs = clamped
+                }
+                eventSink.onPlayerEvent("stateSynchronized", 0.0)
             }
+        }
+        if (deferSeekExecution) {
+            deferredSeekOps += applySeek
+        } else {
+            applySeek()
         }
     }
 
     override fun seekBy(handle: Long, offsetMs: Long) {
-        val state = statesByHandle[handle] ?: return
-        val next = (state.positionMs + offsetMs).coerceIn(0L, state.durationMs)
-        state.positionMs = next
-        if (state.remoteCommandsEnabled) {
-            state.nowPlayingPositionMs = next
+        val applySeek: () -> Unit = {
+            val state = statesByHandle[handle]
+            if (state != null) {
+                val next = (state.positionMs + offsetMs).coerceIn(0L, state.durationMs)
+                state.positionMs = next
+                if (state.remoteCommandsEnabled) {
+                    state.nowPlayingPositionMs = next
+                }
+                state.eventSink.onPlayerEvent("stateSynchronized", 0.0)
+            }
+        }
+        if (deferSeekExecution) {
+            deferredSeekOps += applySeek
+        } else {
+            applySeek()
         }
     }
 
     override fun setSpeed(handle: Long, speed: Float) {
-        statesByHandle[handle]?.speed = speed
+        statesByHandle[handle]?.apply {
+            this.speed = speed
+            eventSink.onPlayerEvent("stateSynchronized", 0.0)
+        }
     }
 
     override fun setVolume(handle: Long, level: Float) = Unit

@@ -61,6 +61,8 @@ import com.nuvio.app.features.downloads.DownloadsUiState
 import com.nuvio.app.features.downloads.SeasonBatchDownloader
 import com.nuvio.app.features.downloads.SeasonDownloadDefaultsStorage
 import com.nuvio.app.features.home.MetaPreview
+import com.nuvio.app.features.player.desktop.NativePlayerController
+import com.nuvio.app.features.player.desktop.NativePlayerHost
 import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
@@ -2012,6 +2014,302 @@ class MiniPlayerSessionTest {
             PlayerSettingsRepository.setExternalPlayerEnabled(previousSettings.externalPlayerEnabled)
             PlayerSettingsRepository.setStreamAutoPlayFallbackOnFailure(previousSettings.streamAutoPlayFallbackOnFailure)
             PlayerSettingsRepository.setStreamAutoPlayMode(previousSettings.streamAutoPlayMode)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(previousSettings.streamReuseLastLinkEnabled)
+        }
+    }
+
+    @Test
+    fun paused_mini_player_delayed_native_seek_updates_dock_and_watch_progress_on_completion() {
+        WatchProgressRepository.ensureLoaded()
+        WatchProgressRepository.clearProgress(episodes[0].id)
+        WatchProgressRepository.clearLocalState()
+
+        val backend = CountingNativePlayerBackend()
+        val hooks = backend.toDesktopHooks()
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        sessionController.open(
+            launch = sampleSeriesLaunch(),
+            launchId = 907L,
+        )
+
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.setContent {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            PlayerSessionHost(
+                                controller = sessionController,
+                                navController = navigator,
+                                externalPlayerId = null,
+                                externalPlayerNotConfiguredText = "",
+                                externalPlayerFailedText = "",
+                                onExternalPlayerLaunch = {},
+                                launchExternalPlayer = { false },
+                                openExternalStreamUrl = { false },
+                                onOpenPartyMedia = {},
+                            )
+                        }
+                    }
+                }
+            }
+            compose.mainClock.advanceTimeBy(50L)
+            compose.waitUntil(5_000L) { backend.createCount == 1 }
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 105_000L
+                durationMs = 1_800_000L
+            }
+            compose.mainClock.advanceTimeBy(600L)
+
+            // Minimize and pause in MiniPlayerDock: snapshot loop settles at 0 Hz.
+            sessionController.minimize()
+            compose.mainClock.advanceTimeBy(100L)
+            compose.onNodeWithContentDescription(text(Res.string.compose_action_pause)).performClick()
+            compose.mainClock.advanceTimeBy(100L)
+            val pausedQueries = backend.snapshotQueries.get()
+            compose.mainClock.advanceTimeBy(5_000L)
+            assertEquals(pausedQueries, backend.snapshotQueries.get(), "paused mini snapshot loop must stay idle")
+
+            // Defer native seek completion so the synchronous refresh reads the stale 105s position and parks.
+            backend.deferSeekExecution = true
+            compose.onNodeWithContentDescription(text(Res.string.compose_player_seek_forward_10)).performClick()
+            compose.mainClock.advanceTimeBy(1_200L)
+            assertEquals(
+                105_000L,
+                sessionController.playbackState?.positionMs,
+                "position remains at 105s while async native seek has not finished yet",
+            )
+            val queriesWhileAwaitingNativeSeek = backend.snapshotQueries.get()
+            compose.mainClock.advanceTimeBy(3_000L)
+            assertEquals(queriesWhileAwaitingNativeSeek, backend.snapshotQueries.get(), "still parked awaiting native completion")
+
+            // Completing the delayed native seek signals stateSynchronized, updating both the dock and saved watch progress.
+            backend.completeDeferredSeeks()
+            compose.mainClock.advanceTimeBy(1_200L)
+            assertEquals(115_000L, sessionController.playbackState?.positionMs)
+            assertEquals(115_000L, backend.statesByHandle[1L]?.nowPlayingPositionMs)
+            assertEquals(
+                115_000L,
+                WatchProgressRepository.progressForVideo(episodes[0].id)?.lastPositionMs,
+                "delayed paused mini-player seek must persist the updated 115s resume position",
+            )
+
+            val queriesAfterSeekSettled = backend.snapshotQueries.get()
+            compose.mainClock.advanceTimeBy(10_000L)
+            assertEquals(queriesAfterSeekSettled, backend.snapshotQueries.get(), "returns to 0 Hz after delayed seek completes")
+        } finally {
+            backend.deferSeekExecution = false
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
+    fun floating_pip_surface_host_is_preserved_across_episode_autoplay_and_source_failover() {
+        PlayerSettingsRepository.ensureLoaded()
+        val previousSettings = PlayerSettingsRepository.uiState.value
+        sourceHealthNowMsForTest = { compose.mainClock.currentTime }
+
+        try {
+            PlayerSettingsRepository.setExternalPlayerEnabled(false)
+            PlayerSettingsRepository.setStreamAutoPlayNextEpisodeEnabled(true)
+            PlayerSettingsRepository.setStreamAutoPlayFallbackOnFailure(true)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(false)
+
+            val ep1PrimaryUrl = "https://example.com/pip-ep1-primary.mp4"
+            val ep1BackupUrl = "https://example.com/pip-ep1-backup.mp4"
+            val ep2Url = "https://example.com/pip-ep2.mp4"
+            MetaDetailsRepository.putCachedMetaForTest(
+                MetaDetails(
+                    id = testSeriesId,
+                    type = "series",
+                    name = "Series",
+                    videos = listOf(
+                        MetaVideo(
+                            id = episodes[0].id,
+                            title = "Episode 1",
+                            season = 1,
+                            episode = 1,
+                            streams = listOf(
+                                StreamItem(
+                                    name = "Primary 1080p",
+                                    url = ep1PrimaryUrl,
+                                    addonName = "Embedded",
+                                    addonId = "embedded",
+                                ),
+                                StreamItem(
+                                    name = "Backup 1080p",
+                                    url = ep1BackupUrl,
+                                    addonName = "Embedded",
+                                    addonId = "embedded",
+                                ),
+                            ),
+                        ),
+                        MetaVideo(
+                            id = episodes[1].id,
+                            title = "Episode 2",
+                            season = 1,
+                            episode = 2,
+                            streams = listOf(
+                                StreamItem(
+                                    name = "Episode 2 1080p",
+                                    url = ep2Url,
+                                    addonName = "Embedded",
+                                    addonId = "embedded",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            PlayerStreamsRepository.episodeStreamsProviderForTest = { _, videoId, _, episode ->
+                if (videoId == episodes[1].id || episode == 2) {
+                    StreamsUiState(
+                        groups = listOf(
+                            AddonStreamGroup(
+                                addonName = "Embedded",
+                                addonId = "embedded",
+                                streams = listOf(
+                                    StreamItem(
+                                        name = "Episode 2 1080p",
+                                        url = ep2Url,
+                                        addonName = "Embedded",
+                                        addonId = "embedded",
+                                    ),
+                                ),
+                                isLoading = false,
+                            ),
+                        ),
+                        isAnyLoading = false,
+                    )
+                } else {
+                    null
+                }
+            }
+
+            val pipHost = NativePlayerHost()
+            var mainHostRef: NativePlayerHost? = null
+            var nativeControllerRef: NativePlayerController? = null
+            val backend = CountingNativePlayerBackend()
+            val hooks = backend.toDesktopHooks(
+                resolveComponentView = { component -> if (component === pipHost) 77L else 1L },
+                onControllerCreated = { host, controller ->
+                    mainHostRef = host
+                    nativeControllerRef = controller
+                },
+            )
+            val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+            val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+            sessionController.open(
+                launch = sampleSeriesLaunch().copy(
+                    sourceUrl = ep1PrimaryUrl,
+                    providerName = "Embedded",
+                    providerAddonId = "embedded",
+                    streamTitle = "Primary 1080p",
+                    sourceAutoSelected = true,
+                ),
+                launchId = 908L,
+            )
+
+            compose.mainClock.autoAdvance = false
+            compose.setContent {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            PlayerSessionHost(
+                                controller = sessionController,
+                                navController = navigator,
+                                externalPlayerId = null,
+                                externalPlayerNotConfiguredText = "",
+                                externalPlayerFailedText = "",
+                                onExternalPlayerLaunch = {},
+                                launchExternalPlayer = { false },
+                                openExternalStreamUrl = { false },
+                                onOpenPartyMedia = {},
+                            )
+                        }
+                    }
+                }
+            }
+            compose.mainClock.advanceTimeBy(50L)
+            compose.waitUntil(5_000L) { backend.createCount == 1 }
+            assertEquals(listOf(1L), backend.createdHostViewPtrs.toList())
+
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 100_000L
+                bufferedPositionMs = 120_000L
+                durationMs = 1_800_000L
+            }
+            compose.mainClock.advanceTimeBy(1_500L)
+
+            // Enter floating PiP: reparents handle 1L from main host (1L) to floating PiP host (77L).
+            compose.runOnIdle {
+                val controller = checkNotNull(nativeControllerRef)
+                assertTrue(controller.reparentSurface(pipHost))
+                controller.setPictureInPictureActive(true)
+                assertTrue(sessionController.setPictureInPicture(true))
+            }
+            compose.mainClock.advanceTimeBy(100L)
+            assertEquals(listOf(1L to 77L), backend.reparentedHandles.toList())
+            assertEquals(77L, backend.statesByHandle[1L]?.hostViewPtr)
+
+            // Source stall failover while in PiP must create handle 2L directly in the floating PiP host (77L).
+            backend.statesByHandle[1L]?.apply {
+                loading = true
+                paused = false
+                positionMs = 100_000L
+                bufferedPositionMs = 120_000L
+            }
+            compose.mainClock.advanceTimeBy(22_000L)
+            compose.mainClock.advanceTimeBy(200L)
+            compose.waitUntil(5_000L) { backend.createCount == 2 && backend.disposeCount == 1 }
+            compose.mainClock.advanceTimeBy(200L)
+            assertEquals(listOf(ep1PrimaryUrl, ep1BackupUrl), backend.createdSources.toList())
+            assertEquals(
+                listOf(1L, 77L),
+                backend.createdHostViewPtrs.toList(),
+                "failover handle during PiP must attach to the floating PiP host (77L), not the 1dp anchor (1L)",
+            )
+            assertEquals(77L, backend.statesByHandle[2L]?.hostViewPtr)
+
+            // Next-episode autoplay while in PiP must also create handle 3L in the floating PiP host (77L).
+            backend.statesByHandle[2L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 1_800_000L
+                durationMs = 1_800_000L
+                ended = true
+            }
+            compose.mainClock.advanceTimeBy(15_000L)
+            compose.waitUntil(5_000L) { backend.createCount == 3 && backend.disposeCount == 2 }
+            compose.mainClock.advanceTimeBy(200L)
+            assertEquals(listOf(ep1PrimaryUrl, ep1BackupUrl, ep2Url), backend.createdSources.toList())
+            assertEquals(
+                listOf(1L, 77L, 77L),
+                backend.createdHostViewPtrs.toList(),
+                "next-episode handle during PiP must attach to the floating PiP host (77L), not the 1dp anchor (1L)",
+            )
+            assertEquals(77L, backend.statesByHandle[3L]?.hostViewPtr)
+
+            // Restoring from PiP reparents handle 3L back to the main host (1L).
+            compose.runOnIdle {
+                val controller = checkNotNull(nativeControllerRef)
+                val mainHost = checkNotNull(mainHostRef)
+                assertTrue(controller.reparentSurface(mainHost))
+                controller.setPictureInPictureActive(false)
+                assertTrue(sessionController.setPictureInPicture(false))
+            }
+            compose.mainClock.advanceTimeBy(100L)
+            assertEquals(1L, backend.statesByHandle[3L]?.hostViewPtr)
+        } finally {
+            compose.mainClock.autoAdvance = true
+            PlayerSettingsRepository.setExternalPlayerEnabled(previousSettings.externalPlayerEnabled)
+            PlayerSettingsRepository.setStreamAutoPlayNextEpisodeEnabled(previousSettings.streamAutoPlayNextEpisodeEnabled)
+            PlayerSettingsRepository.setStreamAutoPlayFallbackOnFailure(previousSettings.streamAutoPlayFallbackOnFailure)
             PlayerSettingsRepository.setStreamReuseLastLinkEnabled(previousSettings.streamReuseLastLinkEnabled)
         }
     }

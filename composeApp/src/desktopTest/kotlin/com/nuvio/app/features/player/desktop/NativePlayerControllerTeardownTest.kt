@@ -1035,6 +1035,143 @@ class NativePlayerControllerTeardownTest {
         assertNull(releasedHostRef.get(), "coordinator must not retain closed host after releaseBeforeNavigation")
         assertNull(disposedControllerRef.get(), "coordinator must not retain closed controller after dispose")
     }
+
+    @Test
+    fun reparentedPipHostIsPreservedAcrossSourceReplacementAndMidCreateTransitions() {
+        val mainHost = NativePlayerHost()
+        val pipHost = NativePlayerHost()
+        val createdHostPointers = Collections.synchronizedList(mutableListOf<Long>())
+        val reparentedHandles = Collections.synchronizedList(mutableListOf<Pair<Long, Long>>())
+        val nextHandle = AtomicInteger(10)
+        val allowThirdCreate = CountDownLatch(1)
+        val thirdCreateStarted = CountDownLatch(1)
+
+        val backend = object : NativePlayerBackend by NoOpNativePlayerBackend {
+            override fun create(
+                hostViewPtr: Long,
+                sourceUrl: String,
+                headerLines: Array<String>,
+                playWhenReady: Boolean,
+                initialPositionMs: Long,
+                controlsPageUrl: String,
+                decoderPriority: Int,
+                nvidiaRtxSuperResolutionEnabled: Boolean,
+                eventSink: NativePlayerEventSink,
+                inMiniPlayer: Boolean,
+                remoteCommandsEnabled: Boolean,
+            ): Long {
+                createdHostPointers += hostViewPtr
+                if (sourceUrl.endsWith("ep3.mp4")) {
+                    thirdCreateStarted.countDown()
+                    allowThirdCreate.await(3, TimeUnit.SECONDS)
+                }
+                return nextHandle.incrementAndGet().toLong()
+            }
+
+            override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean {
+                reparentedHandles += handle to hostViewPtr
+                return true
+            }
+        }
+
+        val controller = NativePlayerController(
+            host = mainHost,
+            backend = backend,
+            isHostDisplayable = { true },
+            resolveHostView = { 100L },
+            isComponentDisplayable = { true },
+            resolveComponentView = { component -> if (component === pipHost) 200L else 100L },
+        )
+
+        // 1. Initial episode attaches in the main host (100L).
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep1.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep1Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 1 && System.nanoTime() < ep1Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(100L), createdHostPointers.toList())
+
+        // 2. Enter PiP: reparents handle 11L to pipHost (200L).
+        SwingUtilities.invokeAndWait {
+            assertTrue(controller.reparentSurface(pipHost))
+            controller.setPictureInPictureActive(true)
+        }
+        assertEquals(listOf(11L to 200L), reparentedHandles.toList())
+
+        // 3. Episode/source replacement (dispose + attach, matching NativePlayerSurface) creates handle 12L in pipHost (200L).
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep2.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep2Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 2 && System.nanoTime() < ep2Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(
+            listOf(100L, 200L),
+            createdHostPointers.toList(),
+            "replacement handle created during PiP must target the floating PiP host rather than the 1dp main-window anchor",
+        )
+
+        // 4. Exit PiP mid-create of ep3: handle 13L starts creating in pipHost (200L) and reparents back to mainHost (100L) on completion.
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep3.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        assertTrue(thirdCreateStarted.await(3, TimeUnit.SECONDS))
+        SwingUtilities.invokeAndWait {
+            assertTrue(controller.reparentSurface(mainHost))
+            controller.setPictureInPictureActive(false)
+        }
+        allowThirdCreate.countDown()
+        val ep3Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (reparentedHandles.size < 2 && System.nanoTime() < ep3Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(11L to 200L, 13L to 100L), reparentedHandles.toList())
+
+        // 5. Subsequent source attaches back in mainHost (100L).
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep4.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep4Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 4 && System.nanoTime() < ep4Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(100L, 200L, 200L, 100L), createdHostPointers.toList())
+        controller.releaseBeforeNavigation {}
+    }
 }
 
 private fun NativePlayerController.pendingSourceForTest(): Any? =
