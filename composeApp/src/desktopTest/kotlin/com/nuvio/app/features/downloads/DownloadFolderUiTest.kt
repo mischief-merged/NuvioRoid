@@ -23,6 +23,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.test.requestFocus
+import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.settings.DownloadFolderSetting
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,16 +33,55 @@ import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
 import org.junit.Rule
+import org.junit.rules.RuleChain
+import org.junit.rules.TestRule
+import org.junit.runners.model.Statement
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalTestApi::class)
 class DownloadFolderUiTest {
-    @get:Rule
     val compose = createComposeRule()
+
+    private val world = FolderWorld()
+    private val store = DesktopStorage.Store(world.root.resolve("downloads.properties"))
+    private val backend = object : DownloadsBackend by LocationsBackend(world) {
+        override fun loadPayload(): String? = store.getString("downloads")
+        override fun loadPayload(profileId: Int): String? = loadPayload()
+        override fun savePayload(payload: String) = store.putString("downloads", payload)
+        override fun savePayload(profileId: Int, payload: String) = savePayload(payload)
+    }
+
+    // The row reads the repository as well as the folder controller. Give both known test data.
+    private val repository = TestRule { body, _ ->
+        object : Statement() {
+            override fun evaluate() {
+                val previousBackend = DownloadsRepository.backend
+                val previousBeforeLoad = DownloadsRepository.beforeCatalogLoad
+                try {
+                    DownloadsRepository.clearLocalState()
+                    DownloadsRepository.backend = backend
+                    DownloadsRepository.beforeCatalogLoad = {}
+                    DownloadsRepository.ensureLoaded()
+                    body.evaluate()
+                } finally {
+                    DownloadsRepository.clearLocalState()
+                    DownloadsRepository.backend = previousBackend
+                    DownloadsRepository.beforeCatalogLoad = previousBeforeLoad
+                    world.close()
+                }
+            }
+        }
+    }
+
+    // Dispose the composition and its load effect before restoring the shared repository.
+    @get:Rule
+    val rules: TestRule = RuleChain.outerRule(repository).around(compose)
 
     private class FakeFolders(initial: DownloadFolderState) : DownloadFolderController {
         override val supported = true
@@ -170,6 +210,8 @@ class DownloadFolderUiTest {
 
     @Test
     fun change_opens_the_picker_and_a_folder_with_nothing_to_move_is_just_saved() {
+        assertTrue(DownloadsRepository.catalogReady.value)
+        assertTrue(DownloadsRepository.uiState.value.items.isEmpty())
         val folders = FakeFolders(state(location("app", "/app/downloads", default = true)))
         compose.setContent { NuvioTheme { DownloadFolderSetting(isTablet = false, controller = folders) } }
 
@@ -180,6 +222,31 @@ class DownloadFolderUiTest {
 
         assertEquals(1, folders.pickCalls)
         assertEquals(listOf("/Volumes/Archive/Movies"), folders.defaults)
+        assertTrue(folders.moves.isEmpty())
+    }
+
+    @Test
+    fun a_saved_download_offers_move_choices_and_leaving_it_keeps_its_file_and_record() {
+        val file = world.appFolder.resolve("saved.mp4").writeVideo(7)
+        val bytes = Files.readAllBytes(file)
+        val item = movieItem("saved", locationId = "app", file = file, bytes = bytes.size.toLong())
+        backend.savePayload(storedPayload(listOf(item)))
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        assertEquals(listOf(item.id), DownloadsRepository.uiState.value.items.map { it.id })
+        val folders = FakeFolders(state(location("app", world.appFolder.toString(), default = true, items = 1, bytes = item.moveBytes)))
+        compose.setContent { NuvioTheme { DownloadFolderSetting(isTablet = false, controller = folders) } }
+
+        compose.onNode(hasText(text(Res.string.settings_download_folder_change)) and isButton()).performClick()
+        waitFor(text(Res.string.download_folder_choice_all))
+        compose.onNodeWithText(text(Res.string.download_folder_confirm_save)).assertDoesNotExist()
+        compose.onNode(hasText(text(Res.string.download_folder_choice_none)) and isButton()).performClick()
+        compose.waitUntil(5_000) { folders.defaults.isNotEmpty() }
+
+        assertEquals(listOf("/Volumes/Archive/Movies"), folders.defaults)
+        assertTrue(folders.moves.isEmpty())
+        assertContentEquals(bytes, Files.readAllBytes(file))
+        assertEquals(listOf(item), decodeStoredDownloads(backend.loadPayload()!!))
     }
 
     @Test
