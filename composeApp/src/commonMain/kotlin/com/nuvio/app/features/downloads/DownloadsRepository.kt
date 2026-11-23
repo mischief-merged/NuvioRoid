@@ -18,10 +18,15 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlin.coroutines.EmptyCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -43,6 +48,8 @@ object DownloadsRepository {
 
     private val _uiState = MutableStateFlow(DownloadsUiState())
     val uiState: StateFlow<DownloadsUiState> = _uiState.asStateFlow()
+
+    internal val completedItems = uiState.map { it.completedItems }.distinctUntilChanged()
 
     private val _hasUnseenCompleted = MutableStateFlow(false)
     val hasUnseenCompleted: StateFlow<Boolean> = _hasUnseenCompleted.asStateFlow()
@@ -169,6 +176,57 @@ object DownloadsRepository {
     /** Runs [block] inside the state lock. Tests only: proves what must not need it. */
     internal fun holdStateLockForTest(block: () -> Unit) = synchronized(stateLock) { block() }
 
+    internal var progressScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var progressJob: Job? = null
+    private val progressWrites = Mutex()
+    private val pendingProgress = mutableMapOf<Int, MutableMap<String, DownloadItem>>()
+
+    private fun scheduleProgressSave() {
+        if (progressJob != null) return
+        progressJob = progressScope.launch {
+            while (true) {
+                delay(5_000)
+                flushProgress()
+                synchronized(stateLock) {
+                    if (progressJob !== coroutineContext[Job]) return@launch
+                    if (pendingProgress.isEmpty()) {
+                        progressJob = null
+                        return@launch
+                    }
+                }
+            }
+        }
+    }
+
+    /** Takes a snapshot under the state lock; storage waits never hold that lock. */
+    internal suspend fun flushProgress(): Boolean = progressWrites.withLock {
+        val snapshots = synchronized(stateLock) {
+            pendingProgress.map { (profile, items) -> Triple(profile, items.toMap(), backend) }
+        }
+        var saved = true
+        for ((profile, items, store) in snapshots) {
+            val success = runCatching { store.saveProgress(profile, items.values.toList()) }.getOrDefault(false)
+            saved = saved && success
+            if (success) synchronized(stateLock) {
+                val pending = pendingProgress[profile]
+                items.forEach { (id, item) -> if (pending?.get(id) == item) pending.remove(id) }
+                if (pending.isNullOrEmpty()) pendingProgress.remove(profile)
+            }
+        }
+        saved
+    }
+
+    /** Stops byte callbacks before the final checkpoint, keeping running records resumable. */
+    internal suspend fun prepareForQuit(): Boolean {
+        val stopped = synchronized(stateLock) {
+            activeTransfers.filterValues { !it.finishing }.toMap().also { transfers ->
+                transfers.keys.forEach { activeTransfers.remove(it) }
+            }.values
+        }
+        stopped.forEach(ActiveTransfer::cancel)
+        return flushProgress()
+    }
+
     fun ensureLoaded() {
         if (_catalogReady.value) return
         // The read calls back into here (a resumed transfer, a connection hold). Waiting again would stick.
@@ -209,6 +267,9 @@ object DownloadsRepository {
         activeTransfers.clear()
         checkingTransfers.clear()
         transfers.forEach(ActiveTransfer::cancel)
+        progressJob?.cancel()
+        progressJob = null
+        pendingProgress.clear()
         hasLoaded = false
         catalogLoadingThread = null
         loadedProfileId = null
@@ -934,7 +995,7 @@ object DownloadsRepository {
             { downloadedBytes, totalBytes ->
                 ifCurrent(item.id, transfer) {
                     if (failIfAnnouncedAsPlaceholder(item, totalBytes)) return@ifCurrent
-                    mutateItem(item.id) { current ->
+                    mutateItem(item.id, progressOnly = true) { current ->
                         if (current.status != DownloadStatus.Downloading) {
                             current
                         } else {
@@ -957,6 +1018,7 @@ object DownloadsRepository {
                     // A bad file, a refusal or a full disk comes again on every attempt.
                     val worthAnotherAttempt = kind == DownloadFailureKind.Other
                     if (current?.status == DownloadStatus.Downloading && attempt < MaxDownloadAttempts && worthAnotherAttempt) {
+                        persist()
                         startDownload(current, attempt + 1)
                     } else {
                         mutateItem(item.id) { failed ->
@@ -1565,7 +1627,7 @@ object DownloadsRepository {
         }
     }
 
-    private fun mutateItem(downloadId: String, transform: (DownloadItem) -> DownloadItem): Unit = synchronized(stateLock) {
+    private fun mutateItem(downloadId: String, progressOnly: Boolean = false, transform: (DownloadItem) -> DownloadItem): Unit = synchronized(stateLock) {
         var changed = false
         val updated = _uiState.value.items.map { item ->
             if (item.id == downloadId) {
@@ -1578,7 +1640,14 @@ object DownloadsRepository {
 
         if (changed) {
             publish(updated)
-            persist()
+            if (progressOnly && backend.batchesProgress) {
+                if (!savingIsUnsafe) loadedProfileId?.let { profile ->
+                    pendingProgress.getOrPut(profile) { mutableMapOf() }[downloadId] = updated.first { it.id == downloadId }
+                    scheduleProgressSave()
+                }
+            } else {
+                persist()
+            }
         }
     }
 
@@ -1616,6 +1685,7 @@ object DownloadsRepository {
             backend.withListLock {
                 val revision = if (backend.rereadsPayload) mergeNewerStored() ?: return@withListLock false else null
                 backend.savePayload(DownloadsCodec.encode(_uiState.value.items, loadedPayload, revision))
+                loadedProfileId?.let { pendingProgress.remove(it) }
                 baseline = _uiState.value.items
                 if (revision != null) baseRevision = revision
                 !durably || backend.syncPayload()
@@ -1810,6 +1880,17 @@ internal interface DownloadsBackend {
     fun loadPayload(): String?
     fun savePayload(payload: String)
 
+    /** Opt in only when counter updates are atomic with ordinary list writes. */
+    val batchesProgress: Boolean get() = false
+
+    /** Updates counters only; it must never add a record or change its status or file address. */
+    fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean = withListLock {
+        val payload = loadPayload() ?: return@withListLock true
+        val updated = DownloadsCodec.withProgress(payload, items) ?: return@withListLock false
+        savePayload(updated)
+        true
+    }
+
     /** The payload from before the last one that was saved. Null where no such copy is kept. */
     fun loadPreviousPayload(): String? = null
 
@@ -1950,6 +2031,11 @@ private object PlatformDownloadsBackend : DownloadsBackend {
     override fun loadPayload(): String? = DownloadsStorage.loadPayload()
 
     override fun savePayload(payload: String) = DownloadsStorage.savePayload(payload)
+
+    override val batchesProgress: Boolean get() = DownloadsStorage.batchesProgress
+
+    override fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean =
+        DownloadsStorage.saveProgress(profileId, items)
 
     override fun loadPreviousPayload(): String? = DownloadsStorage.loadPreviousPayload()
 
@@ -2141,6 +2227,26 @@ internal object DownloadsCodec {
         val fields = (s.keys + o.keys).associateWith { key -> if (o[key] != b[key]) o[key] else s[key] }
             .filterValues { it != null }.mapValues { it.value!! }
         return json.decodeFromJsonElement(DownloadItem.serializer(), JsonObject(fields))
+    }
+
+    /** Patches only still-running records in the current stored list, preserving every other field. */
+    fun withProgress(payload: String, updates: List<DownloadItem>): String? {
+        val decoded = decode(payload) ?: return null
+        val byId = updates.associateBy { it.id }
+        val items = decoded.items.map { stored ->
+            val progress = byId[stored.id]
+            if (progress == null || stored.status != DownloadStatus.Downloading ||
+                stored.fileName != progress.fileName || stored.partialFileKey != progress.partialFileKey ||
+                stored.updatedAtEpochMs > progress.updatedAtEpochMs || stored.downloadedBytes > progress.downloadedBytes ||
+                (stored.updatedAtEpochMs == progress.updatedAtEpochMs && stored.downloadedBytes == progress.downloadedBytes)
+            ) stored else stored.copy(
+                downloadedBytes = progress.downloadedBytes,
+                totalBytes = progress.totalBytes,
+                updatedAtEpochMs = progress.updatedAtEpochMs,
+            )
+        }
+        if (items == decoded.items) return payload
+        return encode(items, decoded, revisionOf(payload) + 1)
     }
 
     fun encode(items: Collection<DownloadItem>, loaded: Decoded?, revision: Long? = null): String {

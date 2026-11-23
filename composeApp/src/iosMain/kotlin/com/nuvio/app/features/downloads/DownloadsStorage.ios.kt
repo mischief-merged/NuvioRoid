@@ -14,6 +14,10 @@ internal actual object DownloadsStorage {
         NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
     }
 
+    // Counter batching needs an atomic list update; keep ordinary saves on this platform.
+    actual val batchesProgress: Boolean = false
+    actual fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean = false
+
     actual fun loadPreviousPayload(): String? = null
 
     actual fun saveUnreadablePayload(payload: String, atEpochMs: Long) {

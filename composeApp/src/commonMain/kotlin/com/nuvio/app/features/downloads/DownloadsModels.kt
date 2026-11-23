@@ -189,8 +189,12 @@ data class DownloadsUiState(
     val activeItems: List<DownloadItem>
         get() = items.filter { it.status != DownloadStatus.Completed || it.isPlaceholder }
 
-    val completedItems: List<DownloadItem>
-        get() = items.filter { it.status == DownloadStatus.Completed && !it.isPlaceholder }
+    val completedItems: List<DownloadItem> = items.filter { it.status == DownloadStatus.Completed && !it.isPlaceholder }
+
+    /** The screen's structure; running rows subscribe to their own counters. */
+    internal fun withoutProgress() = copy(items = items.map { item ->
+        if (item.status == DownloadStatus.Downloading) item.copy(downloadedBytes = 0, totalBytes = null, updatedAtEpochMs = 0) else item
+    })
 }
 
 enum class DownloadEnqueueResult {
