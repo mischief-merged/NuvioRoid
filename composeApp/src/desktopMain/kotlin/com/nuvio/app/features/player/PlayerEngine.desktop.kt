@@ -344,6 +344,7 @@ private fun NativePlayerSurface(
     }
 
     val isInMiniPlayer = controlsState.isInMiniPlayer
+    val eventDrivenMiniSnapshots = isInMiniPlayer && DesktopHostOs.current == DesktopHostOs.MACOS
     LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
         val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
         val includeVideoSize = !isInMiniPlayer
@@ -355,11 +356,14 @@ private fun NativePlayerSurface(
                 null
             }
             if (
-                isInMiniPlayer &&
-                !playWhenReady &&
-                snapshot != null &&
-                !snapshot.isLoading &&
-                !snapshot.isPlaying
+                eventDrivenMiniSnapshots ||
+                (
+                    isInMiniPlayer &&
+                        !playWhenReady &&
+                        snapshot != null &&
+                        !snapshot.isLoading &&
+                        !snapshot.isPlaying
+                    )
             ) {
                 observedRefreshTick = controller.manualRefreshTick.first { it != observedRefreshTick }
                 continue

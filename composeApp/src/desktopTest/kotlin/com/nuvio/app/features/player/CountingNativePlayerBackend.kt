@@ -66,6 +66,12 @@ internal class CountingNativePlayerBackend(
         return statesByHandle[current]
     }
 
+    fun emitPlaybackPosition(handle: Long, positionMs: Long) {
+        val state = statesByHandle[handle] ?: return
+        state.positionMs = positionMs
+        state.eventSink.onPlayerEvent("nativeStateTick", positionMs.toDouble())
+    }
+
     fun toDesktopHooks(
         coordinator: NativePlayerLifecycleCoordinator = NativePlayerLifecycleCoordinator(),
     ): DesktopNativePlayerHooks = DesktopNativePlayerHooks(

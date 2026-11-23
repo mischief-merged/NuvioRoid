@@ -217,6 +217,7 @@ static NSString *NuvioPlaybackNetwork(void) {
                             shadowBlur:(double)shadowBlur;
 - (void)handleScriptMessage:(NSDictionary *)message;
 - (void)startMpvEventDrain;
+- (void)setMiniPropertyObservationEnabled:(BOOL)enabled;
 - (void)applyVolumeSplit:(double)percent;
 - (void)scheduleMpvEventDrain;
 - (void)drainMpvEvents;
@@ -1187,6 +1188,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     // Drains mpv's event queue (property observations, async replies, log lines).
     dispatch_queue_t _mpvDrainQueue;
     std::atomic_bool _mpvDrainStopped;
+    std::atomic_bool _miniPropertiesObserved;
     // True once mpv reports current-ao == avfoundation. That AO buffers deeply
     // inside AVSampleBufferAudioRenderer, so softvol changes lag; its own
     // renderer volume (ao-volume) applies instantly.
@@ -1250,6 +1252,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
 
     @try {
     _cachedDurationSeconds.store(0.0);
+    _miniPropertiesObserved.store(false);
     _cachedPositionSeconds.store(initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0);
     _cachedPositionStamp = CACurrentMediaTime();
     _cachedCacheAheadSeconds.store(0.0);
@@ -1926,14 +1929,8 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
 }
 
 - (NSTimeInterval)desiredSyncTimerInterval {
-    if (!_mpv || !_webView) {
+    if (!_mpv || !_webView || _isInMiniPlayer) {
         return 0.0;
-    }
-    if (_isInMiniPlayer) {
-        if (_cachedPaused.load() && !_cachedLoading.load()) {
-            return 0.0;
-        }
-        return 1.0;
     }
     return 0.5;
 }
@@ -2254,6 +2251,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
         _pendingMiniPlayerResizeUntil = NSDate.timeIntervalSinceReferenceDate + 1.5;
     }
 
+    [self setMiniPropertyObservationEnabled:nextMiniPlayer];
     [self updatePeriodicTimers];
     if (!nextMiniPlayer) {
         [self syncControls];
@@ -2322,6 +2320,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     if (_mpvEventQueue) {
         dispatch_sync(_mpvEventQueue, ^{});
     }
+    [self setMiniPropertyObservationEnabled:NO];
     [self stopMpvEventDrain];
     [_trustBanner removeFromSuperview]; _trustBanner = nil;
     [_videoView destroyMpvRenderContext];
@@ -2359,9 +2358,6 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self updatePeriodicTimers];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
-    if (_isInMiniPlayer && paused) {
-        [self syncControls];
-    }
 }
 
 - (BOOL)isPaused {
@@ -2383,9 +2379,6 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self storeCachedPosition:(double)positionMs / 1000.0 at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
-    if (_isInMiniPlayer && !_timer) {
-        [self syncControls];
-    }
 }
 
 - (void)seekByMilliseconds:(long long)offsetMs {
@@ -2396,9 +2389,6 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     [self storeCachedPosition:fmax(0.0, [self estimatedPositionSeconds] + ((double)offsetMs / 1000.0)) at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
     [self pushCurrentNowPlayingInfoFromCache];
-    if (_isInMiniPlayer && !_timer) {
-        [self syncControls];
-    }
 }
 
 - (void)setSpeed:(double)speed {
@@ -2422,12 +2412,39 @@ static void nuvioMpvWakeup(void *ctx) {
     [player scheduleMpvEventDrain];
 }
 
+static constexpr uint64_t kObserveAoUserdata = 2;
+static constexpr uint64_t kObserveMiniUserdata = 10;
+
 - (void)startMpvEventDrain {
     mpv_handle *mpv = _mpv;
     if (!mpv) return;
     _mpvDrainStopped.store(false);
-    mpv_observe_property(mpv, 2, "current-ao", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, kObserveAoUserdata, "current-ao", MPV_FORMAT_STRING);
     mpv_set_wakeup_callback(mpv, nuvioMpvWakeup, (__bridge void *)self);
+}
+
+- (void)setMiniPropertyObservationEnabled:(BOOL)enabled {
+    mpv_handle *mpv = _mpv;
+    if (!mpv) {
+        _miniPropertiesObserved.store(false);
+        return;
+    }
+    bool next = enabled == YES;
+    bool previous = _miniPropertiesObserved.exchange(next);
+    if (previous == next) {
+        return;
+    }
+    if (next) {
+        // Observe time-pos as INT64 so libmpv emits only on whole-second changes (0 events while paused).
+        mpv_observe_property(mpv, kObserveMiniUserdata, "time-pos", MPV_FORMAT_INT64);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "duration", MPV_FORMAT_DOUBLE);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "pause", MPV_FORMAT_FLAG);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "eof-reached", MPV_FORMAT_FLAG);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "core-idle", MPV_FORMAT_FLAG);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "speed", MPV_FORMAT_DOUBLE);
+    } else {
+        mpv_unobserve_property(mpv, kObserveMiniUserdata);
+    }
 }
 
 - (void)scheduleMpvEventDrain {
@@ -2443,6 +2460,8 @@ static void nuvioMpvWakeup(void *ctx) {
     if (_mpvDrainStopped.load()) return;
     mpv_handle *mpv = _mpv;
     if (!mpv) return;
+    BOOL notifyMiniState = NO;
+    BOOL refreshNowPlaying = NO;
     for (;;) {
         mpv_event *event = mpv_wait_event(mpv, 0);
         if (!event || event->event_id == MPV_EVENT_NONE) break;
@@ -2476,7 +2495,7 @@ static void nuvioMpvWakeup(void *ctx) {
             }
             case MPV_EVENT_PROPERTY_CHANGE: {
                 mpv_event_property *prop = (mpv_event_property *)event->data;
-                if (event->reply_userdata == 2 && prop && prop->format == MPV_FORMAT_STRING) {
+                if (event->reply_userdata == kObserveAoUserdata && prop && prop->format == MPV_FORMAT_STRING) {
                     const char *ao = prop->data ? *(const char **)prop->data : NULL;
                     BOOL isAvf = ao && strcmp(ao, "avfoundation") == 0;
                     BOOL was = _aoIsAvfoundation.exchange(isAvf);
@@ -2487,11 +2506,72 @@ static void nuvioMpvWakeup(void *ctx) {
                         // old softvol drained out of the renderer's queue).
                         [self applyVolumeSplit:_requestedVolumePercent.load()];
                     }
+                } else if (event->reply_userdata == kObserveMiniUserdata && prop && prop->name) {
+                    if (strcmp(prop->name, "time-pos") == 0 && prop->format == MPV_FORMAT_INT64 && prop->data) {
+                        int64_t wholeSeconds = *(int64_t *)prop->data;
+                        [self storeCachedPosition:fmax((double)wholeSeconds, 0.0) at:CACurrentMediaTime()];
+                        if (_cachedDurationSeconds.load() > 0.0 || wholeSeconds > 0) {
+                            _cachedLoading.store(false);
+                        }
+                        notifyMiniState = YES;
+                    } else if (strcmp(prop->name, "duration") == 0 && prop->format == MPV_FORMAT_DOUBLE && prop->data) {
+                        double dur = *(double *)prop->data;
+                        if (std::isfinite(dur) && dur >= 0.0) {
+                            _cachedDurationSeconds.store(dur);
+                        }
+                        notifyMiniState = YES;
+                        refreshNowPlaying = YES;
+                    } else if (strcmp(prop->name, "pause") == 0 && prop->format == MPV_FORMAT_FLAG && prop->data) {
+                        BOOL paused = (*(int *)prop->data) != 0;
+                        [self storeCachedPosition:[self estimatedPositionSeconds] at:CACurrentMediaTime()];
+                        _cachedPaused.store(paused);
+                        notifyMiniState = YES;
+                        refreshNowPlaying = YES;
+                    } else if (strcmp(prop->name, "eof-reached") == 0 && prop->format == MPV_FORMAT_FLAG && prop->data) {
+                        BOOL ended = (*(int *)prop->data) != 0;
+                        _cachedEnded.store(ended);
+                        if (ended) {
+                            _cachedLoading.store(false);
+                        }
+                        notifyMiniState = YES;
+                        refreshNowPlaying = YES;
+                    } else if (strcmp(prop->name, "core-idle") == 0 && prop->format == MPV_FORMAT_FLAG && prop->data) {
+                        BOOL coreIdle = (*(int *)prop->data) != 0;
+                        BOOL paused = _cachedPaused.load();
+                        BOOL ended = _cachedEnded.load();
+                        _cachedLoading.store(!paused && !ended && coreIdle);
+                        notifyMiniState = YES;
+                    } else if (strcmp(prop->name, "speed") == 0 && prop->format == MPV_FORMAT_DOUBLE && prop->data) {
+                        double spd = *(double *)prop->data;
+                        if (std::isfinite(spd) && spd > 0.0) {
+                            _cachedSpeed.store(spd);
+                        }
+                        notifyMiniState = YES;
+                        refreshNowPlaying = YES;
+                    }
                 }
                 break;
             }
             default:
                 break;
+        }
+    }
+    if (notifyMiniState && _miniPropertiesObserved.load()) {
+        double posMs = floor([self estimatedPositionSeconds] * 1000.0);
+        [self sendPlayerEvent:@"nativeStateTick" value:posMs];
+        if (refreshNowPlaying) {
+            double duration = _cachedDurationSeconds.load();
+            double position = [self estimatedPositionSeconds];
+            BOOL paused = _cachedPaused.load();
+            double speed = _cachedSpeed.load();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!self->_mpv) return;
+                [self updateNowPlayingWithTitle:@""
+                                       duration:duration
+                                       position:position
+                                         paused:paused
+                                          speed:speed];
+            });
         }
     }
 }

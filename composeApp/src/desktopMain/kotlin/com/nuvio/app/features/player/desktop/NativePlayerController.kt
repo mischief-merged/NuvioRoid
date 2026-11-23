@@ -782,6 +782,7 @@ internal class NativePlayerController(
                     ensureFallbackHideTimer().onControlsHidden()
                 }
             }
+            "nativeStateTick" -> _manualRefreshTick.update { it + 1L }
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
                 log.d { "scrubChange positionMs=${value.toLong()} handled=$handled handle=$handle" }

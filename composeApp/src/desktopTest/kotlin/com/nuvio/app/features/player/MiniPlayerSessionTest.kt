@@ -71,6 +71,7 @@ import com.nuvio.app.openPlayerExitTarget
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -134,6 +135,7 @@ class MiniPlayerSessionTest {
         LibraryRepository.remove(browsedSeriesId)
         SeasonDownloadDefaultsStorage.savePayload(testDialogProfileId, "")
         TrackingScrobbleCoordinator.scrobblersOverrideForTest = null
+        sourceHealthTickObserverForTest = null
         PlayerStreamsRepository.clearAll()
         ActivePlayerSessionRegistry.setActive(false)
         scope.cancel()
@@ -1047,10 +1049,10 @@ class MiniPlayerSessionTest {
         }
 
         val scrobblesBeforeResume = scrobbles.size
-        backend.statesByHandle[1L]?.positionMs = 468_000L
+        backend.emitPlaybackPosition(1L, 468_000L)
         backend.statesByHandle[1L]?.eventSink?.onPlayerEvent("keyboardToggle", 0.0)
         compose.waitUntil(5_000L) { backend.statesByHandle[1L]?.paused == false }
-        compose.mainClock.advanceTimeBy(1_050L)
+        compose.mainClock.advanceTimeBy(200L)
         compose.waitForIdle()
         compose.waitUntil(5_000L) {
             scrobbles.drop(scrobblesBeforeResume).any { it.first == TrackingScrobbleAction.START }
@@ -1385,19 +1387,19 @@ class MiniPlayerSessionTest {
         val fullModeDimensionQueries = backend.videoDimensionQueries.get()
         assertTrue(fullModeDimensionQueries >= 2, "full mode reads video dimensions")
 
-        // Switch to mini mode: polls only once per second and reuses cached dimensions without JNI queries.
+        // Switch to mini mode on macOS: zero timer polling, updates arrive only on native mpv property events.
         snapshots.clear()
         inMini = true
         compose.mainClock.advanceTimeBy(50L)
         val miniEntrySnapshots = snapshots.size
         val queriesAtMiniStart = backend.videoDimensionQueries.get()
 
-        compose.mainClock.advanceTimeBy(500L)
-        assertEquals(miniEntrySnapshots, snapshots.size, "no 250 ms poll while minimized")
+        compose.mainClock.advanceTimeBy(5_000L)
+        assertEquals(miniEntrySnapshots, snapshots.size, "zero timer polling while minimized on macOS")
 
-        backend.statesByHandle[1L]?.positionMs = 123_000L
-        compose.mainClock.advanceTimeBy(600L)
-        assertEquals(miniEntrySnapshots + 1, snapshots.size, "1 s poll fires while minimized")
+        backend.emitPlaybackPosition(1L, 123_000L)
+        compose.waitUntil(5_000L) { snapshots.any { it.positionMs == 123_000L } }
+        compose.mainClock.advanceTimeBy(50L)
         assertEquals(123_000L, snapshots.last().positionMs)
         assertEquals(1920, snapshots.last().videoWidth)
         assertEquals(queriesAtMiniStart, backend.videoDimensionQueries.get(), "no dimension queries while minimized")
@@ -1413,11 +1415,17 @@ class MiniPlayerSessionTest {
 
     @Test
     fun minimized_session_host_skips_audio_track_scans_and_stops_polling_while_paused() {
+        val sourceHealthTicks = AtomicInteger(0)
+        sourceHealthTickObserverForTest = { sourceHealthTicks.incrementAndGet() }
+
         val backend = CountingNativePlayerBackend()
         val hooks = backend.toDesktopHooks()
         val sessionController = PlayerSessionController(onExitPictureInPicture = {})
         val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
-        sessionController.open(launch = sampleSeriesLaunch(), launchId = 905L)
+        sessionController.open(
+            launch = sampleSeriesLaunch().copy(sourceAutoSelected = true),
+            launchId = 905L,
+        )
 
         compose.mainClock.autoAdvance = false
         compose.setContent {
@@ -1448,47 +1456,64 @@ class MiniPlayerSessionTest {
             durationMs = 1_800_000L
         }
 
-        // Let initial track selection settle in Full mode.
+        // Let initial track selection and full-screen source-health watch run in Full mode.
         compose.mainClock.advanceTimeBy(3_500L)
         assertTrue(backend.audioTrackQueries.get() >= 2, "Full mode scans audio tracks")
+        assertTrue(sourceHealthTicks.get() >= 2, "Full mode source-health monitor runs while playing")
 
-        // Minimize while playing: 1 s snapshot cadence, zero audio-track scans, zero dimension queries.
+        // Minimize while playing: zero timer polls, zero source-health wakeups, zero audio-track or dimension reads;
+        // updates occur only when native mpv property events push a state tick.
         sessionController.minimize()
         compose.mainClock.advanceTimeBy(100L)
         val audioQueriesAtMiniPlay = backend.audioTrackQueries.get()
         val dimQueriesAtMiniPlay = backend.videoDimensionQueries.get()
         val snapQueriesAtMiniPlay = backend.snapshotQueries.get()
+        val healthTicksAtMiniPlay = sourceHealthTicks.get()
 
-        compose.mainClock.advanceTimeBy(3_000L)
+        compose.mainClock.advanceTimeBy(10_000L)
+        assertEquals(snapQueriesAtMiniPlay, backend.snapshotQueries.get(), "zero snapshot timer polls while playing minimized")
+        assertEquals(healthTicksAtMiniPlay, sourceHealthTicks.get(), "zero source-health wakeups while playing minimized")
         assertEquals(audioQueriesAtMiniPlay, backend.audioTrackQueries.get(), "no audio-track scans while minimized")
         assertEquals(dimQueriesAtMiniPlay, backend.videoDimensionQueries.get(), "no video-dimension reads while minimized")
-        assertTrue(backend.snapshotQueries.get() in (snapQueriesAtMiniPlay + 2)..(snapQueriesAtMiniPlay + 4), "1 s snapshot cadence while playing minimized")
 
-        // Pause from MiniPlayerDock: once settled in paused state, zero polling occurs across 10 seconds.
+        backend.emitPlaybackPosition(1L, 105_000L)
+        compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapQueriesAtMiniPlay }
+        compose.mainClock.advanceTimeBy(50L)
+        assertEquals(105_000L, sessionController.playbackState?.positionMs)
+
+        // Pause from MiniPlayerDock: zero snapshot polls and zero source-health wakeups across 10 seconds.
         compose.onNodeWithContentDescription(text(Res.string.compose_action_pause)).performClick()
         compose.mainClock.advanceTimeBy(100L)
         val snapQueriesWhenPaused = backend.snapshotQueries.get()
         val audioQueriesWhenPaused = backend.audioTrackQueries.get()
         val dimQueriesWhenPaused = backend.videoDimensionQueries.get()
+        val healthTicksWhenPaused = sourceHealthTicks.get()
 
         compose.mainClock.advanceTimeBy(10_000L)
         assertEquals(snapQueriesWhenPaused, backend.snapshotQueries.get(), "zero snapshot polls while paused and minimized")
+        assertEquals(healthTicksWhenPaused, sourceHealthTicks.get(), "zero source-health wakeups while paused and minimized")
         assertEquals(audioQueriesWhenPaused, backend.audioTrackQueries.get(), "zero audio-track scans while paused and minimized")
         assertEquals(dimQueriesWhenPaused, backend.videoDimensionQueries.get(), "zero dimension reads while paused and minimized")
 
         // Seeking forward +10s while paused refreshes the dock position once and goes right back to idle.
         compose.onNodeWithContentDescription(text(Res.string.compose_player_seek_forward_10)).performClick()
         compose.mainClock.advanceTimeBy(100L)
-        assertEquals(110_000L, sessionController.playbackState?.positionMs)
+        assertEquals(115_000L, sessionController.playbackState?.positionMs)
         val snapQueriesAfterPausedSeek = backend.snapshotQueries.get()
         compose.mainClock.advanceTimeBy(5_000L)
         assertEquals(snapQueriesAfterPausedSeek, backend.snapshotQueries.get(), "returns to zero polling after paused seek")
+        assertEquals(healthTicksWhenPaused, sourceHealthTicks.get(), "still zero source-health wakeups while paused")
 
-        // Reopen Full mode and resume playback: restores 250 ms polling, dimension reads, and audio-track refresh.
+        // Reopen Full mode while still paused: source-health remains suspended at 0 wakeups until resumed!
         sessionController.restoreFullScreen()
+        compose.mainClock.advanceTimeBy(3_000L)
+        assertEquals(healthTicksWhenPaused, sourceHealthTicks.get(), "zero source-health wakeups while paused in Full mode")
+
+        // Resume playback in Full mode: restores 250 ms polling, source-health watch, dimension reads, and audio-track checks.
         sessionController.togglePlayback()
-        compose.mainClock.advanceTimeBy(600L)
-        assertTrue(backend.snapshotQueries.get() >= snapQueriesAfterPausedSeek + 2, "250 ms polling restored on reopen")
+        compose.mainClock.advanceTimeBy(1_200L)
+        assertTrue(backend.snapshotQueries.get() >= snapQueriesAfterPausedSeek + 3, "250 ms polling restored on reopen")
+        assertTrue(sourceHealthTicks.get() > healthTicksWhenPaused, "source-health watch resumes when playing in Full mode")
         assertTrue(backend.videoDimensionQueries.get() > dimQueriesWhenPaused, "dimension queries restored on reopen")
         assertTrue(backend.audioTrackQueries.get() > audioQueriesWhenPaused, "audio-track checks restored on reopen")
         compose.mainClock.autoAdvance = true
