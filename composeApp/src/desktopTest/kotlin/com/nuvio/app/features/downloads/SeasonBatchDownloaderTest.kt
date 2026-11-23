@@ -1347,4 +1347,69 @@ class SeasonBatchDownloaderTest {
 
         assertEquals(listOf(1, 2), fake.enqueued.map { it.first })
     }
+
+    @Test
+    fun a_failed_check_waits_for_a_transfer_slot_before_trying_another_source() = runTest {
+        val fake = Fake()
+        var summary: SeasonBatchSummary? = null
+        val d = downloader(fake, max = 1, fetch = { ep -> listOf(
+            stream("1080p", "http://x/${ep.episodeNumber}-first.mp4"),
+            stream("720p", "http://x/${ep.episodeNumber}-next.mp4"),
+        ) }, onFinished = { _, result -> summary = result })
+        d.start(request(episodes.take(2)))
+        advanceUntilIdle()
+        assertEquals(listOf(1), fake.enqueued.map { it.first })
+        val first = fake.state.value.items.single().id
+        fake.state.value = fake.state.value.copy(checkingIds = setOf(first))
+        advanceUntilIdle()
+        assertEquals(listOf(1, 2), fake.enqueued.map { it.first })
+        fake.setStatus(1, DownloadStatus.Failed)
+        advanceUntilIdle()
+        // The second transfer holds the only slot. The failed file cannot start another yet.
+        assertEquals(2, fake.enqueued.size)
+        fake.setStatus(2, DownloadStatus.Completed)
+        advanceUntilIdle()
+        assertEquals(listOf(1, 2, 1), fake.enqueued.map { it.first })
+        assertTrue(fake.enqueued.last().second.endsWith("-next.mp4"))
+        fake.setStatus(1, DownloadStatus.Completed)
+        advanceUntilIdle()
+        assertEquals(2, summary?.count(SeasonBatchEpisodeResult.Completed))
+    }
+
+    @Test
+    fun an_adopted_transfer_releases_its_slot_when_its_file_is_being_checked() = runTest {
+        val old = item(9, DownloadStatus.Downloading)
+        val fake = Fake(listOf(old))
+        val d = downloader(fake, max = 1)
+        d.adoptRunning(listOf(old.id))
+        d.start(request(episodes.take(1)))
+        advanceUntilIdle()
+        assertEquals(0, fake.enqueued.size)
+        fake.state.value = fake.state.value.copy(checkingIds = setOf(old.id))
+        advanceUntilIdle()
+        assertEquals(listOf(1), fake.enqueued.map { it.first })
+        assertEquals(DownloadStatus.Downloading, fake.state.value.items.first { it.id == old.id }.status)
+        fake.setStatus(1, DownloadStatus.Completed)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun a_stopped_batch_hands_over_its_slot_only_until_the_network_transfer_ends() = runTest {
+        val fake = Fake()
+        val d = downloader(fake, max = 1)
+        d.start(request(episodes.take(1)))
+        advanceUntilIdle()
+        val first = fake.state.value.items.single().id
+        d.cancel("tt1", 1)
+        advanceUntilIdle()
+        d.start(request(episodes.drop(1).take(1)))
+        advanceUntilIdle()
+        assertEquals(listOf(1), fake.enqueued.map { it.first })
+        fake.state.value = fake.state.value.copy(checkingIds = setOf(first))
+        advanceUntilIdle()
+        assertEquals(listOf(1, 2), fake.enqueued.map { it.first })
+        fake.setStatus(2, DownloadStatus.Completed)
+        advanceUntilIdle()
+    }
+
 }

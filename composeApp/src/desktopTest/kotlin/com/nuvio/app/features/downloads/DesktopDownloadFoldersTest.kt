@@ -38,6 +38,24 @@ class DesktopDownloadFoldersTest {
     private fun fileOf(item: DownloadItem): Path = world.appFolder.resolve(item.fileName)
 
     @Test
+    fun published_files_waiting_for_checks_are_never_moved_as_partial_files() {
+        val drive = world.driveLocation("Archive")
+        for ((index, status) in listOf(DownloadStatus.Paused, DownloadStatus.Downloading).withIndex()) {
+            val pending = episode("A", index + 1, status).copy(awaitingCheck = true)
+            val original = Files.readAllBytes(fileOf(pending))
+            val hooks = Hooks(listOf(pending))
+            val report = controller(hooks).move(setOf(pending.id), drive.path.toString())
+            assertEquals(0, report.moved)
+            assertEquals(listOf(MoveFailureReason.Busy), report.failures.map { it.reason })
+            assertEquals(pending.locationId, hooks.items.single().locationId)
+            assertEquals(pending.localFileUri, hooks.items.single().localFileUri)
+            assertTrue(hooks.items.single().awaitingCheck)
+            assertContentEquals(original, Files.readAllBytes(fileOf(pending)))
+            assertFalse(Files.exists(drive.path.resolve(pending.fileName)))
+        }
+    }
+
+    @Test
     fun moving_one_show_moves_its_episodes_and_leaves_every_other_download_alone() {
         val showA = (1..3).map { episode("A", it) }
         val showB = (1..2).map { episode("B", it) }

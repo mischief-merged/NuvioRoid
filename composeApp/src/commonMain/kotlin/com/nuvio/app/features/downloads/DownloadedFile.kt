@@ -14,6 +14,8 @@ internal data class DownloadedFileFacts(
     val videoHash: String? = null,
     /** The languages of the audio tracks in track order, where the container could be read. */
     val audioLanguages: List<String>? = null,
+    /** The title stated in a readable container header. */
+    val containerTitle: String? = null,
 )
 
 /** Looks at the file of a download. Null where the platform cannot look, which is never a fault. */

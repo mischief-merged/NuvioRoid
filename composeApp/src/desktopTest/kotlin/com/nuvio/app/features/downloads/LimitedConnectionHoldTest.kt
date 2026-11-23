@@ -396,18 +396,25 @@ class LimitedConnectionDownloadsTest {
         val release = java.util.concurrent.CountDownLatch(1)
         // The check of the finished file runs outside the lock; the hold arrives in the middle of it.
         DownloadsRepository.backend = object : DownloadsBackend by backend {
+            override fun inspectFile(localFileUri: String) =
+                DownloadedFileFacts(exists = true, sizeBytes = 300_000_000L, isVideoContainer = true)
             override fun sampleFrames(localFileUri: String): FrameSamples? {
                 finishing.countDown()
                 release.await(10, java.util.concurrent.TimeUnit.SECONDS)
                 return null
             }
         }
-        val finisher = Thread { backend.success.getValue(id)("file:/tmp/e1.mkv", 10L) }.apply { start() }
-        assertTrue(finishing.await(10, java.util.concurrent.TimeUnit.SECONDS))
-
-        hold.report(hotspot)
-        release.countDown()
-        finisher.join(10_000)
+        val previousRuntime = downloadRuntimeLookup
+        downloadRuntimeLookup = { 45 }
+        val finisher = Thread { backend.success.getValue(id)("file:/tmp/e1.mkv", 300_000_000L) }.apply { start() }
+        try {
+            assertTrue(finishing.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            hold.report(hotspot)
+        } finally {
+            release.countDown()
+            finisher.join(10_000)
+            downloadRuntimeLookup = previousRuntime
+        }
 
         assertTrue(backend.cancelled.isEmpty(), "a finished file was stopped while it was checked")
         assertEquals(DownloadStatus.Completed, item(id).status)

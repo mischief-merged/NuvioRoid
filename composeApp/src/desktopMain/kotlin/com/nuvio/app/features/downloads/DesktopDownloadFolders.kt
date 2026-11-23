@@ -424,6 +424,11 @@ internal class DesktopDownloadFolders(
         val failures = mutableListOf<MoveFailure>()
         var unreachable = 0
         fun planOne(item: DownloadItem) {
+            // Its final file must not be planned as a partial file or assigned a different location.
+            if (item.awaitingCheck && item.localFileUri != null) {
+                failures += MoveFailure(item.fileName, MoveFailureReason.Busy)
+                return
+            }
             if (ownership == null && !forSizeOnly) {
                 failures += MoveFailure(item.fileName, MoveFailureReason.OwnedByAnother, "the downloads of another profile could not be read")
                 return
@@ -645,7 +650,8 @@ internal class DesktopDownloadFolders(
         runCatching { refresh() }
     }
 
-    override fun removeJustPublished(localFileUri: String): Boolean = DownloadsPlatformDownloader.removeJustPublished(localFileUri)
+    override fun removeJustPublished(localFileUri: String, fileKey: String?): Boolean =
+        DownloadsPlatformDownloader.removeJustPublished(localFileUri, fileKey)
 
     override fun pickFile(): String? = filePicker()
 

@@ -107,6 +107,12 @@ data class DownloadItem(
      * this download's. Null before a partial file was created.
      */
     val partialFileKey: String? = null,
+    /** The published file is saved but still awaits its checks. Resuming checks never starts a transfer. */
+    val awaitingCheck: Boolean = false,
+    /** A verified body digest kept across a restart while its published file awaits checks. */
+    val publishedDigestVerified: Boolean = false,
+    /** The identity of the published file, saved before its partial name is removed. */
+    val publishedFileKey: String? = null,
 ) {
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
@@ -162,6 +168,8 @@ data class DownloadsUiState(
     val items: List<DownloadItem> = emptyList(),
     /** Set when the stored list could not be read. The screen must not present the list as simply empty then. */
     val storeProblem: DownloadsStoreProblem? = null,
+    /** Transfers whose bodies are finished but whose files are still being checked. Never persisted. */
+    val checkingIds: Set<String> = emptySet(),
 ) {
     /** What is not downloaded: running, paused, failed, and finished files that are not the video. */
     val activeItems: List<DownloadItem>
