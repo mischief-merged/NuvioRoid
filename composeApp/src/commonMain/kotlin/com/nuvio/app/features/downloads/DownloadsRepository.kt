@@ -496,8 +496,8 @@ object DownloadsRepository {
                 providerName = stream.addonName,
                 providerAddonId = stream.addonId,
                 sourceUrl = sourceUrl,
-                sourceHeaders = sanitizeRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
-                sourceResponseHeaders = sanitizeResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
+                sourceHeaders = sanitizeDownloadRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
+                sourceResponseHeaders = sanitizeDownloadResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
                 subtitleRequests = addonSubtitleRequests(
                     type = contentType,
                     videoId = videoId,

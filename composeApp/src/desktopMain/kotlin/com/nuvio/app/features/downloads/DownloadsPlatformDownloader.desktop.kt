@@ -122,6 +122,20 @@ internal actual object DownloadsPlatformDownloader {
             var destination = File(downloadsDir, request.destinationFileName)
             var tempFile = File(downloadsDir, request.item.activePartialFileName)
             val keptPartials = request.item.supersededPartials.toMutableList()
+            fun retireAcceptedPartials() {
+                if (!request.isCompletionAccepted()) return
+                val retiredKeys = retireKeptPartials(
+                    keptPartials = keptPartials,
+                    fallbackDir = downloadsDir.toPath(),
+                    downloadId = request.item.id,
+                    folders = folders,
+                    trashPartial = trashPartial ?: folders::moveToTrash,
+                )
+                if (retiredKeys.isNotEmpty()) {
+                    keptPartials.removeAll { it.partialFileKey in retiredKeys }
+                    request.onSupersededPartialsRetired(retiredKeys)
+                }
+            }
             // A previous process may have stopped after publishing but before verification saved Completed.
             // Check only the recorded address (or the recorded location and name for older records).
             val recovered = publishedDownloadToVerify(request.item, destination, tempFile)
@@ -138,19 +152,7 @@ internal actual object DownloadsPlatformDownloader {
                     return@launch
                 }
                 onSuccess(uri, request.item.totalBytes ?: recovered.length())
-                if (request.isCompletionAccepted()) {
-                    val retiredKeys = retireKeptPartials(
-                        keptPartials = keptPartials,
-                        fallbackDir = downloadsDir.toPath(),
-                        downloadId = request.item.id,
-                        folders = folders,
-                        trashPartial = trashPartial ?: folders::moveToTrash,
-                    )
-                    if (retiredKeys.isNotEmpty()) {
-                        keptPartials.removeAll { it.partialFileKey in retiredKeys }
-                        request.onSupersededPartialsRetired(retiredKeys)
-                    }
-                }
+                retireAcceptedPartials()
                 return@launch
             }
             var knownIdentity: SourceFileIdentity? = request.item.totalBytes?.takeIf { it > 0L }?.let { total ->
@@ -367,19 +369,7 @@ internal actual object DownloadsPlatformDownloader {
                         rememberedUri = uri
                         rememberedKey = rememberPublishedFile(published.toPath())
                         onSuccess(uri, totalBytes ?: finalSize)
-                        if (request.isCompletionAccepted()) {
-                            val retiredKeys = retireKeptPartials(
-                                keptPartials = keptPartials,
-                                fallbackDir = downloadsDir.toPath(),
-                                downloadId = request.item.id,
-                                folders = folders,
-                                trashPartial = trashPartial ?: folders::moveToTrash,
-                            )
-                            if (retiredKeys.isNotEmpty()) {
-                                keptPartials.removeAll { it.partialFileKey in retiredKeys }
-                                request.onSupersededPartialsRetired(retiredKeys)
-                            }
-                        }
+                        retireAcceptedPartials()
                         return@launch
                     } finally {
                         val uri = rememberedUri
