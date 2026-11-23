@@ -264,7 +264,7 @@ internal fun TripReadyPanel(
         locationIdOf = if (folders.supported) folders::locationIdOf else { item -> item.locationId.orEmpty() },
         addressRequired = folders.supported,
         holdState = holdState,
-        offline = network.isOfflineLike,
+        offline = !network.hasInternet,
         nowEpochMs = now,
         rechecks = rechecks,
         tripDeps = tripDeps,
