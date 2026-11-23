@@ -19,6 +19,39 @@ import org.jetbrains.compose.resources.getString
 
 private const val SkipSegmentResolveTimeoutMs = 4_000L
 
+/**
+ * Marks [launch] as playing, runs [prepare], then calls [open] only when this
+ * launch is still the current one and no replacement prompt is waiting on it.
+ * Subtitle and skip-segment lookup can take several seconds after the in-app
+ * session is gone; a newer playback start, or a choice that is still open,
+ * must win, and the older lookup must not open a second player.
+ */
+internal suspend fun launchPreparedExternalPlayback(
+    sessions: PlayerSessionController,
+    launch: PlayerLaunch,
+    prepare: suspend () -> Unit,
+    open: suspend () -> Boolean,
+): Boolean {
+    val token = sessions.beginExternalPlayback(launch)
+    return completeExternalPlayback(sessions, token, prepare, open)
+}
+
+internal suspend fun completeExternalPlayback(
+    sessions: PlayerSessionController,
+    token: Long,
+    prepare: suspend () -> Unit,
+    open: suspend () -> Boolean,
+): Boolean {
+    try {
+        if (!sessions.isCurrentExternalPlayback(token)) return false
+        prepare()
+        if (!sessions.awaitExternalOpenAllowed(token)) return false
+        return open()
+    } finally {
+        sessions.finishExternalPlayback(token)
+    }
+}
+
 // Skip resolution runs on an app-lifetime scope rather than the caller's (often
 // composition-bound) scope, so navigating to the external player cannot cancel an
 // in-flight network lookup partway through.

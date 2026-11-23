@@ -26,6 +26,7 @@ const toggleLabel = document.getElementById("toggleLabel");
 const nextEpisodeButton = document.getElementById("nextEpisodeButton");
 const nextEpisodeButtonLabel = document.getElementById("nextEpisodeButtonLabel");
 const fullscreenButton = document.getElementById("fullscreenButton");
+const minimizeButton = document.getElementById("minimizeButton");
 const pipButton = document.getElementById("pipButton");
 const fullscreenIcon = document.getElementById("fullscreenIcon");
 const title = document.getElementById("title");
@@ -246,6 +247,8 @@ let state = {
   playLabel: "Play",
   pauseLabel: "Pause",
   closeLabel: "Close player",
+  minimizeLabel: "",
+  isInMiniPlayer: false,
   lockLabel: "Lock player controls",
   unlockLabel: "Unlock player controls",
   submitIntroLabel: "Submit Intro",
@@ -2941,6 +2944,7 @@ const clearChromeAutoHideTimer = () => {
 };
 
 const shouldHideCursorForIdleChrome = () => Boolean(
+  !state.isInMiniPlayer &&
   !playbackErrorText() &&
   !state.controlsVisible &&
   !activeModal &&
@@ -3096,7 +3100,12 @@ const renderChrome = () => {
   const isPlaying = Boolean(state.isPlaying);
   const showError = renderPlaybackError();
   root.classList.toggle("pip-mode", Boolean(state.isInPip));
+  root.classList.toggle("mini-mode", Boolean(state.isInMiniPlayer));
   if (!state.isInPip && isPipLocked) setPipLocked(false);
+  if (state.isInMiniPlayer && activeModal) {
+    closePlayerModal(false, false);
+    return;
+  }
   root.classList.toggle("chrome-hidden", Boolean(showError || !state.controlsVisible));
   root.classList.toggle("modal-open", Boolean(activeModal));
   root.classList.toggle("info-open", activeModal === "streamInfo");
@@ -3123,6 +3132,12 @@ const renderChrome = () => {
   setActionButtonLabel("audio", state.audioLabel || "Audio");
   setActionButtonLabel("sources", state.sourcesLabel || "Sources");
   setActionButtonLabel("episodes", state.episodesLabel || "Episodes");
+  if (minimizeButton) {
+    const minimizeLabel = String(state.minimizeLabel || "").trim();
+    setAttr(minimizeButton, "aria-label", minimizeLabel);
+    setAttr(minimizeButton, "title", minimizeLabel);
+    minimizeButton.hidden = !minimizeLabel || Boolean(state.isInPip) || Boolean(state.isInMiniPlayer);
+  }
   if (pipButton) {
     const pipLabel = String(state.pipLabel || "").trim();
     setAttr(pipButton, "aria-label", pipLabel);
@@ -3177,6 +3192,7 @@ const renderChrome = () => {
   }
   syncFullscreenButtons();
   setAttr(backButton, "aria-label", state.closeLabel || "Close player");
+  setAttr(openingBackButton, "aria-label", state.closeLabel || "Close player");
   setAttr(submitIntroButton, "aria-label", state.submitIntroLabel || "Submit Intro");
   setAttr(videoSettingsButton, "aria-label", state.videoSettingsLabel || "Video settings");
   if (shortcutsButton) {
@@ -4444,7 +4460,7 @@ root.addEventListener("contextmenu", event => {
 });
 
 root.addEventListener("pointerdown", event => {
-  if (!canSpeedBoostStart() || state.isInPip || playbackErrorText() || isControlsSurfaceEvent(event)) return;
+  if (!canSpeedBoostStart() || state.isInPip || state.isInMiniPlayer || playbackErrorText() || isControlsSurfaceEvent(event)) return;
   if (event.button !== 0) return;
 
   rootPointerStartX = event.clientX;
@@ -4540,6 +4556,13 @@ window.addEventListener("blur", () => {
 
 root.addEventListener("click", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (suppressNextRootClick) {
     clearSuppressNextRootClick();
@@ -4598,6 +4621,13 @@ if (pipLockBadge) {
 
 root.addEventListener("dblclick", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (playbackErrorText() || isControlsSurfaceEvent(event)) return;
   event.preventDefault();
@@ -4610,7 +4640,7 @@ root.addEventListener("dblclick", event => {
 });
 
 root.addEventListener("wheel", event => {
-  if (playbackErrorText() || activeModal) return;
+  if (state.isInMiniPlayer || playbackErrorText() || activeModal) return;
   const isProgressTarget = Boolean(event.target.closest("#seek, .time-row, .time-pill, .scrub"));
   const delta = event.deltaY !== 0 ? Math.sign(event.deltaY) * -1 : Math.sign(event.deltaX);
   if (delta === 0) return;
@@ -4624,6 +4654,7 @@ root.addEventListener("wheel", event => {
 }, { passive: false });
 
 document.addEventListener("keyup", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Alt" || event.key === "Control" || event.key === "Meta" || event.metaKey || event.ctrlKey || event.altKey) {
     clearSpaceHoldTimerAndStopSpeedBoost();
     return;
@@ -4645,6 +4676,7 @@ const isSkipPromptShown = () =>
   Boolean(state.skipPromptVisible && !state.skipPromptDismissed && !skipPromptAutoHidden);
 
 document.addEventListener("keydown", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Escape" && isPartyConfirmOpen()) {
     event.preventDefault();
     closePartyConfirm();

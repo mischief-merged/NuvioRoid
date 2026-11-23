@@ -90,7 +90,24 @@ int main(int argc, char **argv) {
         }
         afterWakeup = [mode isEqual:@"after-wakeup"];
         @try {
-            [[FailingPlayer alloc] initWithHostView:host sourceUrl:@"https://example.invalid/stream" headerLines:@[] playWhenReady:NO initialPositionMs:0 controlsUrl:@"about:blank" decoderPriority:0 javaVm:nullptr eventSink:nullptr eventMethod:nullptr caFile:@"" network:@"" allowUnverified:NO trustWarning:@""];
+            [[FailingPlayer alloc] initWithHostView:host
+                sourceUrl:@"https://example.invalid/stream"
+                headerLines:@[]
+                playWhenReady:NO
+                initialPositionMs:0
+                controlsUrl:@"about:blank"
+                decoderPriority:0
+                inMiniPlayer:NO
+                allowsRemoteCommands:NO
+                headlessForTest:NO
+                uiQueue:nil
+                javaVm:nullptr
+                eventSink:nullptr
+                eventMethod:nullptr
+                caFile:@""
+                network:@""
+                allowUnverified:NO
+                trustWarning:@""];
             return 22;
         } @catch (NSException *exception) {
             if (![exception.name isEqual:@"StartupProbe"]) return 23;

@@ -24,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -80,13 +81,17 @@ import org.jetbrains.compose.resources.stringResource
  * the season is being added they show how far it is. The menu's first entry is then
  * "Stop (n/total)", and "Auto-download" stays within reach.
  */
+internal val LocalSeasonDownloadStarter = staticCompositionLocalOf<(SeasonBatchRequest) -> SeasonBatchStart> {
+    SeasonBatchDownloads::start
+}
+
 @Composable
 internal fun SeasonDownloadButton(
     meta: MetaDetails,
     seasonNumber: Int,
     modifier: Modifier = Modifier,
     profileId: Int = ProfileRepository.activeProfileId,
-    startBatch: (SeasonBatchRequest) -> SeasonBatchStart = SeasonBatchDownloads::start,
+    startBatch: (SeasonBatchRequest) -> SeasonBatchStart = LocalSeasonDownloadStarter.current,
     running: StateFlow<Map<String, SeasonBatchProgress>> = SeasonBatchDownloads.running,
     cancelBatch: (parentMetaId: String, seasonNumber: Int) -> Unit = SeasonBatchDownloads::cancel,
     autoDownloads: AutoDownloadController = AutoDownloads,

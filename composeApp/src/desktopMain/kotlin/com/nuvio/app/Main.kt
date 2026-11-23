@@ -43,6 +43,7 @@ import com.nuvio.app.features.downloads.SourceReplacements
 import com.nuvio.app.features.downloads.MacDownloadPowerNative
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.plugins.configureDesktopQuickJsLibrary
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.player.PlatformPlayerSurface
 import com.nuvio.app.features.player.desktop.DesktopAppFullscreenController
 import com.nuvio.app.features.player.desktop.DesktopHostOs
@@ -50,6 +51,7 @@ import com.nuvio.app.features.player.desktop.DesktopWindowGeometry
 import com.nuvio.app.features.player.desktop.DesktopWindowModeStorage
 import com.nuvio.app.features.player.desktop.WindowGeometryWrites
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.player.desktop.applyNativeDesktopWindowChrome
 import com.nuvio.app.features.player.desktop.configureMacosWindowBeforePeer
 import com.nuvio.app.features.player.desktop.installDesktopAppFullscreenShortcuts
@@ -65,6 +67,7 @@ import com.nuvio.app.features.settings.BackgroundDownloadPreferences
 import com.nuvio.app.features.settings.applyDesktopRendererPreference
 import com.nuvio.app.features.settings.transparentPreviewResource
 import java.awt.Desktop
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -218,18 +221,16 @@ fun main(args: Array<String>) {
             onDispose { sleepGuard?.close() }
         }
         var quitting by remember { mutableStateOf(false) }
+        val quitStarted = remember { AtomicBoolean(false) }
         val closeApplication: () -> Unit = {
-            if (!quitting) {
+            if (quitStarted.compareAndSet(false, true)) {
                 quitting = true
                 scope.launch {
                     DownloadsRepository.awaitFinishingDownloads()
                     withContext(Dispatchers.IO) { flushDownloadProgressOnExit() }
                     geometryWrites.flushNow()
                     sleepGuard?.close()
-                    P2pStreamingEngine.shutdown()
-                    DiscordPresenceManager.shutdown()
-                    SentryInitializer.close()
-                    exitApplication()
+                    performDesktopQuit(exitApplication = ::exitApplication)
                 }
             }
         }
@@ -438,6 +439,7 @@ fun main(args: Array<String>) {
                 NuvioTheme {
                     PlatformPlayerSurface(
                         sourceUrl = smokePlayerUrl,
+                        useNativeController = true,
                         modifier = Modifier.fillMaxSize(),
                         onControllerReady = {},
                         onSnapshot = {},
@@ -445,6 +447,41 @@ fun main(args: Array<String>) {
                     )
                 }
             }
+        }
+    }
+    NativePlayerLifecycleCoordinator.Default.shutdownAllAndAwait()
+}
+
+internal fun performDesktopQuit(
+    coordinator: NativePlayerLifecycleCoordinator = NativePlayerLifecycleCoordinator.Default,
+    shutdownServices: () -> Unit = {
+        P2pStreamingEngine.shutdown()
+        DiscordPresenceManager.shutdown()
+        SentryInitializer.close()
+    },
+    timeoutMs: Long = 5_000L,
+    exitApplication: () -> Unit,
+) {
+    val completed = AtomicBoolean(false)
+    ActivePlayerSessionRegistry.closeActiveSessionBeforeQuit {
+        Thread(
+            {
+                coordinator.shutdownAllAndAwait(timeoutMs)
+                if (!completed.compareAndSet(false, true)) return@Thread
+                val finish = {
+                    shutdownServices()
+                    exitApplication()
+                }
+                if (SwingUtilities.isEventDispatchThread()) {
+                    finish()
+                } else {
+                    SwingUtilities.invokeLater(finish)
+                }
+            },
+            "nuvio-desktop-quit",
+        ).apply {
+            isDaemon = false
+            start()
         }
     }
 }

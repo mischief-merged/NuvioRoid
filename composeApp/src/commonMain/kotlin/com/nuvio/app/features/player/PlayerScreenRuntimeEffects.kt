@@ -14,6 +14,7 @@ import com.nuvio.app.features.shuffle.shuffleEpisodeProgress
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -102,8 +103,13 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         // Details that arrive from the network replace it.
         if (playerMetaVideos.isEmpty()) {
             val localUri = activeSourceUrl.takeIf { it.startsWith("file:") }
-            // Read off the main thread, with a time limit; applied here.
-            playerMetaVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+            if (localUri != null) {
+                // Read off the main thread, with a time limit; applied here.
+                val savedVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+                if (playerMetaVideos.isEmpty()) {
+                    playerMetaVideos = savedVideos
+                }
+            }
         }
         if (playerMeta?.videos.isNullOrEmpty()) {
             MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.let { meta ->
@@ -482,7 +488,23 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         }
     }
 
+    val isInPipForSearch = rememberIsInPictureInPicture()
+    val playbackInFocus = playerOwnsControllerInput(
+        isMinimized = args.isMinimized,
+        isInPictureInPicture = isInPipForSearch,
+    )
+    SideEffect {
+        pictureInPictureActive = isInPipForSearch
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
+    }
+    LaunchedEffect(args.isMinimized) {
+        if (!args.isMinimized) {
+            refreshAudioTracksIfChanged()
+        }
+    }
+
     DisposableEffect(Unit) {
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
             emitAddonPlayerProgressEvent()

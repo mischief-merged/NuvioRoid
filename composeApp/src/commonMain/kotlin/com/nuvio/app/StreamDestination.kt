@@ -73,6 +73,7 @@ internal fun StreamDestination(
     route: StreamRoute,
     navController: NuvioNavigator,
     p2pEnabled: Boolean,
+    onOpenPlayer: (PlayerLaunch) -> Unit,
     openExternalPlayback: suspend (PlayerLaunch) -> Boolean,
     openExternalStreamUrl: (String) -> Boolean,
     onLandscapeLoadingChanged: (Boolean) -> Unit,
@@ -247,13 +248,8 @@ internal fun StreamDestination(
         )
 
         autoPlayNavigationStarted = replaceStreamRoute
-        val launchId = PlayerLaunchStore.put(playerLaunch)
         StreamsRepository.cancelLoading()
-        navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
-            if (replaceStreamRoute) {
-                popUpTo<StreamRoute> { inclusive = true }
-            }
-        }
+        onOpenPlayer(playerLaunch)
     }
 
     fun requestOrOpenP2pStream(
@@ -398,10 +394,7 @@ internal fun StreamDestination(
             StreamsRepository.clear()
             reuseNavigated = true
             autoPlayNavigationStarted = true
-            val launchId = PlayerLaunchStore.put(playerLaunch)
-            navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
-                popUpTo<StreamRoute> { inclusive = true }
-            }
+            onOpenPlayer(playerLaunch)
         }
     }
 
@@ -569,10 +562,7 @@ internal fun StreamDestination(
         StreamsRepository.consumeAutoPlay()
         StreamsRepository.cancelLoading()
         autoPlayNavigationStarted = true
-        val launchId = PlayerLaunchStore.put(playerLaunch)
-        navController.navigate(PlayerRoute(launchId = launchId, title = playerLaunch.title)) {
-            popUpTo<StreamRoute> { inclusive = true }
-        }
+        onOpenPlayer(playerLaunch)
     }
 
     if (!hasResolvedVideoId) {
@@ -771,11 +761,8 @@ internal fun StreamDestination(
             return
         }
 
-        val launchId = PlayerLaunchStore.put(playerLaunch)
         StreamsRepository.cancelLoading()
-        navController.navigate(
-            PlayerRoute(launchId = launchId, title = playerLaunch.title)
-        )
+        onOpenPlayer(playerLaunch)
     }
 
     LaunchedEffect(reuseNavigated) {

@@ -72,6 +72,10 @@ actual fun togglePlayerPictureInPicture() {
     DesktopPlayerPictureInPicture.toggle()
 }
 
+actual fun exitPlayerPictureInPicture() {
+    DesktopPlayerPictureInPicture.clear()
+}
+
 @Composable
 internal actual fun rememberPlatformPlayerGestureController(): PlayerGestureController? = null
 

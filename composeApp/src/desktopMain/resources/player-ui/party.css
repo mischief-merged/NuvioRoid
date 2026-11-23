@@ -64,6 +64,7 @@
 }
 
 .player.pip-mode .party-pill,
+.player.mini-mode .party-pill,
 .player.error-active .party-pill,
 .player.modal-open .party-pill {
   opacity: 0;

@@ -1,15 +1,9 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
-import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,6 +17,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,12 +31,37 @@ import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerPictureInPicture
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
 import com.nuvio.app.features.autosync.AutoSyncMpvCoordinator
 import com.nuvio.app.features.autosync.DesktopAutoSyncMpvPlatform
 import com.nuvio.app.features.autosync.withAutoSyncMessage
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+
+internal data class DesktopNativePlayerHooks(
+    val createController: (NativePlayerHost, Boolean) -> NativePlayerController = { host, enableRemoteCommands ->
+        NativePlayerController(
+            host = host,
+            lifecycleCoordinator = NativePlayerLifecycleCoordinator.Default,
+            remoteCommandsEnabledByDefault = enableRemoteCommands,
+        )
+    },
+    val forceHostReady: Boolean = false,
+    val renderSwingPanel: Boolean = true,
+    val attachDelayMs: Long = 16L,
+)
+
+internal const val FULL_PLAYER_SNAPSHOT_POLL_MS = 250L
+internal const val MINI_PLAYER_SNAPSHOT_POLL_MS = 2_000L
+
+internal fun desktopSnapshotPollIntervalMs(isInMiniPlayer: Boolean): Long =
+    if (isInMiniPlayer) MINI_PLAYER_SNAPSHOT_POLL_MS else FULL_PLAYER_SNAPSHOT_POLL_MS
+
+internal val LocalDesktopNativePlayerHooks = staticCompositionLocalOf { DesktopNativePlayerHooks() }
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -82,6 +102,7 @@ actual fun PlatformPlayerSurface(
             modifier = modifier,
             playWhenReady = playWhenReady,
             resizeMode = resizeMode,
+            useNativeController = useNativeController,
             initialPositionMs = initialPositionMs ?: 0L,
             initialPositionRequestKey = initialPositionRequestKey,
             playerControlsState = playerControlsState,
@@ -115,6 +136,7 @@ private fun NativePlayerSurface(
     modifier: Modifier,
     playWhenReady: Boolean,
     resizeMode: PlayerResizeMode,
+    useNativeController: Boolean,
     initialPositionMs: Long,
     initialPositionRequestKey: String?,
     playerControlsState: PlayerControlsState,
@@ -128,10 +150,11 @@ private fun NativePlayerSurface(
     onError: (String?) -> Unit,
 ) {
     val platformDensity = LocalNuvioPlatformDensity.current
+    val nativeHooks = LocalDesktopNativePlayerHooks.current
     val host = remember { NativePlayerHost() }
-    val controller = remember(host) { NativePlayerController(host) }
-    val hostFirstPaintComplete = remember { mutableStateOf(false) }
-    val hostFirstFullSizePaintComplete = remember { mutableStateOf(false) }
+    val controller = remember(host, nativeHooks) { nativeHooks.createController(host, useNativeController) }
+    val hostFirstPaintComplete = remember { mutableStateOf(nativeHooks.forceHostReady) }
+    val hostFirstFullSizePaintComplete = remember { mutableStateOf(nativeHooks.forceHostReady) }
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestExternalSubtitles = rememberUpdatedState(externalSubtitles)
     val latestPlayerControlsState = rememberUpdatedState(playerControlsState)
@@ -178,14 +201,22 @@ private fun NativePlayerSurface(
     val nvidiaRtxHdrEnabled = playerSettings.nvidiaRtxHdrEnabled
 
     SideEffect {
+        controller.setRemoteCommandsEnabled(useNativeController)
+        controller.setMiniPlayerMode(controlsState.isInMiniPlayer)
         onControllerReady(readyController)
     }
 
-    DisposableEffect(host) {
-        DesktopPlayerPictureInPicture.setHost(host)
-        DesktopPlayerPictureInPicture.setController(controller)
+    DisposableEffect(host, useNativeController, nativeHooks.forceHostReady) {
+        if (nativeHooks.forceHostReady) {
+            hostFirstPaintComplete.value = true
+            hostFirstFullSizePaintComplete.value = true
+        }
+        if (useNativeController) {
+            DesktopPlayerPictureInPicture.setHost(host)
+            DesktopPlayerPictureInPicture.setController(controller)
+        }
         host.onDisplayableChanged = { displayable ->
-            if (!displayable) {
+            if (!displayable && !nativeHooks.forceHostReady) {
                 hostFirstPaintComplete.value = false
                 hostFirstFullSizePaintComplete.value = false
             }
@@ -197,7 +228,9 @@ private fun NativePlayerSurface(
             hostFirstFullSizePaintComplete.value = true
         }
         onDispose {
-            DesktopPlayerPictureInPicture.release()
+            if (useNativeController) {
+                DesktopPlayerPictureInPicture.release(host)
+            }
             host.onDisplayableChanged = null
             host.onFirstPaint = null
             host.onFirstFullSizePaint = null
@@ -217,14 +250,21 @@ private fun NativePlayerSurface(
         onDispose { controller.dispose() }
     }
 
-    // The controls overlay owns the player shortcuts. After alt-tab, desktop
-    // window focus can return to the AWT/Compose host instead of the embedded
-    // WebView, so explicitly hand keyboard focus back to the native controls
-    // whenever the player window becomes active again.
-    DisposableEffect(controller, hostFirstFullSizePaintComplete.value) {
-        val uninstall = if (hostFirstFullSizePaintComplete.value) {
+    val pipChanges by DesktopPlayerPictureInPicture.changes.collectAsState()
+    val isInPip = useNativeController && pipChanges >= 0 && DesktopPlayerPictureInPicture.isEnabled
+
+    // The controls overlay owns the player shortcuts while in full-screen mode.
+    // When minimized or in PiP, focus stays with the main Compose window so
+    // search inputs and navigation shortcuts work normally.
+    val focusForwardingEnabled = hostFirstFullSizePaintComplete.value &&
+        !controlsState.isInMiniPlayer &&
+        !isInPip
+    DisposableEffect(controller, focusForwardingEnabled) {
+        val uninstall = if (focusForwardingEnabled) {
+            controller.requestKeyboardFocus()
             controller.installWindowFocusForwarding()
         } else {
+            controller.releaseKeyboardFocusToWindow()
             null
         }
         onDispose { uninstall?.invoke() }
@@ -245,7 +285,9 @@ private fun NativePlayerSurface(
         if (!sourceAvailable || !hostFirstFullSizePaintComplete.value) {
             return@LaunchedEffect
         }
-        delay(16L)
+        if (nativeHooks.attachDelayMs > 0L) {
+            delay(nativeHooks.attachDelayMs)
+        }
         controller.attach(
             sourceUrl = sourceUrl,
             sourceHeaders = playbackHeaders,
@@ -275,18 +317,22 @@ private fun NativePlayerSurface(
         controller.setResizeMode(resizeMode)
     }
 
-    LaunchedEffect(controller, controlsState) {
+    LaunchedEffect(controller, controlsState, useNativeController) {
         controller.updateControls(controlsState)
-        DesktopPlayerPictureInPicture.setWindowTitle(controlsState.pipWindowTitle)
+        if (useNativeController) {
+            DesktopPlayerPictureInPicture.setWindowTitle(controlsState.pipWindowTitle)
+        }
     }
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, useNativeController) {
+        if (!useNativeController) return@LaunchedEffect
         DesktopPlayerPictureInPicture.changes.drop(1).collect {
             controller.updateControls(latestControlsState.value)
         }
     }
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, useNativeController) {
+        if (!useNativeController) return@LaunchedEffect
         AppPresenceState.current.collect { snapshot ->
             val player = snapshot as? PresenceSnapshot.Player
             controller.updatePresenceNowPlayingFallback(player?.title, player?.episodeLabel, player?.posterUrl)
@@ -299,67 +345,72 @@ private fun NativePlayerSurface(
         }
     }
 
-    LaunchedEffect(controller) {
+    val isInMiniPlayer = controlsState.isInMiniPlayer
+    LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
+        val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
+        val includeVideoSize = !isInMiniPlayer
         while (true) {
-            if (!controller.isReleasing) onSnapshot(controller.snapshot())
-            delay(250L)
+            val tickBeforeSnapshot = controller.manualRefreshTick.value
+            val snapshot = if (!controller.isReleasing) {
+                controller.snapshot(includeVideoSize = includeVideoSize).also(onSnapshot)
+            } else {
+                null
+            }
+            if (
+                isInMiniPlayer &&
+                !playWhenReady &&
+                snapshot != null &&
+                !snapshot.isLoading &&
+                !snapshot.isPlaying
+            ) {
+                controller.manualRefreshTick.first { it != tickBeforeSnapshot }
+                continue
+            }
+            if (isInMiniPlayer) {
+                // Seek, pause, and speed signals wake a snapshot. With no signal the
+                // wait still lasts the mini poll interval, so the cadence stays put.
+                coroutineScope {
+                    val interval = launch { delay(pollIntervalMs) }
+                    val signal = launch {
+                        controller.manualRefreshTick.first { it != tickBeforeSnapshot }
+                        interval.cancel()
+                    }
+                    interval.join()
+                    signal.cancel()
+                }
+                continue
+            }
+            delay(pollIntervalMs)
         }
     }
-
-    val pipChanges by DesktopPlayerPictureInPicture.changes.collectAsState()
-    val isInPip = pipChanges >= 0 && DesktopPlayerPictureInPicture.isEnabled
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .background(if (isInPip) Color.Transparent else Color.Black),
         contentAlignment = Alignment.Center,
     ) {
         // SwingPanel keeps the stable AWT host. PiP moves only the native player
         // surface to the independent window, so Compose never loses its host peer.
         CompositionLocalProvider(LocalDensity provides platformDensity) {
-            SwingPanel(
-                factory = { host },
-                modifier = if (isInPip) {
-                    Modifier
-                        .align(Alignment.BottomEnd)
-                        .requiredSize(1.dp)
-                } else if (hostFirstPaintComplete.value) {
-                    Modifier.fillMaxSize()
-                } else {
-                    Modifier
-                        .align(Alignment.BottomEnd)
-                        .requiredSize(1.dp)
-                },
-                background = Color.Black,
-            )
-        }
-
-        // Placeholder overlay shown when video has moved to PiP window
-        if (isInPip) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(24.dp),
-                ) {
-                    Text(
-                        text = playerControlsState.pipPlaceholderTitle,
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color.White,
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = { DesktopPlayerPictureInPicture.clear() },
-                    ) {
-                        Text(playerControlsState.pipRestoreLabel)
-                    }
-                }
+            if (nativeHooks.renderSwingPanel) {
+                SwingPanel(
+                    factory = { host },
+                    modifier = if (isInPip) {
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .requiredSize(1.dp)
+                    } else if (hostFirstPaintComplete.value) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .requiredSize(1.dp)
+                    },
+                    background = Color.Black,
+                )
+            } else {
+                Box(modifier = Modifier.fillMaxSize())
             }
         }
     }

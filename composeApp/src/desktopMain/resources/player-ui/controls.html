@@ -36,6 +36,9 @@
       <path d="M6 6L18 18" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"/>
       <path d="M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"/>
     </symbol>
+    <symbol id="icon-minimize" viewBox="0 0 24 24">
+      <path d="M6 9L12 15L18 9" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
     <symbol id="icon-pip" viewBox="0 0 24 24">
       <path d="M19 11h-8v6h8v-6zm4-8H1c-.55 0-1 .45-1 1v16c0 .55.45 1 1 1h22c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zm-2 16H3V6h18v13z" fill="currentColor"/>
     </symbol>
@@ -148,7 +151,7 @@
         <button class="opening-button" id="openingFullscreenButton" data-command="toggleFullscreen" aria-label="Enter fullscreen">
           <svg><use id="openingFullscreenIcon" href="#icon-fullscreen"></use></svg>
         </button>
-        <button class="opening-button" id="openingBackButton" data-command="back" aria-label="Close player">
+        <button class="opening-button" id="openingBackButton" data-command="close" aria-label="Close player">
           <svg><use href="#icon-close"></use></svg>
         </button>
       </nav>
@@ -177,9 +180,10 @@
           <button class="header-button" id="videoSettingsButton" data-command="videoSettings" aria-label="Video settings"><svg><use href="#icon-build"></use></svg></button>
           <button class="header-button" id="shortcutsButton" type="button" aria-label="Keyboard shortcuts"><svg><use href="#icon-help"></use></svg></button>
           <button class="header-button pip-lock-button" id="pipLockButton" type="button" aria-pressed="false" aria-label="Lock player controls"><svg><use href="#icon-lock"></use></svg></button>
+          <button class="header-button" id="minimizeButton" data-command="minimize" aria-label="Minimize player" hidden><svg><use href="#icon-minimize"></use></svg></button>
           <button class="header-button" id="pipButton" data-command="pictureInPicture" aria-label="Picture in picture"><svg><use href="#icon-pip"></use></svg></button>
           <button class="header-button" id="fullscreenButton" data-command="toggleFullscreen" aria-label="Enter fullscreen"><svg><use id="fullscreenIcon" href="#icon-fullscreen"></use></svg></button>
-          <button class="header-button" id="backButton" data-command="back" aria-label="Close player"><svg><use href="#icon-close"></use></svg></button>
+          <button class="header-button" id="backButton" data-command="close" aria-label="Close player"><svg><use href="#icon-close"></use></svg></button>
         </nav>
       </header>
 

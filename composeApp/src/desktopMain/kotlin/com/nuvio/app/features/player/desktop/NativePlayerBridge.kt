@@ -58,7 +58,8 @@ internal object NativePlayerBridge {
     external fun createMac(
         hostViewPtr: Long, sourceUrl: String, headerLines: Array<String>, playWhenReady: Boolean,
         initialPositionMs: Long, controlsPageUrl: String, decoderPriority: Int,
-        nvidiaRtxSuperResolutionEnabled: Boolean, eventSink: NativePlayerEventSink,
+        nvidiaRtxSuperResolutionEnabled: Boolean, inMiniPlayer: Boolean, remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
         caFile: String, network: String, allowUnverified: Boolean, warning: String,
     ): Long
 
@@ -74,6 +75,32 @@ internal object NativePlayerBridge {
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
+
+    /** macOS only: applies [inMiniPlayer] and [remoteCommandsEnabled] inside init before initial focus or activation. */
+    external fun createMacos(
+        hostViewPtr: Long,
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        controlsPageUrl: String,
+        decoderPriority: Int,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+
+    external fun createHeadlessMacosForTest(
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        inMiniPlayer: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+    external fun activeSyncTimerIntervalSecondsForTest(handle: Long): Double
+    external fun attemptedInitialFocusForTest(handle: Long): Boolean
+    external fun lastNowPlayingRateForTest(handle: Long): Double
 
     /**
      * macOS only. Takes 32 by 32 grey pictures of the local video [path] at [fractions] of its duration
@@ -96,6 +123,12 @@ internal object NativePlayerBridge {
 
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
     external fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
+
+    /** macOS only: enables or releases remote media-key and Now Playing ownership for this player. */
+    external fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean)
+
+    /** macOS only: marks docked mini-player mode so native layout and background timers adapt cleanly. */
+    external fun setMiniPlayerMode(handle: Long, inMiniPlayer: Boolean)
     external fun requestFocus(handle: Long)
     external fun beginWindowDrag(handle: Long)
     external fun setWindowResizable(windowHwnd: Long, enabled: Boolean)

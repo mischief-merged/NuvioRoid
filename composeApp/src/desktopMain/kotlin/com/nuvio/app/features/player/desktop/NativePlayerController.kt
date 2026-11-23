@@ -2,6 +2,7 @@ package com.nuvio.app.features.player.desktop
 
 import nuvio.composeapp.generated.resources.*
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.IntSize
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
 import com.nuvio.app.features.player.PlayerControlEpisodeItem
@@ -35,6 +36,10 @@ import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.inferForcedSubtitleTrack
 import com.nuvio.app.features.player.toStorageHexString
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -45,6 +50,29 @@ import java.util.concurrent.CountDownLatch
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 import kotlin.math.roundToInt
+
+/**
+ * Player-basics tests inject seek and controls lambdas. Production passes none,
+ * so the real backend is used unchanged.
+ */
+private fun NativePlayerBackend.withTestCommandOverrides(
+    seekByOverride: ((Long, Long) -> Unit)?,
+    updateControlsOverride: ((Long, String) -> Unit)?,
+): NativePlayerBackend {
+    if (seekByOverride == null && updateControlsOverride == null) return this
+    val delegate = this
+    return object : NativePlayerBackend by delegate {
+        override fun seekBy(handle: Long, offsetMs: Long) {
+            val seek = seekByOverride
+            if (seek != null) seek(handle, offsetMs) else delegate.seekBy(handle, offsetMs)
+        }
+
+        override fun updateControls(handle: Long, controlsJson: String) {
+            val update = updateControlsOverride
+            if (update != null) update(handle, controlsJson) else delegate.updateControls(handle, controlsJson)
+        }
+    }
+}
 
 internal typealias NativePlayerCreate = (
     Long,
@@ -61,31 +89,18 @@ internal typealias NativePlayerCreate = (
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
-    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, rtxHdr, sink ->
-        NativePlayerBridge.ensureLoaded()
-        if (DesktopHostOs.current == DesktopHostOs.MACOS) {
-            val network = NativePlayerBridge.playbackNetworkIdentity()
-            val pem = NativePlayerBridge.systemTrustPem()
-            val bundle = java.nio.file.Files.createTempFile(com.nuvio.app.core.storage.DesktopStorage.cacheDir, "playback-trust-", ".pem")
-            java.nio.file.Files.writeString(bundle, pem)
-            try {
-                NativePlayerBridge.createMac(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink,
-                    bundle.toString(), network, PlaybackNetworkTrust.choices.allows(network),
-                    kotlinx.coroutines.runBlocking { org.jetbrains.compose.resources.getString(Res.string.playback_tls_active) })
-            } finally {
-                // mpv reads this bundle during subsequent connections, so the native player owns its lifetime.
-                bundle.toFile().deleteOnExit()
-            }
-        } else {
-            NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, rtxHdr, sink)
-        }
-    },
-    private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
-    private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
-    private val nativeSeekBy: (Long, Long) -> Unit = NativePlayerBridge::seekBy,
-    private val nativeUpdateControls: (Long, String) -> Unit = NativePlayerBridge::updateControls,
+    backend: NativePlayerBackend = RealNativePlayerBackend,
+    nativeCreate: NativePlayerCreate? = null,
+    nativeDispose: ((Long) -> Unit)? = null,
+    nativeSeekTo: ((Long, Long) -> Unit)? = null,
+    nativeSeekBy: ((Long, Long) -> Unit)? = null,
+    nativeUpdateControls: ((Long, String) -> Unit)? = null,
     private val isHostDisplayable: () -> Boolean = { host.isDisplayable },
     private val resolveHostView: () -> Long = { AwtNativeViewResolver.resolveNativeViewPointer(host) },
+    private val isComponentDisplayable: (Component) -> Boolean = { component -> component.isDisplayable },
+    private val resolveComponentView: (Component) -> Long = { component ->
+        AwtNativeViewResolver.resolveNativeViewPointer(component)
+    },
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
     private val onCreateWaitCompleted: () -> Unit = {},
@@ -104,7 +119,17 @@ internal class NativePlayerController(
             javax.swing.JOptionPane.DEFAULT_OPTION, javax.swing.JOptionPane.WARNING_MESSAGE, null,
             arrayOf(labels[2], labels[3]), labels[2]) == 1
     },
+    private val lifecycleCoordinator: NativePlayerLifecycleCoordinator? = null,
+    remoteCommandsEnabledByDefault: Boolean = true,
 ) : PlayerEngineController {
+    private val usesInjectedCreateStub = nativeCreate != null && backend === RealNativePlayerBackend
+    private val backend: NativePlayerBackend =
+        (if (usesInjectedCreateStub) NoOpNativePlayerBackend else backend)
+            .withTestCommandOverrides(nativeSeekBy, nativeUpdateControls)
+    private val nativeCreateOverride: NativePlayerCreate? = nativeCreate
+    private val nativeDispose: (Long) -> Unit = nativeDispose ?: this.backend::dispose
+    private val nativeSeekTo: (Long, Long) -> Unit = nativeSeekTo ?: this.backend::seekTo
+    private val controlsPageUrlProvider: () -> String = this.backend::controlsPageUrl
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
         val log = Logger.withTag("NativePlayerControls")
@@ -134,6 +159,10 @@ internal class NativePlayerController(
     @Volatile
     private var handle: Long = 0L
 
+    /** Reparented surface target (for example the floating PiP holder), preserved across handle replacements. */
+    @Volatile
+    private var surfaceHostOverride: Component? = null
+
     /** Native teardown of the previous player, if one is still running. */
     @Volatile
     private var disposeInFlight: Thread? = null
@@ -148,12 +177,19 @@ internal class NativePlayerController(
     private var createWaitInFlight: Thread? = null
     private val releaseCallbacks = mutableListOf<ReleaseCallback>()
     private var releaseInFlight: Thread? = null
+    private var releaseWatchdog: Thread? = null
     private var releaseTimedOut: Boolean = false
     private var terminalReleaseFailure: String? = null
     private var certificateFailurePending: Any? = null
     private var activeEventToken: Any? = null
     private var controlsState = PlayerControlsState()
     private var pictureInPictureActive = false
+    private var remoteCommandsEnabled = remoteCommandsEnabledByDefault
+    private var miniPlayerMode = false
+    private val _manualRefreshTick = MutableStateFlow(0L)
+    val manualRefreshTick: StateFlow<Long> = _manualRefreshTick.asStateFlow()
+    @Volatile
+    private var lastKnownVideoSize: IntSize = IntSize.Zero
     @Volatile
     private var currentVolumeLevel = rememberedVolumeLevel.coerceDesktopPlayerVolumeLevel()
     private var pendingSubtitleDelayMs: Int? = null
@@ -165,12 +201,23 @@ internal class NativePlayerController(
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
     private fun eventSink(pending: PendingSource, token: Any) = NativePlayerEventSink { type, value ->
+        if (type == "stateSynchronized") {
+            val current = synchronized(lifecycleLock) {
+                !releaseRequested && pendingSource === pending && activeEventToken === token
+            }
+            if (current) _manualRefreshTick.update { it + 1L }
+            return@NativePlayerEventSink
+        }
         SwingUtilities.invokeLater {
             val current = synchronized(lifecycleLock) {
                 !releaseRequested && pendingSource === pending && activeEventToken === token
             }
             if (current) handlePlayerEvent(type, value, token)
         }
+    }
+
+    init {
+        lifecycleCoordinator?.registerController(this)
     }
 
     fun attach(
@@ -244,18 +291,28 @@ internal class NativePlayerController(
             }
             if (deferAttachUntilCreatesComplete()) return@invokeLater
             disposePlayerHandle()
-            val teardown = disposeInFlight
-            if (teardown == null || !teardown.isAlive) {
+            val localTeardown = disposeInFlight?.takeIf { it.isAlive }
+            val externalTeardowns = lifecycleCoordinator?.pendingTeardownsExcluding(this).orEmpty()
+            if (localTeardown == null && externalTeardowns.isEmpty()) {
                 createPlayer(pending)
                 return@invokeLater
             }
-            // The previous player is still tearing down natively. It owns child windows of this
-            // same host, so creating the next one on top of it races its teardown and can leave the
-            // new player wedged (controls never resized, playback never starts). Wait for it, but
-            // off the EDT, because the teardown itself needs the EDT to keep pumping messages.
+            // The previous player is still tearing down natively. Waiting off the EDT prevents
+            // overlapping two native players across either source switches or session replacements.
+            val teardownsToAwait = buildList {
+                if (localTeardown != null) add(localTeardown)
+                addAll(externalTeardowns)
+            }
             Thread({
-                runCatching { teardown.join(TEARDOWN_WAIT_MS) }
-                val teardownCompleted = !teardown.isAlive
+                val deadlineNanos = System.nanoTime() + TEARDOWN_WAIT_MS * 1_000_000L
+                for (worker in teardownsToAwait) {
+                    while (worker.isAlive) {
+                        val remainingMs = (deadlineNanos - System.nanoTime()) / 1_000_000L
+                        if (remainingMs <= 0L) break
+                        runCatching { worker.join(remainingMs.coerceAtLeast(1L)) }
+                    }
+                }
+                val initialCompleted = teardownsToAwait.none { it.isAlive }
                 SwingUtilities.invokeLater {
                     val terminalFailure = synchronized(lifecycleLock) { terminalReleaseFailure }
                     if (terminalFailure != null) {
@@ -263,11 +320,12 @@ internal class NativePlayerController(
                         return@invokeLater
                     }
                     if (!releaseRequested && isHostDisplayable() && pendingSource === pending) {
-                        if (teardownCompleted) {
-                            createPlayer(pending)
-                        } else {
-                            log.w { "attach aborted because previous native teardown exceeded ${TEARDOWN_WAIT_MS}ms" }
-                            if (!releaseRequested && pendingSource === pending) {
+                        val remainingExternal = lifecycleCoordinator?.pendingTeardownsExcluding(this).orEmpty()
+                        when {
+                            initialCompleted && remainingExternal.isEmpty() -> createPlayer(pending)
+                            initialCompleted && System.nanoTime() < deadlineNanos -> attachPending()
+                            else -> {
+                                log.w { "attach aborted because previous native teardown exceeded ${TEARDOWN_WAIT_MS}ms" }
                                 pending.onError("Previous player is still shutting down. Please try again.")
                             }
                         }
@@ -332,6 +390,17 @@ internal class NativePlayerController(
         true
     }
 
+    private fun resolveEffectiveHostViewPtr(): Long {
+        val overrideHost = surfaceHostOverride
+        if (overrideHost != null) {
+            if (isComponentDisplayable(overrideHost)) {
+                return resolveComponentView(overrideHost)
+            }
+            surfaceHostOverride = null
+        }
+        return resolveHostView()
+    }
+
     private fun createPlayer(pending: PendingSource) {
         val terminalFailure = synchronized(lifecycleLock) { terminalReleaseFailure }
         if (terminalFailure != null) {
@@ -339,7 +408,7 @@ internal class NativePlayerController(
             return
         }
         // Resolving the AWT peer must happen on the EDT; everything after it must not.
-        val hostViewPtr = runCatching { resolveHostView() }
+        val hostViewPtr = runCatching { resolveEffectiveHostViewPtr() }
             .getOrElse { error ->
                 log.w(error) { "attach failed to resolve host source=${pending.sourceUrl.toPlaybackLogKey()}" }
                 if (!releaseRequested && pendingSource === pending) pending.onError(playbackFailureText(error.message))
@@ -354,6 +423,9 @@ internal class NativePlayerController(
             pending.sourceUrl
         }
 
+        val initialMiniPlayer = miniPlayerMode || controlsState.isInMiniPlayer
+        val initialRemoteCommands = remoteCommandsEnabled
+
         // Native create blocks until the player's own UI thread finishes initialising, and that
         // thread creates child windows of the AWT host, which needs the EDT to keep pumping
         // messages. Creating on the EDT is therefore the same circular wait that the teardown had:
@@ -363,22 +435,42 @@ internal class NativePlayerController(
         val createWorker = Thread({
             try {
                 runCatching {
-                    nativeCreate(
-                        hostViewPtr,
-                        resolvedSource,
-                        pending.headerLines.toTypedArray(),
-                        pending.playWhenReady,
-                        pending.initialPositionMs,
-                        NativePlayerBridge.controlsPageUrl,
-                        pending.decoderPriority,
-                        pending.nvidiaRtxSuperResolutionEnabled,
-                        pending.nvidiaRtxHdrEnabled,
-                        eventSink(pending, eventToken),
-                    ).also { if (it == 0L) error("Native player did not return a handle.") }
+                    val createOverride = nativeCreateOverride
+                    val createdHandle = if (createOverride != null) {
+                        createOverride(
+                            hostViewPtr,
+                            resolvedSource,
+                            pending.headerLines.toTypedArray(),
+                            pending.playWhenReady,
+                            pending.initialPositionMs,
+                            controlsPageUrlProvider(),
+                            pending.decoderPriority,
+                            pending.nvidiaRtxSuperResolutionEnabled,
+                            pending.nvidiaRtxHdrEnabled,
+                            eventSink(pending, eventToken),
+                        )
+                    } else {
+                        backend.create(
+                            hostViewPtr = hostViewPtr,
+                            sourceUrl = resolvedSource,
+                            headerLines = pending.headerLines.toTypedArray(),
+                            playWhenReady = pending.playWhenReady,
+                            initialPositionMs = pending.initialPositionMs,
+                            controlsPageUrl = controlsPageUrlProvider(),
+                            decoderPriority = pending.decoderPriority,
+                            nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+                            nvidiaRtxHdrEnabled = pending.nvidiaRtxHdrEnabled,
+                            eventSink = eventSink(pending, eventToken),
+                            inMiniPlayer = initialMiniPlayer,
+                            remoteCommandsEnabled = initialRemoteCommands,
+                        )
+                    }
+                    createdHandle.also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
                     val accepted = synchronized(lifecycleLock) {
                         if (!releaseRequested && terminalReleaseFailure == null && pendingSource === pending && activeEventToken === eventToken) {
                             handle = created
+                            lastKnownVideoSize = IntSize.Zero
                             true
                         } else {
                             false
@@ -407,6 +499,14 @@ internal class NativePlayerController(
                             "attach created handle=$created source=${resolvedSource.toPlaybackLogKey()} " +
                                 "initialPositionMs=${pending.initialPositionMs}"
                         }
+                        val currentHostViewPtr = runCatching { resolveEffectiveHostViewPtr() }.getOrNull()
+                        if (currentHostViewPtr != null && currentHostViewPtr != hostViewPtr) {
+                            backend.reparentSurface(created, currentHostViewPtr)
+                        }
+                        backend.setRemoteCommandsEnabled(created, remoteCommandsEnabled)
+                        if (miniPlayerMode) {
+                            backend.setMiniPlayerMode(created, true)
+                        }
                         applyRememberedVolume()
                         updateControls(controlsState)
                         setResizeMode(rememberedResizeMode)
@@ -418,6 +518,7 @@ internal class NativePlayerController(
                             certificateFailurePending = null
                             handlePlayerEvent("certificateFailure", 0.0, eventToken)
                         }
+                        _manualRefreshTick.update { it + 1L }
                     }
                 }.onFailure { error ->
                     log.w(error) { "attach failed source=${pending.sourceUrl.toPlaybackLogKey()}" }
@@ -428,6 +529,7 @@ internal class NativePlayerController(
             } finally {
                 synchronized(lifecycleLock) {
                     createsInFlight.remove(Thread.currentThread())
+                    lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
                 }
             }
         }, "nuvio-player-create").apply { isDaemon = true }
@@ -488,6 +590,14 @@ internal class NativePlayerController(
         return { window.removeWindowFocusListener(listener) }
     }
 
+    /** The dock is on the browsing window, so auto-hide must not take the cursor away there. */
+    private fun publishHostControlsVisible(
+        visible: Boolean,
+        inMiniPlayer: Boolean = controlsState.isInMiniPlayer,
+    ) {
+        setHostControlsVisible(visible || inMiniPlayer)
+    }
+
     @Synchronized
     fun updateControls(state: PlayerControlsState) {
         val cursorVisible = DesktopPlayerHideTimer.computeDesktopCursorVisible(
@@ -495,7 +605,7 @@ internal class NativePlayerController(
             hasError = state.playbackErrorMessage.isNotBlank(),
             isLoading = state.isLoading,
         )
-        setHostControlsVisible(cursorVisible)
+        publishHostControlsVisible(cursorVisible, state.isInMiniPlayer)
         val currentHandle = handle
         val current = currentHandle.takeIf { it != 0L } ?: run {
             controlsState = state
@@ -524,7 +634,24 @@ internal class NativePlayerController(
                 "speed=${stateWithVolume.playbackSpeedLabel} audioLabel=${stateWithVolume.audioLabel} " +
                 "subsLabel=${stateWithVolume.subtitlesLabel} fullscreen=$isFullscreen"
         }
-        nativeUpdateControls(current, stateWithVolume.toControlsJson(isFullscreen, ::refreshControlsForImage))
+        backend.updateControls(current, stateWithVolume.toControlsJson(isFullscreen, ::refreshControlsForImage))
+    }
+
+    @Synchronized
+    fun setRemoteCommandsEnabled(enabled: Boolean) {
+        remoteCommandsEnabled = enabled
+        handle.takeIf { it != 0L }?.let { current ->
+            backend.setRemoteCommandsEnabled(current, enabled)
+        }
+    }
+
+    @Synchronized
+    fun setMiniPlayerMode(inMiniPlayer: Boolean) {
+        if (miniPlayerMode == inMiniPlayer) return
+        miniPlayerMode = inMiniPlayer
+        handle.takeIf { it != 0L }?.let { current ->
+            backend.setMiniPlayerMode(current, inMiniPlayer)
+        }
     }
 
     private fun refreshControlsForImage() {
@@ -542,17 +669,30 @@ internal class NativePlayerController(
     }
 
     fun reparentSurface(host: Component): Boolean {
-        val current = handle.takeIf { it != 0L } ?: return false
-        if (!host.isDisplayable) return false
-        val pointer = runCatching { AwtNativeViewResolver.resolveNativeViewPointer(host) }
+        if (!isComponentDisplayable(host)) return false
+        val pointer = runCatching { resolveComponentView(host) }
             .onFailure { error -> log.w(error) { "failed to resolve PiP native host ${host.javaClass.name}" } }
             .getOrNull() ?: return false
-        return NativePlayerBridge.reparentSurface(current, pointer)
+        val nextOverride = host.takeIf { it !== this.host }
+        val (current, hasPendingOrCreating) = synchronized(lifecycleLock) {
+            createsInFlight.removeAll { !it.isAlive }
+            handle to (!releaseRequested && (pendingSource != null || createsInFlight.isNotEmpty()))
+        }
+        if (current != 0L) {
+            if (!backend.reparentSurface(current, pointer)) return false
+            surfaceHostOverride = nextOverride
+            return true
+        }
+        if (hasPendingOrCreating) {
+            surfaceHostOverride = nextOverride
+            return true
+        }
+        return false
     }
 
     fun layoutNativeSubviews() {
         val current = handle.takeIf { it != 0L } ?: return
-        NativePlayerBridge.layoutNativeSubviews(current)
+        backend.layoutNativeSubviews(current)
     }
 
     fun requestKeyboardFocus() {
@@ -560,12 +700,22 @@ internal class NativePlayerController(
             val current = handle.takeIf { it != 0L } ?: return@invokeLater
             if (DesktopPlayerPictureInPicture.isEnabled) {
                 DesktopPlayerPictureInPicture.pipWindow?.videoHolderPanel?.requestFocusInWindow()
-                NativePlayerBridge.requestFocus(current)
+                backend.requestFocus(current)
                 return@invokeLater
             }
-            if (!isHostDisplayable()) return@invokeLater
+            if (controlsState.isInMiniPlayer || !isHostDisplayable()) return@invokeLater
             host.requestFocusInWindow()
-            NativePlayerBridge.requestFocus(current)
+            backend.requestFocus(current)
+        }
+    }
+
+    fun releaseKeyboardFocusToWindow() {
+        SwingUtilities.invokeLater {
+            host.resetCursorVisibility()
+            val window = SwingUtilities.getWindowAncestor(host) ?: return@invokeLater
+            if (host.hasFocus()) {
+                window.requestFocusInWindow()
+            }
         }
     }
 
@@ -601,7 +751,12 @@ internal class NativePlayerController(
                 }
             }
             if (!releaseRequested && handle != 0L) {
-                NativePlayerBridge.setNowPlayingMetadata(handle, currentNowPlayingTitle, currentNowPlayingSubtitle, image)
+                backend.setNowPlayingMetadata(
+                    handle,
+                    currentNowPlayingTitle,
+                    currentNowPlayingSubtitle,
+                    image,
+                )
             }
         }
     }
@@ -615,13 +770,16 @@ internal class NativePlayerController(
     @Synchronized
     fun setPictureInPictureActive(active: Boolean) {
         pictureInPictureActive = active
+        if (!active) {
+            surfaceHostOverride = null
+        }
         applyResizeMode()
     }
 
     private fun applyResizeMode() {
         val mode = desktopEffectiveResizeMode(rememberedResizeMode, pictureInPictureActive)
         handle.takeIf { it != 0L }?.let { current ->
-            NativePlayerBridge.setResizeMode(
+            backend.setResizeMode(
                 handle = current,
                 mode = when (mode) {
                     PlayerResizeMode.Fit -> 0
@@ -688,11 +846,12 @@ internal class NativePlayerController(
                 }
             }
             "hideChrome" -> {
-                setHostControlsVisible(false)
+                publishHostControlsVisible(false)
                 if (!onEvent(type, value)) {
                     ensureFallbackHideTimer().onControlsHidden()
                 }
             }
+            "stateSynchronized" -> _manualRefreshTick.update { it + 1L }
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
                 log.d { "scrubChange positionMs=${value.toLong()} handled=$handled handle=$handle" }
@@ -742,7 +901,7 @@ internal class NativePlayerController(
                 if (onEvent(type, value)) return
                 applyFallbackPlaybackState(play = value >= 0.5)
             }
-            "dragWindow" -> NativePlayerBridge.beginWindowDrag(handle)
+            "dragWindow" -> backend.beginWindowDrag(handle)
             "volumeChange" -> setFallbackVolume(value.toFloat())
             "volumeChangeTemporary" -> setTemporaryVolume(value.toFloat())
             "setPlaybackSpeed" -> {
@@ -779,7 +938,7 @@ internal class NativePlayerController(
                 if (!releaseRequested && controlsState.controlsVisible != hideState.controlsVisible) {
                     updateControls(controlsState.copy(controlsVisible = hideState.controlsVisible))
                 } else if (!releaseRequested) {
-                    setHostControlsVisible(hideState.cursorVisible)
+                    publishHostControlsVisible(hideState.cursorVisible)
                 }
             }
         }.also { fallbackHideTimer = it }
@@ -807,13 +966,13 @@ internal class NativePlayerController(
             PlayerControlsAction.KeyboardTogglePlayback -> {
                 val current = handle
                 if (current == 0L) return
-                val isEnded = NativePlayerBridge.isEnded(current)
-                val isPaused = NativePlayerBridge.isPaused(current)
+                val isEnded = backend.isEnded(current)
+                val isPaused = backend.isPaused(current)
                 if (isEnded) {
-                    NativePlayerBridge.seekTo(current, 0L)
-                    NativePlayerBridge.setPaused(current, false)
+                    nativeSeekTo(current, 0L)
+                    backend.setPaused(current, false)
                 } else {
-                    NativePlayerBridge.setPaused(current, !isPaused)
+                    backend.setPaused(current, !isPaused)
                 }
             }
             PlayerControlsAction.SeekBack,
@@ -859,7 +1018,7 @@ internal class NativePlayerController(
             rememberedVolumeLevel = nextLevel
             currentVolumeLevel = nextLevel
             DesktopPlayerVolumeStorage.saveVolumeLevel(nextLevel)
-            NativePlayerBridge.setVolume(current, nextLevel)
+            backend.setVolume(current, nextLevel)
             controlsState = controlsState.copy(volumeLevel = nextLevel)
             updateControls(controlsState)
         }
@@ -871,7 +1030,7 @@ internal class NativePlayerController(
         if (current != 0L) {
             val nextLevel = level.coerceDesktopPlayerVolumeLevel()
             currentVolumeLevel = nextLevel
-            NativePlayerBridge.setVolume(current, nextLevel)
+            backend.setVolume(current, nextLevel)
             controlsState = controlsState.copy(volumeLevel = nextLevel)
             updateControls(controlsState)
         }
@@ -900,7 +1059,7 @@ internal class NativePlayerController(
         if (current == 0L) return
         val level = rememberedVolumeLevel.coerceDesktopPlayerVolumeLevel()
         currentVolumeLevel = level
-        NativePlayerBridge.setVolume(current, level)
+        backend.setVolume(current, level)
         controlsState = controlsState.copy(volumeLevel = level)
         log.d { "applied remembered volume level=$level handle=$current" }
     }
@@ -908,7 +1067,8 @@ internal class NativePlayerController(
     private fun fallbackSeekBy(offsetMs: Long) {
         val current = handle
         if (current != 0L) {
-            nativeSeekBy(current, offsetMs)
+            backend.seekBy(current, offsetMs)
+            _manualRefreshTick.update { it + 1L }
         }
     }
 
@@ -916,26 +1076,35 @@ internal class NativePlayerController(
         val current = handle
         if (current == 0L) return
         val speeds = listOf(1f, 1.25f, 1.5f, 2f)
-        val currentSpeed = NativePlayerBridge.speed(current)
+        val currentSpeed = backend.speed(current)
         val next = speeds.firstOrNull { it > currentSpeed + 0.01f } ?: speeds.first()
-        NativePlayerBridge.setSpeed(current, next)
+        backend.setSpeed(current, next)
     }
 
-    fun snapshot(): PlayerPlaybackSnapshot {
+    fun snapshot(includeVideoSize: Boolean = true): PlayerPlaybackSnapshot {
         val current = handle
         if (current == 0L) return PlayerPlaybackSnapshot(isLoading = true)
         return runCatching {
-            val isLoading = NativePlayerBridge.isLoading(current)
-            val isEnded = NativePlayerBridge.isEnded(current)
-            val videoSize = desktopMpvVideoSize { name -> NativePlayerBridge.stringProperty(current, name) }
+            val isLoading = backend.isLoading(current)
+            val isEnded = backend.isEnded(current)
+            val cachedSize = lastKnownVideoSize
+            val videoSize = if (includeVideoSize || cachedSize == IntSize.Zero) {
+                desktopMpvVideoSize { name -> backend.stringProperty(current, name) }.also { resolved ->
+                    if (resolved != IntSize.Zero) {
+                        lastKnownVideoSize = resolved
+                    }
+                }
+            } else {
+                cachedSize
+            }
             PlayerPlaybackSnapshot(
                 isLoading = isLoading,
-                isPlaying = !NativePlayerBridge.isPaused(current) && !isLoading && !isEnded,
+                isPlaying = !backend.isPaused(current) && !isLoading && !isEnded,
                 isEnded = isEnded,
-                durationMs = NativePlayerBridge.durationMs(current),
-                positionMs = NativePlayerBridge.positionMs(current),
-                bufferedPositionMs = NativePlayerBridge.bufferedPositionMs(current),
-                playbackSpeed = NativePlayerBridge.speed(current),
+                durationMs = backend.durationMs(current),
+                positionMs = backend.positionMs(current),
+                bufferedPositionMs = backend.bufferedPositionMs(current),
+                playbackSpeed = backend.speed(current),
                 videoWidth = videoSize.width,
                 videoHeight = videoSize.height,
             )
@@ -954,6 +1123,9 @@ internal class NativePlayerController(
             releaseRequested = true
             activeEventToken = null
             certificateFailurePending = null
+            createsInFlight.removeAll { !it.isAlive }
+            lifecycleCoordinator?.registerTeardowns(this, createsInFlight)
+            lifecycleCoordinator?.registerTeardown(this, disposeInFlight)
         }
         host.resetCursorVisibility()
         invalidateForRelease()
@@ -974,50 +1146,59 @@ internal class NativePlayerController(
                 else -> {
                     releaseCallbacks += callback
                     active ?: Thread({
-                    awaitThreadCompletion(disposeInFlight, "native teardown")
-                    awaitInFlightCreates()
-                    // A create worker publishes/configures its result on the EDT before leaving
-                    // createsInFlight. Release must drain those already-queued callbacks before
-                    // taking the final disposal snapshot: a stale publication can reject its
-                    // handle and start a tracked disposal after the create thread has exited.
-                    awaitSwingCallbacksQueuedByCreates()
-                    awaitThreadCompletion(disposeInFlight, "native teardown queued by create")
-                    var failureMessage = synchronized(lifecycleLock) { terminalReleaseFailure }
-                    val current = if (failureMessage == null) detachPlayerHandle() else 0L
-                    if (current != 0L) {
-                        log.d { "pre-navigation dispose started handle=$current" }
-                        runCatching { nativeDispose(current) }
-                            .onSuccess { log.d { "pre-navigation dispose completed handle=$current" } }
-                            .onFailure { error ->
-                                failureMessage = "Native player shutdown failed. Quit Nuvio before removing the player."
-                                log.w(error) { "pre-navigation dispose failed handle=$current" }
+                        try {
+                            awaitThreadCompletion(disposeInFlight, "native teardown")
+                            awaitInFlightCreates()
+                            // A create worker publishes/configures its result on the EDT before leaving
+                            // createsInFlight. Release must drain those already-queued callbacks before
+                            // taking the final disposal snapshot: a stale publication can reject its
+                            // handle and start a tracked disposal after the create thread has exited.
+                            awaitSwingCallbacksQueuedByCreates()
+                            awaitThreadCompletion(disposeInFlight, "native teardown queued by create")
+                            var failureMessage = synchronized(lifecycleLock) { terminalReleaseFailure }
+                            val current = if (failureMessage == null) detachPlayerHandle() else 0L
+                            if (current != 0L) {
+                                log.d { "pre-navigation dispose started handle=$current" }
+                                runCatching { nativeDispose(current) }
+                                    .onSuccess { log.d { "pre-navigation dispose completed handle=$current" } }
+                                    .onFailure { error ->
+                                        failureMessage = "Native player shutdown failed. Quit Nuvio before removing the player."
+                                        log.w(error) { "pre-navigation dispose failed handle=$current" }
+                                    }
                             }
-                    }
-                    val callbacks = synchronized(lifecycleLock) {
-                        releaseInFlight = null
-                        releaseTimedOut = false
-                        if (failureMessage != null) terminalReleaseFailure = failureMessage
-                        releaseCallbacks.toList().also { releaseCallbacks.clear() }
-                    }
-                    SwingUtilities.invokeLater {
-                        callbacks.forEach { pending ->
-                            val invoke = if (failureMessage == null) {
-                                { pending.onReleased() }
-                            } else {
-                                { pending.onFailed(failureMessage) }
+                            val callbacks = synchronized(lifecycleLock) {
+                                releaseInFlight = null
+                                releaseTimedOut = false
+                                if (failureMessage != null) terminalReleaseFailure = failureMessage
+                                releaseCallbacks.toList().also { releaseCallbacks.clear() }
                             }
-                            runCatching(invoke)
-                                .onFailure { error -> log.w(error) { "release callback failed" } }
+                            SwingUtilities.invokeLater {
+                                callbacks.forEach { pending ->
+                                    val invoke = if (failureMessage == null) {
+                                        { pending.onReleased() }
+                                    } else {
+                                        { pending.onFailed(failureMessage) }
+                                    }
+                                    runCatching(invoke)
+                                        .onFailure { error -> log.w(error) { "release callback failed" } }
+                                }
+                            }
+                        } finally {
+                            val watchdogToStop = synchronized(lifecycleLock) {
+                                releaseWatchdog.also { releaseWatchdog = null }
+                            }
+                            watchdogToStop?.interrupt()
+                            lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
+                            lifecycleCoordinator?.unregisterController(this)
                         }
+                    }, "nuvio-player-release").apply {
+                        isDaemon = true
+                        releaseInFlight = this
+                        releaseTimedOut = false
+                        shouldStart = true
                     }
-                }, "nuvio-player-release").apply {
-                    isDaemon = true
-                    releaseInFlight = this
-                    releaseTimedOut = false
-                    shouldStart = true
                 }
             }
-        }
         }
         if (immediateFailure != null) {
             SwingUtilities.invokeLater {
@@ -1027,17 +1208,24 @@ internal class NativePlayerController(
             return
         }
         if (shouldStart) {
+            lifecycleCoordinator?.registerTeardown(this, worker, allowUnstarted = true)
             worker.start()
-            startReleaseWatchdog(worker)
+            val startedWatchdog = startReleaseWatchdog(worker)
+            synchronized(lifecycleLock) {
+                if (releaseInFlight === worker && worker.isAlive) {
+                    releaseWatchdog = startedWatchdog
+                } else {
+                    startedWatchdog.interrupt()
+                }
+            }
         }
     }
 
-    private fun startReleaseWatchdog(worker: Thread) {
+    private fun startReleaseWatchdog(worker: Thread): Thread =
         Thread({
             try {
                 Thread.sleep(releaseTimeoutMs)
             } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
                 return@Thread
             }
             val callbacks = synchronized(lifecycleLock) {
@@ -1057,7 +1245,6 @@ internal class NativePlayerController(
             isDaemon = true
             start()
         }
-    }
 
     fun dispose() {
         fallbackHideTimer?.dispose()
@@ -1070,12 +1257,20 @@ internal class NativePlayerController(
                 pendingSource = null
                 activeEventToken = null
                 certificateFailurePending = null
+                createsInFlight.removeAll { !it.isAlive }
+                lifecycleCoordinator?.registerTeardowns(this, createsInFlight)
                 true
             }
         }
         if (!accepted) return
         host.onPeerReady = null
         disposePlayerHandle()
+        val canUnregisterNow = synchronized(lifecycleLock) {
+            handle == 0L && disposeInFlight == null && createsInFlight.isEmpty()
+        }
+        if (canUnregisterNow) {
+            lifecycleCoordinator?.unregisterController(this)
+        }
     }
 
     private fun cancelPendingAttachment() {
@@ -1091,6 +1286,7 @@ internal class NativePlayerController(
         fallbackHideTimer?.dispose()
         fallbackHideTimer = null
         cancelPendingAttachment()
+        surfaceHostOverride = null
         host.onCursorActivity = null
         onAction = { false }
         onEvent = { _, _ -> false }
@@ -1162,17 +1358,32 @@ internal class NativePlayerController(
     /** Must be called while holding [lifecycleLock]. */
     private fun startTrackedDisposeLocked(current: Long) {
         val prior = disposeInFlight?.takeIf { it.isAlive }
-        disposeInFlight = Thread(
+        val worker = Thread(
             {
-                awaitThreadCompletion(prior, "prior native teardown")
-                runCatching { nativeDispose(current) }
-                    .onFailure { error -> recordTerminalDisposeFailure(error, "native", current) }
+                try {
+                    awaitThreadCompletion(prior, "prior native teardown")
+                    runCatching { nativeDispose(current) }
+                        .onFailure { error -> recordTerminalDisposeFailure(error, "native", current) }
+                } finally {
+                    val shouldUnregisterController = synchronized(lifecycleLock) {
+                        if (disposeInFlight === Thread.currentThread()) {
+                            disposeInFlight = null
+                        }
+                        handle == 0L && pendingSource == null && createsInFlight.isEmpty()
+                    }
+                    lifecycleCoordinator?.unregisterTeardown(Thread.currentThread())
+                    if (shouldUnregisterController) {
+                        lifecycleCoordinator?.unregisterController(this)
+                    }
+                }
             },
             "nuvio-player-dispose",
         ).apply {
             isDaemon = true
-            start()
         }
+        disposeInFlight = worker
+        lifecycleCoordinator?.registerTeardown(this, worker, allowUnstarted = true)
+        worker.start()
     }
 
     private fun disposePlayerHandle() {
@@ -1192,29 +1403,34 @@ internal class NativePlayerController(
 
     override fun play() {
         log.d { "play handle=$handle" }
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setPaused(it, false) }
+        handle.takeIf { it != 0L }?.let { backend.setPaused(it, false) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun pause() {
         log.d { "pause handle=$handle" }
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setPaused(it, true) }
+        handle.takeIf { it != 0L }?.let { backend.setPaused(it, true) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun seekTo(positionMs: Long) {
         log.d { "seekTo positionMs=$positionMs handle=$handle" }
         handle.takeIf { it != 0L }?.let { nativeSeekTo(it, positionMs) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun trySeekTo(positionMs: Long): Boolean {
         val current = handle.takeIf { it != 0L } ?: return false
         log.d { "trySeekTo positionMs=$positionMs handle=$current" }
         nativeSeekTo(current, positionMs)
+        _manualRefreshTick.update { it + 1L }
         return true
     }
 
     override fun seekBy(offsetMs: Long) {
         log.d { "seekBy offsetMs=$offsetMs handle=$handle" }
-        handle.takeIf { it != 0L }?.let { nativeSeekBy(it, offsetMs) }
+        handle.takeIf { it != 0L }?.let { backend.seekBy(it, offsetMs) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun retry() {
@@ -1233,11 +1449,12 @@ internal class NativePlayerController(
 
     override fun setPlaybackSpeed(speed: Float) {
         log.d { "setPlaybackSpeed speed=$speed handle=$handle" }
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setSpeed(it, speed) }
+        handle.takeIf { it != 0L }?.let { backend.setSpeed(it, speed) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun getAudioTracks(): List<AudioTrack> =
-        decodeTracks { NativePlayerBridge.audioTracksJson(it) }.map { track ->
+        decodeTracks { backend.audioTracksJson(it) }.map { track ->
             AudioTrack(
                 index = track.index,
                 id = track.id,
@@ -1250,24 +1467,24 @@ internal class NativePlayerController(
     override suspend fun getChapters(): List<PlayerChapter> {
         if (!PlayerSettingsRepository.uiState.value.androidExoChaptersEnabled) return emptyList()
         val current = handle.takeIf { it != 0L } ?: return emptyList()
-        val count = NativePlayerBridge.stringProperty(current, "chapter-list/count").toIntOrNull() ?: return emptyList()
+        val count = backend.stringProperty(current, "chapter-list/count").toIntOrNull() ?: return emptyList()
         return (0 until count).mapNotNull { index ->
-            val seconds = NativePlayerBridge.stringProperty(current, "chapter-list/$index/time").toDoubleOrNull()
+            val seconds = backend.stringProperty(current, "chapter-list/$index/time").toDoubleOrNull()
                 ?: return@mapNotNull null
             PlayerChapter(
                 startMs = (seconds * 1000.0).toLong(),
-                title = NativePlayerBridge.stringProperty(current, "chapter-list/$index/title").takeIf { it.isNotBlank() },
+                title = backend.stringProperty(current, "chapter-list/$index/title").takeIf { it.isNotBlank() },
             )
         }
     }
 
     override suspend fun getMediaInfo(): PlayerMediaInfo {
         val current = handle.takeIf { it != 0L } ?: return PlayerMediaInfo()
-        return mpvMediaInfo { name -> NativePlayerBridge.stringProperty(current, name).takeIf { it.isNotBlank() } }
+        return mpvMediaInfo { name -> backend.stringProperty(current, name).takeIf { it.isNotBlank() } }
     }
 
     override fun getSubtitleTracks(): List<SubtitleTrack> =
-        decodeTracks { NativePlayerBridge.subtitleTracksJson(it) }.map { track ->
+        decodeTracks { backend.subtitleTracksJson(it) }.map { track ->
             SubtitleTrack(
                 index = track.index,
                 id = track.id,
@@ -1283,50 +1500,50 @@ internal class NativePlayerController(
         }
 
     override fun applyAudioLanguagePreferences(languages: List<String>) {
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setAudioLanguages(it, languages.joinToString(",")) }
+        handle.takeIf { it != 0L }?.let { backend.setAudioLanguages(it, languages.joinToString(",")) }
         val trackIndex = findPreferredAudioTrackIndex(getAudioTracks(), languages)
         if (trackIndex >= 0) selectAudioTrack(trackIndex)
     }
 
     override fun selectAudioTrack(index: Int) {
         val current = handle.takeIf { it != 0L } ?: return
-        val tracks = decodeTracks { NativePlayerBridge.audioTracksJson(it) }
+        val tracks = decodeTracks { backend.audioTracksJson(it) }
         val trackId = resolveTrackId(index, tracks) ?: run {
             log.w { "selectAudioTrack missing track index=$index count=${tracks.size} handle=$current" }
             return
         }
         log.d { "selectAudioTrack index=$index trackId=$trackId count=${tracks.size} handle=$current" }
-        NativePlayerBridge.selectAudioTrack(current, trackId)
+        backend.selectAudioTrack(current, trackId)
     }
 
     override fun selectSubtitleTrack(index: Int) {
         val current = handle.takeIf { it != 0L } ?: return
         if (index < 0) {
             log.d { "selectSubtitleTrack off handle=$current" }
-            NativePlayerBridge.selectSubtitleTrack(current, -1)
+            backend.selectSubtitleTrack(current, -1)
             return
         }
-        val tracks = decodeTracks { NativePlayerBridge.subtitleTracksJson(it) }
+        val tracks = decodeTracks { backend.subtitleTracksJson(it) }
         val trackId = resolveTrackId(index, tracks) ?: run {
             log.w { "selectSubtitleTrack missing track index=$index count=${tracks.size} handle=$current" }
             return
         }
         log.d { "selectSubtitleTrack index=$index trackId=$trackId count=${tracks.size} handle=$current" }
-        NativePlayerBridge.selectSubtitleTrack(current, trackId)
+        backend.selectSubtitleTrack(current, trackId)
         applyPendingSubtitleSettings()
     }
 
     override fun setSubtitleUri(url: String) {
         log.d { "setSubtitleUri ${url.toPlaybackLogKey()} handle=$handle" }
         handle.takeIf { it != 0L }?.let { current ->
-            NativePlayerBridge.clearExternalSubtitles(current)
-            NativePlayerBridge.addSubtitleUrl(current, url)
+            backend.clearExternalSubtitles(current)
+            backend.addSubtitleUrl(current, url)
         }
     }
 
     override fun clearExternalSubtitle() {
         log.d { "clearExternalSubtitle handle=$handle" }
-        handle.takeIf { it != 0L }?.let(NativePlayerBridge::clearExternalSubtitles)
+        handle.takeIf { it != 0L }?.let(backend::clearExternalSubtitles)
     }
 
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
@@ -1334,26 +1551,26 @@ internal class NativePlayerController(
         val trackId = if (trackIndex < 0) {
             -1
         } else {
-            val tracks = decodeTracks { NativePlayerBridge.subtitleTracksJson(it) }
+            val tracks = decodeTracks { backend.subtitleTracksJson(it) }
             resolveTrackId(trackIndex, tracks) ?: run {
                 log.w { "clearExternalSubtitleAndSelect missing track index=$trackIndex count=${tracks.size} handle=$current" }
                 return
             }
         }
         log.d { "clearExternalSubtitleAndSelect trackIndex=$trackIndex trackId=$trackId handle=$current" }
-        NativePlayerBridge.clearExternalSubtitlesAndSelect(current, trackId)
+        backend.clearExternalSubtitlesAndSelect(current, trackId)
         applyPendingSubtitleSettings()
     }
 
     override fun setSubtitleVisible(visible: Boolean) {
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setSubtitleVisible(it, visible) }
+        handle.takeIf { it != 0L }?.let { backend.setSubtitleVisible(it, visible) }
     }
 
     override fun setSubtitleDelayMs(delayMs: Int) {
         val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
         pendingSubtitleDelayMs = clamped
         handle.takeIf { it != 0L }?.let { current ->
-            NativePlayerBridge.setSubtitleDelayMs(current, clamped)
+            backend.setSubtitleDelayMs(current, clamped)
         }
     }
 
@@ -1368,7 +1585,7 @@ internal class NativePlayerController(
     private fun applyPendingSubtitleSettings() {
         val current = handle.takeIf { it != 0L } ?: return
         pendingSubtitleDelayMs?.let { delayMs ->
-            NativePlayerBridge.setSubtitleDelayMs(current, delayMs)
+            backend.setSubtitleDelayMs(current, delayMs)
         }
         pendingSubtitleStyle?.let { style ->
             applySubtitleStyle(current, style, pendingUseLibass)
@@ -1377,7 +1594,7 @@ internal class NativePlayerController(
 
     private fun applySubtitleStyle(handle: Long, style: SubtitleStyleState, useLibass: Boolean) {
         val shadow = style.toMpvSubtitleShadow()
-        NativePlayerBridge.applySubtitleStyle(
+        backend.applySubtitleStyle(
             handle = handle,
             textColor = style.textColor.toMpvColorString(),
             backgroundColor = style.backgroundColor.toMpvColorString(),
@@ -1389,7 +1606,7 @@ internal class NativePlayerController(
             useLibass = useLibass,
             stripSdh = style.stripSdh,
         )
-        NativePlayerBridge.setSubtitleAppearance(
+        backend.setSubtitleAppearance(
             handle = handle,
             font = SubtitleFontResolver.mpvFontName(style.appearance.fontId),
             fontsDir = SubtitleFontResolver.fontsDir(),
@@ -1545,6 +1762,8 @@ private fun String.toPlayerControlsAction(): PlayerControlsAction? =
     when (this) {
         "toggleChrome" -> PlayerControlsAction.ToggleChrome
         "back" -> PlayerControlsAction.Back
+        "minimize" -> PlayerControlsAction.Minimize
+        "close" -> PlayerControlsAction.Close
         "toggle" -> PlayerControlsAction.TogglePlayback
         "keyboardToggle" -> PlayerControlsAction.KeyboardTogglePlayback
         "seekBack" -> PlayerControlsAction.SeekBack
@@ -1622,6 +1841,10 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         appendJsonField("pauseLabel", pauseLabel)
         append(',')
         appendJsonField("closeLabel", closeLabel)
+        append(',')
+        appendJsonField("minimizeLabel", minimizeLabel)
+        append(',')
+        appendJsonField("isInMiniPlayer", isInMiniPlayer)
         append(',')
         appendJsonField("mutedLabel", mutedLabel)
         append(',')
@@ -1824,7 +2047,11 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
             if (DesktopHostOs.current == DesktopHostOs.WINDOWS ||
                 DesktopHostOs.current == DesktopHostOs.MACOS
             ) {
-                pipLabel
+                if (DesktopPlayerPictureInPicture.isEnabled && pipRestoreLabel.isNotBlank()) {
+                    pipRestoreLabel
+                } else {
+                    pipLabel
+                }
             } else {
                 ""
             },

@@ -268,4 +268,35 @@ class PlaybackStallDetectorTest {
         val step = PlaybackStallDetector.step((first as Step.Continue).state, sample(5_000L + 600_000L))
         assertEquals(5_000L + 600_000L, (step as Step.Continue).state.pendingSeekSinceMs)
     }
+
+    @Test
+    fun twoSecondMinimizedSamplingSeesBufferGrowthAndStallsAtExactDeadlines() {
+        assertTrue(MINIMIZED_SOURCE_HEALTH_POLL_MS < PlaybackStallDetector.MAX_SAMPLE_GAP_MS)
+
+        fun runTwoSecondSamples(untilMs: Long, make: (Long) -> Sample): Step.Stalled? {
+            var state = armed()
+            var now = 0L
+            while (now < untilMs) {
+                now += MINIMIZED_SOURCE_HEALTH_POLL_MS
+                when (val step = PlaybackStallDetector.step(state, make(now))) {
+                    is Step.Continue -> state = step.state
+                    is Step.Stalled -> return step
+                }
+            }
+            return null
+        }
+
+        // Dead stream at 2s cadence: stalls right after 20s of stillness.
+        assertEquals(null, runTwoSecondSamples(PlaybackStallDetector.STALL_DEADLINE_MS) { now -> sample(now) })
+        val deadStall = runTwoSecondSamples(PlaybackStallDetector.STALL_DEADLINE_MS + 4_000L) { now -> sample(now) }
+        assertIs<Step.Stalled>(deadStall)
+        assertEquals(PlaybackStallDetector.STALL_DEADLINE_MS, deadStall.stillForMs)
+
+        // Rebuffering stream whose buffer grows every 2s: holds off the 20s deadline and reaches the 60s trickle limit.
+        val growingBuffer = { now: Long -> sample(now, bufferedPositionMs = 70_000L + (now / 2_000L) * 400L) }
+        assertEquals(null, runTwoSecondSamples(40_000L, growingBuffer))
+        val trickleStall = runTwoSecondSamples(PlaybackStallDetector.TRICKLE_DEADLINE_MS + 4_000L, growingBuffer)
+        assertIs<Step.Stalled>(trickleStall)
+        assertEquals(PlaybackStallDetector.TRICKLE_DEADLINE_MS, trickleStall.stillForMs)
+    }
 }

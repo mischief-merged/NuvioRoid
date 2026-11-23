@@ -14,6 +14,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.CoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerButton
@@ -91,23 +92,14 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
     val runtime = remember { PlayerScreenRuntime(args) }
     runtime.args = args
     val controllerScope = rememberCoroutineScope()
-
-    // While the player is on screen, keyboard arrows and the gamepad drive playback (seek, volume,
-    // play/pause, modals) instead of moving focus around the hidden app shell behind it.
-    DisposableEffect(runtime, controllerScope) {
-        PlayerControllerBridge.register(
-            scope = controllerScope,
-            handler = { command -> runtime.handlePlayerControllerCommand(command) },
-            isOverlayOpen = { runtime.hasOpenPlayerOverlay || hasOpenPlatformModal() },
-        )
-        ControllerFocusEngine.setPlayerEventHandler { event ->
-            runtime.handlePlayerControllerEvent(event)
-        }
-        onDispose {
-            ControllerFocusEngine.setPlayerEventHandler(null)
-            PlayerControllerBridge.register(null, null, null)
-        }
-    }
+    val isInPip = rememberIsInPictureInPicture()
+    // The session stays mounted in the dock and in picture-in-picture. Only the full player
+    // takes keyboard and gamepad input; the screen underneath keeps it otherwise.
+    PlayerControllerInputRegistration(
+        runtime = runtime,
+        scope = controllerScope,
+        ownsInput = playerOwnsControllerInput(isMinimized = args.isMinimized, isInPictureInPicture = isInPip),
+    )
 
     // The engine publishes a playback snapshot every 250ms. Reading the raw snapshot from this
     // scope would recompose the whole player subtree four times per second, so the values
@@ -131,7 +123,7 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
     BoxWithConstraints(
         modifier = args.modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(if (isDesktop && isInPip) Color.Transparent else Color.Black)
             .pointerInput(Unit) {
                 awaitPointerEventScope {
                     while (true) {
@@ -149,7 +141,6 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
     ) {
         val density = LocalDensity.current
         val horizontalSafePadding = playerHorizontalSafePadding()
-        val isInPip = rememberIsInPictureInPicture()
         val dockPartyPanel = LocalFold.current == null && !isInPip && maxWidth > maxHeight
         val partyPanelWidth = if (dockPartyPanel) minOf(420.dp, maxWidth * 0.45f) else 420.dp
         val animatedPartyPanelInset by animateDpAsState(
@@ -241,5 +232,30 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
             partyPanelInset = partyPanelInset,
             dockPartyPanel = dockPartyPanel,
         )
+    }
+}
+
+@Composable
+internal fun PlayerControllerInputRegistration(
+    runtime: PlayerScreenRuntime,
+    scope: CoroutineScope,
+    ownsInput: Boolean,
+) {
+    DisposableEffect(runtime, scope, ownsInput) {
+        if (!ownsInput) {
+            return@DisposableEffect onDispose { }
+        }
+        PlayerControllerBridge.register(
+            scope = scope,
+            handler = { command -> runtime.handlePlayerControllerCommand(command) },
+            isOverlayOpen = { runtime.hasOpenPlayerOverlay || hasOpenPlatformModal() },
+        )
+        ControllerFocusEngine.setPlayerEventHandler { event ->
+            runtime.handlePlayerControllerEvent(event)
+        }
+        onDispose {
+            ControllerFocusEngine.setPlayerEventHandler(null)
+            PlayerControllerBridge.register(null, null, null)
+        }
     }
 }
