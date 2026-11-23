@@ -1954,6 +1954,7 @@ internal fun MainAppContent(
                                 onProceed = startTrailer,
                             )
                         },
+                        onPreviewsDisallowed = playerSessionController::cancelPendingPreviewReplacement,
                         sharedTransitionScope = this@SharedTransitionLayout,
                         animatedVisibilityScope = LocalNavAnimatedContentScope.current,
                     )

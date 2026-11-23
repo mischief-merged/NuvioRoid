@@ -1282,6 +1282,60 @@ class ReplacePlaybackPromptTest {
         assertEquals(2, continuations)
     }
 
+    @Test
+    fun trailer_replacement_is_dropped_when_previews_are_no_longer_allowed() {
+        var previewsAllowed = true
+        val controller = PlayerSessionController(
+            onExitPictureInPicture = {},
+            previewsAllowed = { previewsAllowed },
+        )
+        val launch = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/s1e1.mp4",
+        )
+        controller.open(launch = launch, launchId = 901L)
+        var started = 0
+        controller.requestTrailerOrAskToReplace(
+            contentTitle = "Dune",
+            trailerTitle = "Official Trailer",
+        ) { started += 1 }
+        assertEquals(true, controller.pendingReplacement?.requiresPreview)
+        assertEquals(901L, controller.activeSession?.launchId)
+
+        previewsAllowed = false
+        controller.cancelPendingPreviewReplacement()
+        assertNull(controller.pendingReplacement)
+        assertEquals(901L, controller.activeSession?.launchId)
+        assertEquals(0, started)
+
+        previewsAllowed = true
+        controller.requestTrailerOrAskToReplace(
+            contentTitle = "Dune",
+            trailerTitle = "Official Trailer",
+        ) { started += 1 }
+        previewsAllowed = false
+        controller.confirmPendingReplacement()
+        assertNull(controller.pendingReplacement)
+        assertEquals(901L, controller.activeSession?.launchId)
+        assertEquals(0, started)
+
+        var replaced = 0
+        controller.launchOrAskToReplace(
+            incomingTitle = "The Bear",
+            videoId = "tt2222222:1:1",
+            parentMetaId = "tt2222222",
+            seasonNumber = 1,
+            episodeNumber = 1,
+        ) { replaced += 1 }
+        assertEquals(false, controller.pendingReplacement?.requiresPreview)
+        controller.confirmPendingReplacement()
+        assertEquals(1, replaced)
+        assertNull(controller.activeSession)
+        assertEquals(0, started)
+    }
+
     private fun mountPlayerSessionHost(
         sessionController: PlayerSessionController,
         navigator: NuvioNavigator,

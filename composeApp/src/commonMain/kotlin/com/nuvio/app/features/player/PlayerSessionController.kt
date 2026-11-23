@@ -158,6 +158,9 @@ internal fun matchesActivePlaybackTarget(
 @Stable
 internal class PlayerSessionController(
     private val onExitPictureInPicture: () -> Unit = ::exitPlayerPictureInPicture,
+    private val previewsAllowed: () -> Boolean = {
+        com.nuvio.app.features.downloads.LimitedConnections.hold.state.value.travel.previewsAllowed
+    },
 ) {
     var activeSession by mutableStateOf<ActivePlayerSession?>(null)
         private set
@@ -184,6 +187,7 @@ internal class PlayerSessionController(
     private val pendingCloseCallbacks = mutableListOf<() -> Unit>()
     private val pendingCloseFailureCallbacks = mutableListOf<() -> Unit>()
     private var confirmedReplacementCallback: (() -> Unit)? = null
+    private var confirmedReplacementRequiresPreview: Boolean = false
 
     val hasActiveSession: Boolean
         get() = activeSession != null
@@ -273,6 +277,7 @@ internal class PlayerSessionController(
         closingLaunchId = null
         pendingCloseCallbacks.clear()
         confirmedReplacementCallback = null
+        confirmedReplacementRequiresPreview = false
         activeSession = session
         playbackState = MiniPlayerPlaybackState(
             title = launch.title,
@@ -375,6 +380,7 @@ internal class PlayerSessionController(
         episodeNumber: Int?,
         sourceUrl: String? = null,
         allowSameTargetReopen: Boolean = true,
+        requiresPreview: Boolean = false,
         onProceed: () -> Unit,
     ) {
         val current = activeSession
@@ -413,6 +419,7 @@ internal class PlayerSessionController(
                     currentTitle = decision.currentTitle,
                     incomingTitle = decision.incomingTitle,
                     onConfirm = onProceed,
+                    requiresPreview = requiresPreview,
                 )
             }
         }
@@ -456,12 +463,20 @@ internal class PlayerSessionController(
             episodeNumber = null,
             sourceUrl = null,
             allowSameTargetReopen = false,
-            onProceed = onProceed,
+            requiresPreview = true,
+            onProceed = {
+                // The prompt can outlive the network that allowed the trailer.
+                if (previewsAllowed()) onProceed()
+            },
         )
     }
 
     fun confirmPendingReplacement() {
         val pending = pendingReplacement ?: return
+        if (pending.requiresPreview && !previewsAllowed()) {
+            pendingReplacement = null
+            return
+        }
         val current = activeSession
         // Retire the external launch before the prompt closes, so a prepare that
         // finished while the prompt was up cannot open in the gap.
@@ -473,11 +488,24 @@ internal class PlayerSessionController(
         }
         prepareClosingState(current.launchId)
         confirmedReplacementCallback = pending.onConfirm
+        confirmedReplacementRequiresPreview = pending.requiresPreview
         requestSessionClose(current)
     }
 
     fun cancelPendingReplacement() {
         pendingReplacement = null
+    }
+
+    /** Drops a trailer prompt, and a trailer start already copied out of that prompt, once previews are blocked. */
+    fun cancelPendingPreviewReplacement() {
+        if (previewsAllowed()) return
+        if (pendingReplacement?.requiresPreview == true) {
+            pendingReplacement = null
+        }
+        if (confirmedReplacementRequiresPreview) {
+            confirmedReplacementCallback = null
+            confirmedReplacementRequiresPreview = false
+        }
     }
 
     fun updatePlaybackState(launchId: Long, state: MiniPlayerPlaybackState) {
@@ -554,6 +582,7 @@ internal class PlayerSessionController(
         val failureCallbacks = pendingCloseFailureCallbacks.toList()
         pendingCloseFailureCallbacks.clear()
         confirmedReplacementCallback = null
+        confirmedReplacementRequiresPreview = false
         failureCallbacks.forEach { it.invoke() }
     }
 
@@ -563,6 +592,7 @@ internal class PlayerSessionController(
             pendingCloseCallbacks.clear()
             pendingCloseFailureCallbacks.clear()
             confirmedReplacementCallback = null
+            confirmedReplacementRequiresPreview = false
         }
     }
 
@@ -597,6 +627,7 @@ internal class PlayerSessionController(
             pendingCloseFailureCallbacks.clear()
             replacementCallback = confirmedReplacementCallback
             confirmedReplacementCallback = null
+            confirmedReplacementRequiresPreview = false
         } else {
             closeCallbacks = emptyList()
             replacementCallback = null

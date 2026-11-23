@@ -73,6 +73,7 @@ internal fun DetailsDestination(
     onPlay: ContentPlayAction,
     onPlayManually: ContentPlayAction,
     onRequestInAppTrailer: ((contentTitle: String, trailerTitle: String, onProceed: () -> Unit) -> Unit)? = null,
+    onPreviewsDisallowed: () -> Unit = {},
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
 ) {
@@ -88,6 +89,7 @@ internal fun DetailsDestination(
         onPlay = onPlay,
         onPlayManually = onPlayManually,
         onRequestInAppTrailer = onRequestInAppTrailer,
+        onPreviewsDisallowed = onPreviewsDisallowed,
         onOpenMeta = onOpenMeta,
         onOpenEpisode = { video ->
             navController.navigate(

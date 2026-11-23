@@ -14,6 +14,8 @@ internal data class PendingPlaybackReplacement(
     val currentTitle: String,
     val incomingTitle: String,
     val onConfirm: () -> Unit,
+    /** A trailer or other preview. Confirming it is refused once previews are no longer allowed. */
+    val requiresPreview: Boolean = false,
 )
 
 internal sealed interface ReplacePlaybackDecision {

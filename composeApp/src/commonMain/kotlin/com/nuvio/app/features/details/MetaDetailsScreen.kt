@@ -226,6 +226,7 @@ fun MetaDetailsScreen(
     onPlay: ((type: String, videoId: String, parentMetaId: String, parentMetaType: String, title: String, logo: String?, poster: String?, background: String?, seasonNumber: Int?, episodeNumber: Int?, episodeTitle: String?, episodeThumbnail: String?, pauseDescription: String?, resumePositionMs: Long?) -> Unit)? = null,
     onPlayManually: ((type: String, videoId: String, parentMetaId: String, parentMetaType: String, title: String, logo: String?, poster: String?, background: String?, seasonNumber: Int?, episodeNumber: Int?, episodeTitle: String?, episodeThumbnail: String?, pauseDescription: String?, resumePositionMs: Long?) -> Unit)? = null,
     onRequestInAppTrailer: ((contentTitle: String, trailerTitle: String, onProceed: () -> Unit) -> Unit)? = null,
+    onPreviewsDisallowed: () -> Unit = {},
     onOpenMeta: ((MetaPreview) -> Unit)? = null,
     onCastClick: ((MetaPerson, String?) -> Unit)? = null,
     onCompanyClick: ((MetaCompany, String) -> Unit)? = null,
@@ -856,6 +857,7 @@ fun MetaDetailsScreen(
                         selectedTrailer = null
                         trailerPlaybackSource = null
                         trailerLoading = false
+                        onPreviewsDisallowed()
                     }
                 }
                 val latestOnRequestInAppTrailer = rememberUpdatedState(onRequestInAppTrailer)
@@ -872,28 +874,31 @@ fun MetaDetailsScreen(
                             TrailerPlaybackMode.EXTERNAL -> runCatching { uriHandler.openUri(youtubeUrl) }
                             TrailerPlaybackMode.IN_APP -> {
                                 val startTrailer = {
-                                    selectedTrailer = trailer
-                                    trailerPlaybackSource = null
-                                    trailerErrorMessage = null
-                                    trailerLoading = true
-                                    trailerRequestToken += 1
-                                    val currentRequestToken = trailerRequestToken
-                                    trailerScope.launch {
-                                        val resolvedSource = runCatching {
-                                            TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
-                                        }.getOrNull()
-                                        if (currentRequestToken != trailerRequestToken) {
-                                            return@launch
+                                    // The prompt can stay open across a network change, so this reads the
+                                    // hold again instead of the value captured when the prompt was created.
+                                    if (com.nuvio.app.features.downloads.LimitedConnections.hold.state.value.travel.previewsAllowed) {
+                                        selectedTrailer = trailer
+                                        trailerPlaybackSource = null
+                                        trailerErrorMessage = null
+                                        trailerLoading = true
+                                        trailerRequestToken += 1
+                                        val currentRequestToken = trailerRequestToken
+                                        trailerScope.launch {
+                                            val resolvedSource = runCatching {
+                                                TrailerPlaybackResolver.resolveFromYouTubeUrl(youtubeUrl)
+                                            }.getOrNull()
+                                            if (currentRequestToken != trailerRequestToken) {
+                                                return@launch
+                                            }
+                                            trailerPlaybackSource = resolvedSource
+                                            trailerErrorMessage = if (resolvedSource == null) {
+                                                getString(Res.string.trailer_no_playable_stream)
+                                            } else {
+                                                null
+                                            }
+                                            trailerLoading = false
                                         }
-                                        trailerPlaybackSource = resolvedSource
-                                        trailerErrorMessage = if (resolvedSource == null) {
-                                            getString(Res.string.trailer_no_playable_stream)
-                                        } else {
-                                            null
-                                        }
-                                        trailerLoading = false
                                     }
-                                    Unit
                                 }
                                 val requestHook = latestOnRequestInAppTrailer.value
                                 if (requestHook != null) {
