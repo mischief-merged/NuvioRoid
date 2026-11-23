@@ -186,45 +186,77 @@ internal fun PlayerScreenRuntime.checkForPlaceholderSource(snapshot: PlayerPlayb
     if (!isDesktop || sourceFailoverCancelled) return
     val url = activeSourceUrl
     val videoId = activeVideoId
-    if (url.isBlank() || videoId == null || placeholderCheckedUrl == url) return
+    if (url.isBlank() || videoId == null) return
     val nowMs = placeholderNowMs()
-    // A file that has played to its end has its final length: no need to wait for it to settle. A clip
-    // shorter than the check's settling time ends before the check could decide otherwise.
-    if (snapshot.isEnded && snapshot.durationMs > 0L) {
-        placeholderCheckedUrl = url
-        placeholderCheckState = null
-        judgePlaceholderLength(url, videoId, snapshot.durationMs, ended = true)
-        return
-    }
-    // The window starts at the first frame; before it there is nothing to look at.
-    val state = placeholderCheckState?.takeIf { placeholderCheckStateUrl == url }
-        ?: if (snapshot.isLoading) return else PlaceholderCheckState(nowMs, snapshot.positionMs)
-    placeholderCheckStateUrl = url
-    val step = stepPlaceholderCheck(
-        state = state,
-        nowMs = nowMs,
-        positionMs = snapshot.positionMs,
-        durationMs = snapshot.durationMs,
-        isLoading = snapshot.isLoading,
-        network = NetworkStatusRepository.uiState.value.condition,
-    )
-    val durationMs = when (step) {
-        is PlaceholderCheckStep.Continue -> {
-            placeholderCheckState = step.state
-            return
-        }
-        PlaceholderCheckStep.Finished -> {
+    if (placeholderCheckedUrl != url) {
+        // A file that has played to its end has its final length: no need to wait for it to settle. A clip
+        // shorter than the check's settling time ends before the check could decide otherwise.
+        if (snapshot.isEnded && snapshot.durationMs > 0L) {
             placeholderCheckedUrl = url
             placeholderCheckState = null
-            syncAddonPlayerStartForPlayback()
+            judgePlaceholderLength(url, videoId, snapshot.durationMs, ended = true)
+            updateAddonTrackingDurationSettle(url, snapshot, nowMs)
             return
         }
-        is PlaceholderCheckStep.Stable -> step.durationMs
+        // The window starts at the first frame; before it there is nothing to look at.
+        val state = placeholderCheckState?.takeIf { placeholderCheckStateUrl == url }
+            ?: if (snapshot.isLoading) null else PlaceholderCheckState(nowMs, snapshot.positionMs)
+        if (state != null) {
+            placeholderCheckStateUrl = url
+            val step = stepPlaceholderCheck(
+                state = state,
+                nowMs = nowMs,
+                positionMs = snapshot.positionMs,
+                durationMs = snapshot.durationMs,
+                isLoading = snapshot.isLoading,
+                network = placeholderNetworkCondition(),
+            )
+            when (step) {
+                is PlaceholderCheckStep.Continue -> {
+                    placeholderCheckState = step.state
+                }
+                PlaceholderCheckStep.Finished -> {
+                    placeholderCheckedUrl = url
+                    placeholderCheckState = null
+                }
+                is PlaceholderCheckStep.Stable -> {
+                    placeholderCheckedUrl = url
+                    placeholderCheckState = null
+                    judgePlaceholderLength(url, videoId, step.durationMs, ended = false)
+                }
+            }
+        }
     }
-    placeholderCheckedUrl = url
-    placeholderCheckState = null
-    judgePlaceholderLength(url, videoId, durationMs, ended = false)
-    syncAddonPlayerStartForPlayback()
+    updateAddonTrackingDurationSettle(url, snapshot, nowMs)
+}
+
+/**
+ * Tracks whether a remote desktop stream has reported a genuinely stable positive duration
+ * for tracking add-on START events, independent of placeholder failover give-ups (seeks,
+ * 30-second window expiry, or offline network status).
+ */
+private fun PlayerScreenRuntime.updateAddonTrackingDurationSettle(
+    url: String,
+    snapshot: PlayerPlaybackSnapshot,
+    nowMs: Long,
+) {
+    if (url.startsWith("file:") || addonTrackingDurationSettledUrl == url) return
+    val currentState = addonTrackingDurationState?.takeIf { addonTrackingDurationStateUrl == url }
+        ?: TrackingDurationSettleState()
+    addonTrackingDurationStateUrl = url
+    val (nextState, settled) = stepTrackingDurationSettle(
+        state = currentState,
+        nowMs = nowMs,
+        durationMs = snapshot.durationMs,
+        isLoading = snapshot.isLoading,
+    )
+    if (settled) {
+        addonTrackingDurationSettledUrl = url
+        addonTrackingDurationState = null
+        syncAddonPlayerStartForPlayback()
+    } else {
+        addonTrackingDurationState = nextState
+    }
 }
 
 /** Judges the final length of the source at [url]; a placeholder is moved on from. */

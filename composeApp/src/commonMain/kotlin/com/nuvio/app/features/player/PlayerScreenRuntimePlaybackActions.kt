@@ -401,7 +401,7 @@ internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     if (sourceFallbackJob?.isActive == true) return false
     if (sourceFailoverForPlaceholder) return false
     if (placeholderDetectedUrl == url) return false
-    if (isDesktop && activeVideoId != null && placeholderCheckedUrl != url) return false
+    if (isDesktop && activeVideoId != null && !url.startsWith("file:") && addonTrackingDurationSettledUrl != url) return false
     if (playbackSnapshot.isEnded) return false
     if (durationMs <= 0L) return false
     if (isShortPlaceholderDuration(durationMs)) return false

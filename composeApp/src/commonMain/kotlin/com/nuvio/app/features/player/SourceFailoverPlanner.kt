@@ -265,3 +265,36 @@ internal fun stepPlaceholderCheck(
         PlaceholderCheckStep.Continue(next)
     }
 }
+
+/**
+ * Duration-stability state used to gate tracking add-on START events on remote desktop streams.
+ * Unlike [PlaceholderCheckState], this never gives up on a seek, a 30-second window, or offline
+ * network conditions: it settles only once [PLACEHOLDER_MIN_STABLE_SNAPSHOTS] non-loading snapshots
+ * agree on a positive duration across at least [PLACEHOLDER_MIN_STABLE_MS].
+ */
+internal data class TrackingDurationSettleState(
+    val stableDurationMs: Long = 0L,
+    val stableSinceMs: Long = 0L,
+    val stableSnapshots: Int = 0,
+)
+
+internal fun stepTrackingDurationSettle(
+    state: TrackingDurationSettleState,
+    nowMs: Long,
+    durationMs: Long,
+    isLoading: Boolean,
+): Pair<TrackingDurationSettleState, Boolean> {
+    if (isLoading || durationMs <= 0L) {
+        return state.copy(stableSnapshots = 0) to false
+    }
+    val sameRun = state.stableSnapshots > 0 &&
+        kotlin.math.abs(durationMs - state.stableDurationMs) <= PLACEHOLDER_DURATION_TOLERANCE_MS
+    val next = if (sameRun) {
+        state.copy(stableSnapshots = state.stableSnapshots + 1)
+    } else {
+        state.copy(stableDurationMs = durationMs, stableSinceMs = nowMs, stableSnapshots = 1)
+    }
+    val settled = next.stableSnapshots >= PLACEHOLDER_MIN_STABLE_SNAPSHOTS &&
+        nowMs - next.stableSinceMs >= PLACEHOLDER_MIN_STABLE_MS
+    return next to settled
+}

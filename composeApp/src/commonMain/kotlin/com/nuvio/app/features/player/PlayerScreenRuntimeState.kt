@@ -318,8 +318,16 @@ internal class PlayerScreenRuntime(
     var placeholderCheckStateUrl: String? = null
     var placeholderCheckState: PlaceholderCheckState? = null
     var placeholderWarnedUrl: String? = null
+    /** Remote source whose duration settled over stable non-loading snapshots for tracking add-ons. */
+    var addonTrackingDurationSettledUrl: String? = null
+    var addonTrackingDurationStateUrl: String? = null
+    var addonTrackingDurationState: TrackingDurationSettleState? = null
     /** Monotonic clock in milliseconds for the placeholder check. Tests replace it to step time. */
     var placeholderNowMs: () -> Long = ::defaultPlaceholderNowMs
+    /** Current network condition for the placeholder check. Tests replace it to simulate offline playback. */
+    var placeholderNetworkCondition: () -> com.nuvio.app.core.network.NetworkCondition = {
+        com.nuvio.app.core.network.NetworkStatusRepository.uiState.value.condition
+    }
     /** Where moving on to another source finds the sources: the player's own search. Tests give their own list. */
     var failoverSourceSearch: FailoverSourceSearch = FailoverSourceSearch.Player
 
@@ -328,6 +336,8 @@ internal class PlayerScreenRuntime(
     var showVideoSettingsModal by mutableStateOf(false)
     var showStreamInfo by mutableStateOf(false)
     var showPartyPanel by mutableStateOf(false)
+    /** True while an embedded desktop native controls popup (audio, subtitles, speed, etc.) is open. */
+    var nativeControlsModalOpen by mutableStateOf(false)
     var partyPanelToken by mutableStateOf(0L)
     var partyMessage by mutableStateOf("")
     var partyMessageToken by mutableStateOf(0L)

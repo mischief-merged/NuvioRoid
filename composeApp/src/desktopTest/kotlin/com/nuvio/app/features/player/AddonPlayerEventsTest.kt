@@ -415,4 +415,76 @@ class AddonPlayerEventsTest {
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
         assertNull(runtime.activeAddonPlayerEventTarget)
     }
+
+    @Test
+    fun provisional_full_length_with_seek_then_short_placeholder_sends_no_events() {
+        val runtime = runtime(runtimeMinutes = 45)
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 2_700_000L, positionMs = 0L)
+        // User seeks ahead before 3s: placeholder failover check finishes, but tracking START still waits for settled duration.
+        deliverSnapshot(runtime, nowMs = 1_000L, durationMs = 2_700_000L, positionMs = 600_000L)
+        assertTrue(events.isEmpty(), "seek must not send START before duration settles, got $events")
+
+        // Duration drops to a short placeholder clip and settles there.
+        deliverSnapshot(runtime, nowMs = 2_000L, durationMs = 15_000L, positionMs = 2_000L)
+        deliverSnapshot(runtime, nowMs = 3_500L, durationMs = 15_000L, positionMs = 3_500L)
+        deliverSnapshot(runtime, nowMs = 5_000L, durationMs = 15_000L, positionMs = 5_000L)
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+
+        assertTrue(events.isEmpty(), "placeholder after seek must never send START or STOP, got $events")
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun provisional_full_length_past_30s_window_then_short_placeholder_sends_no_events() {
+        val runtime = runtime(runtimeMinutes = 45)
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 2_700_000L, positionMs = 0L)
+        // Buffering lasts past the 30-second placeholder window: placeholder failover gives up, but tracking START still waits.
+        deliverSnapshot(runtime, nowMs = 10_000L, durationMs = 2_700_000L, positionMs = 0L, isLoading = true)
+        deliverSnapshot(runtime, nowMs = 31_000L, durationMs = 2_700_000L, positionMs = 500L, isLoading = false)
+        assertTrue(events.isEmpty(), "30s window expiry must not send START before duration settles, got $events")
+
+        // Duration drops to a short placeholder and settles there.
+        deliverSnapshot(runtime, nowMs = 32_000L, durationMs = 15_000L, positionMs = 1_500L)
+        deliverSnapshot(runtime, nowMs = 33_500L, durationMs = 15_000L, positionMs = 3_000L)
+        deliverSnapshot(runtime, nowMs = 35_000L, durationMs = 15_000L, positionMs = 4_500L)
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+
+        assertTrue(events.isEmpty(), "placeholder after 30s window must never send START or STOP, got $events")
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun healthy_stream_after_early_seek_still_sends_start_once_duration_settles() {
+        val runtime = runtime(runtimeMinutes = 45)
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 2_700_000L, positionMs = 0L)
+        // User seeks immediately; placeholder failover gives up (Finished), but tracking settle continues.
+        deliverSnapshot(runtime, nowMs = 1_000L, durationMs = 2_700_000L, positionMs = 600_000L)
+        assertTrue(events.isEmpty(), "must still wait for 3s stability after seek")
+
+        deliverSnapshot(runtime, nowMs = 3_000L, durationMs = 2_700_000L, positionMs = 602_000L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
+    }
+
+    @Test
+    fun offline_local_file_sends_start_and_stop_even_for_brief_playback() {
+        val localUrl = "file:///Users/test/Downloads/episode.mkv"
+        val runtime = runtime(
+            sourceUrl = localUrl,
+            runtimeMinutes = 45,
+            activeStream = null,
+        ).apply {
+            placeholderNetworkCondition = { com.nuvio.app.core.network.NetworkCondition.NoInternet }
+        }
+
+        // Single brief snapshot while offline: local container duration is final and sends START immediately.
+        deliverSnapshot(runtime, nowMs = 0L, durationMs = 2_700_000L, positionMs = 500L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
 }
