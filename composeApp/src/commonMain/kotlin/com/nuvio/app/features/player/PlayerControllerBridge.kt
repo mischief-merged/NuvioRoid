@@ -31,10 +31,21 @@ internal object PlayerControllerBridge {
     @Volatile
     private var handler: ((PlayerCommand) -> Boolean)? = null
 
-    fun register(scope: CoroutineScope?, handler: ((PlayerCommand) -> Boolean)?) {
+    @Volatile
+    private var overlayOpenCheck: (() -> Boolean)? = null
+
+    fun register(
+        scope: CoroutineScope?,
+        handler: ((PlayerCommand) -> Boolean)?,
+        isOverlayOpen: (() -> Boolean)? = null,
+    ) {
         this.scope = scope
         this.handler = handler
+        this.overlayOpenCheck = isOverlayOpen
     }
+
+    /** True while the active player has an open modal, dialog, or side panel that owns input focus. */
+    fun isOverlayOpen(): Boolean = overlayOpenCheck?.invoke() == true
 
     /**
      * Dispatches a command to the player. Gamepad input arrives on the polling thread, so the

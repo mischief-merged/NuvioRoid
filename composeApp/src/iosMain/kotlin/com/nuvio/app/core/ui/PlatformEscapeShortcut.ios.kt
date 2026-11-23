@@ -16,3 +16,5 @@ internal actual fun PlatformModalBackHandler(
 }
 
 internal actual fun dispatchPlatformLocalBack(): Boolean = false
+
+internal actual fun hasOpenPlatformModal(): Boolean = false

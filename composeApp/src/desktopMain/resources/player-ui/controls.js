@@ -1100,6 +1100,9 @@ const setModalVisibility = (modal, visible, animated = true) => {
 const closePlayerModal = (notifyDismiss = false, animated = true) => {
   const closingModal = activeModal;
   activeModal = "";
+  if (closingModal) {
+    send("nativeModalState", 0);
+  }
   if (fontPickerOpen) setFontPickerOpen(false);
   modalElements.forEach(modal => {
     setModalVisibility(modal, false, animated);
@@ -1118,9 +1121,13 @@ const openPlayerModal = modal => {
     closePlayerModal(false);
     return;
   }
+  const wasOpen = Boolean(activeModal);
   if (activeModal === "party" && modal !== "party") onPartyModalClosed();
   if (modal === "party" && activeModal !== "party") onPartyModalOpened();
   activeModal = modal;
+  if (!wasOpen) {
+    send("nativeModalState", 1);
+  }
   if (modal === "submitIntro") {
     const contentKey = state.submitIntroContentKey || "";
     if (submitIntroDraft.contentKey !== contentKey) {

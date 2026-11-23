@@ -209,11 +209,14 @@ actual fun PlatformKeyboardNavigationHost() {
         val dispatcher = java.awt.KeyEventDispatcher { event: KeyEvent ->
             if (event.id != KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
 
-            val isPlayerActive = ControllerManager.screenContext.value.screenType ==
-                ControllerScreenType.Player
+            val isPlayerPlaybackControlsActive =
+                ControllerManager.screenContext.value.screenType == ControllerScreenType.Player &&
+                    !PlayerControllerBridge.isOverlayOpen() &&
+                    !DesktopEscapeShortcut.hasOpenModal()
 
-            // Inside the player the arrows are playback controls, not focus movement.
-            if (isPlayerActive) {
+            // Inside the player the arrows and space/enter are playback controls, except while a
+            // player modal or side panel owns focus.
+            if (isPlayerPlaybackControlsActive) {
                 if (event.keyCode == KeyEvent.VK_SPACE || event.keyCode == KeyEvent.VK_ENTER) {
                     if (PlayerControllerBridge.dispatch(PlayerCommand.TogglePlayback)) {
                         return@KeyEventDispatcher true
@@ -240,7 +243,7 @@ actual fun PlatformKeyboardNavigationHost() {
                 else -> return@KeyEventDispatcher false
             }
 
-            if (isPlayerActive) {
+            if (isPlayerPlaybackControlsActive) {
                 val command = when (direction) {
                     ControllerDirection.Left -> PlayerCommand.SeekBack
                     ControllerDirection.Right -> PlayerCommand.SeekForward

@@ -37,6 +37,8 @@ internal object DesktopEscapeShortcut {
         }
     }
 
+    fun hasOpenModal(): Boolean = synchronized(modalHandlers) { modalHandlers.isNotEmpty() }
+
     fun registerLocal(handler: () -> Unit) {
         synchronized(localHandlers) {
             localHandlers.removeAll { it === handler }

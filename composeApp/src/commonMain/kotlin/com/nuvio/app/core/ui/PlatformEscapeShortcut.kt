@@ -23,3 +23,6 @@ internal expect fun PlatformModalBackHandler(
 
 /** Runs the innermost active modal or local [PlatformBackHandler] on desktop; returns false when none is active. */
 internal expect fun dispatchPlatformLocalBack(): Boolean
+
+/** True on desktop when a modal registered via [PlatformModalBackHandler] is currently open. */
+internal expect fun hasOpenPlatformModal(): Boolean

@@ -42,7 +42,12 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.LocalFold
 import com.nuvio.app.features.p2p.P2pStreamingState
+import com.nuvio.app.controller.ControllerDirection
+import com.nuvio.app.controller.ControllerEvent
+import com.nuvio.app.controller.XboxButton
+import com.nuvio.app.controller.audio.ControllerSoundPlayer
 import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.core.ui.hasOpenPlatformModal
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.p2p.formatP2pMegabytes
 import com.nuvio.app.features.p2p.formatP2pSpeed
@@ -76,7 +81,11 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     val runtime = this
     val systemBackRegistration = args.onSystemBackHandlerChanged
     DisposableEffect(runtime, systemBackRegistration) {
-        systemBackRegistration { runtime.requestBack() }
+        systemBackRegistration {
+            if (!runtime.dismissOpenPlayerOverlay()) {
+                runtime.requestBack()
+            }
+        }
         onDispose { systemBackRegistration(null) }
     }
     val isInPip = rememberIsInPictureInPicture()
@@ -1323,6 +1332,9 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
         "parentalGuideComplete" -> {
             showParentalGuide = false
         }
+        "nativeModalState" -> {
+            nativeControlsModalOpen = value >= 0.5
+        }
         else -> return handlePartyControlsEvent(type, value)
     }
     return true
@@ -1390,11 +1402,67 @@ internal fun PlayerScreenRuntime.handlePlayerControllerCommand(command: PlayerCo
     }
 
 /**
+ * True while any Compose or embedded native player overlay owns focus, so keyboard arrows/Enter
+ * and gamepad D-pad/A operate the overlay instead of seeking or toggling playback underneath it.
+ */
+internal val PlayerScreenRuntime.hasOpenPlayerOverlay: Boolean
+    get() = isPanelOpen ||
+        showChaptersPanel ||
+        showSwitchEngineConfirm ||
+        pendingP2pSwitch != null ||
+        playerControlsPendingP2pSwitch != null ||
+        nativeControlsModalOpen
+
+/**
+ * Translates a controller event while the player is active. When a player modal, dialog, or side
+ * panel is open, directional navigation and A/Select yield (`false`) so Compose focus operates the
+ * overlay while B/Back still dismisses it.
+ */
+internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
+    event: ControllerEvent,
+    modalOpen: Boolean = hasOpenPlatformModal(),
+    dispatch: (PlayerCommand) -> Boolean = PlayerControllerBridge::dispatch,
+    onNavigateHandled: () -> Unit = ControllerSoundPlayer::playNavigate,
+): Boolean {
+    val overlayOpen = hasOpenPlayerOverlay || modalOpen
+    return when (event) {
+        is ControllerEvent.Navigate -> {
+            if (overlayOpen) return false
+            val handled = when (event.direction) {
+                ControllerDirection.Left -> dispatch(PlayerCommand.SeekBack)
+                ControllerDirection.Right -> dispatch(PlayerCommand.SeekForward)
+                ControllerDirection.Up -> dispatch(PlayerCommand.VolumeUp)
+                ControllerDirection.Down -> dispatch(PlayerCommand.VolumeDown)
+            }
+            if (handled) onNavigateHandled()
+            handled
+        }
+        is ControllerEvent.ButtonPressed -> when (event.button) {
+            XboxButton.B -> dispatch(PlayerCommand.Back)
+            XboxButton.A -> if (overlayOpen) false else dispatch(PlayerCommand.TogglePlayback)
+            XboxButton.X -> if (overlayOpen) false else dispatch(PlayerCommand.Audio)
+            XboxButton.Y -> if (overlayOpen) false else dispatch(PlayerCommand.Subtitles)
+            XboxButton.LB, XboxButton.LT -> if (overlayOpen) false else dispatch(PlayerCommand.SeekBack)
+            XboxButton.RB, XboxButton.RT -> if (overlayOpen) false else dispatch(PlayerCommand.SeekForward)
+            XboxButton.Menu -> if (overlayOpen) false else dispatch(PlayerCommand.Episodes)
+            XboxButton.View -> if (overlayOpen) false else dispatch(PlayerCommand.Sources)
+            else -> false
+        }
+        else -> false
+    }
+}
+
+/**
  * Dismisses any open player modal, dialog, or side panel before exiting playback.
  * Returns true if an overlay was dismissed (so the Back press is consumed).
  */
 internal fun PlayerScreenRuntime.dismissOpenPlayerOverlay(): Boolean {
     if (dispatchPlatformLocalBack()) return true
+    if (nativeControlsModalOpen) {
+        nativeControlsModalOpen = false
+        playerControlsCloseModalsToken += 1
+        return true
+    }
     if (showSwitchEngineConfirm) {
         showSwitchEngineConfirm = false
         return true

@@ -1,6 +1,9 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.ui.Modifier
+import com.nuvio.app.controller.ControllerDirection
+import com.nuvio.app.controller.ControllerEvent
+import com.nuvio.app.controller.XboxButton
 import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.plugins.PluginRepository
@@ -143,6 +146,88 @@ class PlayerControllerCommandTest {
             assertEquals(0, exitCalls)
         } finally {
             DesktopEscapeShortcut.unregisterModal(modalHandler)
+        }
+    }
+
+    @Test
+    fun controller_navigation_and_select_yield_while_player_panel_is_open_and_back_closes_it() {
+        var exitCalls = 0
+        val runtime = createRuntime(isSeries = true, onExit = { exitCalls += 1 })
+        val dispatched = mutableListOf<PlayerCommand>()
+        val dispatch: (PlayerCommand) -> Boolean = { cmd ->
+            dispatched += cmd
+            runtime.handlePlayerControllerCommand(cmd)
+        }
+
+        // Open Episodes panel via Menu button.
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.Menu), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertTrue(runtime.showEpisodesPanel)
+        assertTrue(runtime.hasOpenPlayerOverlay)
+
+        // While panel is open, D-pad and A yield (return false) so Compose focus operates the panel.
+        dispatched.clear()
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Down), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Right), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.X), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertTrue(dispatched.isEmpty(), "playback commands must not fire while overlay is open: $dispatched")
+
+        // Pressing B closes the panel without exiting playback.
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.B), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertFalse(runtime.showEpisodesPanel)
+        assertFalse(runtime.hasOpenPlayerOverlay)
+        assertEquals(0, exitCalls)
+
+        // Once closed, A toggles playback again.
+        dispatched.clear()
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = false, dispatch = dispatch, onNavigateHandled = {}))
+        assertEquals(listOf(PlayerCommand.TogglePlayback), dispatched)
+    }
+
+    @Test
+    fun native_player_popup_suspends_playback_controls_and_back_closes_popup_before_exiting() {
+        var exitCalls = 0
+        val runtime = createRuntime(isSeries = true, onExit = { exitCalls += 1 })
+        val initialCloseToken = runtime.playerControlsCloseModalsToken
+
+        // Native macOS WebView popup (e.g. Audio or Subtitles) opens.
+        assertTrue(runtime.handlePlayerControlsEvent("nativeModalState", 1.0))
+        assertTrue(runtime.nativeControlsModalOpen)
+        assertTrue(runtime.hasOpenPlayerOverlay)
+
+        // D-pad and A yield while the native popup is open.
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Down), modalOpen = false, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = false, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+
+        // First Back closes the native popup via closeModalsToken without exiting playback.
+        assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+        assertFalse(runtime.nativeControlsModalOpen)
+        assertEquals(initialCloseToken + 1L, runtime.playerControlsCloseModalsToken)
+        assertEquals(0, exitCalls)
+
+        // Second Back exits playback now that the native popup is closed.
+        assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+        assertEquals(1, exitCalls)
+    }
+
+    @Test
+    fun player_controller_bridge_reports_overlay_open_state_for_desktop_keyboard_navigation() {
+        val runtime = createRuntime(isSeries = true)
+        PlayerControllerBridge.register(
+            scope = null,
+            handler = runtime::handlePlayerControllerCommand,
+            isOverlayOpen = { runtime.hasOpenPlayerOverlay },
+        )
+        try {
+            assertFalse(PlayerControllerBridge.isOverlayOpen())
+            runtime.showSourcesPanel = true
+            assertTrue(PlayerControllerBridge.isOverlayOpen())
+            runtime.showSourcesPanel = false
+            assertFalse(PlayerControllerBridge.isOverlayOpen())
+            runtime.handlePlayerControlsEvent("nativeModalState", 1.0)
+            assertTrue(PlayerControllerBridge.isOverlayOpen())
+        } finally {
+            PlayerControllerBridge.register(null, null, null)
         }
     }
 }

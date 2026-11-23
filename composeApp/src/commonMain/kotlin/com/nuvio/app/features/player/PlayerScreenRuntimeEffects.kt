@@ -167,6 +167,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         showSourcesPanel = false
         showEpisodesPanel = false
         showChaptersPanel = false
+        nativeControlsModalOpen = false
         chapters = emptyList()
         chaptersLoadedForSourceUrl = null
         clearChapterSkipState()
