@@ -89,7 +89,10 @@ object TrackingProviderRegistry {
 
     fun register(provider: TrackingAuthProvider) {
         val previousJob = synchronized(lock) {
-            authProviders[provider.descriptor.id] = provider
+            val previousAuth = authProviders.put(provider.descriptor.id, provider)
+            if (previousAuth != null && previousAuth !== provider) {
+                profileStores.remove(previousAuth)
+            }
             profileStores += provider
             authObservationJobs.remove(provider.descriptor.id)
         }

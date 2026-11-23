@@ -153,14 +153,7 @@ internal object AutoDownloads : AutoDownloadController {
             MetaDetailsRepository.fetch(rule.parentMetaType, rule.parentMetaId, cacheResult = false, useCached = false)
                 ?.releasedBatchEpisodes(CurrentDateProvider.todayIsoDate())
         },
-        isWatched = { rule, episode ->
-            WatchedRepository.isWatched(
-                id = rule.parentMetaId,
-                type = rule.parentMetaType,
-                season = episode.seasonNumber,
-                episode = episode.episodeNumber,
-            )
-        },
+        isWatched = ::isEpisodeWatchedForAutoDownload,
         downloads = { DownloadsRepository.uiState.value.items },
         seasonDefaults = SeasonDownloadDefaultsRepository::load,
         startBatch = SeasonBatchDownloads::start,
@@ -387,6 +380,59 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    /** Cancels pending watched removals when content is unwatched or its playback progress is cleared. */
+    fun cancelPendingRemovals(
+        parentMetaId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
+        cancelPendingRemovals(
+            parentMetaIds = listOf(parentMetaId),
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            videoId = videoId,
+            onlyNonEpisode = onlyNonEpisode,
+        )
+    }
+
+    /** Cancels pending watched removals matching any alias of unwatched or cleared content. */
+    fun cancelPendingRemovals(
+        parentMetaIds: Collection<String>,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
+        if (!isAvailable) return
+        val normalizedParents = parentMetaIds
+            .map { it.trim() }
+            .filterTo(linkedSetOf()) { it.isNotEmpty() }
+        val normalizedVideoId = videoId?.trim()?.takeIf { it.isNotEmpty() }
+        if (normalizedParents.isEmpty() && normalizedVideoId == null) return
+        val profileId = ProfileRepository.activeProfileId
+        runCatching {
+            val cancelled = deleteAfterWatching.cancelForContent(
+                profileId = profileId,
+                parentMetaIds = normalizedParents,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = normalizedVideoId,
+                onlyNonEpisode = onlyNonEpisode,
+            )
+            if (cancelled) {
+                scope.launch {
+                    runCatching {
+                        store.currentRules()
+                            .filter { it.parentMetaId.trim() in normalizedParents }
+                            .forEach { engine.refreshStatus(profileId, it.key) }
+                    }
+                }
+            }
+        }
+    }
+
     /** Says that [item] will be deleted, with a Keep button for as long as the message stays. */
     private suspend fun announceScheduledDeletion(profileId: Int, item: DownloadItem) {
         val due = store.removals(profileId).firstOrNull { it.downloadId == item.id } ?: return
@@ -422,6 +468,28 @@ internal object AutoDownloads : AutoDownloadController {
     private const val PollIntervalMs = 10L * 60 * 1000
     private const val PlaybackCheckDelayMs = 5_000L
 }
+
+/**
+ * Whether [episode] counts as watched for an automatic-download rule: either marked watched in
+ * history or finished by local playback on this device during this install (never a cloud-synced
+ * or tracker-synced progress row).
+ */
+internal fun isEpisodeWatchedForAutoDownload(
+    rule: AutoDownloadRule,
+    episode: SeasonBatchEpisode,
+    isWatchedInHistory: (id: String, type: String, season: Int, episode: Int) -> Boolean = { id, type, season, number ->
+        WatchedRepository.isWatched(id = id, type = type, season = season, episode = number)
+    },
+    isLocallyFinishedOnDevice: (parentMetaId: String, season: Int, episode: Int) -> Boolean = { parentMetaId, season, number ->
+        WatchProgressRepository.isEpisodeLocallyFinished(
+            parentMetaId = parentMetaId,
+            seasonNumber = season,
+            episodeNumber = number,
+        )
+    },
+): Boolean =
+    isWatchedInHistory(rule.parentMetaId, rule.parentMetaType, episode.seasonNumber, episode.episodeNumber) ||
+        isLocallyFinishedOnDevice(rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
 
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
 internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {

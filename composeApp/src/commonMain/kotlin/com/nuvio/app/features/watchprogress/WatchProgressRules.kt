@@ -23,7 +23,92 @@ internal data class StoredWatchProgressPayload(
     val deltaCursorEventId: Long = 0L,
     val deltaInitialized: Boolean = false,
     val dirtyProgressKeys: Set<String> = emptySet(),
+    val locallyFinishedEpisodeKeys: Set<String> = emptySet(),
+    val locallyFinishedEpisodeGroups: List<Set<String>> = emptyList(),
 )
+
+internal data class LocallyFinishedEpisodeAlias(
+    val parentMetaId: String,
+    val seasonNumber: Int,
+    val episodeNumber: Int,
+)
+
+internal fun localFinishedEpisodeKey(
+    parentMetaId: String,
+    seasonNumber: Int,
+    episodeNumber: Int,
+): String = "${parentMetaId.trim()}|$seasonNumber|$episodeNumber"
+
+internal fun parseLocalFinishedEpisodeKey(key: String): LocallyFinishedEpisodeAlias? {
+    val lastSep = key.lastIndexOf('|')
+    if (lastSep <= 0) return null
+    val episode = key.substring(lastSep + 1).toIntOrNull() ?: return null
+    val prevSep = key.lastIndexOf('|', startIndex = lastSep - 1)
+    if (prevSep <= 0) return null
+    val season = key.substring(prevSep + 1, lastSep).toIntOrNull() ?: return null
+    val parent = key.substring(0, prevSep).trim().takeIf { it.isNotEmpty() } ?: return null
+    return LocallyFinishedEpisodeAlias(
+        parentMetaId = parent,
+        seasonNumber = season,
+        episodeNumber = episode,
+    )
+}
+
+internal fun mergeLocallyFinishedEpisodeGroup(
+    existingGroups: Collection<Set<String>>,
+    newGroup: Set<String>,
+): List<Set<String>> {
+    val cleaned = newGroup.map { it.trim() }.filterTo(linkedSetOf()) { it.isNotEmpty() }
+    if (cleaned.isEmpty()) return existingGroups.filter { it.isNotEmpty() }
+    val merged = linkedSetOf<String>().apply { addAll(cleaned) }
+    val remaining = mutableListOf<Set<String>>()
+    existingGroups.forEach { group ->
+        val normalized = group.map { it.trim() }.filterTo(linkedSetOf()) { it.isNotEmpty() }
+        if (normalized.isEmpty()) return@forEach
+        if (normalized.any { it in merged }) {
+            merged += normalized
+        } else {
+            remaining += normalized
+        }
+    }
+    remaining += merged
+    return remaining
+}
+
+internal fun normalizeLocallyFinishedEpisodeGroups(
+    groups: Collection<Set<String>>,
+    legacyKeys: Set<String> = emptySet(),
+): List<Set<String>> {
+    var normalized = emptyList<Set<String>>()
+    groups.forEach { group ->
+        normalized = mergeLocallyFinishedEpisodeGroup(normalized, group)
+    }
+    val covered = normalized.flatten().toSet()
+    legacyKeys.forEach { key ->
+        val trimmed = key.trim()
+        if (trimmed.isNotEmpty() && trimmed !in covered) {
+            normalized = mergeLocallyFinishedEpisodeGroup(normalized, setOf(trimmed))
+        }
+    }
+    return normalized
+}
+
+internal fun parseEpisodeFromPlaybackVideoId(
+    videoId: String,
+    parentMetaId: String? = null,
+): Triple<String, Int, Int>? {
+    val trimmedVideoId = videoId.trim()
+    val lastColon = trimmedVideoId.lastIndexOf(':')
+    if (lastColon <= 0) return null
+    val episode = trimmedVideoId.substring(lastColon + 1).toIntOrNull() ?: return null
+    val prevColon = trimmedVideoId.lastIndexOf(':', startIndex = lastColon - 1)
+    if (prevColon <= 0) return null
+    val season = trimmedVideoId.substring(prevColon + 1, lastColon).toIntOrNull() ?: return null
+    val resolvedParent = parentMetaId?.trim()?.takeIf { it.isNotEmpty() }
+        ?: trimmedVideoId.substring(0, prevColon).trim().takeIf { it.isNotEmpty() }
+        ?: return null
+    return Triple(resolvedParent, season, episode)
+}
 
 internal object WatchProgressCodec {
     private val json = Json {
@@ -42,11 +127,17 @@ internal object WatchProgressCodec {
                     .newestByProgressKey()
                     .values
                     .sortedWith(watchProgressEntryFreshnessComparator.reversed())
+                val normalizedGroups = normalizeLocallyFinishedEpisodeGroups(
+                    groups = storedPayload.locallyFinishedEpisodeGroups,
+                    legacyKeys = storedPayload.locallyFinishedEpisodeKeys,
+                )
                 storedPayload.copy(
                     entries = migratedEntries,
                     dirtyProgressKeys = storedPayload.dirtyProgressKeys.intersect(
                         migratedEntries.mapTo(mutableSetOf()) { entry -> entry.resolvedProgressKey() },
                     ),
+                    locallyFinishedEpisodeKeys = normalizedGroups.flatten().toSet(),
+                    locallyFinishedEpisodeGroups = normalizedGroups,
                 )
             }
         }.getOrDefault(StoredWatchProgressPayload())
@@ -65,8 +156,14 @@ internal object WatchProgressCodec {
         deltaCursorEventId: Long,
         deltaInitialized: Boolean,
         dirtyProgressKeys: Set<String> = emptySet(),
-    ): String =
-        json.encodeToString(
+        locallyFinishedEpisodeKeys: Set<String> = emptySet(),
+        locallyFinishedEpisodeGroups: List<Set<String>> = emptyList(),
+    ): String {
+        val normalizedGroups = normalizeLocallyFinishedEpisodeGroups(
+            groups = locallyFinishedEpisodeGroups,
+            legacyKeys = locallyFinishedEpisodeKeys,
+        )
+        return json.encodeToString(
             StoredWatchProgressPayload(
                 entries = entries
                     .newestByProgressKey()
@@ -76,8 +173,11 @@ internal object WatchProgressCodec {
                 deltaCursorEventId = deltaCursorEventId,
                 deltaInitialized = deltaInitialized,
                 dirtyProgressKeys = dirtyProgressKeys,
+                locallyFinishedEpisodeKeys = normalizedGroups.flatten().toSet(),
+                locallyFinishedEpisodeGroups = normalizedGroups,
             ),
         )
+    }
 }
 
 internal fun shouldStoreWatchProgress(

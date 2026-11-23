@@ -204,6 +204,7 @@ internal fun PlayerScreenRuntime.resetAddonSubtitlesIfSourceChanged() {
 internal fun PlayerScreenRuntime.currentPlaybackProgressPercent(
     snapshot: PlayerPlaybackSnapshot = playbackSnapshot,
 ): Float {
+    if (snapshot.isEnded && !isShortPlaceholderDuration(snapshot.durationMs)) return 100f
     val duration = snapshot.durationMs.takeIf { it > 0L } ?: return 0f
     return ((snapshot.positionMs.toFloat() / duration.toFloat()) * 100f)
         .coerceIn(0f, 100f)
@@ -480,11 +481,15 @@ internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
 internal fun PlayerScreenRuntime.flushWatchProgress(
     scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
 ) {
+    WatchProgressRepository.flushPlaybackProgress(
+        session = playbackSession,
+        snapshot = playbackSnapshot,
+    )
     when (scrobbleAction) {
         TrackingScrobbleAction.PAUSE -> emitTrackingScrobblePause()
         TrackingScrobbleAction.STOP -> {
-            reportLocalPlaybackCompleted()
             emitStopScrobbleForCurrentProgress()
+            reportLocalPlaybackCompleted()
         }
         TrackingScrobbleAction.START -> Unit
     }
@@ -493,10 +498,6 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
         TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
         TrackingScrobbleAction.START -> Unit
     }
-    WatchProgressRepository.flushPlaybackProgress(
-        session = playbackSession,
-        snapshot = playbackSnapshot,
-    )
 }
 
 /** Tells automatic downloads that a downloaded file was played to the point that counts as watched. */
