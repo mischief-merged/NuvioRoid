@@ -554,13 +554,7 @@ internal fun DownloadsScreenContent(
             }
             if (holdState.travel.enabled) {
                 item(key = "travel-state") {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
-                        .semantics { liveRegion = LiveRegionMode.Polite }) {
-                        Text(stringResource(Res.string.travel_status, (holdState.travel.capBytesPerSecond / 1000).toInt()),
-                            style = MaterialTheme.typography.bodyMedium)
-                        if (holdState.travel.remembered) Text(stringResource(Res.string.travel_network_remembered),
-                            style = MaterialTheme.typography.bodySmall)
-                    }
+                    TravelModeStatusBanner(holdState.travel)
                 }
             }
             holdState.holdReason?.takeUnless { it == LimitedConnectionReason.Travel }?.let { reason ->
@@ -1870,6 +1864,27 @@ private fun SpeedLimitLine(megabytesPerSecond: Int, onChange: (() -> Unit)?) {
     }
 }
 
+@Composable
+internal fun TravelModeStatusBanner(travel: TravelState) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite },
+    ) {
+        Text(
+            text = stringResource(Res.string.travel_status, (travel.capBytesPerSecond / 1000).toInt()),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        if (travel.remembered) {
+            Text(
+                text = stringResource(Res.string.travel_network_remembered),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
 /**
  * Downloads wait because the connection is limited: says why, and offers to download anyway on this
  * network (until it changes or the app is closed).
@@ -1890,13 +1905,13 @@ internal fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnywa
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            if (reason != LimitedConnectionReason.CheckingNetwork) Text(
+            if (reason.canDownloadAnyway) Text(
                 text = stringResource(Res.string.downloads_held_detail),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        if (reason != LimitedConnectionReason.CheckingNetwork) TextButton(
+        if (reason.canDownloadAnyway) TextButton(
             modifier = Modifier.semantics { contentDescription = anywayDescription },
             onClick = onDownloadAnyway,
         ) {

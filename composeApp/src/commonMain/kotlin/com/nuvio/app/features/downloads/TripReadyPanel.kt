@@ -299,6 +299,7 @@ internal data class TripReadyUiSnapshot(
     val summary: TripReadySummary,
     val offline: Boolean,
     val holdReason: LimitedConnectionReason?,
+    val travelState: TravelState = TravelState(),
     val selectedHours: Int,
     val isBuildingPlan: Boolean,
     val activePlan: TripFillPlan?,
@@ -406,6 +407,7 @@ internal fun rememberTripReadyController(
         summary = summary,
         offline = offline,
         holdReason = holdState.holdReason,
+        travelState = holdState.travel,
         selectedHours = selectedHours,
         isBuildingPlan = isBuildingPlan,
         activePlan = activePlan,
@@ -463,9 +465,16 @@ internal fun LazyListScope.tripReadyContent(
         TripOverviewCard(summary = summary)
     }
 
-    if (state.holdReason != null && (summary.downloading.isNotEmpty() || summary.pausedItems.any { it.first.pausedByConnection })) {
+    if (state.travelState.enabled) {
+        item(key = "trip-travel-state") {
+            TravelModeStatusBanner(state.travelState)
+        }
+    }
+
+    val holdBannerReason = state.holdReason?.takeUnless { it == LimitedConnectionReason.Travel }
+    if (holdBannerReason != null && (summary.downloading.isNotEmpty() || summary.pausedItems.any { it.first.pausedByConnection })) {
         item(key = "trip-connection-hold") {
-            ConnectionHoldLine(reason = state.holdReason, onDownloadAnyway = onDownloadAnyway)
+            ConnectionHoldLine(reason = holdBannerReason, onDownloadAnyway = onDownloadAnyway)
         }
     }
 
@@ -931,17 +940,23 @@ private fun TripFillPlanPreview(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = stringResource(Res.string.downloads_trip_fill_hold_notice, stringResource(connectionHoldTitle(reason))),
+                        text = if (reason == LimitedConnectionReason.CheckingNetwork) {
+                            stringResource(connectionHoldTitle(reason))
+                        } else {
+                            stringResource(Res.string.downloads_trip_fill_hold_notice, stringResource(connectionHoldTitle(reason)))
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = tokens.colors.textPrimary,
                         modifier = Modifier.weight(1f),
                     )
-                    val anywayDescription = stringResource(Res.string.downloads_held_download_anyway_description)
-                    TextButton(
-                        modifier = Modifier.semantics { contentDescription = anywayDescription },
-                        onClick = onDownloadAnyway,
-                    ) {
-                        Text(stringResource(Res.string.downloads_held_download_anyway))
+                    if (reason.canDownloadAnyway) {
+                        val anywayDescription = stringResource(Res.string.downloads_held_download_anyway_description)
+                        TextButton(
+                            modifier = Modifier.semantics { contentDescription = anywayDescription },
+                            onClick = onDownloadAnyway,
+                        ) {
+                            Text(stringResource(Res.string.downloads_held_download_anyway))
+                        }
                     }
                 }
             }

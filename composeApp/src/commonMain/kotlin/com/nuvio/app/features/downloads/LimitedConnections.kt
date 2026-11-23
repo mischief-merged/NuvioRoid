@@ -42,6 +42,10 @@ internal sealed interface LimitedConnectionReason {
 internal val LimitedConnectionReason.holdsUserDownloads: Boolean
     get() = this != LimitedConnectionReason.SlowConnection && this != LimitedConnectionReason.Travel
 
+/** Whether the user's "Download anyway" override on this network lifts [this] hold. */
+internal val LimitedConnectionReason.canDownloadAnyway: Boolean
+    get() = this != LimitedConnectionReason.CheckingNetwork && this != LimitedConnectionReason.Travel
+
 /** What the system says about the path traffic takes now. */
 internal sealed interface NetworkPathReport {
     /** Nothing is known: no detector on this platform, or it could not start. Never holds anything. */

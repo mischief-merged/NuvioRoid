@@ -26,11 +26,14 @@ import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_back
 import nuvio.composeapp.generated.resources.compose_settings_root_downloads_title
+import nuvio.composeapp.generated.resources.downloads_checking_network
+import nuvio.composeapp.generated.resources.downloads_held_download_anyway
 import nuvio.composeapp.generated.resources.downloads_trip_fill_plan_button
 import nuvio.composeapp.generated.resources.downloads_trip_fill_plan_heading
 import nuvio.composeapp.generated.resources.downloads_trip_fill_start
 import nuvio.composeapp.generated.resources.downloads_trip_ready_button
 import nuvio.composeapp.generated.resources.downloads_trip_ready_title
+import nuvio.composeapp.generated.resources.travel_status
 import org.jetbrains.compose.resources.getString
 import org.junit.After
 import org.junit.Before
@@ -361,6 +364,97 @@ class TripReadyPanelTest {
         // Back button exits Trip ready back to Downloads root.
         compose.onNodeWithContentDescription(backDesc).performClick()
         compose.onNodeWithText(downloadsTitle).assertIsDisplayed()
+    }
+
+    @Test
+    fun `trip ready shows travel banner without download anyway for travel and checking network holds`() {
+        val pausedAuto = DownloadItem(
+            id = "ep-travel",
+            contentType = "series",
+            parentMetaId = "show:andor",
+            parentMetaType = "series",
+            videoId = "show:andor:1:1",
+            title = "Andor",
+            seasonNumber = 1,
+            episodeNumber = 1,
+            streamTitle = "Andor S01E01",
+            providerName = "Addon",
+            sourceUrl = "https://ex/ep1.mkv",
+            fileName = "ep1.mkv",
+            status = DownloadStatus.Paused,
+            downloadedBytes = 100_000L,
+            totalBytes = 500_000L,
+            createdAtEpochMs = 1_000L,
+            updatedAtEpochMs = 2_000L,
+            autoDownloadRuleKey = "series:show:andor",
+            pausedByConnection = true,
+        )
+        val downloadsFlow = MutableStateFlow(DownloadsUiState(items = listOf(pausedAuto)))
+        val hold = ConnectionHold().apply { setTravelEnabled(true) }
+        val preview8HrText = runBlocking { getString(Res.string.downloads_trip_fill_plan_button, DefaultTripFillHours) }
+        val planHeading8Hr = runBlocking { getString(Res.string.downloads_trip_fill_plan_heading, DefaultTripFillHours) }
+        val travelStatusText = runBlocking { getString(Res.string.travel_status, (DefaultTravelCapBytesPerSecond / 1000).toInt()) }
+        val downloadAnywayText = runBlocking { getString(Res.string.downloads_held_download_anyway) }
+        val checkingNetworkText = runBlocking { getString(Res.string.downloads_checking_network) }
+
+        var planHoldReason: LimitedConnectionReason? = LimitedConnectionReason.CheckingNetwork
+        val deps = TripReadyDeps(
+            collectShows = { emptyList() },
+            buildPlan = { hours, _ ->
+                TripFillPlan(
+                    requestedHours = hours,
+                    plannedEpisodes = emptyList(),
+                    totalPlannedMinutes = 0,
+                    totalEstimatedBytes = 0L,
+                    qualityDefaults = SeasonDownloadDefaults(),
+                    storageLimitBytes = null,
+                    remainingStorageLimitBytes = null,
+                    freeDiskBytes = null,
+                    connectionHoldReason = planHoldReason,
+                    stoppedReason = TripPlanStopReason.NoMoreEpisodes,
+                )
+            },
+            loadDiskInfo = { _, _ -> emptyMap() },
+        )
+
+        compose.setContent {
+            NuvioTheme {
+                TripReadyPanel(
+                    onBack = {},
+                    onOpenDownload = {},
+                    onOpenShow = { _, _ -> },
+                    downloadsStateFlow = downloadsFlow,
+                    folders = NoDownloadFolders,
+                    rechecks = null,
+                    connectionHold = hold,
+                    tripDeps = deps,
+                )
+            }
+        }
+
+        // Travel mode: shows Travel status banner, never "Download anyway".
+        compose.onNodeWithText(travelStatusText).assertIsDisplayed()
+        assertEquals(0, compose.onAllNodesWithText(downloadAnywayText).fetchSemanticsNodes().size)
+
+        // Checking network on the plan card: shows checking message without "Download anyway".
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(preview8HrText))
+        compose.onNodeWithText(preview8HrText).performClick()
+        compose.waitUntil(timeoutMillis = 3_000L) {
+            compose.onAllNodesWithText(planHeading8Hr).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(checkingNetworkText))
+        compose.onNodeWithText(checkingNetworkText).assertIsDisplayed()
+        assertEquals(0, compose.onAllNodesWithText(downloadAnywayText).fetchSemanticsNodes().size)
+
+        // Switching to a Hotspot hold shows "Download anyway" for both the held download and the plan card.
+        planHoldReason = LimitedConnectionReason.Hotspot
+        hold.setTravelEnabled(false)
+        hold.report(NetworkPathReport.Known(expensive = true, constrained = false, networkKey = "en0|r1"))
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(preview8HrText))
+        compose.onNodeWithText(preview8HrText).performClick()
+        compose.waitUntil(timeoutMillis = 3_000L) {
+            compose.onAllNodesWithText(downloadAnywayText).fetchSemanticsNodes().size == 2
+        }
     }
 
     private class FakeFolderController(
