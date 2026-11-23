@@ -58,11 +58,10 @@ class ReviewRequestPathsTest : UntrustedLocalServerTest() {
     }
 
     @Test fun `now playing image preparation blocks private destinations and redirects`() = server { url, hits ->
-        val images = com.nuvio.app.features.player.desktop.WebviewImages
-        val encode = images.javaClass.getDeclaredMethod("encode", String::class.java).apply { isAccessible = true }
         fun denied(address: String) {
-            val error = assertFailsWith<java.lang.reflect.InvocationTargetException> { encode.invoke(images, address) }
-            assertIs<NetworkPolicyException>(error.targetException)
+            assertFailsWith<NetworkPolicyException> {
+                com.nuvio.app.features.player.desktop.WebviewImages.encode(address)
+            }
         }
         denied(url)
         TrustedHomeServers.add("localhost")
