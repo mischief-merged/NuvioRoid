@@ -33,6 +33,10 @@ internal interface DownloadsHooks {
     /** Every record of every profile. Null when the list of any profile cannot be read. */
     fun allRecords(): List<RecordRef>? = items().map { RecordRef.of(profileId(), it) }
 
+    /** Every record of every profile other than [profileId]. Null when another profile's list cannot be read. */
+    fun otherProfileRecords(profileId: Int): List<RecordRef>? =
+        allRecords()?.filter { it.profileId != profileId }
+
     /** The record [downloadId] in the list of [profileId], whichever profile is active. */
     fun recordOf(profileId: Int, downloadId: String): DownloadItem?
 
@@ -62,14 +66,22 @@ internal object DesktopProfileLists : ProfileLists {
 }
 
 /** The records of every profile's stored list. Null when one of them cannot be read. */
-internal fun storedRecordsOfAllProfiles(store: DesktopStorage.Store): List<RecordRef>? {
+internal fun storedRecordsOfAllProfiles(
+    store: DesktopStorage.Store,
+    excludeProfileId: Int? = null,
+): List<RecordRef>? {
     // As the file is now, read again under its lock.
     val entries = store.freshEntries()
-    return entries.keys.mapNotNull { key -> key.removePrefix("downloads_").takeIf { key.startsWith("downloads_") && it.isNotEmpty() && it.all(Char::isDigit) }?.toIntOrNull()?.let { it to key } }
-        .flatMap { (profileId, key) ->
-            val items = decodeStoredDownloads(entries[key].orEmpty()) ?: return null
-            items.map { RecordRef.of(profileId, it) }
-        }
+    return entries.keys.mapNotNull { key ->
+        key.removePrefix("downloads_")
+            .takeIf { key.startsWith("downloads_") && it.isNotEmpty() && it.all(Char::isDigit) }
+            ?.toIntOrNull()
+            ?.takeIf { it != excludeProfileId }
+            ?.let { it to key }
+    }.flatMap { (profileId, key) ->
+        val items = decodeStoredDownloads(entries[key].orEmpty()) ?: return null
+        items.map { RecordRef.of(profileId, it) }
+    }
 }
 
 internal object RepositoryDownloadsHooks : DownloadsHooks {
@@ -89,9 +101,12 @@ internal object RepositoryDownloadsHooks : DownloadsHooks {
     override fun allRecords(): List<RecordRef>? {
         val loaded = DownloadsRepository.loadedProfile() ?: return null
         val inMemory = DownloadsRepository.uiState.value.items
-        val stored = storedRecordsOfAllProfiles(DesktopStorage.store("nuvio_downloads")) ?: return null
-        return inMemory.map { RecordRef.of(loaded, it) } + stored.filter { it.profileId != loaded }
+        val stored = storedRecordsOfAllProfiles(DesktopStorage.store("nuvio_downloads"), excludeProfileId = loaded) ?: return null
+        return inMemory.map { RecordRef.of(loaded, it) } + stored
     }
+
+    override fun otherProfileRecords(profileId: Int): List<RecordRef>? =
+        storedRecordsOfAllProfiles(DesktopStorage.store("nuvio_downloads"), excludeProfileId = profileId)
 
     override fun recordOf(profileId: Int, downloadId: String): DownloadItem? =
         DownloadsRepository.recordOf(profileId, downloadId, DesktopProfileLists)
@@ -669,6 +684,29 @@ internal class DesktopDownloadFolders(
             item.id,
             { it.status == DownloadStatus.Completed && it.localFileUri == null && it.locationId == item.locationId },
         ) { it.copy(localFileUri = uri, locationId = location.id) } == RelocateResult.Confirmed
+    }
+
+    override fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult {
+        if (moveRunning.get()) return DiskScanResult(busy = true)
+        val scanner = DownloadDiskScanner(
+            locations = locations,
+            allRecords = { profileId, items ->
+                val others = hooks.otherProfileRecords(profileId) ?: return@DownloadDiskScanner null
+                items.map { RecordRef.of(profileId, it) } + others
+            },
+            leftoverPaths = {
+                runCatching { mover.leftovers() }.getOrDefault(emptyList())
+                    .flatMap { listOfNotNull(it.sourcePath.takeIf(String::isNotBlank), it.destinationPath.takeIf(String::isNotBlank)) }
+                    .mapNotNull { runCatching { DownloadOwnership.keyOf(Paths.get(it)) }.getOrNull() }
+                    .toSet()
+            },
+        )
+        return scanner.scan(activeProfileId, inMemoryItems, nextDownloadId, nowEpochMs)
     }
 
     override fun setAside(leftoverId: String): Boolean = mover.setAside(leftoverId).also { runCatching { refresh() } }

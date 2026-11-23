@@ -3312,4 +3312,26 @@
     <string name="downloads_source_rejected">This source did not pass the download checks.</string>
     <string name="network_response_too_large">This response is too large. Try a different source.</string>
     <string name="network_requests_busy">Too many requests are running. Please try again.</string>
+    <string name="downloads_find_on_disk">Find downloads on disk</string>
+    <string name="downloads_find_on_disk_scanning">Scanning…</string>
+    <string name="downloads_find_on_disk_none">No new downloads found on disk.</string>
+    <plurals name="downloads_find_on_disk_found">
+        <item quantity="one">Found %1$d download on disk.</item>
+        <item quantity="other">Found %1$d downloads on disk.</item>
+    </plurals>
+    <plurals name="downloads_find_on_disk_none_with_unrecognised">
+        <item quantity="one">No matching downloads found; %1$d unrecognised file is on disk.</item>
+        <item quantity="other">No matching downloads found; %1$d unrecognised files are on disk.</item>
+    </plurals>
+    <string name="downloads_find_on_disk_found_partial">%1$d added to downloads; %2$d unrecognised.</string>
+    <string name="downloads_find_on_disk_busy">A move is in progress. Try again when it finishes.</string>
+    <string name="downloads_section_unrecognised">Unrecognised files</string>
+    <string name="downloads_unrecognised_note">These files in your download folders could not be matched to a title or episode. Nothing was moved or deleted.</string>
+    <string name="downloads_unrecognised_reason_no_companion">No download details found beside this file.</string>
+    <string name="downloads_unrecognised_reason_foreign_companion">The folder beside this file was not created by this app.</string>
+    <string name="downloads_unrecognised_reason_episode_mismatch">This file did not match an episode in the saved show details.</string>
+    <string name="downloads_unrecognised_reason_ambiguous_name">Could not tell which title or episode this file belongs to.</string>
+    <string name="downloads_unrecognised_reason_unreadable_companion">The saved details beside this file could not be read.</string>
+    <string name="downloads_unrecognised_reason_not_video">Not a complete video file.</string>
+    <string name="downloads_unrecognised_size_location">%1$s • %2$s</string>
 </resources>

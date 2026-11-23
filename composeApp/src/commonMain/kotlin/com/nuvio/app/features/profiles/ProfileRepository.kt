@@ -85,6 +85,10 @@ object ProfileRepository {
 
     val activeProfileId: Int get() = activeProfileIndex
 
+    internal fun setActiveProfileIdForTest(profileIndex: Int) {
+        activeProfileIndex = profileIndex
+    }
+
     fun setRememberLastProfileEnabled(enabled: Boolean) {
         if (_state.value.rememberLastProfileEnabled == enabled) return
 

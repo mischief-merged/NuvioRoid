@@ -49,9 +49,12 @@ class ListSaveAcrossCopiesTest {
     /** A backend over one shared Store file, as the desktop app saves its list. */
     private class StoreBackend(world: FolderWorld, val store: DesktopStorage.Store) : DownloadsBackend by LocationsBackend(world) {
         override fun loadPayload(): String? = store.getString("downloads_1")
+        override fun loadPayload(profileId: Int): String? = loadPayload()
         override fun savePayload(payload: String) = store.putString("downloads_1", payload)
+        override fun savePayload(profileId: Int, payload: String) = savePayload(payload)
         override val rereadsPayload: Boolean get() = true
         override fun loadFreshPayload(): String? = store.getFreshString("downloads_1")
+        override fun loadFreshPayload(profileId: Int): String? = loadFreshPayload()
         override fun <T> withListLock(block: () -> T): T = store.exclusive(block)
     }
 
