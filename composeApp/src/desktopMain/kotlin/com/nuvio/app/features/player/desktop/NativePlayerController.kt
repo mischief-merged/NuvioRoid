@@ -633,7 +633,11 @@ internal class NativePlayerController(
         }
     }
 
-    private fun handlePlayerEvent(type: String, value: Double, eventToken: Any? = activeEventToken) {
+    private fun handlePlayerEvent(type: String, value: Double) {
+        handlePlayerEvent(type, value, activeEventToken)
+    }
+
+    private fun handlePlayerEvent(type: String, value: Double, eventToken: Any?) {
         if (type.shouldLogNativeControlEvent()) {
             log.d { "event received handle=$handle type=$type value=$value" }
         }
