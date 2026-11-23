@@ -395,6 +395,7 @@ internal suspend fun PlayerScreenRuntime.resolveParentalGuideImdbId(): String? {
 
 internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     durationMs: Long = playbackSnapshot.durationMs,
+    allowEnded: Boolean = false,
 ): Boolean {
     val url = activeSourceUrl
     if (url.isBlank()) return false
@@ -404,7 +405,7 @@ internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     if (sourceFailoverForPlaceholder) return false
     if (placeholderDetectedUrl == url) return false
     if (isDesktop && activeVideoId != null && !url.startsWith("file:") && addonTrackingDurationSettledUrl != url) return false
-    if (playbackSnapshot.isEnded) return false
+    if (!allowEnded && playbackSnapshot.isEnded) return false
     if (durationMs <= 0L) return false
     if (isShortPlaceholderDuration(durationMs)) return false
     val assessment = if (activeTorrentInfoHash == null) {
@@ -457,20 +458,35 @@ internal fun PlayerScreenRuntime.emitAddonPlayerEvent(
         lastAddonPlayerAction = null
         dispatchAddonPlayerEvent(active, AddonPlayerAction.STOP, positionMs, durationMs)
     }
-    if (!isSourceAcceptedForAddonPlayerEvents(durationMs)) {
+    if (action == AddonPlayerAction.PAUSE && activeAddonPlayerEventTarget == null) return
+    if (!forceResend && activeAddonPlayerEventTarget == target && lastAddonPlayerAction == action) return
+    if (!isSourceAcceptedForAddonPlayerEvents(
+            durationMs = durationMs,
+            allowEnded = action == AddonPlayerAction.PAUSE,
+        )
+    ) {
         val current = activeAddonPlayerEventTarget
-        if (current != null) {
+        if (current != null && !(action == AddonPlayerAction.PAUSE && playbackHoldIncomplete())) {
             activeAddonPlayerEventTarget = null
             lastAddonPlayerAction = null
             dispatchAddonPlayerEvent(current, AddonPlayerAction.STOP, positionMs, durationMs)
         }
         return
     }
-    if (action == AddonPlayerAction.PAUSE && activeAddonPlayerEventTarget == null) return
-    if (!forceResend && activeAddonPlayerEventTarget == target && lastAddonPlayerAction == action) return
     activeAddonPlayerEventTarget = target
     lastAddonPlayerAction = action
     dispatchAddonPlayerEvent(target, action, positionMs, durationMs)
+}
+
+internal fun PlayerScreenRuntime.emitAddonPlayerProgressEvent(
+    scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
+    holdIncomplete: Boolean = playbackHoldIncomplete(),
+) {
+    when (scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)) {
+        TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
+        TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
+        TrackingScrobbleAction.START -> Unit
+    }
 }
 
 internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
@@ -523,11 +539,10 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
         }
         TrackingScrobbleAction.START -> Unit
     }
-    when (action) {
-        TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
-        TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
-        TrackingScrobbleAction.START -> Unit
-    }
+    emitAddonPlayerProgressEvent(
+        scrobbleAction = scrobbleAction,
+        holdIncomplete = holdIncomplete,
+    )
 }
 
 /** Tells automatic downloads that a downloaded file was played to the point that counts as watched. */
