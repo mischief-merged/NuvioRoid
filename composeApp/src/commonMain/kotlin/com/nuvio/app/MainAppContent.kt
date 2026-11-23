@@ -993,29 +993,23 @@ internal fun MainAppContent(
             }
         }
 
-        fun launchLocalPlayer(savedLaunch: PlayerLaunch) {
-            coroutineScope.launch {
-                // The saved subtitle files are checked and the preferred one picked before playback starts.
-                val preparedSubtitles = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
-                    localSubtitles = savedLaunch.externalSubtitles,
-                    settings = playerSettingsUiState,
-                    parentMetaId = savedLaunch.parentMetaId,
-                )
-                val playerLaunch = savedLaunch.copy(
-                    externalSubtitles = preparedSubtitles.subtitles,
-                    startupSubtitleSelection = preparedSubtitles.selection,
-                )
-                if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
-                    playerSessionController.launchExternalOrAskToReplace(
-                        launch = playerLaunch,
-                        allowSameTargetReopen = false,
-                    ) {
-                        startExternalPlayback(playerLaunch)
-                    }
-                    return@launch
+        suspend fun launchLocalPlayer(savedLaunch: PlayerLaunch) {
+            // The saved subtitle files are checked and the preferred one picked before playback starts
+            // inside the active preparation job so cancel and new selections still apply.
+            val playerLaunch = prepareLocalPlayerLaunch(
+                savedLaunch = savedLaunch,
+                settings = playerSettingsUiState,
+            )
+            if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
+                playerSessionController.launchExternalOrAskToReplace(
+                    launch = playerLaunch,
+                    allowSameTargetReopen = false,
+                ) {
+                    startExternalPlayback(playerLaunch)
                 }
-                openPlayerSession(playerLaunch)
+                return
             }
+            openPlayerSession(playerLaunch)
         }
 
         fun openDownloadedItem(item: DownloadItem) {
@@ -1225,6 +1219,7 @@ internal fun MainAppContent(
                     episodeNumber = episodeNumber,
                 )
             ) {
+                playbackPreparation.cancel()
                 return
             }
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
@@ -1522,6 +1517,7 @@ internal fun MainAppContent(
         val openContinueWatching: (ContinueWatchingItem, Boolean, Boolean) -> Unit = { item, manualSelection, startFromBeginning ->
             resumePromptItem = null
             if (item.isCloudLibraryContinueWatchingItem()) {
+                playbackPreparation.cancel()
                 coroutineScope.launch {
                     when (
                         val lookup = CloudLibraryRepository.findPlaybackTargetForProgressResult(
