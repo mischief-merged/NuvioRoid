@@ -26,7 +26,7 @@ import kotlin.test.assertTrue
  * A partial that cannot be continued stays on disk while its replacement is fetched, and is moved
  * to Trash only after that replacement is accepted.
  */
-class PartialReplacementTest {
+class PartialReplacementTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val trashBefore = DownloadsPlatformDownloader.trashPartial
     private val waitBefore = DownloadsPlatformDownloader.waitBeforeRetry
     private val holding = Files.createTempDirectory("nuvio-partial-replacement-trash")

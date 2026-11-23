@@ -28,7 +28,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class ChunkVerificationCancelTest {
+class ChunkVerificationCancelTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun pause_before_any_bytes_arrive_closes_without_waiting_for_the_socket() {
         assertPauseClosesPromptly(sendSniffBytesFirst = false)
