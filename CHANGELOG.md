@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- Mini player: keep browsing while a video plays in a small window (macOS) ([#135](https://github.com/mischief-merged/NuvioRoid/pull/135)).
 - Travel mode for plane and Starlink Wi-Fi, with network rules re-checked after the Mac wakes ([#105](https://github.com/mischief-merged/NuvioRoid/pull/105)).
 - Player basics: media keys, Now Playing, keyboard shortcuts and auto-hiding controls ([#102](https://github.com/mischief-merged/NuvioRoid/pull/102)).
 - Downloads keep going in the background when the window closes, with a menu bar progress item and a check before quitting; the Mac stays awake only while data is arriving ([#64](https://github.com/mischief-merged/NuvioRoid/pull/64)).
