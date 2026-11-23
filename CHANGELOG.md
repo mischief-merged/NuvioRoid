@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- Offline first: downloaded copies play without internet and pages keep working offline ([#66](https://github.com/mischief-merged/NuvioRoid/pull/66)).
 - Trip ready: offline hours at a glance and a Fill for my trip button ([#100](https://github.com/mischief-merged/NuvioRoid/pull/100)).
 - Mini player: keep browsing while a video plays in a small window (macOS) ([#135](https://github.com/mischief-merged/NuvioRoid/pull/135)).
 - Travel mode for plane and Starlink Wi-Fi, with network rules re-checked after the Mac wakes ([#105](https://github.com/mischief-merged/NuvioRoid/pull/105)).

@@ -205,7 +205,7 @@ internal fun PlayerScreenModalHosts(
             ),
             onSeasonSelected = { },
             onEpisodeSelected = { episode ->
-                if (!onEpisodeSelectedForDownload(episode)) {
+                if (!onEpisodeSelectedForDownload(episode) && !com.nuvio.app.core.network.NetworkStatusRepository.uiState.value.isNoInternet) {
                     onEpisodeStreamsRequested(episode)
                 }
             },
@@ -251,7 +251,7 @@ internal fun selectDownloadedEpisodeForPlayback(
         seasonNumber = episode.season,
         episodeNumber = episode.episode,
         videoId = episode.id,
-    )
+    )?.takeIf { DownloadsRepository.verifyCompletedDownload(it.id) }
     if (downloadedEpisode != null) {
         onDownloadedEpisodeSelected(downloadedEpisode, episode)
         return true

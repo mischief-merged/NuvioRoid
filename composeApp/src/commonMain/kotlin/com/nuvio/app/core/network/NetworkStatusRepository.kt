@@ -35,6 +35,12 @@ data class NetworkStatusUiState(
     val isOnline: Boolean
         get() = condition == NetworkCondition.Online
 
+    val isNoInternet: Boolean
+        get() = condition == NetworkCondition.NoInternet
+
+    val hasInternet: Boolean
+        get() = condition != NetworkCondition.NoInternet
+
     val isOfflineLike: Boolean
         get() = condition == NetworkCondition.NoInternet || condition == NetworkCondition.ServersUnreachable
 }
@@ -71,6 +77,9 @@ object NetworkStatusRepository {
     private var pendingProbeAfterCurrent = false
     private var pendingProbeConfirmFailures = false
     private var foregroundRefreshJob: Job? = null
+    private var probeJob: Job? = null
+    private var probeGeneration = 0
+    private val probeLock = Any()
 
     fun ensureStarted() {
         if (started) return
@@ -97,7 +106,8 @@ object NetworkStatusRepository {
             return
         }
 
-        scope.launch {
+        val generation = probeGeneration
+        probeJob = scope.launch {
             var nextConfirmFailures = confirmFailures
             do {
                 val runConfirmFailures = nextConfirmFailures || pendingProbeConfirmFailures
@@ -105,15 +115,18 @@ object NetworkStatusRepository {
                 pendingProbeAfterCurrent = false
                 pendingProbeConfirmFailures = false
                 probeInFlight = true
-                runProbe(confirmFailures = runConfirmFailures)
+                runProbe(confirmFailures = runConfirmFailures, generation = generation)
                 probeInFlight = false
-            } while (pendingProbeAfterCurrent)
+            } while (pendingProbeAfterCurrent && generation == probeGeneration)
         }
     }
 
-    private suspend fun runProbe(confirmFailures: Boolean) {
-        if (_uiState.value.condition == NetworkCondition.Unknown) {
-            _uiState.value = NetworkStatusUiState(condition = NetworkCondition.Checking)
+    private suspend fun runProbe(confirmFailures: Boolean, generation: Int) {
+        synchronized(probeLock) {
+            if (generation != probeGeneration) return
+            if (_uiState.value.condition == NetworkCondition.Unknown) {
+                _uiState.value = NetworkStatusUiState(condition = NetworkCondition.Checking)
+            }
         }
 
         val previousCondition = _uiState.value.condition
@@ -127,7 +140,10 @@ object NetworkStatusRepository {
             nextCondition = probeCondition()
         }
 
-        _uiState.value = NetworkStatusUiState(condition = nextCondition)
+        synchronized(probeLock) {
+            if (generation != probeGeneration) return
+            _uiState.value = NetworkStatusUiState(condition = nextCondition)
+        }
     }
 
     private suspend fun probeCondition(): NetworkCondition {
@@ -151,6 +167,25 @@ object NetworkStatusRepository {
 
     /** Asks the public internet now, whatever [uiState] last said. */
     suspend fun isInternetReachable(): Boolean = probePublicInternet()
+
+    internal fun setConditionForTest(condition: NetworkCondition) {
+        _uiState.value = NetworkStatusUiState(condition = condition)
+    }
+
+    internal fun resetForTest() {
+        synchronized(probeLock) {
+            probeGeneration++
+            started = false
+            probeInFlight = false
+            pendingProbeAfterCurrent = false
+            pendingProbeConfirmFailures = false
+            foregroundRefreshJob?.cancel()
+            foregroundRefreshJob = null
+            probeJob?.cancel()
+            probeJob = null
+            _uiState.value = NetworkStatusUiState()
+        }
+    }
 
     private suspend fun probePublicInternet(): Boolean =
         probeReachable(PUBLIC_PROBE_PRIMARY) || probeReachable(PUBLIC_PROBE_FALLBACK)

@@ -144,6 +144,7 @@ data class PlayerControlsState(
     val subtitlesLabel: String = "Subs",
     val audioLabel: String = "Audio",
     val sourcesLabel: String = "Sources",
+    val availableOfflineLabel: String = "Available offline",
     val episodesLabel: String = "Episodes",
     val externalPlayerLabel: String = "External",
     val playLabel: String = "Play",
@@ -413,6 +414,8 @@ data class PlayerControlEpisodeItem(
     val episode: Int = 0,
     val isCurrent: Boolean = false,
     val isWatched: Boolean = false,
+    val isAvailableOffline: Boolean = false,
+    val isEnabled: Boolean = true,
 )
 
 data class PlayerControlAddonSubtitleItem(

@@ -1,12 +1,16 @@
 package com.nuvio.app.features.home.components
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.format.formatReleaseDateForDisplay
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioPosterCard
 import com.nuvio.app.core.ui.NuvioPosterShape
 import com.nuvio.app.core.ui.desktopCatalogShelfPosterBaseWidthDp
 import com.nuvio.app.core.ui.rememberPosterCardStyleUiState
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
 
@@ -21,6 +25,10 @@ fun HomePosterCard(
     showLandscapeOverlay: Boolean = true,
 ) {
     val posterCardStyle = rememberPosterCardStyleUiState()
+    val offlineIndex = rememberOfflineDownloadIndex()
+    val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+    val isAvailableOffline = offlineIndex.hasMeta(item.id)
+    val isUnavailableOffline = networkStatus.isNoInternet && !isAvailableOffline
     val isLandscapeMode = useLandscapeBackdropMode || posterCardStyle.catalogLandscapeModeEnabled
     val effectiveLandscapePoster = if (posterCardStyle.alwaysShowLandscapeClearlogo) null else item.landscapePoster
     val imageUrl = if (isLandscapeMode) {
@@ -51,6 +59,8 @@ fun HomePosterCard(
             bottomLeftLogoUrl = if (isLandscapeMode && showLandscapeOverlay && effectiveLandscapePoster.isNullOrBlank()) item.logo else null,
             bottomLeftText = if (isLandscapeMode && showLandscapeOverlay && effectiveLandscapePoster.isNullOrBlank() && item.logo.isNullOrBlank() && !posterCardStyle.hideLabelsEnabled) item.name else null,
             isWatched = isWatched,
+            isAvailableOffline = isAvailableOffline,
+            isUnavailableOffline = isUnavailableOffline,
             onClick = onClick,
             onLongClick = onLongClick,
         )

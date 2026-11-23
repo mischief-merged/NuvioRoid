@@ -363,14 +363,42 @@ internal object WriterTokens {
 internal object ItemLocks {
     private val lock = kotlinx.atomicfu.locks.SynchronizedObject()
     private val held = mutableSetOf<String>()
+    private val watchedOnRelease = mutableSetOf<String>()
+    private var releaseListener: (() -> Unit)? = null
+
+    fun setReleaseListener(listener: (() -> Unit)?) {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            releaseListener = listener
+        }
+    }
 
     fun tryAcquire(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) { held.add(id) }
 
     fun release(id: String) {
-        kotlinx.atomicfu.locks.synchronized(lock) { held.remove(id) }
+        val listenerToNotify = kotlinx.atomicfu.locks.synchronized(lock) {
+            held.remove(id)
+            if (watchedOnRelease.remove(id)) releaseListener else null
+        }
+        listenerToNotify?.invoke()
     }
 
     fun isHeld(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) { id in held }
+
+    /**
+     * Returns true and marks [id] for a release notification when [id] is currently held.
+     * Both happen under [lock] so a scan cannot check a held item and miss its unlock.
+     */
+    fun watchIfHeld(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) {
+        if (id !in held) return@synchronized false
+        watchedOnRelease.add(id)
+        true
+    }
+
+    fun clearWatched() {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            watchedOnRelease.clear()
+        }
+    }
 
     inline fun <T> withLock(id: String, busy: () -> T, block: () -> T): T {
         if (!tryAcquire(id)) return busy()

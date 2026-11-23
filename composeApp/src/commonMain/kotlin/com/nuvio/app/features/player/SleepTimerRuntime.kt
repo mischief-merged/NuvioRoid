@@ -109,8 +109,8 @@ private fun PlayerScreenRuntime.applySleepTimerStep(step: SleepTimerStep) {
  * Shows the Up Next card when the episode is close enough, and starts the next episode
  * only when nothing has asked playback to stop here.
  */
-internal fun PlayerScreenRuntime.onNextEpisodeThresholdChanged() {
-    val shouldShow = nextEpisodeInfo != null && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
+internal fun PlayerScreenRuntime.onNextEpisodeThresholdChanged(canPlayNext: Boolean = true) {
+    val shouldShow = nextEpisodeInfo != null && canPlayNext && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
     val blocked = sleepTimer.blocksAutomaticNextEpisode()
     if (
         nextEpisodeAutoPlayAutomatic &&

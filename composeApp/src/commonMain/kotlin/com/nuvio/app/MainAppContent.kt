@@ -275,6 +275,9 @@ internal fun MainAppContent(
         val focusManager = LocalFocusManager.current
         val uriHandler = LocalUriHandler.current
         val coroutineScope = rememberCoroutineScope()
+        val playbackPreparation = remember(coroutineScope) {
+            PlaybackPreparationController(scope = coroutineScope)
+        }
         var selectedTab by rememberSaveable(initialTab) { mutableStateOf(initialTab) }
         var searchFocusRequestCount by remember { mutableStateOf(0) }
         val homeScrollToTopRequests = remember { MutableSharedFlow<Unit>(extraBufferCapacity = 1) }
@@ -373,11 +376,10 @@ internal fun MainAppContent(
         WatchedRepository.uiState
     }.collectAsStateWithLifecycle()
     val fullyWatchedSeriesKeys by WatchedRepository.fullyWatchedSeriesKeys.collectAsStateWithLifecycle()
-    val completedDownloads by DownloadsRepository.uiState.collectMappedAsState { it.completedItems }
-    val downloadsCatalogReady by DownloadsRepository.catalogReady.collectAsStateWithLifecycle()
     val networkCondition by NetworkStatusRepository.uiState.collectMappedAsState { it.condition }
     val playbackAvailability = rememberPlaybackAvailability()
     val playbackUnavailableMessage = stringResource(Res.string.playback_unavailable_message)
+    val offlineConnectToPlayMessage = stringResource(Res.string.offline_connect_to_play)
     val downloadedProviderLabel = stringResource(Res.string.provider_downloaded)
     val externalPlayerNotConfiguredText = stringResource(Res.string.external_player_not_configured)
     val externalPlayerUnavailableText = stringResource(Res.string.external_player_unavailable)
@@ -687,10 +689,9 @@ internal fun MainAppContent(
 
     LaunchedEffect(
         ownsAppRuntime,
+        initialHomeReady,
         offlineLaunchRouteHandled,
         networkCondition,
-        completedDownloads,
-        downloadsCatalogReady,
     ) {
         if (!ownsAppRuntime) return@LaunchedEffect
         val condition = networkCondition
@@ -699,30 +700,11 @@ internal fun MainAppContent(
         if (revealShellForOffline(offline)) {
             initialHomeReady = true
         }
-        when (
-            offlineLaunch(
-                alreadyHandled = offlineLaunchRouteHandled,
-                networkKnown = networkKnown,
-                offline = offline,
-                downloadsEnabled = AppFeaturePolicy.downloadsEnabled,
-                // Only checked after the downloads list is ready, because the check can wait on it.
-                hasPlayableDownload = {
-                    completedDownloads.any {
-                        !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
-                    }
-                },
-                downloadsListReady = downloadsCatalogReady,
-            )
-        ) {
-            OfflineLaunch.Wait -> Unit
-            OfflineLaunch.StayHere -> offlineLaunchRouteHandled = true
-            OfflineLaunch.OpenDownloads -> {
-                offlineLaunchRouteHandled = true
-                activateTab(AppScreenTab.Library)
-                navController.navigate(DownloadsRoute(downloadsTitle)) {
-                    launchSingleTop = true
-                }
-            }
+        if (!initialHomeReady || offlineLaunchRouteHandled) return@LaunchedEffect
+        if (networkKnown) {
+            // Offline startup keeps Home active so the "Downloaded" row and local Continue Watching
+            // entries appear immediately instead of jumping straight into the Downloads screen.
+            offlineLaunchRouteHandled = true
         }
     }
 
@@ -1010,50 +992,7 @@ internal fun MainAppContent(
             }
         }
 
-        fun openDownloadedItem(item: DownloadItem) {
-            val sourceUrl = DownloadsRepository.playableLocalFileUri(item) ?: return
-            if (
-                playerSessionController.reopenIfMatching(
-                    videoId = item.videoId,
-                    parentMetaId = item.parentMetaId,
-                    seasonNumber = item.seasonNumber,
-                    episodeNumber = item.episodeNumber,
-                    sourceUrl = sourceUrl,
-                )
-            ) {
-                return
-            }
-            val resumeEntry = item.videoId
-                .takeIf { it.isNotBlank() }
-                ?.let(WatchProgressRepository::progressForVideo)
-                ?.takeIf { it.isResumable }
-
-            val playerLaunch = PlayerLaunch(
-                profileId = activePlaybackProfileId,
-                title = item.title,
-                sourceUrl = sourceUrl,
-                sourceHeaders = emptyMap(),
-                sourceResponseHeaders = emptyMap(),
-                externalSubtitles = DownloadSubtitles.localSubtitles(sourceUrl),
-                streamType = null,
-                logo = item.logo,
-                poster = item.poster,
-                background = item.background,
-                seasonNumber = item.seasonNumber,
-                episodeNumber = item.episodeNumber,
-                episodeTitle = item.episodeTitle,
-                episodeThumbnail = item.episodeThumbnail,
-                streamTitle = item.streamTitle,
-                streamSubtitle = item.streamSubtitle,
-                providerName = item.providerName,
-                providerAddonId = item.providerAddonId,
-                contentType = item.contentType,
-                videoId = item.videoId,
-                parentMetaId = item.parentMetaId,
-                parentMetaType = item.parentMetaType,
-                initialPositionMs = resumeEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L,
-                initialProgressFraction = resumeEntry?.progressFraction?.takeIf { it > 0f },
-            )
+        fun launchLocalPlayer(playerLaunch: PlayerLaunch) {
             if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
                 playerSessionController.launchExternalOrAskToReplace(
                     launch = playerLaunch,
@@ -1064,6 +1003,59 @@ internal fun MainAppContent(
                 return
             }
             openPlayerSession(playerLaunch)
+        }
+
+        fun openDownloadedItem(item: DownloadItem) {
+            playbackPreparation.openDownloadedItem(
+                item = item,
+                onUnavailable = { NuvioToastController.show(playbackUnavailableMessage) },
+                onLocalPlaybackReady = { resolved ->
+                    if (
+                        playerSessionController.reopenIfMatching(
+                            videoId = resolved.item.videoId,
+                            parentMetaId = resolved.item.parentMetaId,
+                            seasonNumber = resolved.item.seasonNumber,
+                            episodeNumber = resolved.item.episodeNumber,
+                            sourceUrl = resolved.sourceUrl,
+                        )
+                    ) {
+                        return@openDownloadedItem
+                    }
+                    val resumeEntry = resolved.item.videoId
+                        .takeIf { it.isNotBlank() }
+                        ?.let(WatchProgressRepository::progressForVideo)
+                        ?.takeIf { it.isResumable }
+
+                    launchLocalPlayer(
+                        PlayerLaunch(
+                            profileId = activePlaybackProfileId,
+                            title = resolved.item.title,
+                            sourceUrl = resolved.sourceUrl,
+                            sourceHeaders = emptyMap(),
+                            sourceResponseHeaders = emptyMap(),
+                            externalSubtitles = resolved.externalSubtitles,
+                            streamType = null,
+                            logo = resolved.item.logo,
+                            poster = resolved.item.poster,
+                            background = resolved.item.background,
+                            seasonNumber = resolved.item.seasonNumber,
+                            episodeNumber = resolved.item.episodeNumber,
+                            episodeTitle = resolved.item.episodeTitle,
+                            episodeThumbnail = resolved.item.episodeThumbnail,
+                            streamTitle = resolved.item.streamTitle,
+                            streamSubtitle = resolved.item.streamSubtitle,
+                            providerName = resolved.item.providerName,
+                            providerAddonId = resolved.item.providerAddonId,
+                            contentType = resolved.item.contentType,
+                            videoId = resolved.item.videoId,
+                            parentMetaId = resolved.item.parentMetaId,
+                            parentMetaType = resolved.item.parentMetaType,
+                            initialPositionMs = resumeEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L,
+                            initialProgressFraction = resumeEntry?.progressFraction?.takeIf { it > 0f },
+                        ),
+                    )
+                },
+            )
         }
 
         fun openExternalStreamUrl(url: String): Boolean {
@@ -1211,104 +1203,102 @@ internal fun MainAppContent(
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
             val targetResumeProgressFraction = if (startFromBeginning) null else resumeProgressFraction
 
-            if (!manualSelection && AppFeaturePolicy.downloadsEnabled) {
-                val downloadedItem = DownloadsRepository.findPlayableDownload(
-                    parentMetaId = parentMetaId,
-                    seasonNumber = seasonNumber,
-                    episodeNumber = episodeNumber,
-                    videoId = videoId,
-                )
-                val localSourceUrl = downloadedItem?.let(DownloadsRepository::playableLocalFileUri)
-                if (!localSourceUrl.isNullOrBlank()) {
-                    val playerLaunch = PlayerLaunch(
-                        profileId = activePlaybackProfileId,
-                        title = title,
-                        sourceUrl = localSourceUrl,
-                        sourceHeaders = emptyMap(),
-                        sourceResponseHeaders = emptyMap(),
-                        externalSubtitles = DownloadSubtitles.localSubtitles(localSourceUrl),
-                        logo = logo,
-                        poster = poster,
-                        background = background,
-                        seasonNumber = seasonNumber,
-                        episodeNumber = episodeNumber,
-                        episodeTitle = episodeTitle,
-                        episodeThumbnail = episodeThumbnail,
-                        streamTitle = downloadedItem.streamTitle.ifBlank { title },
-                        streamSubtitle = downloadedItem.streamSubtitle,
-                        pauseDescription = pauseDescription,
-                        providerName = downloadedItem.providerName.ifBlank { downloadedProviderLabel },
-                        providerAddonId = downloadedItem.providerAddonId,
-                        contentType = type,
-                        videoId = videoId,
-                        parentMetaId = parentMetaId,
-                        parentMetaType = parentMetaType,
-                        initialPositionMs = targetResumePositionMs,
-                        initialProgressFraction = targetResumeProgressFraction,
-                    )
-                    if (useExternalPlayer) {
-                        playerSessionController.launchExternalOrAskToReplace(
-                            launch = playerLaunch,
+            playbackPreparation.launchWithDownloadPreference(
+                manualSelection = manualSelection,
+                downloadsEnabled = AppFeaturePolicy.downloadsEnabled,
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+                onStreamFallback = {
+                    if (!PlaybackAvailability.current().canStream(type, videoId)) {
+                        NuvioToastController.show(
+                            if (NetworkStatusRepository.uiState.value.isNoInternet) {
+                                offlineConnectToPlayMessage
+                            } else {
+                                playbackUnavailableMessage
+                            },
+                        )
+                        return@launchWithDownloadPreference
+                    }
+
+                    val navigateToStreamRoute = {
+                        val streamLaunchId = StreamLaunchStore.put(
+                            StreamLaunch(
+                                profileId = activePlaybackProfileId,
+                                type = type,
+                                videoId = videoId,
+                                parentMetaId = parentMetaId,
+                                parentMetaType = parentMetaType,
+                                title = title,
+                                logo = logo,
+                                poster = poster,
+                                background = background,
+                                seasonNumber = seasonNumber,
+                                episodeNumber = episodeNumber,
+                                episodeTitle = episodeTitle,
+                                episodeThumbnail = episodeThumbnail,
+                                pauseDescription = pauseDescription,
+                                resumePositionMs = if (startFromBeginning) 0L else resumePositionMs,
+                                resumeProgressFraction = targetResumeProgressFraction,
+                                manualSelection = manualSelection,
+                                startFromBeginning = startFromBeginning,
+                                pickPurpose = pickPurpose,
+                            ),
+                        )
+                        navController.navigate(
+                            StreamRoute(launchId = streamLaunchId, title = title),
+                        )
+                    }
+
+                    if (promptBeforeStreamRoute && playerSessionController.hasActivePlayback) {
+                        playerSessionController.launchOrAskToReplace(
+                            incomingTitle = title,
+                            videoId = videoId,
+                            parentMetaId = parentMetaId,
+                            seasonNumber = seasonNumber,
+                            episodeNumber = episodeNumber,
                             allowSameTargetReopen = false,
                         ) {
-                            startExternalPlayback(playerLaunch)
+                            navigateToStreamRoute()
                         }
-                        return
+                        return@launchWithDownloadPreference
                     }
-                    openPlayerSession(playerLaunch)
-                    return
-                }
-            }
 
-            if (!PlaybackAvailability.current().canStream(type, videoId)) {
-                NuvioToastController.show(playbackUnavailableMessage)
-                return
-            }
-
-            val navigateToStreamRoute = {
-                val streamLaunchId = StreamLaunchStore.put(
-                    StreamLaunch(
-                        profileId = activePlaybackProfileId,
-                        type = type,
-                        videoId = videoId,
-                        parentMetaId = parentMetaId,
-                        parentMetaType = parentMetaType,
-                        title = title,
-                        logo = logo,
-                        poster = poster,
-                        background = background,
-                        seasonNumber = seasonNumber,
-                        episodeNumber = episodeNumber,
-                        episodeTitle = episodeTitle,
-                        episodeThumbnail = episodeThumbnail,
-                        pauseDescription = pauseDescription,
-                        resumePositionMs = if (startFromBeginning) 0L else resumePositionMs,
-                        resumeProgressFraction = targetResumeProgressFraction,
-                        manualSelection = manualSelection,
-                        startFromBeginning = startFromBeginning,
-                        pickPurpose = pickPurpose,
-                    ),
-                )
-                navController.navigate(
-                    StreamRoute(launchId = streamLaunchId, title = title),
-                )
-            }
-
-            if (promptBeforeStreamRoute && playerSessionController.hasActivePlayback) {
-                playerSessionController.launchOrAskToReplace(
-                    incomingTitle = title,
-                    videoId = videoId,
-                    parentMetaId = parentMetaId,
-                    seasonNumber = seasonNumber,
-                    episodeNumber = episodeNumber,
-                    allowSameTargetReopen = false,
-                ) {
                     navigateToStreamRoute()
-                }
-                return
-            }
-
-            navigateToStreamRoute()
+                },
+                onLocalPlaybackReady = { resolved ->
+                    val downloadedItem = resolved.item
+                    launchLocalPlayer(
+                        PlayerLaunch(
+                            profileId = activePlaybackProfileId,
+                            title = title,
+                            sourceUrl = resolved.sourceUrl,
+                            sourceHeaders = emptyMap(),
+                            sourceResponseHeaders = emptyMap(),
+                            externalSubtitles = resolved.externalSubtitles,
+                            logo = logo,
+                            poster = poster,
+                            background = background,
+                            seasonNumber = seasonNumber,
+                            episodeNumber = episodeNumber,
+                            episodeTitle = episodeTitle,
+                            episodeThumbnail = episodeThumbnail,
+                            streamTitle = downloadedItem.streamTitle.ifBlank { title },
+                            streamSubtitle = downloadedItem.streamSubtitle,
+                            pauseDescription = pauseDescription,
+                            providerName = downloadedItem.providerName.ifBlank { downloadedProviderLabel },
+                            providerAddonId = downloadedItem.providerAddonId,
+                            contentType = type,
+                            videoId = videoId,
+                            parentMetaId = parentMetaId,
+                            parentMetaType = parentMetaType,
+                            initialPositionMs = targetResumePositionMs,
+                            initialProgressFraction = targetResumeProgressFraction,
+                        ),
+                    )
+                },
+            )
         }
 
         // Opens the list of sources of the title of a download that needs another source, in download
@@ -1482,12 +1472,20 @@ internal fun MainAppContent(
         }
 
         fun canPlayContinueWatching(item: ContinueWatchingItem): Boolean =
-            item.isCloudLibraryContinueWatchingItem() || playbackAvailability.canPlay(
+            (networkCondition != NetworkCondition.NoInternet && item.isCloudLibraryContinueWatchingItem()) || playbackAvailability.canPlay(
                 type = item.parentMetaType,
                 videoId = item.videoId,
                 parentMetaId = item.parentMetaId,
                 seasonNumber = item.seasonNumber,
                 episodeNumber = item.episodeNumber,
+            )
+
+        fun hasLocalContinueWatchingDownload(item: ContinueWatchingItem): Boolean =
+            !item.isCloudLibraryContinueWatchingItem() && playbackAvailability.hasLocalDownload(
+                parentMetaId = item.parentMetaId,
+                seasonNumber = item.seasonNumber,
+                episodeNumber = item.episodeNumber,
+                videoId = item.videoId,
             )
 
         fun canSelectContinueWatchingStreams(item: ContinueWatchingItem): Boolean =
@@ -1571,6 +1569,8 @@ internal fun MainAppContent(
                         title = item.title,
                     ),
                 )
+            } else if (!canPlayContinueWatching(item) && networkCondition == NetworkCondition.NoInternet) {
+                NuvioToastController.show(offlineConnectToPlayMessage)
             } else {
                 openContinueWatching(item, false, false)
             }
@@ -2359,7 +2359,14 @@ internal fun MainAppContent(
             selectedContinueWatchingForActions?.let { item ->
                 selectedContinueWatchingZoomAnchor?.let { anchor ->
                     key(item.videoId, anchor) {
-                        val showManualPlayOption = streamAutoPlayEnabled && canSelectContinueWatchingStreams(item)
+                        val isDownloadedItem = hasLocalContinueWatchingDownload(item)
+                        val canStreamItem = canSelectContinueWatchingStreams(item)
+                        val showStreamInsteadOption = isDownloadedItem && canStreamItem
+                        val showManualPlayOption = showStreamInsteadOption ||
+                            (streamAutoPlayEnabled && canStreamItem)
+                        val manualPlayLabel = stringResource(
+                            if (showStreamInsteadOption) Res.string.stream_instead else Res.string.play_manually,
+                        )
                         val showDetailsOption = !item.isCloudLibraryContinueWatchingItem()
                         NuvioPosterZoomActionOverlay(
                             imageUrl = cloudLibraryDisplayArtworkUrl(anchor.imageUrl ?: item.poster ?: item.imageUrl),
@@ -2412,7 +2419,7 @@ internal fun MainAppContent(
                                     add(
                                         PosterZoomOverlayAction(
                                             icon = Icons.Default.PlayArrow,
-                                            label = stringResource(Res.string.play_manually),
+                                            label = manualPlayLabel,
                                             onSelected = { onContinueWatchingPlayManually(item) },
                                         ),
                                     )
@@ -2454,11 +2461,18 @@ internal fun MainAppContent(
                 }
             }
 
+            val sheetCwItem = selectedContinueWatchingForActions.takeIf { selectedContinueWatchingZoomAnchor == null }
+            val sheetIsDownloaded = sheetCwItem?.let(::hasLocalContinueWatchingDownload) == true
+            val sheetCanStream = sheetCwItem?.let(::canSelectContinueWatchingStreams) == true
+            val sheetShowStreamInstead = sheetIsDownloaded && sheetCanStream
             NuvioContinueWatchingActionSheet(
-                item = selectedContinueWatchingForActions.takeIf { selectedContinueWatchingZoomAnchor == null },
-                showManualPlayOption = streamAutoPlayEnabled &&
-                    selectedContinueWatchingForActions?.let(::canSelectContinueWatchingStreams) == true,
-                showDetailsOption = selectedContinueWatchingForActions?.isCloudLibraryContinueWatchingItem() != true,
+                item = sheetCwItem,
+                showManualPlayOption = sheetShowStreamInstead ||
+                    (streamAutoPlayEnabled && sheetCanStream),
+                manualPlayLabel = stringResource(
+                    if (sheetShowStreamInstead) Res.string.stream_instead else Res.string.play_manually,
+                ),
+                showDetailsOption = sheetCwItem?.isCloudLibraryContinueWatchingItem() != true,
                 onDismiss = { selectedContinueWatchingForActions = null },
                 onOpenDetails = {
                     selectedContinueWatchingForActions?.let { item ->
@@ -2589,7 +2603,7 @@ internal fun MainAppContent(
             }
 
             NuvioFloatingPrompt(
-                visible = resumePromptItem != null,
+                visible = resumePromptItem?.let(::canPlayContinueWatching) == true,
                 imageUrl = resumePromptItem?.poster ?: resumePromptItem?.imageUrl,
                 title = resumePromptItem?.title.orEmpty(),
                 subtitle = resumePromptItem?.let { localizedContinueWatchingSubtitle(it) }.orEmpty(),
@@ -2625,6 +2639,12 @@ internal fun MainAppContent(
                     playbackAudioLanguage = playerSettingsUiState.preferredAudioLanguage,
                 )
             }
+
+            PlaybackPreparationOverlay(
+                visible = playbackPreparation.isPreparing,
+                onCancel = playbackPreparation::cancel,
+                modifier = Modifier.zIndex(18f),
+            )
 
             NuvioToastHost(
                 modifier = Modifier

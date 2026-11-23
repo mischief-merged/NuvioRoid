@@ -65,6 +65,7 @@ fun EpisodeWatchedActionSheet(
     onTogglePreviousWatched: () -> Unit,
     onToggleSeasonWatched: () -> Unit,
     showPlayManually: Boolean = false,
+    manualPlayLabel: String = stringResource(Res.string.play_manually),
     onPlayManually: (() -> Unit)? = null,
     ratingMedia: TrackingMediaReference? = null,
 ) {
@@ -173,7 +174,7 @@ fun EpisodeWatchedActionSheet(
                         if (showPlayManually && onPlayManually != null) {
                             NuvioBottomSheetActionRow(
                                 icon = Icons.Default.PlayArrow,
-                                title = stringResource(Res.string.play_manually),
+                                title = manualPlayLabel,
                                 onClick = {
                                     onPlayManually()
                                     dismiss()
