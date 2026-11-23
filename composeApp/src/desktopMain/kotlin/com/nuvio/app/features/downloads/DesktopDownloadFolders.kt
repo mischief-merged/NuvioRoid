@@ -722,6 +722,7 @@ internal class DesktopDownloadFolders(
                 moveRunning.set(false)
                 runCatching { refresh() }
                 runCatching { hooks.resumeHeld() }
+                runCatching { hooks.refreshOfflineIndex() }
             }
         }
     }

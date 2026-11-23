@@ -876,4 +876,45 @@ class OfflineFirstBehaviorTest {
         assertTrue(resolutionThreads.isNotEmpty())
         assertFalse(resolutionThreads.any { it === callerThread })
     }
+
+    @Test
+    fun verifyCompletedDownload_refreshes_offline_index_after_releasing_ItemLocks() {
+        val lockAwareBackend = object : DownloadsBackend by backend {
+            override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
+        }
+        val movie = downloadItem("mv-lock", "tt-lock", "tt-lock", totalBytes = 1_000L)
+        backend.presentUris += movie.localFileUri!!
+        backend.fileFacts[movie.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val previousDispatcher = DownloadsRepository.indexDispatcher
+        DownloadsRepository.indexDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        try {
+            persistItems(movie)
+            DownloadsRepository.backend = lockAwareBackend
+            DownloadsRepository.ensureOfflineIndexStarted()
+            assertTrue(DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId))
+
+            assertTrue(DownloadsRepository.verifyCompletedDownload(movie.id))
+            assertTrue(
+                DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId),
+                "Verified download must remain in offlineIndex after ItemLocks is released",
+            )
+
+            // If an index build runs while a connected item is temporarily held by ItemLocks,
+            // lastCompletedIndexKey must not stay poisoned once the lock is released.
+            assertTrue(ItemLocks.tryAcquire(movie.id))
+            try {
+                DownloadsRepository.refreshOfflineIndex()
+                assertFalse(DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId))
+            } finally {
+                ItemLocks.release(movie.id)
+            }
+            DownloadsRepository.ensureOfflineIndexStarted()
+            assertTrue(
+                DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId),
+                "Ordinary index refresh after ItemLocks release must restore the temporarily held item",
+            )
+        } finally {
+            DownloadsRepository.indexDispatcher = previousDispatcher
+        }
+    }
 }

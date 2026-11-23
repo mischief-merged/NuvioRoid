@@ -375,13 +375,14 @@ object DownloadsRepository {
                         lastCompletedIndexKey = key
                         key.isNotEmpty()
                     }
-                    val built = if (shouldBuild) {
-                        OfflineDownloadIndex(snapshot, ::resolveLocalUriWithoutMutation)
+                    val (built, heldWhileConnected) = if (shouldBuild) {
+                        buildOfflineIndexWithHoldCheck(snapshot)
                     } else {
-                        OfflineDownloadIndex.Empty
+                        OfflineDownloadIndex.Empty to false
                     }
                     synchronized(indexLock) {
                         if (offlineIndexObserved && indexGeneration == generation) {
+                            if (heldWhileConnected) lastCompletedIndexKey = null
                             _offlineIndex.value = built
                         }
                     }
@@ -447,10 +448,11 @@ object DownloadsRepository {
         val candidates = items.filter { it.isVerifiedCompletedStatus() }
         val job = indexScope.launch(indexDispatcher) {
             // A newer index, or a cleared list, already took this one's place. Do not look at the files.
-            if (!isActive || synchronized(indexLock) { indexGeneration != generation }) return@launch
-            val built = OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
+            if (!isActive || synchronized(indexLock) { !offlineIndexObserved || indexGeneration != generation }) return@launch
+            val (built, heldWhileConnected) = buildOfflineIndexWithHoldCheck(candidates)
             synchronized(indexLock) {
-                if (indexGeneration == generation) {
+                if (offlineIndexObserved && indexGeneration == generation) {
+                    if (heldWhileConnected) lastCompletedIndexKey = null
                     _offlineIndex.value = built
                 }
             }
@@ -518,6 +520,19 @@ object DownloadsRepository {
         if (candidates.isEmpty()) return false
         return OfflineDownloadIndex(candidates, ::resolveLocalUriWithoutMutation)
             .hasMeta(normalized)
+    }
+
+    private fun buildOfflineIndexWithHoldCheck(candidates: List<DownloadItem>): Pair<OfflineDownloadIndex, Boolean> {
+        var heldWhileConnected = false
+        val index = OfflineDownloadIndex(candidates) { item ->
+            if (!item.isVerifiedCompletedStatus()) return@OfflineDownloadIndex null
+            if (isBusyOrAway(item)) {
+                if (backend.isConnected(item)) heldWhileConnected = true
+                return@OfflineDownloadIndex null
+            }
+            (backend.locate(item) as? FileLookup.Found)?.uri
+        }
+        return index to heldWhileConnected
     }
 
     internal fun resolveLocalUriWithoutMutation(item: DownloadItem): String? {
@@ -2100,28 +2115,35 @@ object DownloadsRepository {
         // A move has the item. Its file is in the middle of changing places, so this check cannot
         // say the file is lost, and it also cannot say the file is playable.
         if (!ItemLocks.tryAcquire(downloadId)) return false
+        var verified = false
         try {
             var snapshot = initial
             for (attempt in 0..2) {
                 val checked = snapshot.withoutLostFile()
-                synchronized(stateLock) {
+                val shouldRetry = synchronized(stateLock) {
                     val latest = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
                     if (!latest.isVerifiedCompletedStatus()) return false
                     if (latest != snapshot && attempt < 2) {
                         snapshot = latest
+                        true
                     } else if (checked.status == DownloadStatus.Completed) {
-                        scheduleOfflineIndexRefresh(_uiState.value.items, force = true)
-                        return true
+                        verified = true
+                        false
                     } else {
                         mutateItem(downloadId) { checked }
-                        return false
+                        false
                     }
                 }
+                if (!shouldRetry) break
             }
-            return false
         } finally {
             ItemLocks.release(downloadId)
         }
+        if (verified) {
+            val snapshot = synchronized(stateLock) { _uiState.value.items }
+            scheduleOfflineIndexRefresh(snapshot, force = true)
+        }
+        return verified
     }
 
     /** This finished download, or the failed download it has become because its file is lost. */
