@@ -18,6 +18,8 @@ internal data class DownloadPlatformRequest(
     val mayPublish: () -> Boolean = { true },
     /** Saves the final address durably before the partial name may be removed. False keeps both names. */
     val onPublished: (localFileUri: String, size: Long, fileKey: String?) -> Boolean = { _, _, _ -> true },
+    /** Releases the publishing wait even if platform work ends before it can report a result. */
+    val onFinished: () -> Unit = {},
 ) {
     val sourceUrl: String get() = item.sourceUrl
     val sourceHeaders: Map<String, String> get() = item.sourceHeaders

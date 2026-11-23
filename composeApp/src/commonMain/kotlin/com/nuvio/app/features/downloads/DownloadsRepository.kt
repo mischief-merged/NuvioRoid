@@ -130,6 +130,12 @@ object DownloadsRepository {
     // The transfer that currently owns each download. A transfer that was paused, replaced or removed
     // is no longer in this map, so whatever it reports afterwards is ignored.
     private val activeTransfers = mutableMapOf<String, ActiveTransfer>()
+    @Volatile
+    private var finishingSteps = DownloadFinishingSteps()
+
+    /** Stops new publications and gives work already publishing or verifying a bounded time to save. */
+    internal suspend fun awaitFinishingDownloads(timeoutMs: Long = 10_000L): Boolean =
+        finishingSteps.awaitForQuit(timeoutMs)
     @kotlin.concurrent.Volatile
     private var hasLoaded = false
 
@@ -277,6 +283,7 @@ object DownloadsRepository {
         val transfers = activeTransfers.values.toList()
         activeTransfers.clear()
         checkingTransfers.clear()
+        finishingSteps = DownloadFinishingSteps()
         transfers.forEach(ActiveTransfer::cancel)
         progressJob?.cancel()
         progressJob = null
@@ -1103,14 +1110,22 @@ object DownloadsRepository {
             return
         }
         val transfer = ActiveTransfer()
+        val finishing = finishingSteps
         // Registered before the downloader is asked to start, so a report made before start returns
         // already finds this transfer.
         clearCheck(item.id)
         activeTransfers[item.id] = transfer
         if (item.awaitingCheck && item.localFileUri != null) {
+            if (!finishing.begin(transfer)) {
+                removeTransfer(item.id)
+                return
+            }
             transfer.digestVerified = item.publishedDigestVerified
             transfer.finishing = true
-            checkScope.launch { finishTransfer(item, transfer, item.localFileUri, item.totalBytes ?: item.downloadedBytes) }
+            checkScope.launch {
+                try { finishTransfer(item, transfer, item.localFileUri, item.totalBytes ?: item.downloadedBytes) }
+                finally { finishing.end(transfer) }
+            }
             return
         }
 
@@ -1121,12 +1136,12 @@ object DownloadsRepository {
                 limits = autoTransferLimits(item, transfer),
                 onPartialCreated = { key -> ifCurrent(item.id, transfer) { mutateItem(item.id) { it.copy(partialFileKey = key) } } },
                 onFileNameChanged = { name -> ifCurrent(item.id, transfer) { mutateItem(item.id) { it.copy(fileName = name, partialFileKey = null) } } },
+                onFinished = { finishing.end(transfer) },
                 onPublished = { uri, size, key -> rememberPublished(item.id, transfer, uri, size, key) },
-                // Decided under the state lock, so a connection hold either came first (the transfer
-                // ends as paused, its partial file intact) or sees the transfer finishing and leaves it.
+                // A connection hold or quit either came first, or sees this work finishing and leaves it.
                 mayPublish = {
                     synchronized(stateLock) {
-                        (activeTransfers[item.id] === transfer).also { if (it) transfer.finishing = true }
+                        (activeTransfers[item.id] === transfer && finishing.begin(transfer)).also { if (it) transfer.finishing = true }
                     }
                 },
             ),
@@ -1147,43 +1162,54 @@ object DownloadsRepository {
                     }
                 }
             },
-            { localFileUri, totalBytes -> finishTransfer(item, transfer, localFileUri, totalBytes) },
+            { localFileUri, totalBytes ->
+                if (finishing.begin(transfer)) {
+                    try { finishTransfer(item, transfer, localFileUri, totalBytes) }
+                    finally { finishing.end(transfer) }
+                }
+            },
             { message ->
-                ifCurrent(item.id, transfer) {
-                    removeTransfer(item.id)
-                    val current = _uiState.value.items.firstOrNull { it.id == item.id }
-                    val kind = classifyDownloadFailure(message)
-                    // A bad file, a refusal or a full disk comes again on every attempt.
-                    val worthAnotherAttempt = kind == DownloadFailureKind.Other
-                    if (current?.status == DownloadStatus.Downloading && attempt < MaxDownloadAttempts && worthAnotherAttempt) {
-                        persist()
-                        startDownload(current, attempt + 1)
-                    } else {
-                        mutateItem(item.id) { failed ->
-                            if (failed.status != DownloadStatus.Downloading) {
-                                failed
-                            } else {
-                                failed.copy(
-                                    status = DownloadStatus.Failed,
-                                    failureKind = kind,
-                                    errorMessage = message.ifBlank { runBlocking { getString(Res.string.download_failed) } },
-                                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                                )
+                try {
+                    ifCurrent(item.id, transfer) {
+                        removeTransfer(item.id)
+                        val current = _uiState.value.items.firstOrNull { it.id == item.id }
+                        val kind = classifyDownloadFailure(message)
+                        // A bad file, a refusal or a full disk comes again on every attempt.
+                        val worthAnotherAttempt = kind == DownloadFailureKind.Other
+                        if (current?.status == DownloadStatus.Downloading && attempt < MaxDownloadAttempts && worthAnotherAttempt && !finishing.isClosing) {
+                            persist()
+                            startDownload(current, attempt + 1)
+                        } else {
+                            mutateItem(item.id) { failed ->
+                                if (failed.status != DownloadStatus.Downloading) {
+                                    failed
+                                } else {
+                                    failed.copy(
+                                        status = DownloadStatus.Failed,
+                                        failureKind = kind,
+                                        errorMessage = message.ifBlank { runBlocking { getString(Res.string.download_failed) } },
+                                        updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                                    )
+                                }
                             }
                         }
                     }
-                }
+                } finally { finishing.end(transfer) }
             },
             {
-                ifCurrent(item.id, transfer) {
-                    removeTransfer(item.id)
-                    mutateItem(item.id) { current ->
-                        if (current.status != DownloadStatus.Downloading) return@mutateItem current
-                        // A transfer that could not run because its location is away or being moved
-                        // waits for it, and goes on by itself.
-                        current.copy(status = DownloadStatus.Paused, errorMessage = null, pausedByFolder = backend.heldByFolder(current))
+                try {
+                    ifCurrent(item.id, transfer) {
+                        removeTransfer(item.id)
+                        // Quit refused a new publication: leave it interrupted, to resume on the next launch.
+                        if (finishing.isClosing && !transfer.finishing) return@ifCurrent
+                        mutateItem(item.id) { current ->
+                            if (current.status != DownloadStatus.Downloading) return@mutateItem current
+                            // A transfer that could not run because its location is away or being moved
+                            // waits for it, and goes on by itself.
+                            current.copy(status = DownloadStatus.Paused, errorMessage = null, pausedByFolder = backend.heldByFolder(current))
+                        }
                     }
-                }
+                } finally { finishing.end(transfer) }
             },
         )
         transfer.attach(handle)

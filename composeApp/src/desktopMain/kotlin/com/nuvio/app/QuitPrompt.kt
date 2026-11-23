@@ -9,6 +9,7 @@ import nuvio.composeapp.generated.resources.quit_downloads_keep_open
 import nuvio.composeapp.generated.resources.quit_downloads_message
 import nuvio.composeapp.generated.resources.quit_downloads_quit
 import nuvio.composeapp.generated.resources.quit_downloads_title
+import nuvio.composeapp.generated.resources.quit_downloads_background_message
 import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 
@@ -39,7 +40,8 @@ internal fun QuitWithDownloadsDialog(
 ) {
     NuvioStatusModal(
         title = stringResource(Res.string.quit_downloads_title),
-        message = pluralStringResource(Res.plurals.quit_downloads_message, activeDownloads, activeDownloads),
+        message = if (activeDownloads > 0) pluralStringResource(Res.plurals.quit_downloads_message, activeDownloads, activeDownloads)
+            else stringResource(Res.string.quit_downloads_background_message),
         isVisible = true,
         destructive = true,
         confirmText = stringResource(Res.string.quit_downloads_quit),

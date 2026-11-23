@@ -2336,13 +2336,24 @@
     <string name="downloads_auto_toast_save_failed">Couldn't save auto-download for this show. Try again.</string>
     <string name="downloads_auto_toast_off_failed">Couldn't turn off auto-download for this show. Try again.</string>
     <string name="downloads_auto_toast_limit_failed">Couldn't change the storage limit. Try again.</string>
-    <string name="quit_downloads_title">Quit Nuvio?</string>
+    <string name="quit_downloads_title">Downloads are still running. Quit anyway?</string>
     <plurals name="quit_downloads_message">
         <item quantity="one">%1$d download is in progress. It will pause and resume next time you open Nuvio.</item>
         <item quantity="other">%1$d downloads are in progress. They will pause and resume next time you open Nuvio.</item>
     </plurals>
     <string name="quit_downloads_quit">Quit</string>
-    <string name="quit_downloads_keep_open">Keep open</string>
+    <string name="quit_downloads_keep_open">Keep downloading</string>
+    <string name="quit_downloads_background_message">Download checks and source searches will stop until you open NuvioRoid again.</string>
+    <string name="settings_keep_downloading_title">Keep downloading after the window closes</string>
+    <string name="settings_keep_downloading_description">Downloads keep going in the background. Reopen the window from the Dock or menu bar.</string>
+    <string name="downloads_sleep_reason">Downloading files</string>
+    <string name="downloads_tray_progress">%1$d downloading · %2$d%</string>
+    <string name="downloads_tray_running">%1$d downloading</string>
+    <string name="downloads_tray_paused">%1$d paused</string>
+    <string name="downloads_tray_idle">No downloads running</string>
+    <string name="downloads_tray_show">Show NuvioRoid</string>
+    <string name="downloads_tray_pause_all">Pause all</string>
+    <string name="downloads_tray_resume_all">Resume all</string>
     <string name="downloads_auto_section_title">Auto-download</string>
     <string name="downloads_auto_check_now">Check now</string>
     <string name="downloads_auto_checking_toast">Checking for new episodes</string>

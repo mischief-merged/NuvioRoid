@@ -386,14 +386,19 @@ internal class DownloadTraffic {
     private val active = mutableListOf<Pair<Long, TransferEndpoint>>()
     private var nextToken = 0L
     private var bytes = 0L
+    private val _activeCount = MutableStateFlow(0)
+    val activeCount: StateFlow<Int> = _activeCount.asStateFlow()
 
     fun begin(endpoint: TransferEndpoint): Long = synchronized(lock) {
         val token = ++nextToken
         active += token to endpoint
+        _activeCount.value = active.size
         token
     }
 
-    fun end(token: Long) = synchronized(lock) { active.removeAll { it.first == token } }
+    fun end(token: Long) = synchronized(lock) {
+        active.removeAll { it.first == token }.also { _activeCount.value = active.size }
+    }
 
     fun add(count: Int) = synchronized(lock) { bytes += count }
 
