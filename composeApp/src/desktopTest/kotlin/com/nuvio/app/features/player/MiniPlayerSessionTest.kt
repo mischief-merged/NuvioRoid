@@ -1057,7 +1057,7 @@ class MiniPlayerSessionTest {
         val fullSlotBounds = compose.onNodeWithTag("player_session_surface_slot").fetchSemanticsNode().boundsInRoot
         assertTrue(fullSlotBounds.width >= 1000f && fullSlotBounds.height >= 700f, "Full mode surface fills window")
         assertEquals("Series", backend.statesByHandle[1L]?.nowPlayingTitle)
-        assertEquals("S1E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
+        assertEquals("S1 E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
 
         // Minimize while playing: surface slot shrinks to exact 334x188 mini slot above dock controls.
         compose.runOnIdle {
@@ -1108,7 +1108,7 @@ class MiniPlayerSessionTest {
         compose.waitForIdle()
         compose.onNodeWithText("Library Saved: Browsed Show").assertIsDisplayed()
         assertEquals("Series", backend.statesByHandle[1L]?.nowPlayingTitle)
-        assertEquals("S1E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
+        assertEquals("S1 E1 - Episode 1", backend.statesByHandle[1L]?.nowPlayingSubtitle)
 
         // Dispatch native media-key toggle while minimized: pauses playback and delivers PAUSE scrobble, then resumes & delivers START.
         val scrobblesBeforeMediaKey = scrobbles.size
