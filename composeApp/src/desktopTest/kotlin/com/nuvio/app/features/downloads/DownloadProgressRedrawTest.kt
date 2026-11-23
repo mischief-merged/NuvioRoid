@@ -114,12 +114,13 @@ class DownloadProgressRedrawTest {
             val before = compose.runOnIdle { rowVisits["Finished episode"] ?: 0 }
             assertTrue(before > 0)
             ticks()
-            compose.onAllNodesWithText(" • 1.7 KB • ", substring = true).assertCountEquals(1)
+            // 512 + 984 + 256 = 1,752 B = 1.8 KB in decimal units.
+            compose.onAllNodesWithText(" • 1.8 KB • ", substring = true).assertCountEquals(1)
             assertEquals(before, compose.runOnIdle { rowVisits["Finished episode"] ?: 0 })
             compose.runOnIdle { backend.progress.getValue("Other show")(9500, 10000) }
             compose.mainClock.advanceTimeBy(250)
             compose.waitForIdle()
-            compose.onAllNodesWithText(" • 1.7 KB • ", substring = true).assertCountEquals(1)
+            compose.onAllNodesWithText(" • 1.8 KB • ", substring = true).assertCountEquals(1)
             assertEquals(before, compose.runOnIdle { rowVisits["Finished episode"] ?: 0 })
         } finally {
             if (!alreadyWatched) WatchedRepository.unmarkWatchedLocally(listOf(watched))
