@@ -441,9 +441,16 @@ internal class PlayerSessionController(
         }
     }
 
+    fun closeActiveSession(onClosed: () -> Unit = {}) {
+        closeActiveSession(
+            onClosed = onClosed,
+            onFailed = {},
+        )
+    }
+
     fun closeActiveSession(
-        onClosed: () -> Unit = {},
-        onFailed: () -> Unit = {},
+        onClosed: () -> Unit,
+        onFailed: () -> Unit,
     ) {
         val current = activeSession ?: run {
             onClosed()

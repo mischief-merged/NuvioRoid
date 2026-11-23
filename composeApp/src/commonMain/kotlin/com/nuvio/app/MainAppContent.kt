@@ -1791,9 +1791,9 @@ internal fun MainAppContent(
                                 onContinueWatchingClick = onContinueWatchingClick,
                                 onContinueWatchingLongPress = onContinueWatchingLongPress,
                                 onSwitchProfile = {
-                                    playerSessionController.closeActiveSession {
-                                        onSwitchProfile()
-                                    }
+                                    playerSessionController.closeActiveSession(
+                                        onClosed = { onSwitchProfile() },
+                                    )
                                 },
                                 onSettingsPageClick = if (useNativeNavigation && !isTabletLayout) {
                                     { pageName, title ->
@@ -1890,15 +1890,17 @@ internal fun MainAppContent(
                                 }
                             }
                             if (playerSessionController.hasActiveSession) {
-                                playerSessionController.closeActiveSession { switchProfileAction() }
+                                playerSessionController.closeActiveSession(
+                                    onClosed = { switchProfileAction() },
+                                )
                             } else {
                                 switchProfileAction()
                             }
                         },
                         onAddProfileRequested = {
-                            playerSessionController.closeActiveSession {
-                                onSwitchProfile()
-                            }
+                            playerSessionController.closeActiveSession(
+                                onClosed = { onSwitchProfile() },
+                            )
                         },
                     )
                 }

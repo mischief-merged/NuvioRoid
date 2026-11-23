@@ -716,6 +716,129 @@ class ReplacePlaybackPromptTest {
         assertEquals(510_000L, WatchProgressRepository.progressForVideo(firstVideoId)?.lastPositionMs)
     }
 
+    @Test
+    fun open_in_external_player_from_session_host_releases_retained_player_before_launching_system_player() {
+        val disposeStarted = CountDownLatch(1)
+        val allowDispose = CountDownLatch(1)
+        val backend = CountingNativePlayerBackend(
+            onDisposeHook = {
+                disposeStarted.countDown()
+                allowDispose.await(5, TimeUnit.SECONDS)
+            },
+        )
+        val hooks = backend.toDesktopHooks()
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        val launch = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "file:///tmp/severance-s1e1.mkv",
+        )
+        val externalHandoffs = mutableListOf<String>()
+
+        sessionController.open(launch = launch, launchId = 701L)
+        compose.setContent {
+            NuvioTheme {
+                CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        PlayerSessionHost(
+                            controller = sessionController,
+                            navController = navigator,
+                            externalPlayerId = "system",
+                            externalPlayerNotConfiguredText = "",
+                            externalPlayerFailedText = "",
+                            onExternalPlayerLaunch = {},
+                            launchExternalPlayer = {
+                                externalHandoffs += launch.sourceUrl
+                                true
+                            },
+                            openExternalStreamUrl = { false },
+                            onOpenPartyMedia = {},
+                            allowExternalPlayer = true,
+                        )
+                    }
+                }
+            }
+        }
+        compose.waitUntil(5_000L) { backend.createCount == 1 }
+        compose.runOnIdle {
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 395_000L
+                durationMs = 1_800_000L
+            }
+            sessionController.minimize()
+            assertTrue(sessionController.isMinimized)
+            sessionController.restoreFullScreen()
+            assertTrue(sessionController.isFullScreen)
+        }
+        compose.mainClock.advanceTimeBy(300L)
+        compose.waitForIdle()
+
+        // Trigger "Open in external player" from the retained player controls with Desktop's "system" player id.
+        backend.statesByHandle[1L]?.eventSink?.onPlayerEvent("external", 0.0)
+        assertTrue(disposeStarted.await(5, TimeUnit.SECONDS))
+        assertTrue(externalHandoffs.isEmpty(), "system external player must not launch before native disposal finishes")
+
+        allowDispose.countDown()
+        compose.waitUntil(5_000L) { externalHandoffs.size == 1 }
+        compose.waitForIdle()
+
+        assertFalse(sessionController.hasActiveSession)
+        assertEquals(1, backend.disposeCount)
+        assertEquals(0, backend.activeHandleCount)
+        assertEquals(listOf(launch.sourceUrl), externalHandoffs)
+        assertEquals(395_000L, WatchProgressRepository.progressForVideo(firstVideoId)?.lastPositionMs)
+    }
+
+    @Test
+    fun close_active_session_trailing_lambda_runs_when_idle_or_closed_and_never_on_close_failure() {
+        val controller = PlayerSessionController(onExitPictureInPicture = {})
+        var continuations = 0
+
+        // Idle session: trailing lambda runs immediately (e.g. opening profile picker when nothing plays).
+        controller.closeActiveSession {
+            continuations += 1
+        }
+        assertEquals(1, continuations)
+
+        // Active session whose close fails: trailing lambda must NOT run while old session remains active.
+        val launch = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/s1e1.mp4",
+        )
+        controller.open(launch = launch, launchId = 801L)
+        var pendingOnClosed: (() -> Unit)? = null
+        controller.bindControls(
+            launchId = 801L,
+            controls = PlayerSessionControls(
+                togglePlayback = {},
+                seekForward = {},
+                requestClose = { onClosed -> pendingOnClosed = onClosed },
+                requestBack = {},
+            ),
+        )
+        controller.closeActiveSession {
+            continuations += 1
+        }
+        assertEquals(1, continuations)
+        controller.notifyCloseFailed(801L)
+        assertEquals(1, continuations, "failed close must not invoke success continuation")
+        assertTrue(controller.hasActiveSession)
+
+        // Retry close and succeed: trailing lambda runs exactly once after session clears.
+        controller.closeActiveSession {
+            continuations += 1
+        }
+        pendingOnClosed?.invoke()
+        assertFalse(controller.hasActiveSession)
+        assertEquals(2, continuations)
+    }
+
     private fun mountPlayerSessionHost(
         sessionController: PlayerSessionController,
         navigator: NuvioNavigator,

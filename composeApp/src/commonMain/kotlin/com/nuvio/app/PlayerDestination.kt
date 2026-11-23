@@ -63,6 +63,7 @@ internal fun BoxScope.PlayerSessionHost(
     launchExternalPlayer: (ExternalPlayerIntentResult.Success) -> Boolean,
     openExternalStreamUrl: (String) -> Boolean,
     onOpenPartyMedia: (PartyMedia) -> Unit,
+    allowExternalPlayer: Boolean = externalPlayerSupported,
 ) {
     DisposableEffect(controller) {
         ActivePlayerSessionRegistry.bindController(controller)
@@ -255,7 +256,7 @@ internal fun BoxScope.PlayerSessionHost(
             onSessionCloseFailed = { controller.notifyCloseFailed(session.launchId) },
             onExitTarget = { exitTarget.target = it },
             onSystemBackHandlerChanged = { handler -> systemBackHandler = handler },
-            onOpenInExternalPlayer = if (externalPlayerSupported) {
+            onOpenInExternalPlayer = if (allowExternalPlayer) {
                 { request ->
                     val playerLaunch = PlayerLaunch(
                         profileId = launch.profileId,
@@ -282,19 +283,21 @@ internal fun BoxScope.PlayerSessionHost(
                         initialPositionMs = request.resumePositionMs,
                         subtitleExtras = launch.subtitleExtras,
                     )
-                    onExternalPlayerLaunch(playerLaunch)
                     val intentResult = ExternalPlayerPlatform.buildIntent(
                         request = request,
                         playerId = externalPlayerId,
                     )
                     when (intentResult) {
                         is ExternalPlayerIntentResult.Success -> {
-                            val launched = launchExternalPlayer(intentResult)
-                            if (!launched) {
-                                NuvioToastController.show(externalPlayerFailedText)
-                            } else if (externalPlayerId == "infuse") {
-                                controller.closeActiveSession()
-                            }
+                            controller.closeActiveSession(
+                                onClosed = {
+                                    onExternalPlayerLaunch(playerLaunch)
+                                    val launched = launchExternalPlayer(intentResult)
+                                    if (!launched) {
+                                        NuvioToastController.show(externalPlayerFailedText)
+                                    }
+                                },
+                            )
                         }
                         ExternalPlayerIntentResult.NotConfigured -> {
                             NuvioToastController.show(externalPlayerNotConfiguredText)
