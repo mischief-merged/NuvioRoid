@@ -405,4 +405,101 @@ class AutoDownloadStorageLimitTest {
         assertEquals(false, DownloadsRepository.rateTracker.hasSamples(first.id))
         assertEquals(false, DownloadsRepository.rateTracker.hasSamples(second.id))
     }
+
+    @Test
+    fun stale_disk_scan_after_profile_change_does_not_dispatch_trip_recovery_for_the_old_profile() {
+        val originalProfile = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
+        val profileA = originalProfile + 10
+        val profileB = originalProfile + 11
+        val dispatched = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val scanEntered = java.util.concurrent.CountDownLatch(1)
+        val allowScanFinish = java.util.concurrent.CountDownLatch(1)
+        val abaEntered = java.util.concurrent.CountDownLatch(1)
+        val abaRelease = java.util.concurrent.CountDownLatch(1)
+        var blockProfileAScan = false
+        var blockAbaScan = false
+
+        try {
+            val racingBackend = object : DownloadsBackend by backend {
+                override fun scanDownloadsOnDisk(
+                    activeProfileId: Int,
+                    inMemoryItems: List<DownloadItem>,
+                    nextDownloadId: (Long) -> String,
+                    nowEpochMs: Long,
+                ): DiskScanResult {
+                    if (activeProfileId == profileA && blockProfileAScan) {
+                        scanEntered.countDown()
+                        allowScanFinish.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                        return DiskScanResult()
+                    }
+                    if (activeProfileId == profileA && blockAbaScan) {
+                        abaEntered.countDown()
+                        abaRelease.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                        return DiskScanResult()
+                    }
+                    return backend.scanDownloadsOnDisk(activeProfileId, inMemoryItems, nextDownloadId, nowEpochMs)
+                }
+            }
+
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = racingBackend
+            backend.diskScanSupported = true
+            backend.moveRunning = true
+            backend.scanResult = DiskScanResult(busy = true)
+            DownloadsRepository.onProfileReadyForTrip = { dispatched += it }
+
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(profileA)
+            DownloadsRepository.ensureLoaded()
+            assertEquals(emptyList(), dispatched)
+
+            // Move ends; profile A starts recoverAndStartTripAfterBusyScan via resumeHeldByFolder and blocks mid-scan.
+            backend.moveRunning = false
+            blockProfileAScan = true
+            val staleWorker = Thread { DownloadsRepository.resumeHeldByFolder() }
+            staleWorker.start()
+            assertEquals(true, scanEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // Meanwhile user switches to profile B, which finishes loading and dispatches its own trip recovery.
+            backend.scanResult = DiskScanResult(busy = false)
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(profileB)
+            DownloadsRepository.onProfileChanged()
+            assertEquals(listOf(profileB), dispatched.toList())
+
+            // Profile A's delayed scan now completes; it must not dispatch trip recovery for profile A or switch back.
+            allowScanFinish.countDown()
+            staleWorker.join(5_000)
+            blockProfileAScan = false
+            assertEquals(listOf(profileB), dispatched.toList())
+
+            // Also verify ABA profile switch invalidates an in-flight findDownloadsOnDisk generation.
+            dispatched.clear()
+            backend.moveRunning = true
+            backend.scanResult = DiskScanResult(busy = true)
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(profileA)
+            DownloadsRepository.onProfileChanged()
+            assertEquals(emptyList(), dispatched)
+
+            backend.moveRunning = false
+            blockAbaScan = true
+            val abaWorker = Thread { DownloadsRepository.findDownloadsOnDisk() }
+            abaWorker.start()
+            assertEquals(true, abaEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            blockAbaScan = false
+            backend.scanResult = DiskScanResult(busy = false)
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(profileB)
+            DownloadsRepository.onProfileChanged()
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(profileA)
+            DownloadsRepository.onProfileChanged()
+            assertEquals(listOf(profileB, profileA), dispatched.toList())
+
+            abaRelease.countDown()
+            abaWorker.join(5_000)
+            assertEquals(listOf(profileB, profileA), dispatched.toList())
+        } finally {
+            allowScanFinish.countDown()
+            abaRelease.countDown()
+            com.nuvio.app.features.profiles.ProfileRepository.setActiveProfileIdForTest(originalProfile)
+        }
+    }
 }

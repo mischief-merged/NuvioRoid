@@ -1047,4 +1047,83 @@ class TripPlannerTest {
             cachedSize = bytes,
         ),
     )
+
+    @Test
+    fun `stale profile load callback does not cancel active profiles trip fill runner`() = runBlocking {
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val downloads = MutableStateFlow(DownloadsUiState())
+        val runner = TripFillRunner(
+            scope = scope,
+            downloads = downloads,
+            prepareStream = { stream, _ ->
+                gate.await()
+                stream
+            },
+            enqueue = { show, episode, _ ->
+                downloads.update {
+                    it.copy(
+                        items = it.items + dl(
+                            id = "dl-${episode.episodeNumber}",
+                            parentMetaId = show.parentMetaId,
+                            season = episode.seasonNumber,
+                            episode = episode.episodeNumber,
+                            status = DownloadStatus.Completed,
+                        ),
+                    )
+                }
+                DownloadEnqueueResult.Started
+            },
+            currentProfileId = { 2 },
+        )
+        val plan = TripFillPlan(
+            requestedHours = 4,
+            plannedEpisodes = listOf(
+                TripPlannedEpisode(
+                    show = TripShowCandidate("series", "tt1", "Show"),
+                    episode = ep("tt1:1:1", 1, 1, 45),
+                    effectiveRuntimeMinutes = 45,
+                    runtimeEstimated = false,
+                    rankedStreams = listOf(stream("1080p", "https://ex/1.mkv", cached = true, bytes = 500_000_000L)),
+                    selectedStream = stream("1080p", "https://ex/1.mkv", cached = true, bytes = 500_000_000L),
+                    isCached = true,
+                    estimatedBytes = 500_000_000L,
+                    sizeEstimated = false,
+                ),
+            ),
+            totalPlannedMinutes = 45,
+            totalEstimatedBytes = 500_000_000L,
+            qualityDefaults = SeasonDownloadDefaults(),
+            storageLimitBytes = null,
+            remainingStorageLimitBytes = null,
+            freeDiskBytes = null,
+            connectionHoldReason = null,
+            stoppedReason = TripPlanStopReason.TargetReached,
+            profileId = 2,
+        )
+
+        try {
+            assertTrue(runner.start(plan))
+            assertTrue(runner.state.value.isRunning)
+
+            // Delayed callback for profile 1 arrives after profile 2 has already started its runner.
+            TripFillHost.onProfileLoaded(
+                profileId = 1,
+                activeProfile = { 2 },
+                loadPendingPlan = { null },
+                awaitOnline = {},
+                activeRunner = runner,
+            )
+
+            assertTrue(runner.state.value.isRunning)
+
+            gate.complete(Unit)
+            val finalState = runner.state.first { !it.isRunning && it.doneSummary != null }
+            assertEquals(1, finalState.doneSummary?.queuedCount)
+            assertFalse(finalState.doneSummary?.stoppedEarly ?: true)
+        } finally {
+            gate.complete(Unit)
+            scope.cancel()
+        }
+    }
 }

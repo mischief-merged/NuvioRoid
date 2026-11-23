@@ -1105,19 +1105,31 @@ internal class TripFillRunner(
 
 internal object TripFillHost {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val hostLock = SynchronizedObject()
 
     private val queue = TripFillQueue(SeasonDownloadDefaultsStorage::loadTripQueue, SeasonDownloadDefaultsStorage::saveTripQueue)
     private var recovery: Job? = null
 
-    fun onProfileLoaded(profileId: Int) {
-        recovery?.cancel()
-        val previous = runner.stop(clearPending = false)
-        recovery = scope.launch {
-            previous?.join()
-            val plan = queue.pending(profileId) ?: return@launch
-            NetworkStatusRepository.uiState.first { !it.isOfflineLike }
-            if (DownloadsRepository.loadedProfile() == profileId && ProfileRepository.activeProfileId == profileId) {
-                runner.start(plan)
+    fun onProfileLoaded(
+        profileId: Int,
+        activeProfile: () -> Int? = {
+            DownloadsRepository.loadedProfile()?.takeIf { it == ProfileRepository.activeProfileId }
+        },
+        loadPendingPlan: (Int) -> TripFillPlan? = queue::pending,
+        awaitOnline: suspend () -> Unit = { NetworkStatusRepository.uiState.first { !it.isOfflineLike } },
+        activeRunner: TripFillRunner = runner,
+    ) {
+        synchronized(hostLock) {
+            if (activeProfile() != profileId) return
+            recovery?.cancel()
+            val previous = activeRunner.stop(clearPending = false)
+            recovery = scope.launch {
+                previous?.join()
+                val plan = loadPendingPlan(profileId) ?: return@launch
+                awaitOnline()
+                if (activeProfile() == profileId) {
+                    activeRunner.start(plan)
+                }
             }
         }
     }
