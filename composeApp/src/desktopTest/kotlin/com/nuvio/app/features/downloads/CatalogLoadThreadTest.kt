@@ -242,6 +242,46 @@ class CatalogLoadThreadTest {
     }
 
     @Test
+    fun a_pause_during_a_reload_still_pauses_what_the_reload_finds() {
+        DownloadsRepository.ensureLoaded()
+        assertTrue(DownloadsRepository.catalogReady.value)
+        assertEquals(emptyList(), DownloadsRepository.uiState.value.items)
+
+        val release = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        probe.payload = payloadOf(stored("d1", "Downloading"))
+        probe.beforeReturn = {
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+        }
+        val loader = Thread({ DownloadsRepository.onProfileChanged() }, "catalog-reloader")
+        val done = CountDownLatch(1)
+        val pauser = Thread({
+            DownloadsRepository.pauseActiveDownloads()
+            done.countDown()
+        }, "catalog-pauser")
+        loader.start()
+        try {
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            pauser.start()
+            val returnedWhileReading = pauseReturnedWhileReadWasBlocked(pauser, done)
+            release.countDown()
+            loader.join(5_000)
+            pauser.join(5_000)
+            assertFalse(loader.isAlive)
+            assertFalse(pauser.isAlive)
+            assertEquals(2, probe.loads)
+            assertFalse(returnedWhileReading)
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.single().status)
+            assertTrue(DownloadsRepository.catalogReady.value)
+        } finally {
+            release.countDown()
+            loader.join(5_000)
+            pauser.join(5_000)
+        }
+    }
+
+    @Test
     fun a_pause_on_the_interface_thread_still_reads_the_list() {
         DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
 

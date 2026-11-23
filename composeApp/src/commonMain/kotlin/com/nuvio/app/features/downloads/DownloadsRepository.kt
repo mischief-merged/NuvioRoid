@@ -650,6 +650,10 @@ object DownloadsRepository {
         val resumedBefore = downloadsResumedAtLoad
         val transfersBefore = activeTransfers.toMap()
         catalogLoadingThread = Thread.currentThread()
+        // Not ready until this attempt publishes, including a profile switch, so a pause during the
+        // read waits and then sees the list this read found. The thread doing the read already returns
+        // from ensureLoaded, so clearing this does not start the read again.
+        _catalogReady.value = false
         try {
             onCatalogLoad()
             _hasUnseenCompleted.value = false
