@@ -90,6 +90,8 @@ fun main(args: Array<String>) {
     runCatching { com.nuvio.app.features.downloads.DesktopDownloads.install() }
     // Watches for hotspots and Low Data Mode networks, on which downloads wait (when the setting is on).
     runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
+    // Downloads leave the connection to other apps, and wait on a very slow network or one that blocks them.
+    runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
     AppIconRepository.ensureLoaded()
     AutoSyncPreferencesDesktop.initialize()
     DiscordPresenceManager.start()

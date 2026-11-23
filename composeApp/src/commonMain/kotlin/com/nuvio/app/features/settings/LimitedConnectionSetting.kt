@@ -23,3 +23,19 @@ internal fun LimitedConnectionSetting(isTablet: Boolean, hold: ConnectionHold = 
         onCheckedChange = hold::setEnabled,
     )
 }
+
+/**
+ * Settings > Playback > Let other apps go first. On by default: downloads slow down whenever other apps
+ * need the connection, and automatic downloads wait while the network is very slow.
+ */
+@Composable
+internal fun PoliteDownloadsSetting(isTablet: Boolean) {
+    val enabled by com.nuvio.app.features.downloads.PoliteDownloadsHost.enabled.collectAsStateWithLifecycle()
+    SettingsSwitchRow(
+        title = stringResource(Res.string.settings_polite_downloads_title),
+        description = stringResource(Res.string.settings_polite_downloads_description),
+        checked = enabled,
+        isTablet = isTablet,
+        onCheckedChange = com.nuvio.app.features.downloads.PoliteDownloadsHost::setEnabled,
+    )
+}

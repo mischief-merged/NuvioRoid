@@ -39,6 +39,8 @@ internal fun LazyListScope.playbackSettingsContent(
                         SettingsGroupDivider(isTablet = isTablet)
                         LimitedConnectionSetting(isTablet)
                         SettingsGroupDivider(isTablet = isTablet)
+                        PoliteDownloadsSetting(isTablet)
+                        SettingsGroupDivider(isTablet = isTablet)
                         DownloadFolderSetting(isTablet)
                     }
                 }
