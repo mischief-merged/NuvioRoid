@@ -45,13 +45,18 @@ object CollectionSyncService {
     }
 
     suspend fun pullFromServer(profileId: Int) {
+        val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
         if (ProfileRepository.activeProfileId != profileId) return
         runCatching {
             val params = buildJsonObject {
                 put("p_profile_id", profileId)
             }
             val result = SupabaseProvider.client.postgrest.rpc("sync_pull_collections", params)
-            if (ProfileRepository.activeProfileId != profileId) return@runCatching
+            if (ProfileRepository.activeProfileId != profileId || !AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@runCatching
             val blobs = result.decodeList<SupabaseCollectionBlob>()
             val blob = blobs.firstOrNull()
 

@@ -492,6 +492,9 @@ object WatchedRepository {
             }
             return false
         }
+        if (source.providerId == null && !AuthRepository.isRemoteAccountAuthenticated()) {
+            return false
+        }
         val removedByRemote = itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
             val items = source.providerId
                 ?.let { providerId -> providerItems[providerId]?.values.orEmpty() }

@@ -8,6 +8,8 @@ internal expect object DownloadsStorage {
     val batchesProgress: Boolean
     fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean
 
+    fun saveFinishedRecord(record: FinishedDownloadRecord): Boolean
+
     /** The payload from before the last one that was saved, where the platform keeps it. */
     fun loadPreviousPayload(): String?
     fun loadPreviousPayload(profileId: Int): String?

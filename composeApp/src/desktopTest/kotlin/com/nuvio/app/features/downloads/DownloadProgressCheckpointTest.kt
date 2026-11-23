@@ -107,10 +107,12 @@ class DownloadProgressCheckpointTest : TrustedLocalServerTest() {
         backend.success.getValue("three")("file:/three.mp4", null)
         assertEquals(345L, saved("three").downloadedBytes)
         assertEquals(DownloadStatus.Completed, saved("three").status)
-        // The final address is saved before checking, then the accepted result is saved.
-        assertEquals(4, backend.writes)
+        assertEquals("file:/three.mp4", saved("three").localFileUri)
+        // No frame look, so the address and the accepted result are one save after the row is shown.
+        // The queued byte count for that row is dropped, so the timer does not write it again.
+        assertEquals(3, backend.writes)
         advanceTimeBy(5000); runCurrent()
-        assertEquals(4, backend.writes)
+        assertEquals(3, backend.writes)
     }
 
     @Test fun quit_freezes_callbacks_and_flushes_before_returning() = runTest {

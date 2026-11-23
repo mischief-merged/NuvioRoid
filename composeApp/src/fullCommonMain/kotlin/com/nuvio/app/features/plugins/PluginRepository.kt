@@ -1,9 +1,10 @@
 package com.nuvio.app.features.plugins
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.network.SupabaseProvider
 import com.nuvio.app.features.addons.encodeUnsafeHttpUrlCharacters
-import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.tmdb.TmdbService
 import com.nuvio.app.features.plugins.runtime.PluginRuntime
@@ -111,6 +112,7 @@ actual object PluginRepository {
 
     actual fun clearLocalState() {
         cancelActiveRefreshes()
+        PluginRuntime.setSearchPaused(false)
         persistenceGeneration.incrementAndGet()
         currentProfileId = 1
         initialized = false
@@ -118,6 +120,11 @@ actual object PluginRepository {
     }
 
     actual suspend fun pullFromServer(profileId: Int) {
+        val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
         val effectiveProfileId = resolveEffectiveProfileId(profileId)
         ensureStateLoadedForProfile(effectiveProfileId)
         runCatching {
@@ -128,6 +135,7 @@ actual object PluginRepository {
                     order("sort_order", Order.ASCENDING)
                 }
                 .decodeList<PluginRow>()
+            if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@runCatching
 
             val urls = dedupeManifestUrls(rows.map { it.url })
             val existingState = _uiState.value

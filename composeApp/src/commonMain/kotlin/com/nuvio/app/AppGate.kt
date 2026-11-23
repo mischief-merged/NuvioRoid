@@ -376,17 +376,19 @@ internal fun AppGate(
 
         when (authState) {
             is AuthState.Loading -> {
-                if (hasCachedProfileAccess) {
+                if (!isDesktop && hasCachedProfileAccess) {
                     enterProfileGate(cachedProfiles, syncOnEnter = false)
                 } else {
                     gateScreen = AppGateScreen.Loading.name
                 }
             }
             is AuthState.Unauthenticated -> {
-                if (allowCachedProfileAccess) {
+                if (!isDesktop && allowCachedProfileAccess) {
                     enterProfileGate(cachedProfiles, syncOnEnter = false)
                 } else {
-                    ProfileRepository.clearInMemory()
+                    if (!isDesktop) {
+                        ProfileRepository.clearInMemory()
+                    }
                     profileSelectionLoading = false
                     profileSelectionTransitionActive = false
                     gateScreen = AppGateScreen.Auth.name
@@ -396,7 +398,10 @@ internal fun AppGate(
                 val authenticatedState = authState as AuthState.Authenticated
                 ProfileRepository.ensureLoaded(authenticatedState.userId)
                 if (gateScreen == AppGateScreen.Loading.name || gateScreen == AppGateScreen.Auth.name) {
-                    enterProfileGate(ProfileRepository.state.value.profiles, syncOnEnter = true)
+                    enterProfileGate(
+                        ProfileRepository.state.value.profiles,
+                        syncOnEnter = !isDesktop || !authenticatedState.isAnonymous,
+                    )
                 }
             }
         }
@@ -405,7 +410,9 @@ internal fun AppGate(
     LaunchedEffect((authState as? AuthState.Authenticated)?.userId) {
         val authenticatedState = authState as? AuthState.Authenticated ?: return@LaunchedEffect
         ProfileRepository.ensureLoaded(authenticatedState.userId)
-        ProfileRepository.pullProfiles()
+        if (!isDesktop || !authenticatedState.isAnonymous) {
+            ProfileRepository.pullProfiles()
+        }
     }
 
     LaunchedEffect(
@@ -421,8 +428,10 @@ internal fun AppGate(
             autoSkipProfileSelection &&
             gateScreen == AppGateScreen.ProfileSelection.name
         ) {
+            val shouldSyncOnAutoSkip =
+                if (isDesktop) (authState as? AuthState.Authenticated)?.isAnonymous == false else true
             rememberedStartupProfile(profileState.profiles)?.let { profile ->
-                selectProfile(profile, sync = true)
+                selectProfile(profile, sync = shouldSyncOnAutoSkip)
                 gateScreen = AppGateScreen.Main.name
                 autoSkipProfileSelection = false
                 return@LaunchedEffect
@@ -433,7 +442,7 @@ internal fun AppGate(
             val onlyProfile = profileState.profiles.first()
             if (onlyProfile.pinEnabled) return@LaunchedEffect
 
-            selectProfile(onlyProfile, sync = true)
+            selectProfile(onlyProfile, sync = shouldSyncOnAutoSkip)
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
         }
@@ -633,7 +642,11 @@ internal fun AppGate(
                             gateScope.launch {
                                 selectProfile(
                                     profile = profile,
-                                    sync = authState is AuthState.Authenticated,
+                                    sync = if (isDesktop) {
+                                        (authState as? AuthState.Authenticated)?.isAnonymous == false
+                                    } else {
+                                        authState is AuthState.Authenticated
+                                    },
                                 )
                                 gateScreen = AppGateScreen.Main.name
                                 if (!renderMainContent) {

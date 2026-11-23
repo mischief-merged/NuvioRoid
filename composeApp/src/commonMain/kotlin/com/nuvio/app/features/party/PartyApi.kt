@@ -49,7 +49,7 @@ internal object PartyApi {
         })
 
     suspend fun preview(code: String): PartyPreview {
-        val body = SupabaseProvider.client.postgrest.rpc("watch_party_preview", buildJsonObject { put("p_code", code) }).data
+        val body = SupabaseProvider.publicClient.postgrest.rpc("watch_party_preview", buildJsonObject { put("p_code", code) }).data
         return json.decodeFromString(PartyPreview.serializer(), body)
     }
 
@@ -115,10 +115,10 @@ internal object PartyApi {
     }
 
     suspend fun clock(): Long =
-        SupabaseProvider.client.postgrest.rpc("watch_party_clock").data.trim().toLong()
+        SupabaseProvider.publicClient.postgrest.rpc("watch_party_clock").data.trim().toLong()
 
     suspend fun enabled(): Boolean =
-        SupabaseProvider.client.postgrest.rpc("watch_party_enabled").data.trim().toBooleanStrict()
+        SupabaseProvider.publicClient.postgrest.rpc("watch_party_enabled").data.trim().toBooleanStrict()
 
     private suspend fun call(function: String, params: JsonObject): PartySnapshot {
         val body = SupabaseProvider.client.postgrest.rpc(function, params).data

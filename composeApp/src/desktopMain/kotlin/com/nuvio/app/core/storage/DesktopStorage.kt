@@ -17,23 +17,46 @@ internal object DesktopStorage {
     private val json = Json { ignoreUnknownKeys = true }
     private val stores = mutableMapOf<String, Store>()
 
-    val rootDir: Path by lazy {
+    private val defaultRootDir: Path by lazy {
         resolveAppDataDir().also { Files.createDirectories(it) }
     }
 
-    val cacheDir: Path by lazy {
+    private val defaultCacheDir: Path by lazy {
         resolveCacheDir().also { Files.createDirectories(it) }
     }
 
+    @Volatile
+    private var overrideRootDir: Path? = null
+
+    @Volatile
+    private var overrideCacheDir: Path? = null
+
+    val rootDir: Path
+        get() = overrideRootDir ?: defaultRootDir
+
+    val cacheDir: Path
+        get() = overrideCacheDir ?: defaultCacheDir
+
+    internal fun setRootDirForTest(root: Path?, cache: Path? = null) {
+        overrideRootDir = root?.also { Files.createDirectories(it) }
+        overrideCacheDir = cache?.also { Files.createDirectories(it) }
+        resetInMemoryStores()
+    }
+
+    internal fun resetInMemoryStores() {
+        synchronized(stores) {
+            stores.values.forEach(Store::clearInMemory)
+        }
+    }
+
     fun store(name: String, cacheEntries: Int? = null): Store = synchronized(stores) {
-        stores.getOrPut(name) { Store(rootDir.resolve("$name.properties"), cacheEntries) }
+        stores.getOrPut(name) {
+            Store(fileProvider = { rootDir.resolve("$name.properties") }, cacheEntries = cacheEntries)
+        }
     }
 
     fun wipe() {
-        synchronized(stores) {
-            stores.values.forEach(Store::clearInMemory)
-            stores.clear()
-        }
+        resetInMemoryStores()
         if (!rootDir.exists()) return
         wipeFolder(rootDir, KeptOnWipe)
     }
@@ -44,6 +67,43 @@ internal object DesktopStorage {
      * copies of them. Settings and lists go; the files stay where they are.
      */
     internal val KeptOnWipe = setOf("downloads", "moves")
+
+    internal const val ArchiveDirectoryPrefix = "account-"
+    internal const val OwnerStampFileName = "account_owner.json"
+    internal const val TransitionJournalFileName = "account_transition.json"
+
+    private val excludedTopLevelEntries = setOf(
+        "downloads",
+        "moves",
+        "updates",
+        "cancelled-transitions",
+        "instance.lock",
+        OwnerStampFileName,
+        "$OwnerStampFileName.tmp",
+        TransitionJournalFileName,
+        "$TransitionJournalFileName.tmp",
+    )
+
+    // This Mac's choices. They are not one account's files, so a folder that only has them is still empty.
+    private val excludedDeviceStoreNames = setOf(
+        "server_configuration",
+        "nuvio_window_state",
+        "nuvio_updater",
+        "nuvio_desktop_renderer",
+        "network_trust",
+    )
+
+    internal fun isExcludedFromAccountArchive(entryName: String): Boolean {
+        if (entryName in excludedTopLevelEntries) return true
+        if (entryName.startsWith(ArchiveDirectoryPrefix)) return true
+        return excludedDeviceStoreNames.any { base ->
+            val props = "$base.properties"
+            entryName == props ||
+                entryName == "$props.bak" ||
+                entryName == "$props.tmp" ||
+                entryName == "$props.lock"
+        }
+    }
 
     /** Deletes everything under [root] except the top-level entries named in [keep] and what is inside them. Never follows a link. */
     internal fun wipeFolder(root: Path, keep: Set<String>) {
@@ -95,13 +155,24 @@ internal object DesktopStorage {
      * written over what is on disk, so a copy whose memory is stale never overwrites another copy's keys.
      */
     internal class Store(
-        private val file: Path,
+        private val fileProvider: () -> Path,
         private val cacheEntries: Int? = null,
         private val write: (Properties, OutputStream) -> Unit = { properties, output ->
             properties.store(output, "Nuvio desktop preferences")
         },
     ) {
-        private val gate = FileGate.of(file.resolveSibling("${file.fileName}.lock"))
+        constructor(
+            file: Path,
+            cacheEntries: Int? = null,
+            write: (Properties, OutputStream) -> Unit = { properties, output ->
+                properties.store(output, "Nuvio desktop preferences")
+            },
+        ) : this(fileProvider = { file }, cacheEntries = cacheEntries, write = write)
+
+        private val file: Path
+            get() = fileProvider()
+        private val gate: FileGate
+            get() = FileGate.of(file.resolveSibling("${file.fileName}.lock"))
         private val cacheOrder = LinkedHashSet<String>()
         private var loadingCache = false
         private val cacheOrderKey = "__cache_access_order"
@@ -129,9 +200,12 @@ internal object DesktopStorage {
             override fun clear() { super.clear(); cacheOrder.clear() }
         }
         private var loaded = false
+        private var loadedFromFile: Path? = null
         private var fileIsGood = false
-        private val temporaryFile = file.resolveSibling("${file.fileName}.tmp")
-        private val previousFile = file.resolveSibling("${file.fileName}.bak")
+        private val temporaryFile: Path
+            get() = file.resolveSibling("${file.fileName}.tmp")
+        private val previousFile: Path
+            get() = file.resolveSibling("${file.fileName}.bak")
 
         /** Runs [block] holding the lock of this store file across processes. Re-entrant. */
         fun <T> exclusive(block: () -> T): T = gate.exclusive(block)
@@ -258,6 +332,7 @@ internal object DesktopStorage {
         fun clearInMemory() = local {
             properties.clear()
             loaded = false
+            loadedFromFile = null
         }
 
         /** Under the lock: the file is read again, [apply] changes only its own keys, and the result is saved. */
@@ -267,18 +342,21 @@ internal object DesktopStorage {
         }
 
         private fun ensureLoaded() {
-            if (loaded) return
+            val current = file
+            if (loaded && loadedFromFile == current) return
             reload()
         }
 
         private fun reload() {
             val recent = cacheOrder.toList()
+            val current = file
             loaded = true
+            loadedFromFile = current
             properties.clear()
-            if (!file.exists()) return
+            if (!current.exists()) return
             loadingCache = true
             try {
-                fileIsGood = read(file, properties)
+                fileIsGood = read(current, properties)
                 if (!fileIsGood) {
                     properties.clear()
                     read(previousFile, properties)

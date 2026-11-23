@@ -2,6 +2,8 @@ package com.nuvio.app.features.player.desktop
 
 import com.nuvio.app.core.storage.DesktopStorage
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -152,6 +154,100 @@ class WindowGeometryWriteTest {
         writes.flushNow()
         assertEquals(1, persists)
         assertEquals(1, writes.writes)
+    }
+
+    @Test
+    fun a_note_during_a_save_stays_pending() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val saved = mutableListOf<Float>()
+        val writes = WindowGeometryWrites { _, geometry ->
+            saved += geometry!!.x
+            if (saved.size == 1) {
+                started.countDown()
+                assertTrue(release.await(2, TimeUnit.SECONDS))
+            }
+        }
+        writes.note(wasMaximized = false, geometry = geometry(1), now = 0)
+        val thread = Thread { assertTrue(writes.flushIfDue(300)) }
+        thread.start()
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        writes.note(wasMaximized = false, geometry = geometry(2), now = 1_000)
+        release.countDown()
+        thread.join(2_000)
+        assertFalse(thread.isAlive)
+
+        assertEquals(listOf(1f), saved)
+        assertEquals(1, writes.writes)
+        assertEquals(300L, writes.millisUntilDue(1_000))
+        assertTrue(writes.flushIfDue(1_300))
+        assertEquals(listOf(1f, 2f), saved)
+        assertEquals(2, writes.writes)
+        assertNull(writes.millisUntilDue(2_000))
+    }
+
+    @Test
+    fun closing_writes_a_position_that_arrives_during_the_save() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val saved = mutableListOf<Float>()
+        val writes = WindowGeometryWrites { _, geometry ->
+            saved += geometry!!.x
+            if (saved.size == 1) {
+                started.countDown()
+                assertTrue(release.await(2, TimeUnit.SECONDS))
+            }
+        }
+        writes.note(wasMaximized = true, geometry = geometry(4), now = 0)
+        val thread = Thread { writes.flushNow() }
+        thread.start()
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        writes.note(wasMaximized = false, geometry = geometry(5), now = 10)
+        release.countDown()
+        thread.join(2_000)
+        assertFalse(thread.isAlive)
+
+        assertEquals(listOf(4f, 5f), saved)
+        assertEquals(2, writes.writes)
+        assertNull(writes.millisUntilDue(10_000))
+        writes.flushNow()
+        assertEquals(2, writes.writes)
+    }
+
+    @Test
+    fun a_close_waits_for_the_save_already_running_and_keeps_the_newer_position() {
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val closeFinished = CountDownLatch(1)
+        val saved = java.util.Collections.synchronizedList(mutableListOf<Float>())
+        val writes = WindowGeometryWrites { _, geometry ->
+            val position = geometry ?: return@WindowGeometryWrites
+            if (position.x == 1f) {
+                started.countDown()
+                assertTrue(release.await(2, TimeUnit.SECONDS))
+            }
+            saved += position.x
+        }
+        writes.note(wasMaximized = false, geometry = geometry(1), now = 0)
+        val quiet = Thread { assertTrue(writes.flushIfDue(300)) }
+        quiet.start()
+        assertTrue(started.await(2, TimeUnit.SECONDS))
+        writes.note(wasMaximized = false, geometry = geometry(2), now = 1_000)
+        val close = Thread {
+            writes.flushNow()
+            closeFinished.countDown()
+        }
+        close.start()
+        assertFalse(closeFinished.await(500, TimeUnit.MILLISECONDS))
+        assertEquals(emptyList<Float>(), saved.toList())
+        release.countDown()
+        quiet.join(2_000)
+        close.join(2_000)
+        assertFalse(quiet.isAlive)
+        assertFalse(close.isAlive)
+        assertEquals(listOf(1f, 2f), saved.toList())
+        assertEquals(2, writes.writes)
+        assertNull(writes.millisUntilDue(10_000))
     }
 
     private fun geometry(x: Long) = DesktopWindowGeometry(x = x.toFloat(), y = 40f, width = 1280f, height = 720f)

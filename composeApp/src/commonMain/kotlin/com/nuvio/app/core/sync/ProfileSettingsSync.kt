@@ -110,9 +110,14 @@ object ProfileSettingsSync {
     }
 
     suspend fun pull(profileId: Int): Boolean {
+        val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return false
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return false
         ensureRepositoriesLoaded()
         return syncMutex.withLock {
-            if (ProfileRepository.activeProfileId != profileId) {
+            if (ProfileRepository.activeProfileId != profileId || !AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) {
                 log.d { "pull(profileId=$profileId) — skipped because profile is no longer active" }
                 return@withLock false
             }
@@ -127,7 +132,7 @@ object ProfileSettingsSync {
                     put("p_platform", profileSettingsPlatform)
                 }
                 val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profile_settings_blob", params)
-                if (ProfileRepository.activeProfileId != profileId) return@withLock false
+                if (ProfileRepository.activeProfileId != profileId || !AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@withLock false
                 val response = result.decodeList<SettingsBlobResponse>().firstOrNull()
                 val remoteJson = response?.settingsJson
 

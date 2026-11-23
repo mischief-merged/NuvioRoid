@@ -2,6 +2,7 @@ package com.nuvio.app.features.player
 
 import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.addons.AddonPlayerEventTarget
+import androidx.compose.runtime.snapshots.Snapshot
 import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.servers.ServerItemRef
 import com.nuvio.app.features.servers.ServerStreams
@@ -38,6 +39,7 @@ internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
     snapshot: PlayerPlaybackSnapshot,
     playbackKey: PlaybackKey = activePlaybackKey,
 ): Boolean {
+    if (frozenForQuit) return false
     if (playbackKey != activePlaybackKey) return false
     val previousPositionMs = playbackSnapshot.positionMs
     val reported = if (partyRateNudge != null) snapshot.copy(playbackSpeed = partyBaseRate()) else snapshot
@@ -172,6 +174,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
             (activeInitialProgressFraction == null || activeInitialProgressFraction!! <= 0f)
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
+        frozenForQuit = false
         pendingSeekScrobbleRestart = false
         awaitingPausedSeekSnapshot = false
         resetTrackSelectionState()
@@ -535,11 +538,28 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
     leavingEpisode: Boolean = false,
     holdIncomplete: Boolean = playbackHoldIncomplete(leavingEpisode = leavingEpisode),
 ) {
+    if (frozenForQuit) return
+    commitWatchProgress(
+        scrobbleAction = scrobbleAction,
+        holdIncomplete = holdIncomplete,
+        syncRemote = !holdIncomplete,
+    )
+}
+
+/**
+ * The save shared by pause, stop, and quit. A sleep hold turns a stop into a pause, keeps the
+ * episode unfinished, and does not schedule removal of a downloaded file.
+ */
+private fun PlayerScreenRuntime.commitWatchProgress(
+    scrobbleAction: TrackingScrobbleAction,
+    holdIncomplete: Boolean,
+    syncRemote: Boolean,
+) {
     val action = scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)
     WatchProgressRepository.flushPlaybackProgress(
         session = playbackSession,
         snapshot = playbackSnapshot,
-        syncRemote = !holdIncomplete,
+        syncRemote = syncRemote,
         holdIncomplete = holdIncomplete,
     )
     when (action) {
@@ -567,7 +587,31 @@ private fun PlayerScreenRuntime.reportLocalPlaybackCompleted() {
     if (completed) AutoDownloads.onLocalPlaybackCompleted(activeSourceUrl)
 }
 
+internal fun PlayerScreenRuntime.stopPlaybackAndFlushForQuit() {
+    // Taken before playback is forced off. An armed minute timer uses that to decide whether
+    // it would pause before the file ends, and a sleep stop already holding stays held.
+    val holdIncomplete = playbackHoldIncomplete()
+    Snapshot.withMutableSnapshot {
+        frozenForQuit = true
+        shouldPlay = false
+        seekProgressSyncJob?.cancel()
+        seekProgressSyncJob = null
+        previousIsPlaying = false
+        pendingSeekScrobbleRestart = false
+        if (playbackSnapshot.isPlaying) {
+            playbackSnapshot = playbackSnapshot.copy(isPlaying = false)
+        }
+    }
+    runCatching { playerController?.pause() }
+    commitWatchProgress(
+        scrobbleAction = TrackingScrobbleAction.STOP,
+        holdIncomplete = holdIncomplete,
+        syncRemote = false,
+    )
+}
+
 internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
+    if (frozenForQuit) return
     val shouldRestartScrobbleAfterSeek = shouldPlay || playbackSnapshot.isPlaying
     if (!shouldRestartScrobbleAfterSeek) {
         awaitingPausedSeekSnapshot = true
@@ -575,6 +619,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     seekProgressSyncJob?.cancel()
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
+        if (frozenForQuit) return@launch
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
         val expectedTargetMs = lastSeekTargetMs ?: pendingSeekTarget?.first
         val reachedTarget = expectedTargetMs?.let { targetMs ->
@@ -637,6 +682,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
 }
 
 internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
+    if (frozenForQuit) return
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now

@@ -20,6 +20,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import com.nuvio.app.features.addons.AddonPlayerAction
+import androidx.compose.runtime.snapshots.Snapshot
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.downloads.SidecarIo
 import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
@@ -153,6 +155,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         initialLoadCompleted = false
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
+        frozenForQuit = false
         pendingSeekScrobbleRestart = false
         seekProgressSyncJob?.cancel()
         seekProgressSyncJob = null
@@ -474,20 +477,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         onDispose { ServerPlayback.stop(effectSourceUrl) }
     }
 
-    DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
-        val effectVideoId = playbackSession.videoId
-        val effectSourceUrl = activeSourceUrl
-        val effectSourceAudioUrl = activeSourceAudioUrl
-        onDispose {
-            if (
-                playbackSession.videoId == effectVideoId &&
-                activeSourceUrl == effectSourceUrl &&
-                activeSourceAudioUrl == effectSourceAudioUrl
-            ) {
-                flushWatchProgress()
-            }
-        }
-    }
+    BindPlayerQuitAndDisposeEffects()
 
     val isInPipForSearch = rememberIsInPictureInPicture()
     val playbackInFocus = playerOwnsControllerInput(
@@ -525,7 +515,50 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
 }
 
 @Composable
-private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
+internal fun PlayerScreenRuntime.BindPlayerQuitAndDisposeEffects() {
+    DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
+        val effectVideoId = playbackSession.videoId
+        val effectSourceUrl = activeSourceUrl
+        val effectSourceAudioUrl = activeSourceAudioUrl
+        frozenForQuit = false
+        val unregisterFlushHook = WatchProgressRepository.registerActivePlayerFlushHook(
+            onQuitAborted = {
+                Snapshot.withMutableSnapshot {
+                    if (
+                        playbackSession.videoId == effectVideoId &&
+                        activeSourceUrl == effectSourceUrl &&
+                        activeSourceAudioUrl == effectSourceAudioUrl
+                    ) {
+                        frozenForQuit = false
+                    }
+                }
+            },
+            onStopAndFlush = {
+                if (
+                    playbackSession.videoId == effectVideoId &&
+                    activeSourceUrl == effectSourceUrl &&
+                    activeSourceAudioUrl == effectSourceAudioUrl
+                ) {
+                    stopPlaybackAndFlushForQuit()
+                }
+            },
+        )
+        onDispose {
+            unregisterFlushHook()
+            if (
+                !frozenForQuit &&
+                playbackSession.videoId == effectVideoId &&
+                activeSourceUrl == effectSourceUrl &&
+                activeSourceAudioUrl == effectSourceAudioUrl
+            ) {
+                flushWatchProgress()
+            }
+        }
+    }
+}
+
+@Composable
+internal fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
     val folded = LocalFold.current != null
 
     // The engine publishes a playback snapshot every 250ms. Reading the raw snapshot here
@@ -601,7 +634,9 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         snapshotSignals.isLoading,
         snapshotSignals.isEnded,
         snapshotSignals.durationMs,
+        frozenForQuit,
     ) {
+        if (frozenForQuit) return@LaunchedEffect
         ServerPlayback.onPlaybackSnapshot(
             url = activeSourceUrl,
             positionMs = playbackSnapshot.positionMs,

@@ -4,6 +4,7 @@ import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.ServerConfiguration
 import com.nuvio.app.core.network.ServerConfigurationRepository
 import com.nuvio.app.core.network.SupabaseProvider
+import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.user.UserInfo
 import io.github.jan.supabase.auth.user.UserSession
@@ -13,6 +14,7 @@ import io.github.jan.supabase.postgrest.rpc
 import io.ktor.client.statement.bodyAsText
 import kotlin.uuid.ExperimentalUuidApi
 import kotlin.uuid.Uuid
+import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,6 +60,7 @@ object DeviceLinkAuthRepository {
     private val json = Json { ignoreUnknownKeys = true }
     private val _state = MutableStateFlow<DeviceLinkAuthState>(DeviceLinkAuthState.Idle)
     val state: StateFlow<DeviceLinkAuthState> = _state.asStateFlow()
+    private val attemptCounter = atomic(0L)
     private var activeJob: Job? = null
 
     @OptIn(ExperimentalUuidApi::class)
@@ -65,40 +68,71 @@ object DeviceLinkAuthRepository {
         if (_state.value is DeviceLinkAuthState.Starting || _state.value is DeviceLinkAuthState.Waiting) return
 
         activeJob?.cancel()
+        val myAttemptId = attemptCounter.incrementAndGet()
+        val attemptEpoch = AuthRepository.currentAuthEpoch()
+        val configuration = ServerConfigurationRepository.active.value
+
         activeJob = scope.launch {
             _state.value = DeviceLinkAuthState.Starting
-            val configuration = ServerConfigurationRepository.active.value
             val nonce = Uuid.random().toString()
+            val throwaway = SupabaseProvider.createThrowawayAuthClient(
+                configuration = configuration,
+                includeDeviceLinkPlugins = true,
+            )
+            var handedOffToAuth = false
             try {
                 val session = startSession(
+                    client = throwaway,
                     configuration = configuration,
                     nonce = nonce,
                     deviceName = currentDeviceClientMetadata().deviceName,
                 )
+                if (!isCurrentAttempt(myAttemptId, configuration)) return@launch
                 _state.value = DeviceLinkAuthState.Waiting(
                     code = formatDeviceLinkCode(session.userCode),
                     verificationUrl = session.verificationUriComplete,
                 )
-                pollAndComplete(session, nonce)
+                handedOffToAuth = pollAndComplete(
+                    client = throwaway,
+                    session = session,
+                    nonce = nonce,
+                    myAttemptId = myAttemptId,
+                    attemptEpoch = attemptEpoch,
+                    configuration = configuration,
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: DeviceLinkAuthException) {
                 log.w(error) { "Device link sign-in stopped" }
-                _state.value = DeviceLinkAuthState.Failed(error.reason)
+                if (attemptCounter.value == myAttemptId) {
+                    _state.value = DeviceLinkAuthState.Failed(error.reason)
+                }
             } catch (error: Throwable) {
                 log.w(error) { "Device link sign-in failed" }
-                _state.value = DeviceLinkAuthState.Failed(DeviceLinkAuthFailure.Start)
+                if (attemptCounter.value == myAttemptId) {
+                    _state.value = DeviceLinkAuthState.Failed(DeviceLinkAuthFailure.Start)
+                }
+            } finally {
+                if (!handedOffToAuth) {
+                    runCatching { throwaway.close() }
+                }
             }
         }
     }
 
     fun cancel() {
+        attemptCounter.incrementAndGet()
         activeJob?.cancel()
         activeJob = null
         _state.value = DeviceLinkAuthState.Idle
     }
 
+    private fun isCurrentAttempt(myAttemptId: Long, configuration: ServerConfiguration): Boolean =
+        attemptCounter.value == myAttemptId &&
+            ServerConfigurationRepository.active.value.backendUrl == configuration.backendUrl
+
     private suspend fun startSession(
+        client: SupabaseClient,
         configuration: ServerConfiguration,
         nonce: String,
         deviceName: String,
@@ -109,7 +143,7 @@ object DeviceLinkAuthRepository {
             put("p_device_name", deviceName)
             put("p_device_type", "mobile")
         }
-        return SupabaseProvider.client.postgrest
+        return client.postgrest
             .rpc("start_device_login_session", params)
             .decodeList<DeviceLinkStartResponse>()
             .firstOrNull()
@@ -121,20 +155,28 @@ object DeviceLinkAuthRepository {
             ?: throw DeviceLinkAuthException(DeviceLinkAuthFailure.Start)
     }
 
-    private suspend fun pollAndComplete(session: DeviceLinkStartResponse, nonce: String) {
+    private suspend fun pollAndComplete(
+        client: SupabaseClient,
+        session: DeviceLinkStartResponse,
+        nonce: String,
+        myAttemptId: Long,
+        attemptEpoch: Long,
+        configuration: ServerConfiguration,
+    ): Boolean {
         var pollAttempts = 0
         var consecutiveFailures = 0
         val intervalMillis = session.pollIntervalSeconds.coerceIn(2, 10) * 1_000L
 
         while (currentCoroutineContext().isActive && pollAttempts < maxPollAttempts) {
             delay(intervalMillis)
+            if (!isCurrentAttempt(myAttemptId, configuration)) return false
             pollAttempts += 1
             val poll = try {
                 val params = buildJsonObject {
                     put("p_code", session.deviceCode)
                     put("p_device_nonce", nonce)
                 }
-                SupabaseProvider.client.postgrest
+                client.postgrest
                     .rpc("poll_tv_login_session", params)
                     .decodeList<DeviceLinkPollResponse>()
                     .firstOrNull()
@@ -151,13 +193,20 @@ object DeviceLinkAuthRepository {
             when (poll.status.trim().lowercase()) {
                 "pending" -> Unit
                 "approved" -> {
+                    if (!isCurrentAttempt(myAttemptId, configuration)) return false
                     _state.value = DeviceLinkAuthState.Waiting(
                         code = formatDeviceLinkCode(session.userCode),
                         verificationUrl = session.verificationUriComplete,
                         isCompleting = true,
                     )
-                    completeSession(session.deviceCode, nonce)
-                    return
+                    return completeSession(
+                        client = client,
+                        deviceCode = session.deviceCode,
+                        nonce = nonce,
+                        myAttemptId = myAttemptId,
+                        attemptEpoch = attemptEpoch,
+                        configuration = configuration,
+                    )
                 }
                 else -> throw DeviceLinkAuthException(DeviceLinkAuthFailure.Expired)
             }
@@ -166,17 +215,24 @@ object DeviceLinkAuthRepository {
         throw DeviceLinkAuthException(DeviceLinkAuthFailure.Expired)
     }
 
-    private suspend fun completeSession(deviceCode: String, nonce: String) {
+    private suspend fun completeSession(
+        client: SupabaseClient,
+        deviceCode: String,
+        nonce: String,
+        myAttemptId: Long,
+        attemptEpoch: Long,
+        configuration: ServerConfiguration,
+    ): Boolean {
         try {
             val payload = buildJsonObject {
                 put("code", deviceCode)
                 put("device_nonce", nonce)
             }
-            val response = SupabaseProvider.client.functions.invoke("tv-logins-exchange", payload)
+            val response = client.functions.invoke("tv-logins-exchange", payload)
             val result = json.decodeFromString<DeviceLinkExchangeResponse>(response.bodyAsText())
-            val user = result.user ?: SupabaseProvider.client.auth.retrieveUser(result.accessToken)
+            val user = result.user ?: client.auth.retrieveUser(result.accessToken)
             val expiresIn = requireNotNull(result.expiresIn?.takeIf { it > 0L })
-            SupabaseProvider.client.auth.importSession(
+            client.auth.importSession(
                 UserSession(
                     accessToken = result.accessToken,
                     refreshToken = result.refreshToken,
@@ -184,7 +240,21 @@ object DeviceLinkAuthRepository {
                     tokenType = result.tokenType?.takeIf { it.isNotBlank() } ?: "bearer",
                     user = user,
                 ),
+                autoRefresh = false,
             )
+            if (!isCurrentAttempt(myAttemptId, configuration)) {
+                runCatching { client.auth.signOut() }
+                return false
+            }
+            AuthRepository.completeDeviceLinkSignIn(
+                throwaway = client,
+                attemptServer = configuration,
+                attemptEpoch = attemptEpoch,
+            )
+            if (attemptCounter.value == myAttemptId) {
+                _state.value = DeviceLinkAuthState.Idle
+            }
+            return true
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {

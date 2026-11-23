@@ -25,6 +25,11 @@ internal actual object DownloadsStorage {
     actual fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean =
         saveDownloadProgress(store, profileId, items)
 
+    actual fun saveFinishedRecord(record: FinishedDownloadRecord): Boolean = store.exclusive {
+        val key = ProfileScopedKey.of("downloads", record.profileId)
+        persistFinishedDownloadRecord(record, { store.getFreshString(key) }, { store.putString(key, it) }, store::sync)
+    }
+
     actual fun loadPreviousPayload(): String? =
         store.getPreviousString(ProfileScopedKey.of("downloads"))
 

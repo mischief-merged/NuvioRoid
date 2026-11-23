@@ -14,6 +14,9 @@ internal class DownloadFinishingSteps {
 
     val isClosing: Boolean get() = synchronized(lock) { closing }
 
+    /** A quit that did not finish must not keep refusing publications. */
+    fun reopen(): Unit = synchronized(lock) { closing = false }
+
     fun begin(token: Any): Boolean = synchronized(lock) {
         if (token in pending.value) return true
         if (closing) return false

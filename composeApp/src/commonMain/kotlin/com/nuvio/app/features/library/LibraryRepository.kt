@@ -220,6 +220,11 @@ object LibraryRepository {
         }
 
         nuvioSyncMutex.withLock {
+            val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+                ?.takeUnless { it.isAnonymous }
+                ?.userId
+                ?: return@withLock
+            if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@withLock
             val serializedToken = activeOperationToken(profileId) ?: return@withLock
             val pullSnapshot = localState.markPullStarted(serializedToken) ?: return@withLock
 
@@ -230,6 +235,7 @@ object LibraryRepository {
                         profileId = profileId,
                         pageSize = librarySnapshotPageSize,
                     )
+                    if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@withLock
                     val applyResult = localState.applyServerItems(
                         pullSnapshot = pullSnapshot,
                         serverItems = serverItems,
@@ -244,7 +250,7 @@ object LibraryRepository {
                         }
                     }
                 }
-                pullLibraryDelta(serializedToken, profileId)
+                pullLibraryDelta(serializedToken, profileId, expectedUserId)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -256,6 +262,7 @@ object LibraryRepository {
     private suspend fun pullLibraryDelta(
         token: LibraryProfileToken,
         profileId: Int,
+        expectedUserId: String,
     ) {
         val initialSnapshot = localState.snapshot()
         if (initialSnapshot.token != token) return
@@ -263,7 +270,7 @@ object LibraryRepository {
             initialCursor = initialSnapshot.deltaCursorEventId,
             pageSize = libraryDeltaPageSize,
             fetchPage = { cursor, limit ->
-                if (isActiveOperation(token)) {
+                if (isActiveOperation(token) && AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) {
                     syncAdapter.pullDelta(
                         profileId = profileId,
                         sinceEventId = cursor,
@@ -274,7 +281,7 @@ object LibraryRepository {
                 }
             },
             applyPage = { events, _ ->
-                if (!isActiveOperation(token)) {
+                if (!isActiveOperation(token) || !AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) {
                     null
                 } else {
                     localState.applyDeltaEvents(token, events)?.also { snapshot ->

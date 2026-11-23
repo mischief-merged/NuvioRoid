@@ -1,6 +1,8 @@
 package com.nuvio.app.features.addons
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.network.SupabaseProvider
 import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.sync.putSyncOriginClientId
@@ -116,6 +118,11 @@ object AddonRepository {
     }
 
     suspend fun pullFromServer(profileId: Int) {
+        val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
         currentProfileId = resolveEffectiveProfileId(profileId)
         log.i { "pullFromServer() — profileId=$profileId, initialized=$initialized" }
         runCatching {
@@ -126,6 +133,7 @@ object AddonRepository {
                     order("sort_order", Order.ASCENDING)
                 }
                 .decodeList<AddonRow>()
+            if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@runCatching
 
             val rowsByUrl = linkedMapOf<String, AddonRow>()
             rows.forEach { row ->

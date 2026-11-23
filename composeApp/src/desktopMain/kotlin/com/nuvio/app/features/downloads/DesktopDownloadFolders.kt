@@ -8,12 +8,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.awt.Desktop
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
 import java.awt.EventQueue
 import java.util.Locale
+import java.util.Properties
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -85,6 +89,112 @@ internal fun storedRecordsOfAllProfiles(
     }
 }
 
+/**
+ * Download records kept in account archives under [root]. The videos stay in the downloads
+ * folder when an account is archived, so a later scan still has to know who they belonged to.
+ * A missing catalog means that account had no download list. A catalog that cannot be read,
+ * including an empty file, a link, or a file whose absence cannot be confirmed, makes the
+ * whole result unknown: adopting would claim a file whose owner could not be checked.
+ * The previous copy of a catalog is never read, because an older copy can omit a file this
+ * one still names. Nothing here is locked across the walk.
+ */
+internal fun archivedDownloadRecords(root: Path): List<RecordRef>? {
+    when (observePath(root)) {
+        ObservedPath.Absent, ObservedPath.Other -> return emptyList()
+        ObservedPath.Unknown -> return null
+        ObservedPath.Directory -> Unit
+    }
+    val archives = try {
+        Files.list(root).use { stream ->
+            stream.filter { entry ->
+                entry.fileName?.toString()?.startsWith(DesktopStorage.ArchiveDirectoryPrefix) == true
+            }.toList()
+        }
+    } catch (_: Exception) {
+        return null
+    }
+    val records = mutableListOf<RecordRef>()
+    for (archive in archives) {
+        when (observePath(archive)) {
+            ObservedPath.Absent, ObservedPath.Other -> continue
+            ObservedPath.Unknown -> return null
+            ObservedPath.Directory -> Unit
+        }
+        val catalog = archive.resolve(DownloadsCatalogFileName)
+        when (observeCatalog(catalog)) {
+            ObservedCatalog.Absent -> continue
+            ObservedCatalog.Unreadable -> return null
+            ObservedCatalog.File -> records += readArchivedCatalog(catalog) ?: return null
+        }
+    }
+    return records
+}
+
+/**
+ * Absence is only a confirmed miss. A link, a file that cannot be statted, or any other
+ * failure to tell what the path is stays unknown, so a scan does not adopt around it.
+ */
+private enum class ObservedPath { Absent, Directory, Other, Unknown }
+
+private fun observePath(path: Path): ObservedPath = try {
+    val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    when {
+        attributes.isSymbolicLink -> ObservedPath.Unknown
+        attributes.isDirectory -> ObservedPath.Directory
+        else -> ObservedPath.Other
+    }
+} catch (_: NoSuchFileException) {
+    ObservedPath.Absent
+} catch (_: IOException) {
+    ObservedPath.Unknown
+}
+
+/** A plain catalog file, a confirmed miss, or anything that must stop adoption. */
+private enum class ObservedCatalog { Absent, File, Unreadable }
+
+private fun observeCatalog(path: Path): ObservedCatalog = try {
+    val attributes = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    if (attributes.isSymbolicLink || !attributes.isRegularFile) ObservedCatalog.Unreadable else ObservedCatalog.File
+} catch (_: NoSuchFileException) {
+    ObservedCatalog.Absent
+} catch (_: IOException) {
+    ObservedCatalog.Unreadable
+}
+
+private const val DownloadsCatalogFileName = "nuvio_downloads.properties"
+
+/** Null when [catalog] is not a readable list. An empty list of records is a catalog that named none. */
+private fun readArchivedCatalog(catalog: Path): List<RecordRef>? {
+    if (Files.isSymbolicLink(catalog)) return null
+    if (!Files.isRegularFile(catalog, LinkOption.NOFOLLOW_LINKS)) return null
+    val size = runCatching { Files.size(catalog) }.getOrNull() ?: return null
+    if (size == 0L) return null
+    val properties = Properties()
+    if (!runCatching { Files.newInputStream(catalog).use { properties.load(it) } }.isSuccess) return null
+    val records = mutableListOf<RecordRef>()
+    for (key in properties.stringPropertyNames()) {
+        if (!key.startsWith("downloads_")) continue
+        val profileKey = key.removePrefix("downloads_")
+        if (profileKey.isEmpty() || !profileKey.all(Char::isDigit)) continue
+        val payload = properties.getProperty(key) ?: return null
+        val items = decodeStoredDownloads(payload) ?: return null
+        // The stored profile id is not reused. A fresh profile can have the same id and the same
+        // download id, and that pair would otherwise look like the owner of the archived file.
+        records += items.map { RecordRef.of(ArchivedDownloadProfileId, it) }
+    }
+    return records
+}
+
+/** Live lists other than [profileId], plus every archived list. Null when either cannot be read. */
+internal fun ownershipRecordsExcept(profileId: Int): List<RecordRef>? {
+    val stored = storedRecordsOfAllProfiles(
+        DesktopStorage.store("nuvio_downloads"),
+        excludeProfileId = profileId,
+    ) ?: return null
+    val archived = archivedDownloadRecords(DesktopStorage.rootDir) ?: return null
+    return stored + archived
+}
+
 internal object RepositoryDownloadsHooks : DownloadsHooks {
     override fun items(): List<DownloadItem> {
         DownloadsRepository.ensureLoaded()
@@ -99,16 +209,16 @@ internal object RepositoryDownloadsHooks : DownloadsHooks {
 
     override fun <T> withListLock(block: () -> T): T = DownloadsStorage.withListLock(block)
 
-    // Without the repository's state lock: the mover asks this while it holds the list lock.
+    // Without the repository's state lock. The live catalog's lock is released before account
+    // archives are read. The mover asks this while it holds the list lock.
     override fun allRecords(): List<RecordRef>? {
         val loaded = DownloadsRepository.loadedProfile() ?: return null
         val inMemory = DownloadsRepository.uiState.value.items
-        val stored = storedRecordsOfAllProfiles(DesktopStorage.store("nuvio_downloads"), excludeProfileId = loaded) ?: return null
+        val stored = ownershipRecordsExcept(loaded) ?: return null
         return inMemory.map { RecordRef.of(loaded, it) } + stored
     }
 
-    override fun otherProfileRecords(profileId: Int): List<RecordRef>? =
-        storedRecordsOfAllProfiles(DesktopStorage.store("nuvio_downloads"), excludeProfileId = profileId)
+    override fun otherProfileRecords(profileId: Int): List<RecordRef>? = ownershipRecordsExcept(profileId)
 
     override fun recordOf(profileId: Int, downloadId: String): DownloadItem? =
         DownloadsRepository.recordOf(profileId, downloadId, DesktopProfileLists)
@@ -432,13 +542,14 @@ internal class DesktopDownloadFolders(
      * Checks every few seconds, off the interface thread. The first thing it does is settle a cut-short move.
      * [afterRecovery] runs on that same thread once the move is settled, before the watcher loops.
      */
-    fun start(afterRecovery: () -> Unit = {}) {
+    fun start(afterRecovery: () -> Unit = {}, skipInitialRecovery: Boolean = false) {
         if (monitor != null) return
         stopped = false
         monitor = Thread({
             recoveryRunner = Thread.currentThread()
             try {
-                runCatching { recoverInterrupted() }
+                // After an account archive the leftover journals belong to the folder that was just put away.
+                if (!skipInitialRecovery) runCatching { recoverInterrupted() }
             } finally {
                 recoveryDone.countDown()
             }
@@ -471,8 +582,15 @@ internal class DesktopDownloadFolders(
         monitor = null
     }
 
+    internal fun stopForTest() {
+        stop()
+    }
+
     /** At start: settles an interrupted move. It touches no user file and changes no record. */
     fun recoverInterrupted(): RecoveryReport? = if (mover.hasJournals()) mover.recover() else null
+
+    internal fun hasUnresolvedMoveState(): Boolean =
+        moveRunning.get() || mover.unresolvedJournals().isNotEmpty()
 
     private class Planned(val items: List<MoveItem>, val unreachable: Int, val failures: List<MoveFailure>)
 
@@ -822,11 +940,14 @@ internal object DesktopDownloads {
     @Volatile
     private var override: DesktopDownloadFolders? = null
 
-    private val real: DesktopDownloadFolders by lazy {
+    @Volatile
+    private var realInstance: DesktopDownloadFolders? = null
+
+    private fun createReal(): DesktopDownloadFolders {
         val appFolder = DesktopStorage.rootDir.resolve("downloads")
         val locations = DownloadLocations(DownloadLocationConfig(DesktopStorage.store("nuvio_download_folders")), { appFolder })
         val isMac = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT).contains("mac")
-        DesktopDownloadFolders(
+        return DesktopDownloadFolders(
             locations = locations,
             validator = DownloadFolderValidator(locations, DesktopStorage.rootDir, DesktopStorage.cacheDir),
             mover = DownloadMover(
@@ -843,25 +964,81 @@ internal object DesktopDownloads {
         )
     }
 
-    val folders: DesktopDownloadFolders get() = override ?: real
+    private fun ensureReal(): DesktopDownloadFolders = synchronized(this) {
+        realInstance ?: createReal().also { realInstance = it }
+    }
+
+    val folders: DesktopDownloadFolders get() = override ?: ensureReal()
 
     /** For tests: use [folders], or the real ones again with null. */
     fun replaceForTest(folders: DesktopDownloadFolders?) {
+        override?.stopForTest()
         override = folders
+    }
+
+    internal fun resetForTest() {
+        override?.stopForTest()
+        override = null
+        val existing = synchronized(this) {
+            realInstance.also { realInstance = null }
+        }
+        existing?.stopForTest()
+        if (DownloadFolders.controller === existing) {
+            DownloadFolders.controller = NoDownloadFolders
+        }
+        // These hooks are process-wide. Leaving them set makes later screens skip the list read
+        // on the interface thread, and wait for a recovery thread that has already stopped.
+        DownloadsRepository.deferLoadOnThisThread = { false }
+        DownloadsRepository.beforeCatalogLoad = {}
     }
 
     /**
      * Called once when the app starts. Recovery runs on the location thread, and the downloads list
      * is read only after that, never on the interface thread.
+     * After an account archive, [skipInitialRecovery] leaves leftover move journals where they are.
      */
-    fun install() {
-        val folders = real
+    fun install(skipInitialRecovery: Boolean = false) {
+        val folders = ensureReal()
         DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
         DownloadsRepository.beforeCatalogLoad = {
             if (Thread.currentThread() !== folders.recoveryRunner) folders.awaitRecovery()
         }
         DownloadFolders.controller = folders
         // Read the list on the location thread, after recovery, so the interface thread never decodes it.
-        folders.start(afterRecovery = { DownloadsRepository.ensureLoaded() })
+        folders.start(
+            skipInitialRecovery = skipInitialRecovery,
+            afterRecovery = { DownloadsRepository.ensureLoaded() },
+        )
+    }
+
+    /**
+     * Runs download-move recovery now in the current owner's folder context and returns true only when
+     * no move is running and no unreadable or open/unresolved move journal remains.
+     */
+    fun recoverAndVerifyMoveStateClean(root: Path): Boolean {
+        override?.let { custom ->
+            if (custom.state.value.moving) return false
+            val report = custom.recoverInterrupted()
+            if (report != null && (report.busy || report.unresolved > 0 || report.unreadable > 0)) return false
+            return !custom.hasUnresolvedMoveState()
+        }
+        if (root == DesktopStorage.rootDir && (DownloadFolders.controller as? DesktopDownloadFolders)?.state?.value?.moving == true) {
+            return false
+        }
+        val appFolder = root.resolve("downloads")
+        val locations = DownloadLocations(
+            DownloadLocationConfig(DesktopStorage.Store(root.resolve("nuvio_download_folders.properties"))),
+            { appFolder },
+        )
+        val mover = DownloadMover(
+            journalDir = root.resolve("moves"),
+            resolve = { id -> locations.location(id)?.takeIf { locations.availability(it) == FolderAvailability.Available }?.path },
+            trash = DownloadsTrash::moveToTrash,
+            locationPath = { id -> locations.location(id)?.path },
+        )
+        if (!mover.hasJournals()) return true
+        val report = mover.recover()
+        if (report.busy || report.unresolved > 0 || report.unreadable > 0) return false
+        return mover.unresolvedJournals().isEmpty()
     }
 }

@@ -87,13 +87,27 @@ import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.DeviceLinkAuthRepository
 import com.nuvio.app.core.auth.DeviceLinkAuthState
 import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.core.ui.DialogButton
+import com.nuvio.app.core.ui.DialogButtonStyle
+import com.nuvio.app.core.ui.DialogButtons
+import com.nuvio.app.core.ui.DialogSurface
+import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.features.settings.AppBrandWordmark
+import com.nuvio.app.isDesktop
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.PI
 import kotlin.math.sin
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_cancel
+import nuvio.composeapp.generated.resources.auth_adopt_existing_data_message
+import nuvio.composeapp.generated.resources.auth_adopt_existing_data_no
+import nuvio.composeapp.generated.resources.auth_adopt_existing_data_title
+import nuvio.composeapp.generated.resources.auth_adopt_existing_data_yes
+import nuvio.composeapp.generated.resources.auth_start_fresh
+import nuvio.composeapp.generated.resources.auth_start_fresh_confirm_message
+import nuvio.composeapp.generated.resources.auth_start_fresh_confirm_title
 import nuvio.composeapp.generated.resources.compose_auth_already_have_account
 import nuvio.composeapp.generated.resources.compose_auth_continue_without_account
 import nuvio.composeapp.generated.resources.compose_auth_create_account
@@ -189,6 +203,8 @@ fun AuthScreen(
     modifier: Modifier = Modifier,
 ) {
     val authError by AuthRepository.error.collectAsStateWithLifecycle()
+    val authNotice by AuthRepository.notice.collectAsStateWithLifecycle()
+    val pendingAdoption by AuthRepository.pendingAdoption.collectAsStateWithLifecycle()
     val deviceLinkAuthState by DeviceLinkAuthRepository.state.collectAsStateWithLifecycle()
     val serverConnectionState by ServerConnectionController.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -202,6 +218,9 @@ fun AuthScreen(
     var passwordFieldBounds by remember { mutableStateOf<Rect?>(null) }
     var showServerSheet by rememberSaveable { mutableStateOf(false) }
     var showOfficialServerDialog by rememberSaveable { mutableStateOf(false) }
+    var showStartFreshDialog by rememberSaveable { mutableStateOf(false) }
+    var isStartingFresh by remember { mutableStateOf(false) }
+    var isAdoptionBusy by remember { mutableStateOf(false) }
 
     fun submitAuth() {
         if (email.isBlank() || password.length < 6 || isLoading) return
@@ -209,8 +228,14 @@ fun AuthScreen(
         isLoading = true
         focusManager.clearFocus(force = true)
         scope.launch {
-            if (isSignUp) AuthRepository.signUpWithEmail(email, password)
-            else AuthRepository.signInWithEmail(email, password)
+            if (isSignUp) {
+                AuthRepository.signUpWithEmail(email, password)
+                if (AuthRepository.notice.value != null) {
+                    isSignUp = false
+                }
+            } else {
+                AuthRepository.signInWithEmail(email, password)
+            }
             isLoading = false
         }
     }
@@ -286,6 +311,8 @@ fun AuthScreen(
                         passwordVisible = passwordVisible,
                         isLoading = isLoading,
                         authError = authError,
+                        authNotice = authNotice,
+                        showStartFresh = isDesktop,
                         deviceLinkAuthState = deviceLinkAuthState,
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
                         formPaneWidth = if (compactLargeScreen) 460.dp else formPaneWidth,
@@ -309,6 +336,12 @@ fun AuthScreen(
                             DeviceLinkAuthRepository.cancel()
                             AuthRepository.signInAnonymously()
                         },
+                        onStartFresh = {
+                            focusManager.clearFocus(force = true)
+                            DeviceLinkAuthRepository.cancel()
+                            AuthRepository.clearError()
+                            showStartFreshDialog = true
+                        },
                         onStartDeviceLink = ::startDeviceLink,
                         onCancelDeviceLink = DeviceLinkAuthRepository::cancel,
                         onEmailBoundsChange = { emailFieldBounds = it },
@@ -322,6 +355,8 @@ fun AuthScreen(
                         passwordVisible = passwordVisible,
                         isLoading = isLoading,
                         authError = authError,
+                        authNotice = authNotice,
+                        showStartFresh = isDesktop,
                         deviceLinkAuthState = deviceLinkAuthState,
                         deviceLinkEnabled = serverConnectionState.activeServer.capabilities.tvLogin,
                         statusBarTop = statusBarTop,
@@ -340,6 +375,12 @@ fun AuthScreen(
                             focusManager.clearFocus(force = true)
                             DeviceLinkAuthRepository.cancel()
                             AuthRepository.signInAnonymously()
+                        },
+                        onStartFresh = {
+                            focusManager.clearFocus(force = true)
+                            DeviceLinkAuthRepository.cancel()
+                            AuthRepository.clearError()
+                            showStartFreshDialog = true
                         },
                         onStartDeviceLink = ::startDeviceLink,
                         onCancelDeviceLink = DeviceLinkAuthRepository::cancel,
@@ -409,6 +450,76 @@ fun AuthScreen(
             },
         )
     }
+
+    if (isDesktop && showStartFreshDialog) {
+        NuvioStatusModal(
+            title = stringResource(Res.string.auth_start_fresh_confirm_title),
+            message = stringResource(Res.string.auth_start_fresh_confirm_message),
+            isVisible = true,
+            isBusy = isStartingFresh,
+            confirmText = stringResource(Res.string.auth_start_fresh),
+            dismissText = stringResource(Res.string.action_cancel),
+            onConfirm = {
+                if (isStartingFresh) return@NuvioStatusModal
+                isStartingFresh = true
+                scope.launch {
+                    try {
+                        AuthRepository.startFresh()
+                    } finally {
+                        isStartingFresh = false
+                        showStartFreshDialog = false
+                    }
+                }
+            },
+            onDismiss = {
+                if (!isStartingFresh) {
+                    showStartFreshDialog = false
+                }
+            },
+        )
+    }
+
+    if (pendingAdoption != null) {
+        DialogSurface(
+            onDismissRequest = {},
+            title = stringResource(Res.string.auth_adopt_existing_data_title),
+            message = stringResource(Res.string.auth_adopt_existing_data_message),
+        ) {
+            DialogButtons {
+                DialogButton(
+                    text = stringResource(Res.string.auth_adopt_existing_data_no),
+                    enabled = !isAdoptionBusy,
+                    onClick = {
+                        if (isAdoptionBusy) return@DialogButton
+                        isAdoptionBusy = true
+                        scope.launch {
+                            try {
+                                AuthRepository.declinePendingAdoption()
+                            } finally {
+                                isAdoptionBusy = false
+                            }
+                        }
+                    },
+                )
+                DialogButton(
+                    text = stringResource(Res.string.auth_adopt_existing_data_yes),
+                    style = DialogButtonStyle.Primary,
+                    loading = isAdoptionBusy,
+                    onClick = {
+                        if (isAdoptionBusy) return@DialogButton
+                        isAdoptionBusy = true
+                        scope.launch {
+                            try {
+                                AuthRepository.confirmPendingAdoption()
+                            } finally {
+                                isAdoptionBusy = false
+                            }
+                        }
+                    },
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -419,6 +530,8 @@ private fun AuthMobileLayout(
     passwordVisible: Boolean,
     isLoading: Boolean,
     authError: String?,
+    authNotice: String?,
+    showStartFresh: Boolean,
     deviceLinkAuthState: DeviceLinkAuthState,
     deviceLinkEnabled: Boolean,
     statusBarTop: Dp,
@@ -428,6 +541,7 @@ private fun AuthMobileLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onContinueWithoutAccount: () -> Unit,
+    onStartFresh: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
@@ -480,6 +594,8 @@ private fun AuthMobileLayout(
                 passwordVisible = passwordVisible,
                 isLoading = isLoading,
                 authError = authError,
+                authNotice = authNotice,
+                showStartFresh = showStartFresh,
                 deviceLinkAuthState = deviceLinkAuthState,
                 deviceLinkEnabled = deviceLinkEnabled,
                 metrics = MobileAuthFormMetrics,
@@ -489,6 +605,7 @@ private fun AuthMobileLayout(
                 onSubmit = onSubmit,
                 onToggleAuthMode = onToggleAuthMode,
                 onContinueWithoutAccount = onContinueWithoutAccount,
+                onStartFresh = onStartFresh,
                 onStartDeviceLink = onStartDeviceLink,
                 onCancelDeviceLink = onCancelDeviceLink,
                 onEmailBoundsChange = onEmailBoundsChange,
@@ -507,6 +624,8 @@ private fun AuthLargeLayout(
     passwordVisible: Boolean,
     isLoading: Boolean,
     authError: String?,
+    authNotice: String?,
+    showStartFresh: Boolean,
     deviceLinkAuthState: DeviceLinkAuthState,
     deviceLinkEnabled: Boolean,
     formPaneWidth: Dp,
@@ -520,6 +639,7 @@ private fun AuthLargeLayout(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onContinueWithoutAccount: () -> Unit,
+    onStartFresh: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
@@ -609,6 +729,8 @@ private fun AuthLargeLayout(
                     passwordVisible = passwordVisible,
                     isLoading = isLoading,
                     authError = authError,
+                    authNotice = authNotice,
+                    showStartFresh = showStartFresh,
                     deviceLinkAuthState = deviceLinkAuthState,
                     deviceLinkEnabled = deviceLinkEnabled,
                     metrics = formMetrics,
@@ -619,6 +741,7 @@ private fun AuthLargeLayout(
                     onSubmit = onSubmit,
                     onToggleAuthMode = onToggleAuthMode,
                     onContinueWithoutAccount = onContinueWithoutAccount,
+                    onStartFresh = onStartFresh,
                     onStartDeviceLink = onStartDeviceLink,
                     onCancelDeviceLink = onCancelDeviceLink,
                     onEmailBoundsChange = onEmailBoundsChange,
@@ -698,6 +821,8 @@ private fun AuthForm(
     passwordVisible: Boolean,
     isLoading: Boolean,
     authError: String?,
+    authNotice: String?,
+    showStartFresh: Boolean,
     deviceLinkAuthState: DeviceLinkAuthState,
     deviceLinkEnabled: Boolean,
     metrics: AuthFormMetrics,
@@ -708,6 +833,7 @@ private fun AuthForm(
     onSubmit: () -> Unit,
     onToggleAuthMode: () -> Unit,
     onContinueWithoutAccount: () -> Unit,
+    onStartFresh: () -> Unit,
     onStartDeviceLink: () -> Unit,
     onCancelDeviceLink: () -> Unit,
     onEmailBoundsChange: (Rect) -> Unit,
@@ -763,6 +889,16 @@ private fun AuthForm(
                 text = errorText,
                 style = MaterialTheme.typography.bodyMedium.copy(
                     color = MaterialTheme.colorScheme.error,
+                    fontSize = (13f * scale).sp,
+                    lineHeight = (18f * scale).sp,
+                ),
+            )
+        } ?: authNotice?.let { noticeText ->
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = noticeText,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    color = AuthTextSecondary,
                     fontSize = (13f * scale).sp,
                     lineHeight = (18f * scale).sp,
                 ),
@@ -823,6 +959,18 @@ private fun AuthForm(
             scale = scale,
             onClick = onContinueWithoutAccount,
         )
+
+        if (showStartFresh) {
+            Spacer(modifier = Modifier.height(14.dp * scale))
+
+            AuthSecondaryButton(
+                text = stringResource(Res.string.auth_start_fresh),
+                enabled = !isLoading,
+                height = metrics.secondaryHeight,
+                scale = scale,
+                onClick = onStartFresh,
+            )
+        }
 
         Spacer(modifier = Modifier.height(14.dp))
 
