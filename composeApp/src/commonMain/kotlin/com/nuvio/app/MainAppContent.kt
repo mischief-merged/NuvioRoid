@@ -687,18 +687,18 @@ internal fun MainAppContent(
         if (revealShellForOffline(offline)) {
             initialHomeReady = true
         }
-        val hasPlayableDownload = completedDownloads.any {
-            !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
-        }
         when (
             offlineLaunch(
                 alreadyHandled = offlineLaunchRouteHandled,
                 networkKnown = networkKnown,
                 offline = offline,
                 downloadsEnabled = AppFeaturePolicy.downloadsEnabled,
-                hasPlayableDownload = hasPlayableDownload,
-                // The list is read off the interface thread. Wait for it, or an offline launch
-                // would miss downloads that are still being read.
+                // Only checked after the downloads list is ready, because the check can wait on it.
+                hasPlayableDownload = {
+                    completedDownloads.any {
+                        !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
+                    }
+                },
                 downloadsListReady = downloadsCatalogReady,
             )
         ) {

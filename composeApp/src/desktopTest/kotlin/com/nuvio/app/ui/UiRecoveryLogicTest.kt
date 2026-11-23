@@ -254,8 +254,8 @@ class DetailLoadTest {
     fun retry_changes_the_load_key_and_a_null_result_is_a_failure() = runBlocking {
         assertEquals("person:4#0", detailLoadKey("person:4", 0))
         assertEquals("person:4#1", detailLoadKey("person:4", nextDetailAttempt(0)))
-        val ready = loadOrFail(0, "Couldn't load this person.") { "Ada" }
-        assertEquals(DetailLoadOutcome.Ready("Ada"), ready)
+        val ready = loadOrFail(0, "Couldn't load this person.") { "Sample" }
+        assertEquals(DetailLoadOutcome.Ready("Sample"), ready)
         val failed = loadOrFail(1, "Couldn't load this person.") { null }
         assertEquals(DetailLoadOutcome.Failed("Couldn't load this person."), failed)
     }
@@ -323,24 +323,43 @@ class StartupShellTest {
         assertFalse(revealShellForOffline(offline = false))
         assertEquals(
             OfflineLaunch.Wait,
-            offlineLaunch(false, networkKnown = false, offline = true, downloadsEnabled = true, hasPlayableDownload = true),
+            offlineLaunch(false, networkKnown = false, offline = true, downloadsEnabled = true, hasPlayableDownload = { true }),
         )
         assertEquals(
             OfflineLaunch.OpenDownloads,
-            offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = true),
+            offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = { true }),
         )
         assertEquals(
             OfflineLaunch.StayHere,
-            offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = false),
+            offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = { false }),
         )
         assertEquals(
             OfflineLaunch.StayHere,
-            offlineLaunch(false, networkKnown = true, offline = false, downloadsEnabled = true, hasPlayableDownload = true),
+            offlineLaunch(false, networkKnown = true, offline = false, downloadsEnabled = true, hasPlayableDownload = { true }),
         )
         assertEquals(
             OfflineLaunch.Wait,
-            offlineLaunch(true, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = true),
+            offlineLaunch(true, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = { true }),
         )
+    }
+
+    @Test
+    fun the_file_check_never_runs_before_the_downloads_list_is_ready() {
+        var checks = 0
+        val check = { checks += 1; true }
+        // Still loading, already handled, online, network unknown or downloads off: no file check.
+        offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = check, downloadsListReady = false)
+        offlineLaunch(true, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = check, downloadsListReady = true)
+        offlineLaunch(false, networkKnown = true, offline = false, downloadsEnabled = true, hasPlayableDownload = check, downloadsListReady = true)
+        offlineLaunch(false, networkKnown = false, offline = true, downloadsEnabled = true, hasPlayableDownload = check, downloadsListReady = true)
+        offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = false, hasPlayableDownload = check, downloadsListReady = true)
+        assertEquals(0, checks)
+        // Ready, offline, downloads on: the check runs once and decides.
+        assertEquals(
+            OfflineLaunch.OpenDownloads,
+            offlineLaunch(false, networkKnown = true, offline = true, downloadsEnabled = true, hasPlayableDownload = check, downloadsListReady = true),
+        )
+        assertEquals(1, checks)
     }
 
     @Test
@@ -353,7 +372,7 @@ class StartupShellTest {
                 networkKnown = true,
                 offline = true,
                 downloadsEnabled = true,
-                hasPlayableDownload = false,
+                hasPlayableDownload = { false },
                 downloadsListReady = false,
             ),
         )
@@ -364,7 +383,7 @@ class StartupShellTest {
                 networkKnown = true,
                 offline = true,
                 downloadsEnabled = true,
-                hasPlayableDownload = true,
+                hasPlayableDownload = { true },
                 downloadsListReady = true,
             ),
         )
@@ -376,7 +395,7 @@ class StartupShellTest {
                 networkKnown = true,
                 offline = true,
                 downloadsEnabled = false,
-                hasPlayableDownload = false,
+                hasPlayableDownload = { false },
                 downloadsListReady = false,
             ),
         )
@@ -388,7 +407,7 @@ class StartupShellTest {
                 networkKnown = true,
                 offline = false,
                 downloadsEnabled = true,
-                hasPlayableDownload = false,
+                hasPlayableDownload = { false },
                 downloadsListReady = false,
             ),
         )
