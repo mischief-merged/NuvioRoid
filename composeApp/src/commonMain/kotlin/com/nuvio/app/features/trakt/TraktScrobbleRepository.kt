@@ -389,7 +389,7 @@ internal object TraktScrobbleRepository : TrackingScrobbler {
                     ids = item.ids.toRequestBodyOrNull(),
                 ),
                 progress = clampedProgress,
-                appVersion = AppVersionPolicy.displayVersionName,
+                appVersion = AppVersionPolicy.packageVersionName,
             )
 
             is TraktScrobbleItem.Episode -> TraktScrobbleRequest(
@@ -404,7 +404,7 @@ internal object TraktScrobbleRepository : TrackingScrobbler {
                     number = item.number,
                 ),
                 progress = clampedProgress,
-                appVersion = AppVersionPolicy.displayVersionName,
+                appVersion = AppVersionPolicy.packageVersionName,
             )
         }
     }

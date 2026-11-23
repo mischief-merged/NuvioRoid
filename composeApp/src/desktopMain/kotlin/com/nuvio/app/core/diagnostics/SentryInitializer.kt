@@ -1,6 +1,6 @@
 package com.nuvio.app.core.diagnostics
 
-import com.nuvio.app.core.build.AppVersionConfig
+import com.nuvio.app.core.build.AppVersionPolicy
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.settings.SentrySettingsRepository
 import io.sentry.Breadcrumb
@@ -65,8 +65,8 @@ object SentryInitializer {
 
         Sentry.configureScope { sentryScope ->
             sentryScope.setTag("app.package_name", "com.nuvio.media.desktop")
-            sentryScope.setTag("app.version_name", AppVersionConfig.DESKTOP_VERSION_NAME)
-            sentryScope.setTag("app.version_code", AppVersionConfig.DESKTOP_VERSION_CODE.toString())
+            sentryScope.setTag("app.version_name", AppVersionPolicy.displayVersionName)
+            sentryScope.setTag("app.version_code", AppVersionPolicy.displayVersionCode.toString())
             sentryScope.setTag("desktop.platform", metadata.platform)
             sentryScope.setTag("desktop.architecture", metadata.architecture)
         }

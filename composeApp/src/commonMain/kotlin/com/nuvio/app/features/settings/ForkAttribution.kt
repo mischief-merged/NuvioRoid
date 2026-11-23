@@ -27,6 +27,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.build.AppVersionPolicy
+import com.nuvio.app.core.build.UPSTREAM_DESKTOP_VERSION
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.fork_about_based_on
 import nuvio.composeapp.generated.resources.fork_about_based_on_with_core
@@ -38,17 +39,12 @@ import nuvio.composeapp.generated.resources.nuvioroid_logo
 import org.jetbrains.compose.resources.painterResource
 import org.jetbrains.compose.resources.stringResource
 
-/** What this fork is called, which build it is, and what it is built on. */
+/** The fork's name and project links. */
 internal object ForkIdentity {
     const val NAME = "NuvioRoid"
 
-    /** Counts NuvioRoid builds on top of one upstream version; raise it with each release. */
-    const val BUILD = 2
     const val PROJECT_HOST = "github.com/mischief-merged/NuvioRoid"
     const val PROJECT_URL = "https://$PROJECT_HOST"
-
-    /** For example "0.1.36.2": the upstream desktop version with this fork's build number. */
-    fun version(upstreamVersion: String): String = "${upstreamVersion.substringBefore('-')}.$BUILD"
 }
 
 /** The footer of Settings: this fork's name and version, then what it is based on and who made that. */
@@ -58,7 +54,6 @@ internal fun ForkAttribution(
     modifier: Modifier = Modifier,
 ) {
     val uriHandler = LocalUriHandler.current
-    val upstreamVersion = AppVersionPolicy.displayVersionName
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
     Column(
         modifier = modifier
@@ -87,16 +82,16 @@ internal fun ForkAttribution(
         AttributionLine(
             stringResource(
                 Res.string.fork_about_version,
-                ForkIdentity.version(upstreamVersion),
+                AppVersionPolicy.displayVersionName,
                 AppVersionPolicy.displayVersionCode,
             ),
         )
         val core = AppVersionPolicy.basedOnVersionName
         AttributionLine(
             if (core != null) {
-                stringResource(Res.string.fork_about_based_on_with_core, upstreamVersion, core)
+                stringResource(Res.string.fork_about_based_on_with_core, UPSTREAM_DESKTOP_VERSION, core)
             } else {
-                stringResource(Res.string.fork_about_based_on, upstreamVersion)
+                stringResource(Res.string.fork_about_based_on, UPSTREAM_DESKTOP_VERSION)
             },
         )
         AttributionLine(stringResource(Res.string.fork_about_credit))

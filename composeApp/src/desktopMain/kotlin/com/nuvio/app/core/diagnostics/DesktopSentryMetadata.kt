@@ -1,6 +1,6 @@
 package com.nuvio.app.core.diagnostics
 
-import com.nuvio.app.core.build.AppVersionConfig
+import com.nuvio.app.core.build.AppVersionPolicy
 import java.util.Locale
 
 internal data class DesktopSentryMetadata(
@@ -14,8 +14,8 @@ internal fun currentDesktopSentryMetadata(): DesktopSentryMetadata =
     desktopSentryMetadata(
         osName = System.getProperty("os.name").orEmpty(),
         osArchitecture = System.getProperty("os.arch").orEmpty(),
-        versionName = AppVersionConfig.DESKTOP_VERSION_NAME,
-        versionCode = AppVersionConfig.DESKTOP_VERSION_CODE,
+        versionName = AppVersionPolicy.displayVersionName,
+        versionCode = AppVersionPolicy.displayVersionCode,
     )
 
 internal fun desktopSentryMetadata(

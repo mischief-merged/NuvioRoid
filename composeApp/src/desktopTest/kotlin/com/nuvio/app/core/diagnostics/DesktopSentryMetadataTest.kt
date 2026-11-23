@@ -1,9 +1,23 @@
 package com.nuvio.app.core.diagnostics
 
+import com.nuvio.app.core.build.AppVersionPolicy
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
 class DesktopSentryMetadataTest {
+    @Test
+    fun currentMetadataUsesTheDisplayedForkVersionAndBuild() {
+        val metadata = currentDesktopSentryMetadata()
+        assertEquals(
+            "com.nuvio.media.desktop@${AppVersionPolicy.displayVersionName}+${AppVersionPolicy.displayVersionCode}",
+            metadata.release,
+        )
+        assertEquals(
+            "${AppVersionPolicy.displayVersionCode}-${metadata.platform}-${metadata.architecture}",
+            metadata.distribution,
+        )
+    }
+
     @Test
     fun createsMacosArm64Metadata() {
         val metadata = desktopSentryMetadata(
