@@ -14,6 +14,7 @@ data class TrackingScrobbleFailure(
 
 object TrackingScrobbleCoordinator {
     private val log = Logger.withTag("TrackingScrobble")
+    internal var scrobblersOverrideForTest: (() -> Collection<TrackingScrobbler>)? = null
 
     suspend fun scrobble(
         profileId: Int,
@@ -21,9 +22,12 @@ object TrackingScrobbleCoordinator {
         event: TrackingScrobbleEvent,
     ): List<TrackingScrobbleFailure> {
         if (profileId != ProfileRepository.activeProfileId) return emptyList()
-        TrackingProviderRegistry.ensureLoaded()
+        val scrobblers = scrobblersOverrideForTest?.invoke() ?: run {
+            TrackingProviderRegistry.ensureLoaded()
+            TrackingProviderRegistry.connectedScrobblers()
+        }
         val failures = dispatchTrackingScrobble(
-            scrobblers = TrackingProviderRegistry.connectedScrobblers(),
+            scrobblers = scrobblers,
             profileId = profileId,
             action = action,
             event = event,
@@ -42,9 +46,12 @@ object TrackingScrobbleCoordinator {
         event: TrackingScrobbleEvent,
     ): List<TrackingScrobbleFailure> {
         if (profileId != ProfileRepository.activeProfileId) return emptyList()
-        TrackingProviderRegistry.ensureLoaded()
+        val scrobblers = scrobblersOverrideForTest?.invoke() ?: run {
+            TrackingProviderRegistry.ensureLoaded()
+            TrackingProviderRegistry.connectedScrobblers()
+        }
         val failures = dispatchTrackingSeekScrobble(
-            scrobblers = TrackingProviderRegistry.connectedScrobblers(),
+            scrobblers = scrobblers,
             profileId = profileId,
             action = action,
             event = event,

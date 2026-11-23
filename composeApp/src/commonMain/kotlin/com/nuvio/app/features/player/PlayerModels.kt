@@ -24,6 +24,7 @@ data class PlayerLaunch(
     val sourceHeaders: Map<String, String> = emptyMap(),
     val sourceResponseHeaders: Map<String, String> = emptyMap(),
     val externalSubtitles: List<com.nuvio.app.features.streams.StreamSubtitle> = emptyList(),
+    val startupSubtitleSelection: StartupSubtitleSelection? = null,
     val streamType: String? = null,
     val logo: String? = null,
     val poster: String? = null,
@@ -297,6 +298,8 @@ internal data class PlaybackKey(
 
 data class PlayerPlaybackSnapshot(
     val isLoading: Boolean = true,
+    /** The engine is still opening the source and has not read its tracks yet. */
+    val isOpening: Boolean = isLoading,
     val isPlaying: Boolean = false,
     val isEnded: Boolean = false,
     val durationMs: Long = 0L,

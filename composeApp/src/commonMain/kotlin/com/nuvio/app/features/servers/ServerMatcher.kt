@@ -1,5 +1,6 @@
 package com.nuvio.app.features.servers
 
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsRepository
@@ -61,7 +62,7 @@ internal class ServerMatcher(
     private val log = Logger.withTag("ServerMatcher")
     private val lock = SynchronizedObject()
     private val indexes = mutableMapOf<String, IndexBuild>()
-    private val convertedImdb = mutableMapOf<Long, String>()
+    private val convertedImdb = BoundedCache<Long, String>()
     private val lookups = linkedMapOf<LookupKey, TitleLookup>()
     private val titleNames = linkedMapOf<String, TitleName>()
 

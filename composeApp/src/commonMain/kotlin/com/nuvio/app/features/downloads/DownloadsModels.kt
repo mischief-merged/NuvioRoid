@@ -36,6 +36,32 @@ enum class DownloadFailureKind {
 }
 
 @Serializable
+data class KeptPartialFile(
+    val fileName: String,
+    val partialFileKey: String,
+    val locationId: String? = null,
+)
+
+@Serializable
+data class DownloadClientResolve(
+    val type: String? = null,
+    val infoHash: String? = null,
+    val fileIdx: Int? = null,
+    val magnetUri: String? = null,
+    val sources: List<String> = emptyList(),
+    val torrentName: String? = null,
+    val filename: String? = null,
+    val season: Int? = null,
+    val episode: Int? = null,
+    val service: String? = null,
+    val isCached: Boolean? = null,
+    val rawFilename: String? = null,
+    val rawSize: Long? = null,
+    val debridProviderId: String? = null,
+    val debridProviderName: String? = null,
+)
+
+@Serializable
 data class DownloadItem(
     val id: String,
     val contentType: String,
@@ -85,9 +111,11 @@ data class DownloadItem(
     val preferredAudioLanguage: String? = null,
     /** The automatic-download rule that queued this item. Null for a download the user started. */
     val autoDownloadRuleKey: String? = null,
+    /** Queued by a trip fill; kept for storage accounting across restarts. */
+    val tripFill: Boolean = false,
     /** The limit that paused this automatic download. Cleared when it is resumed. */
     val autoDownloadStop: AutoDownloadStop? = null,
-    /** Why this download failed. Null for a download that is not failed, or failed before this was recorded. */
+    /** Why this source failed. Also set on a finished file rejected by a batch; null when no failure was recorded. */
     val failureKind: DownloadFailureKind? = null,
     /**
      * The download location this item lives in or is going to. Null for an item written before
@@ -107,7 +135,49 @@ data class DownloadItem(
      * this download's. Null before a partial file was created.
      */
     val partialFileKey: String? = null,
+    /** The published file is saved but still awaits its checks. Resuming checks never starts a transfer. */
+    val awaitingCheck: Boolean = false,
+    /** A verified body digest kept across a restart while its published file awaits checks. */
+    val publishedDigestVerified: Boolean = false,
+    /** The identity of the published file, saved before its partial name is removed. */
+    val publishedFileKey: String? = null,
+    /**
+     * Every source already downloaded for this title, as [sourceIdentityKeys] write them, this one's and
+     * those of the downloads it replaced or sits beside. A source the app picks by itself is never one of them.
+     */
+    val triedSources: List<String> = emptyList(),
+    /** How many sources the app has started by itself for this title, each after a source that was bad. */
+    val autoSourceAttempts: Int = 0,
+    /** The app looked for a working source by itself and found none. Only the user picks one now. */
+    val noWorkingSourceFound: Boolean = false,
+    /** Normalized torrent info hash of the chosen source, when present. */
+    val sourceInfoHash: String? = null,
+    /** File index within a multi-file torrent of the chosen source, when present. */
+    val sourceFileIdx: Int? = null,
+    /** Release or file name stated by the source or debrid resolver, when present. */
+    val sourceFilename: String? = null,
+    /** File size in bytes stated by the source or debrid resolver, when present. */
+    val sourceFileSizeBytes: Long? = null,
+    /** Binge group identifier of the chosen source, when present. */
+    val sourceBingeGroup: String? = null,
+    /** Whether the download URL was obtained through Nuvio's local debrid resolver. */
+    val sourceDebridResolved: Boolean = false,
+    /** Metadata needed to re-resolve the same source directly with the debrid resolver. */
+    val sourceClientResolve: DownloadClientResolve? = null,
+    /** Strong ETag returned by the server for the active partial file. */
+    val sourceETag: String? = null,
+    /** Last-Modified header returned by the server for the active partial file. */
+    val sourceLastModified: String? = null,
+    /** Active partial file name inside the download's folder when it differs from `$fileName.part`. */
+    val partialFileName: String? = null,
+    /** Older partials kept untouched while a refreshed link downloads from scratch into a new partial. */
+    val supersededPartials: List<KeptPartialFile> = emptyList(),
+    /** Whether the current [sourceUrl] came from a link refresh and still needs verification before joining the active partial. */
+    val pendingLinkVerification: Boolean = false,
 ) {
+    val activePartialFileName: String
+        get() = partialFileName?.takeIf { it.isNotBlank() } ?: "$fileName.part"
+
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
 
@@ -117,12 +187,17 @@ data class DownloadItem(
             (failureKind == DownloadFailureKind.BadFile || failureKind == DownloadFailureKind.SourceRefused)
 
     /**
-     * A finished download whose file is not the video: a placeholder the source served in its place.
-     * It keeps its file, so that the user can delete it to the trash, but it is not downloaded: it
+     * A finished download whose file is not suitable: a placeholder, or a source rejected by the batch
+     * checks (including the chosen audio language). It keeps its file for the user to trash, but it
      * does not play, does not count as available offline and is replaced by a fetch from another source.
      */
     val isPlaceholder: Boolean
-        get() = status == DownloadStatus.Completed && framesCheck == DownloadFramesCheck.NotTheRealVideo
+        get() = status == DownloadStatus.Completed &&
+            (framesCheck == DownloadFramesCheck.NotTheRealVideo || failureKind == DownloadFailureKind.BadFile)
+
+    /** Its source is the problem: a file that is not the video, or a source that failed in a way trying it again cannot fix. */
+    val hasBadSource: Boolean
+        get() = needsAnotherSource || isPlaceholder
 
     val isPlayable: Boolean
         get() = status == DownloadStatus.Completed && !localFileUri.isNullOrBlank() && !isPlaceholder
@@ -162,13 +237,21 @@ data class DownloadsUiState(
     val items: List<DownloadItem> = emptyList(),
     /** Set when the stored list could not be read. The screen must not present the list as simply empty then. */
     val storeProblem: DownloadsStoreProblem? = null,
+    /** Transfers whose bodies are finished but whose files are still being checked. Never persisted. */
+    val checkingIds: Set<String> = emptySet(),
+    /** Files in download folders that could not be matched confidently during a scan. */
+    val unrecognisedFiles: List<UnrecognisedFile> = emptyList(),
 ) {
     /** What is not downloaded: running, paused, failed, and finished files that are not the video. */
     val activeItems: List<DownloadItem>
         get() = items.filter { it.status != DownloadStatus.Completed || it.isPlaceholder }
 
-    val completedItems: List<DownloadItem>
-        get() = items.filter { it.status == DownloadStatus.Completed && !it.isPlaceholder }
+    val completedItems: List<DownloadItem> = items.filter { it.status == DownloadStatus.Completed && !it.isPlaceholder }
+
+    /** The screen's structure; running rows subscribe to their own counters. */
+    internal fun withoutProgress() = copy(items = items.map { item ->
+        if (item.status == DownloadStatus.Downloading) item.copy(downloadedBytes = 0, totalBytes = null, updatedAtEpochMs = 0) else item
+    })
 }
 
 enum class DownloadEnqueueResult {

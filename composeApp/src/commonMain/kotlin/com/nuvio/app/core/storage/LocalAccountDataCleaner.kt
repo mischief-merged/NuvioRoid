@@ -81,6 +81,9 @@ internal object LocalAccountDataCleaner {
         P2pSettingsRepository.clearLocalState()
         CatalogRepository.clear()
         StreamsRepository.clear()
+        if (AppFeaturePolicy.pluginsEnabled) {
+            PluginRepository.setLocalPluginSearchPaused(false)
+        }
         MetaDetailsRepository.clear()
         SearchRepository.reset()
         SubtitleRepository.clear()

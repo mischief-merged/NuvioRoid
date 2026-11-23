@@ -175,7 +175,11 @@ internal fun confirmedFramesProblem(first: FrameSamples, takeMore: () -> FrameSa
  * without a marker proves nothing. Only a hint: absolute numbering, packs and stale tags make it wrong.
  */
 internal fun FrameSamples.titleNamesAnotherEpisode(expectedSeason: Int?, expectedEpisode: Int?): Boolean {
-    val title = containerTitle
+    return containerTitle.titleNamesAnotherEpisode(expectedSeason, expectedEpisode)
+}
+
+internal fun String?.titleNamesAnotherEpisode(expectedSeason: Int?, expectedEpisode: Int?): Boolean {
+    val title = this
     if (title == null || expectedSeason == null || expectedEpisode == null) return false
     val markers = EpisodeMarker.findAll(title).map { match ->
         val episodes = mutableSetOf(match.groupValues[2].toInt())

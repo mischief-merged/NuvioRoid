@@ -21,10 +21,14 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.watching.domain.isShortPlaceholderDuration
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
@@ -61,12 +65,20 @@ internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
 }
 
 internal fun PlayerScreenRuntime.cancelNextEpisodeAutoPlay() {
-    nextEpisodeAutoPlayJob?.cancel()
-    nextEpisodeAutoPlayJob = null
-    nextEpisodeAutoPlayAutomatic = false
-    nextEpisodeAutoPlaySearching = false
-    nextEpisodeAutoPlaySourceName = null
-    nextEpisodeAutoPlayCountdown = null
+    val (autoPlay, pending) = synchronized(episodeSwitchLock) {
+        val autoPlay = nextEpisodeAutoPlayJob
+        val pending = downloadedEpisodeSwitch
+        nextEpisodeAutoPlayJob = null
+        downloadedEpisodeSwitch = null
+        nextEpisodeAutoPlayAutomatic = false
+        nextEpisodeAutoPlaySearching = false
+        nextEpisodeAutoPlaySourceName = null
+        nextEpisodeAutoPlayCountdown = null
+        nextEpisodeAutoPlayTarget = null
+        autoPlay to pending
+    }
+    autoPlay?.cancel()
+    if (pending != null && pending.job !== autoPlay) pending.job.cancel()
 }
 
 internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
@@ -79,35 +91,38 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     settings: PlayerSettingsUiState,
     currentStreamBingeGroup: String?,
     onDownloadedEpisodeSelected: (DownloadItem, MetaVideo) -> Unit,
-    onEpisodeStreamSelected: (StreamItem, MetaVideo) -> Unit,
+    /** The source auto-play picked, the episode, and the sources tried before the source. */
+    onEpisodeStreamSelected: (StreamItem, MetaVideo, PlayerSourceFallbackTried) -> Unit,
     onManualSelectionRequired: (MetaVideo) -> Unit,
     onSearchingChanged: (Boolean) -> Unit,
     onSourceNameChanged: (String?) -> Unit,
     onCountdownChanged: (Int?) -> Unit,
     onNextEpisodeCardVisibleChanged: (Boolean) -> Unit,
+    isOffline: () -> Boolean = ::isNetworkOffline,
+    findDownloadedEpisode: (MetaVideo) -> DownloadItem? = { video ->
+        DownloadsRepository.findCachedPlayableDownload(parentMetaId, video.season, video.episode, video.id)
+    },
+    verifyDownloadedEpisode: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    },
+    onDownloadVerificationJob: (Job) -> Unit = {},
+    onOfflineDownloadDeclined: () -> Unit = {},
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
     if (nextEpisodeInfo.hasAired != true) return null
 
-    val downloadedNextEpisode = DownloadsRepository.findPlayableDownload(
-        parentMetaId = parentMetaId,
-        seasonNumber = nextVideo.season,
-        episodeNumber = nextVideo.episode,
-        videoId = nextVideo.id,
-    )
-    if (downloadedNextEpisode != null) {
-        onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
-        return null
-    }
-
-    // Offline: the auto-play fan-out is a network search, so skip it entirely.
-    if (isNetworkOffline()) return null
+    val hasDownload = findDownloadedEpisode(nextVideo) != null
+    // Offline with nothing saved: there is no network search to start, and no file to check.
+    if (!hasDownload && isOffline()) return null
 
     previousJob?.cancel()
-    onSearchingChanged(true)
-    onSourceNameChanged(null)
-    onCountdownChanged(null)
+    // A saved file is checked before it is chosen. Searching starts only once that file is ruled out.
+    if (!hasDownload) {
+        onSearchingChanged(true)
+        onSourceNameChanged(null)
+        onCountdownChanged(null)
+    }
 
     val type = contentType ?: parentMetaType
     val shouldAutoSelectInManualMode =
@@ -117,11 +132,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                     settings.streamAutoPlayPreferBingeGroup
                 )
 
-    val bingeGroupOnlyManualMode =
-        shouldAutoSelectInManualMode &&
-            (!settings.streamAutoPlayNextEpisodeEnabled ||
-                !settings.streamAutoPlayNextEpisodeFallbackEnabled) &&
-            settings.streamAutoPlayPreferBingeGroup
+    val bingeGroupOnlyManualMode = isNextEpisodeBingeGroupOnly(settings)
 
     val effectiveMode = if (shouldAutoSelectInManualMode) {
         StreamAutoPlayMode.FIRST_STREAM
@@ -154,9 +165,27 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         null
     }
 
-    return launch {
+    val job = launch(start = CoroutineStart.LAZY) {
+        if (hasDownload) {
+            val verified = withContext(Dispatchers.IO) {
+                val candidate = findDownloadedEpisode(nextVideo)
+                if (candidate != null && verifyDownloadedEpisode(candidate)) candidate else null
+            }
+            if (verified != null) {
+                onDownloadedEpisodeSelected(verified, nextVideo)
+                return@launch
+            }
+            if (isOffline()) {
+                if (isActive) onOfflineDownloadDeclined()
+                return@launch
+            }
+            onSearchingChanged(true)
+            onSourceNameChanged(null)
+            onCountdownChanged(null)
+        }
+
         // Connectivity may have dropped between the request and the actual search.
-        if (isNetworkOffline()) {
+        if (isOffline()) {
             onSearchingChanged(false)
             return@launch
         }
@@ -284,22 +313,67 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             trySelectStream(allStreams)?.let(::selectStream) ?: finishWithoutSelection()
         }
 
-        val selected = selectedStream?.let { stream ->
-            when (val result = DirectDebridPlaybackResolver.resolveToPlayableStream(stream, nextVideo.season, nextVideo.episode)) {
-                is DirectDebridPlayableResult.Success -> result.stream
-                else -> {
-                    result.toastMessage()?.let { NuvioToastController.show(it) }
-                    PlayerStreamsRepository.loadEpisodeStreams(
-                        type = type,
-                        videoId = nextVideo.id,
-                        season = nextVideo.season,
-                        episode = nextVideo.episode,
-                        forceRefresh = true,
+        // A debrid result that cannot be played (expired, no longer cached, a failed resolve) moves
+        // on to the next source auto selection would pick when falling back is on, the way the
+        // stream screen does. Only the last failure is shown.
+        val resolveRun = selectedStream?.let { stream ->
+            resolveWithSourceFallback<StreamItem, DirectDebridPlayableResult>(
+                first = stream,
+                maxSources = if (settings.streamAutoPlayFallbackActive) settings.streamAutoPlayFallbackMaxSources else 0,
+                resolve = { candidate ->
+                    SubtitleStartupCoordinator.prefetchForStream(
+                        StartupSubtitleRequest(
+                            type = type,
+                            videoId = nextVideo.id,
+                            parentMetaId = parentMetaId,
+                            settings = settings,
+                            streamExternalSubtitles = candidate.externalSubtitles,
+                            videoHash = candidate.behaviorHints.videoHash,
+                            videoSizeBytes = candidate.behaviorHints.videoSize,
+                            filename = candidate.behaviorHints.filename,
+                        ),
                     )
-                    null
-                }
-            }
+                    when (
+                        val result = DirectDebridPlaybackResolver.resolveToPlayableStream(
+                            candidate,
+                            nextVideo.season,
+                            nextVideo.episode,
+                        )
+                    ) {
+                        is DirectDebridPlayableResult.Success -> PlayerSourceResolveAttempt.Resolved(result.stream)
+                        else -> PlayerSourceResolveAttempt.Failed(result)
+                    }
+                },
+                nextCandidate = { failed, triedKeys ->
+                    nextEpisodeFallbackCandidate(
+                        streams = PlayerStreamsRepository.episodeStreamsState.value.groups.flatMap { it.streams },
+                        settings = settings,
+                        triedKeys = triedKeys,
+                        failedAddonId = failed.addonId,
+                        failedInfoHash = failed.p2pInfoHash,
+                        preferredBingeGroup = preferredBingeGroup,
+                        bingeGroupOnly = bingeGroupOnlyManualMode,
+                        preferences = autoPlayPreferences,
+                        runtimeMinutes = autoPlayRuntimeMinutes,
+                        wanted = autoPlayWanted,
+                        installedAddonNames = installedAddonNames,
+                        debridEnabled = debridSettings.canResolvePlayableLinks,
+                        activeResolverProviderId = debridSettings.activeResolverProviderId,
+                    )
+                },
+            )
         }
+        resolveRun?.failure?.let { result ->
+            result.toastMessage()?.let { NuvioToastController.show(it) }
+            PlayerStreamsRepository.loadEpisodeStreams(
+                type = type,
+                videoId = nextVideo.id,
+                season = nextVideo.season,
+                episode = nextVideo.episode,
+                forceRefresh = true,
+            )
+        }
+        val selected = resolveRun?.resolved
         onSearchingChanged(false)
         if (selected != null) {
             onSourceNameChanged((selected.name?.takeIf { it.isNotBlank() } ?: selected.addonName).trim())
@@ -307,7 +381,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                 onCountdownChanged(i)
                 delay(1000)
             }
-            onEpisodeStreamSelected(selected, nextVideo)
+            onEpisodeStreamSelected(selected, nextVideo, resolveRun.tried)
             onNextEpisodeCardVisibleChanged(false)
             onCountdownChanged(null)
             onSourceNameChanged(null)
@@ -316,6 +390,90 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             onNextEpisodeCardVisibleChanged(false)
         }
     }
+    if (hasDownload) onDownloadVerificationJob(job)
+    job.start()
+    return job
+}
+
+internal fun isNextEpisodeBingeGroupOnly(settings: PlayerSettingsUiState): Boolean {
+    val shouldAutoSelectInManualMode =
+        settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
+            (settings.streamAutoPlayNextEpisodeEnabled || settings.streamAutoPlayPreferBingeGroup)
+    return shouldAutoSelectInManualMode &&
+        (!settings.streamAutoPlayNextEpisodeEnabled || !settings.streamAutoPlayNextEpisodeFallbackEnabled) &&
+        settings.streamAutoPlayPreferBingeGroup
+}
+
+/**
+ * Picks the next fallback source when resolving the next episode's selected stream fails.
+ * When [bingeGroupOnly] is true (Manual mode with binge-group preference and fallback off),
+ * only untried streams in [preferredBingeGroup] are eligible so fallback never escapes to another group.
+ */
+internal fun nextEpisodeFallbackCandidate(
+    streams: List<StreamItem>,
+    settings: PlayerSettingsUiState,
+    triedKeys: Set<String>,
+    failedAddonId: String? = null,
+    failedInfoHash: String? = null,
+    preferredBingeGroup: String? = null,
+    bingeGroupOnly: Boolean = false,
+    preferences: com.nuvio.app.features.downloads.SeasonDownloadDefaults = StreamAutoPlayPolicy.preferencesFor(settings.streamAutoPlayMode),
+    runtimeMinutes: Int? = null,
+    wanted: com.nuvio.app.features.streams.WantedContent? = null,
+    installedAddonNames: Set<String> = AddonRepository.uiState.value.addons.enabledAddons().map { it.displayTitle }.toSet(),
+    debridEnabled: Boolean = DebridSettingsRepository.snapshot().canResolvePlayableLinks,
+    activeResolverProviderId: String? = DebridSettingsRepository.snapshot().activeResolverProviderId,
+): StreamItem? {
+    val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
+    if (bingeGroupOnly) {
+        if (targetBingeGroup.isEmpty()) return null
+        val bingeGroupStreams = streams.filter { it.behaviorHints.bingeGroup == targetBingeGroup }
+        if (bingeGroupStreams.isEmpty()) return null
+        return nextSourceFallbackCandidate(
+            streams = bingeGroupStreams,
+            settings = settings,
+            triedKeys = triedKeys,
+            failedAddonId = failedAddonId,
+            failedInfoHash = failedInfoHash,
+            preferences = preferences,
+            runtimeMinutes = runtimeMinutes,
+            wanted = wanted,
+            installedAddonNames = installedAddonNames,
+            debridEnabled = debridEnabled,
+            activeResolverProviderId = activeResolverProviderId,
+        )
+    }
+    if (settings.streamAutoPlayPreferBingeGroup && targetBingeGroup.isNotEmpty()) {
+        val bingeGroupStreams = streams.filter { it.behaviorHints.bingeGroup == targetBingeGroup }
+        if (bingeGroupStreams.isNotEmpty()) {
+            nextSourceFallbackCandidate(
+                streams = bingeGroupStreams,
+                settings = settings,
+                triedKeys = triedKeys,
+                failedAddonId = failedAddonId,
+                failedInfoHash = failedInfoHash,
+                preferences = preferences,
+                runtimeMinutes = runtimeMinutes,
+                wanted = wanted,
+                installedAddonNames = installedAddonNames,
+                debridEnabled = debridEnabled,
+                activeResolverProviderId = activeResolverProviderId,
+            )?.let { return it }
+        }
+    }
+    return nextSourceFallbackCandidate(
+        streams = streams,
+        settings = settings,
+        triedKeys = triedKeys,
+        failedAddonId = failedAddonId,
+        failedInfoHash = failedInfoHash,
+        preferences = preferences,
+        runtimeMinutes = runtimeMinutes,
+        wanted = wanted,
+        installedAddonNames = installedAddonNames,
+        debridEnabled = debridEnabled,
+        activeResolverProviderId = activeResolverProviderId,
+    )
 }
 
 internal fun PlayerScreenRuntime.preloadNextEpisodeSources() {

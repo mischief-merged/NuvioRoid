@@ -53,6 +53,7 @@ object PartyChat {
     private val log = Logger.withTag("PartyChat")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
     private val syncLock = Mutex()
+    internal var loadHistory: suspend (String, String, Long?) -> PartyChatHistory = PartyApi::listMessages
 
     private val _messages = MutableStateFlow<List<PartyChatMessage>>(emptyList())
     val messages: StateFlow<List<PartyChatMessage>> = _messages.asStateFlow()
@@ -94,7 +95,7 @@ object PartyChat {
                 clientId = clientId,
                 status = PartyChatStatus.Sending,
             )
-            _messages.update { it + message }
+            _messages.update { appendPartyChatMessage(it, message, MESSAGE_LIMIT) }
             deliver(current.partyId, message)
         }
     }
@@ -112,6 +113,7 @@ object PartyChat {
         scope.launch {
             if (room?.partyId != next.partyId) reset()
             room = next
+            ownMemberIds.retainAll(_messages.value.filter { it.mine }.map { it.memberId }.toSet())
             ownMemberIds += next.memberId
             sync()
         }
@@ -146,7 +148,7 @@ object PartyChat {
             val target = room?.partyId ?: return
             val after = if (loaded) _messages.value.lastOrNull { it.id != null }?.id else null
             val history = try {
-                PartyApi.listMessages(target, SyncClientIdentity.currentClientId(), after)
+                loadHistory(target, SyncClientIdentity.currentClientId(), after)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -264,3 +266,9 @@ internal fun mergePartyChat(
     val merged = confirmed.values.sortedBy { it.id } + pending
     return PartyChatMerge(merged.takeLast(limit), added)
 }
+
+internal fun appendPartyChatMessage(
+    current: List<PartyChatMessage>,
+    message: PartyChatMessage,
+    limit: Int,
+): List<PartyChatMessage> = (current + message).takeLast(limit)

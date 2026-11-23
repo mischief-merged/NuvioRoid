@@ -14,14 +14,17 @@ import com.nuvio.app.features.shuffle.shuffleEpisodeProgress
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import com.nuvio.app.features.addons.AddonPlayerAction
+import androidx.compose.runtime.snapshots.Snapshot
 import com.nuvio.app.features.details.MetaDetailsRepository
-import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.downloads.SidecarIo
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.features.downloads.savedEpisodeVideosFor
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamRequest
@@ -78,7 +81,7 @@ private data class PlayerSnapshotSignals(
  * treated as "not offline" so we never suppress work we are not sure about.
  */
 internal fun isNetworkOffline(): Boolean =
-    NetworkStatusRepository.uiState.value.isOfflineLike
+    NetworkStatusRepository.uiState.value.isNoInternet
 
 @Composable
 private fun rememberNetworkCondition(): NetworkCondition {
@@ -103,8 +106,13 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         // Details that arrive from the network replace it.
         if (playerMetaVideos.isEmpty()) {
             val localUri = activeSourceUrl.takeIf { it.startsWith("file:") }
-            // Read off the main thread, with a time limit; applied here.
-            playerMetaVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+            if (localUri != null) {
+                // Read off the main thread, with a time limit; applied here.
+                val savedVideos = SidecarIo.read { savedEpisodeVideosFor(localUri) }.orEmpty()
+                if (playerMetaVideos.isEmpty()) {
+                    playerMetaVideos = savedVideos
+                }
+            }
         }
         if (playerMeta?.videos.isNullOrEmpty()) {
             MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.let { meta ->
@@ -147,6 +155,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         initialLoadCompleted = false
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
+        frozenForQuit = false
         pendingSeekScrobbleRestart = false
         seekProgressSyncJob?.cancel()
         seekProgressSyncJob = null
@@ -166,6 +175,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         showSourcesPanel = false
         showEpisodesPanel = false
         showChaptersPanel = false
+        nativeControlsModalOpen = false
         chapters = emptyList()
         chaptersLoadedForSourceUrl = null
         clearChapterSkipState()
@@ -262,13 +272,48 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         }
     }
 
-    LaunchedEffect(playbackSession.videoId) {
-        subtitleDelayMs = PlayerTrackPreferenceStorage.loadSubtitleDelayMs(playbackSession.videoId) ?: 0
+    LaunchedEffect(parentMetaId, playbackSession.videoId) {
+        subtitleDelayMs = loadShowSubtitleDelayMs(
+            parentMetaId = parentMetaId,
+            videoId = playbackSession.videoId,
+        ) ?: 0
         subtitleAutoSyncState = SubtitleAutoSyncUiState()
     }
 
     LaunchedEffect(playerController, subtitleDelayMs) {
         playerController?.setSubtitleDelayMs(subtitleDelayMs)
+    }
+
+    LaunchedEffect(playerController) {
+        val controller = playerController ?: return@LaunchedEffect
+        controller.setOnExternalSubtitleLoadFailed { _ ->
+            selectedAddonSubtitleId = null
+            selectedSubtitleIndex = -1
+            useCustomSubtitles = false
+            isUserExplicitSubtitleSelection = false
+            refreshTracks()
+        }
+    }
+
+    LaunchedEffect(
+        activeSourceUrl,
+        externalSubtitles,
+        playerSettingsUiState.preferredSubtitleLanguage,
+        playerSettingsUiState.secondaryPreferredSubtitleLanguage,
+        parentMetaId,
+    ) {
+        if (activeSourceUrl.startsWith("file:", ignoreCase = true) &&
+            externalSubtitles.isNotEmpty() &&
+            startupSubtitleSelection == null
+        ) {
+            val prepared = SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+                localSubtitles = externalSubtitles,
+                settings = playerSettingsUiState,
+                parentMetaId = parentMetaId,
+            )
+            externalSubtitles = prepared.subtitles
+            startupSubtitleSelection = prepared.selection
+        }
     }
 
     BindAudioDelayEffects()
@@ -340,7 +385,11 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         addonSubtitleFetchKey,
         networkCondition,
     ) {
-        if (activeSourceUrl.startsWith("file:") && externalSubtitles.isNotEmpty()) return@LaunchedEffect
+        if (activeSourceUrl.startsWith("file:", ignoreCase = true) &&
+            (externalSubtitles.isNotEmpty() || startupSubtitleSelection?.exhaustedOrTimedOut == true)
+        ) {
+            return@LaunchedEffect
+        }
         val fetchKey = addonSubtitleFetchKey ?: return@LaunchedEffect
         // For P2P streams, wait until the local engine URL is available before
         // triggering the fetch so that hash computation can use the real HTTP URL.
@@ -467,31 +516,28 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         onDispose { ServerPlayback.stop(effectSourceUrl) }
     }
 
-    // A downloaded file that is open is not removed after watching.
-    DisposableEffect(activeSourceUrl) {
-        val openFileUrl = activeSourceUrl.takeIf { it.startsWith("file:") }
-        if (openFileUrl != null) AutoDownloads.onLocalFileOpened(openFileUrl)
-        onDispose { if (openFileUrl != null) AutoDownloads.onLocalFileClosed(openFileUrl) }
-    }
+    BindPlayerQuitAndDisposeEffects()
 
-    DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
-        val effectVideoId = playbackSession.videoId
-        val effectSourceUrl = activeSourceUrl
-        val effectSourceAudioUrl = activeSourceAudioUrl
-        onDispose {
-            if (
-                playbackSession.videoId == effectVideoId &&
-                activeSourceUrl == effectSourceUrl &&
-                activeSourceAudioUrl == effectSourceAudioUrl
-            ) {
-                flushWatchProgress()
-            }
+    val isInPipForSearch = rememberIsInPictureInPicture()
+    val playbackInFocus = playerOwnsControllerInput(
+        isMinimized = args.isMinimized,
+        isInPictureInPicture = isInPipForSearch,
+    )
+    SideEffect {
+        pictureInPictureActive = isInPipForSearch
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
+    }
+    LaunchedEffect(args.isMinimized) {
+        if (!args.isMinimized) {
+            refreshAudioTracksIfChanged()
         }
     }
 
     DisposableEffect(Unit) {
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
+            emitAddonPlayerProgressEvent()
             args.launchId?.let { launchId ->
                 PlayerLaunchStore.update(launchId) { currentLaunch(it) }
                 // The player is gone: release the launch payload once the restore window has
@@ -508,7 +554,50 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
 }
 
 @Composable
-private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
+internal fun PlayerScreenRuntime.BindPlayerQuitAndDisposeEffects() {
+    DisposableEffect(playbackSession.videoId, activeSourceUrl, activeSourceAudioUrl) {
+        val effectVideoId = playbackSession.videoId
+        val effectSourceUrl = activeSourceUrl
+        val effectSourceAudioUrl = activeSourceAudioUrl
+        frozenForQuit = false
+        val unregisterFlushHook = WatchProgressRepository.registerActivePlayerFlushHook(
+            onQuitAborted = {
+                Snapshot.withMutableSnapshot {
+                    if (
+                        playbackSession.videoId == effectVideoId &&
+                        activeSourceUrl == effectSourceUrl &&
+                        activeSourceAudioUrl == effectSourceAudioUrl
+                    ) {
+                        frozenForQuit = false
+                    }
+                }
+            },
+            onStopAndFlush = {
+                if (
+                    playbackSession.videoId == effectVideoId &&
+                    activeSourceUrl == effectSourceUrl &&
+                    activeSourceAudioUrl == effectSourceAudioUrl
+                ) {
+                    stopPlaybackAndFlushForQuit()
+                }
+            },
+        )
+        onDispose {
+            unregisterFlushHook()
+            if (
+                !frozenForQuit &&
+                playbackSession.videoId == effectVideoId &&
+                activeSourceUrl == effectSourceUrl &&
+                activeSourceAudioUrl == effectSourceAudioUrl
+            ) {
+                flushWatchProgress()
+            }
+        }
+    }
+}
+
+@Composable
+internal fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
     val folded = LocalFold.current != null
 
     // The engine publishes a playback snapshot every 250ms. Reading the raw snapshot here
@@ -537,7 +626,10 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         showParentalGuide,
         errorMessage,
     ) {
+        // Desktop owns its 3s pointer/modal/hover hide timer inside the native player UI
+        // so Compose never fights open HTML panels, cursor drags, or paused auto-hide.
         if (
+            isDesktop ||
             !controlsVisible ||
             isScrubbingTimeline ||
             !playbackSnapshot.isPlaying ||
@@ -581,7 +673,9 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         snapshotSignals.isLoading,
         snapshotSignals.isEnded,
         snapshotSignals.durationMs,
+        frozenForQuit,
     ) {
+        if (frozenForQuit) return@LaunchedEffect
         ServerPlayback.onPlaybackSnapshot(
             url = activeSourceUrl,
             positionMs = playbackSnapshot.positionMs,
@@ -601,6 +695,8 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
             flushWatchProgress(TrackingScrobbleAction.PAUSE)
         }
 
+        syncAddonPlayerStartForPlayback()
+
         if (playbackSnapshot.isPlaying && pendingSeekScrobbleRestart) {
             pendingSeekScrobbleRestart = false
             if (hasRequestedScrobbleStartForCurrentItem) {
@@ -617,6 +713,16 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         }
         if (playbackSnapshot.isPlaying) {
             persistPlaybackProgressTick()
+        }
+    }
+
+    if (isDesktop) {
+        LaunchedEffect(Unit) {
+            while (true) {
+                val fading = sleepTimer.phase == SleepTimerPhase.Fading
+                delay(if (fading) 200L else 1_000L)
+                advanceSleepTimer(System.currentTimeMillis())
+            }
         }
     }
 }
@@ -926,6 +1032,8 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         }
     }
 
+    val offlineIndex = rememberOfflineDownloadIndex()
+
     LaunchedEffect(
         activePlaybackKey,
         playbackSnapshot,
@@ -940,21 +1048,20 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
         playerSettingsUiState.streamAutoPlayNextEpisodeEnabled,
         nextEpisodeCardDismissed,
+        sleepTimer.option,
+        sleepTimer.phase,
+        sleepTimer.stopAfterEpisode,
+        offlineIndex,
     ) {
-        val shouldShow = nextEpisodeInfo != null && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
-        if (nextEpisodeAutoPlayAutomatic &&
-            (!shouldShow || !playerSettingsUiState.streamAutoPlayNextEpisodeEnabled)
-        ) {
-            cancelNextEpisodeAutoPlay()
-        }
-        if (shouldShow && !showNextEpisodeCard) {
-            showNextEpisodeCard = true
-            if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true && !isPartyControlLocked) {
-                playNextEpisode(automatic = true)
-            }
-        } else if (!shouldShow) {
-            showNextEpisodeCard = false
-        }
+        val canPlayNextOffline = nextEpisodeInfo?.let { info ->
+            !isNetworkOffline() || offlineIndex.hasFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = info.season,
+                episodeNumber = info.episode,
+                videoId = info.videoId,
+            )
+        } == true
+        onNextEpisodeThresholdChanged(canPlayNext = canPlayNextOffline)
     }
 }
 
@@ -1084,14 +1191,30 @@ internal fun PlayerScreenRuntime.tryRefreshExpiredLinkAfterError(message: String
             }
             // Debrid links are always requested anew; a prepared or in-memory one may be the expired link.
             val unresolved = if (candidate.debridResolved) candidate.copy(url = null, debridResolved = false) else candidate
-            val stream = when (
-                val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-                    stream = unresolved,
-                    season = season,
-                    episode = episode,
-                    forceRefresh = true,
-                )
-            ) {
+            val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = StartupSubtitleRequest(
+                    type = type,
+                    videoId = currentVideoId,
+                    parentMetaId = parentMetaId,
+                    settings = playerSettingsUiState,
+                    streamExternalSubtitles = unresolved.externalSubtitles,
+                    videoHash = unresolved.behaviorHints.videoHash,
+                    videoSizeBytes = unresolved.behaviorHints.videoSize,
+                    filename = unresolved.behaviorHints.filename,
+                ),
+                resolveSource = {
+                    DirectDebridPlaybackResolver.resolveToPlayableStream(
+                        stream = unresolved,
+                        season = season,
+                        episode = episode,
+                        forceRefresh = true,
+                    )
+                },
+                extractStreamSubtitles = { res ->
+                    (res as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+                },
+            )
+            val stream = when (resolved) {
                 is DirectDebridPlayableResult.Success -> resolved.stream
                 else -> {
                     showErrorUnlessSourceFallback(message)
@@ -1105,7 +1228,7 @@ internal fun PlayerScreenRuntime.tryRefreshExpiredLinkAfterError(message: String
                 return@launch
             }
 
-            playReplacementSource(stream, refreshedUrl, currentVideoId)
+            playReplacementSource(stream, refreshedUrl, currentVideoId, preparedSubtitles = preparedSubs)
         } finally {
             PlayerStreamsRepository.stopSourcesLoading()
         }
@@ -1127,6 +1250,7 @@ private fun PlayerScreenRuntime.retryServerSourceAfterError(message: String?): B
             controlsVisible = !playerControlsLocked
             return@launch
         }
+        startupSubtitleSelection = null
         externalSubtitles = playback.subtitles
         activeSourceUrl = playback.url
         activeSourceHeaders = playback.headers

@@ -29,10 +29,7 @@ import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.components.AutoDownloadDialog
-import com.nuvio.app.features.details.components.DownloadChoiceDialog
-import com.nuvio.app.features.details.components.SeasonDownloadChoiceRow
 import com.nuvio.app.features.profiles.ProfileRepository
-import com.nuvio.app.features.settings.SettingsChoiceDialog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import nuvio.composeapp.generated.resources.*
@@ -55,7 +52,6 @@ internal fun AutoDownloadSection(
 ) {
     val rules by controller.rules.collectAsState()
     val statuses by controller.statuses.collectAsState()
-    val storageLimitGb by controller.storageLimitGb.collectAsState()
     val removals by controller.removals.collectAsState()
     val recentlyDeleted by controller.recentlyDeleted.collectAsState()
     val downloadsState by downloads.collectAsState()
@@ -64,7 +60,6 @@ internal fun AutoDownloadSection(
             hasRules = rules.isNotEmpty(),
             hasAutoDownloads = downloadsState.items.any { it.autoDownloadRuleKey != null },
             hasRecentlyDeleted = recentlyDeletedShown(recentlyDeleted, nowEpochMs()).isNotEmpty(),
-            storageLimitGb = storageLimitGb,
         )
     ) {
         return
@@ -72,8 +67,6 @@ internal fun AutoDownloadSection(
     val tokens = MaterialTheme.nuvio
     val checkingText = stringResource(Res.string.downloads_auto_checking_toast)
     val checkNowText = stringResource(Res.string.downloads_auto_check_now)
-    // The profile the storage limit picker was opened for, while it is open.
-    var storageLimitPickerProfileId by remember { mutableStateOf<Int?>(null) }
     // The rule whose dialog is open, with the profile it was opened for.
     var ruleToEdit by remember { mutableStateOf<Pair<Int, String>?>(null) }
     // The episode "Delete now" asks about, with the profile it was pressed for, until it is answered.
@@ -107,12 +100,6 @@ internal fun AutoDownloadSection(
                 Text(text = checkNowText, style = MaterialTheme.typography.labelLarge)
             }
         }
-        SeasonDownloadChoiceRow(
-            title = stringResource(Res.string.downloads_auto_storage_limit),
-            description = stringResource(Res.string.downloads_auto_storage_limit_profile_description),
-            value = autoDownloadStorageLimitLabel(storageLimitGb),
-            onClick = { storageLimitPickerProfileId = profileId },
-        )
         if (rules.isEmpty()) {
             Text(
                 text = stringResource(Res.string.downloads_auto_no_rules),
@@ -170,15 +157,18 @@ internal fun AutoDownloadSection(
                 } else {
                     pluralStringResource(Res.plurals.downloads_auto_pending_in_hours, hoursLeft, hoursLeft)
                 }
-                val keepDescription = stringResource(Res.string.downloads_auto_keep_description, item.title, season, episode)
-                val deleteDescription = stringResource(Res.string.downloads_auto_delete_now_description, item.title, season, episode)
+                val keepDescription = if (item.isEpisode) stringResource(Res.string.downloads_auto_keep_description, item.title, season, episode)
+                else stringResource(Res.string.downloads_keep_description, item.title)
+                val deleteDescription = if (item.isEpisode) stringResource(Res.string.downloads_auto_delete_now_description, item.title, season, episode)
+                else stringResource(Res.string.downloads_movie_delete_now_description, item.title)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = stringResource(Res.string.downloads_auto_pending_row, item.title, season, episode, due),
+                        text = if (item.isEpisode) stringResource(Res.string.downloads_auto_pending_row, item.title, season, episode, due)
+                        else stringResource(Res.string.downloads_movie_removal_row, item.title, due),
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.bodyMedium,
                         color = tokens.colors.textPrimary,
@@ -214,7 +204,9 @@ internal fun AutoDownloadSection(
                     pluralStringResource(Res.plurals.downloads_auto_recent_days_ago, days, days)
                 }
                 Text(
-                    text = stringResource(
+                    text = if (entry.seasonNumber == null || entry.episodeNumber == null) {
+                        stringResource(Res.string.downloads_movie_removal_row, entry.title, ago)
+                    } else stringResource(
                         Res.string.downloads_auto_recent_row,
                         entry.title,
                         entry.seasonNumber ?: 0,
@@ -254,8 +246,12 @@ internal fun AutoDownloadSection(
 
     deletionToConfirm?.let { (confirmProfileId, item) ->
         NuvioStatusModal(
-            title = stringResource(Res.string.downloads_auto_delete_now_title),
-            message = stringResource(
+            title = stringResource(if (item.isEpisode) Res.string.downloads_auto_delete_now_title else Res.string.downloads_movie_delete_now_title),
+            message = if (!item.isEpisode) stringResource(
+                if (controller.usesSystemTrash) Res.string.downloads_movie_delete_now_message_trash
+                else Res.string.downloads_movie_delete_now_message_held,
+                item.title,
+            ) else stringResource(
                 if (controller.usesSystemTrash) {
                     Res.string.downloads_auto_delete_now_message_trash
                 } else {
@@ -276,35 +272,21 @@ internal fun AutoDownloadSection(
             onDismiss = { deletionToConfirm = null },
         )
     }
-
-    storageLimitPickerProfileId?.let { pickerProfileId ->
-        DownloadChoiceDialog(
-            title = stringResource(Res.string.downloads_auto_storage_limit),
-            options = AutoDownloadStore.storageLimitOptionsGb,
-            selected = storageLimitGb,
-            label = { autoDownloadStorageLimitLabel(it) },
-            onSelect = {
-                controller.setStorageLimit(pickerProfileId, it)
-                storageLimitPickerProfileId = null
-            },
-            onDismiss = { storageLimitPickerProfileId = null },
-        )
-    }
 }
 
 private const val MillisPerMinute = 60_000L
 
 /**
  * Whether the auto-download section is on the Downloads screen. It is when a rule exists, and also
- * when automatic downloads still exist or were deleted recently, or the storage limit was changed
- * from its default, so that the limit and the history stay reachable after the last rule is off.
+ * when automatic downloads still exist or were deleted recently, so the history stays reachable
+ * after the last rule is off. The storage limit lives on the storage summary, so a changed limit
+ * alone does not keep this section on screen above the list.
  */
 internal fun autoDownloadSectionShown(
     hasRules: Boolean,
     hasAutoDownloads: Boolean,
     hasRecentlyDeleted: Boolean,
-    storageLimitGb: Int?,
-): Boolean = hasRules || hasAutoDownloads || hasRecentlyDeleted || storageLimitGb != AutoDownloadStore.DefaultStorageLimitGb
+): Boolean = hasRules || hasAutoDownloads || hasRecentlyDeleted
 
 @Composable
 internal fun autoDownloadStorageLimitLabel(limitGb: Int?): String =

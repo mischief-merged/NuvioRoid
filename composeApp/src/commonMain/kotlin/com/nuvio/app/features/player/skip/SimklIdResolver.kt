@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.skip
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.simkl.SIMKL_API_BASE_URL
 import com.nuvio.app.features.simkl.SimklConfig
 import kotlinx.serialization.json.Json
@@ -31,9 +32,9 @@ internal object SimklIdResolver {
         val tvdbEpisode: Int
     )
 
-    private val idsCache = HashMap<String, ResolvedIds?>()
-    private val episodeCache = HashMap<Long, List<EpisodeMapping>>()
-    private val animeSeasonCache = HashMap<String, List<AnimeSeasonEntry>>()
+    private val idsCache = BoundedCache<String, ResolvedIds?>()
+    private val episodeCache = BoundedCache<Long, List<EpisodeMapping>>()
+    private val animeSeasonCache = BoundedCache<String, List<AnimeSeasonEntry>>()
 
     private fun commonParams(): String {
         val clientId = SimklConfig.CLIENT_ID

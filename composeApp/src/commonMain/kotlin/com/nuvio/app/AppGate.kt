@@ -1,5 +1,6 @@
 package com.nuvio.app
 
+import com.nuvio.app.features.settings.PreloadAppBrandWordmark
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -24,6 +26,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.controller.ControllerFocusEngine
+import com.nuvio.app.controller.ControllerManager
+import com.nuvio.app.controller.ControllerScreenContext
+import com.nuvio.app.controller.ControllerScreenType
 import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.auth.DeviceSessionRegistration
@@ -122,6 +128,7 @@ internal fun AppGate(
     nativeProfileSwitcherController: NativeProfileSwitcherController?,
     appGateController: AppGateController?,
 ) {
+    PreloadAppBrandWordmark()
     if (bypassAppGate) {
         MainAppContent(
             initialTab = initialTab,
@@ -369,17 +376,19 @@ internal fun AppGate(
 
         when (authState) {
             is AuthState.Loading -> {
-                if (hasCachedProfileAccess) {
+                if (!isDesktop && hasCachedProfileAccess) {
                     enterProfileGate(cachedProfiles, syncOnEnter = false)
                 } else {
                     gateScreen = AppGateScreen.Loading.name
                 }
             }
             is AuthState.Unauthenticated -> {
-                if (allowCachedProfileAccess) {
+                if (!isDesktop && allowCachedProfileAccess) {
                     enterProfileGate(cachedProfiles, syncOnEnter = false)
                 } else {
-                    ProfileRepository.clearInMemory()
+                    if (!isDesktop) {
+                        ProfileRepository.clearInMemory()
+                    }
                     profileSelectionLoading = false
                     profileSelectionTransitionActive = false
                     gateScreen = AppGateScreen.Auth.name
@@ -389,7 +398,10 @@ internal fun AppGate(
                 val authenticatedState = authState as AuthState.Authenticated
                 ProfileRepository.ensureLoaded(authenticatedState.userId)
                 if (gateScreen == AppGateScreen.Loading.name || gateScreen == AppGateScreen.Auth.name) {
-                    enterProfileGate(ProfileRepository.state.value.profiles, syncOnEnter = true)
+                    enterProfileGate(
+                        ProfileRepository.state.value.profiles,
+                        syncOnEnter = !isDesktop || !authenticatedState.isAnonymous,
+                    )
                 }
             }
         }
@@ -398,7 +410,9 @@ internal fun AppGate(
     LaunchedEffect((authState as? AuthState.Authenticated)?.userId) {
         val authenticatedState = authState as? AuthState.Authenticated ?: return@LaunchedEffect
         ProfileRepository.ensureLoaded(authenticatedState.userId)
-        ProfileRepository.pullProfiles()
+        if (!isDesktop || !authenticatedState.isAnonymous) {
+            ProfileRepository.pullProfiles()
+        }
     }
 
     LaunchedEffect(
@@ -414,8 +428,10 @@ internal fun AppGate(
             autoSkipProfileSelection &&
             gateScreen == AppGateScreen.ProfileSelection.name
         ) {
+            val shouldSyncOnAutoSkip =
+                if (isDesktop) (authState as? AuthState.Authenticated)?.isAnonymous == false else true
             rememberedStartupProfile(profileState.profiles)?.let { profile ->
-                selectProfile(profile, sync = true)
+                selectProfile(profile, sync = shouldSyncOnAutoSkip)
                 gateScreen = AppGateScreen.Main.name
                 autoSkipProfileSelection = false
                 return@LaunchedEffect
@@ -426,7 +442,7 @@ internal fun AppGate(
             val onlyProfile = profileState.profiles.first()
             if (onlyProfile.pinEnabled) return@LaunchedEffect
 
-            selectProfile(onlyProfile, sync = true)
+            selectProfile(onlyProfile, sync = shouldSyncOnAutoSkip)
             gateScreen = AppGateScreen.Main.name
             autoSkipProfileSelection = false
         }
@@ -582,6 +598,25 @@ internal fun AppGate(
                 .zIndex(NuvioTokens.Z.dialog),
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
+                // The picker is a Compose-owned screen: keep the spatial engine out of it so its
+                // selection never activates items on the main content hidden underneath the gate.
+                DisposableEffect(Unit) {
+                    ControllerFocusEngine.deferNavigationToCompose = true
+                    ControllerFocusEngine.clearFocus()
+                    val previousContext = ControllerManager.screenContext.value
+                    ControllerManager.updateScreenContext(
+                        ControllerScreenContext(
+                            screenType = ControllerScreenType.ProfileSelection,
+                            canNavigateBack = !autoSkipProfileSelection,
+                            selectLabel = "Select",
+                            backLabel = if (!autoSkipProfileSelection) "Back" else "Home",
+                        ),
+                    )
+                    onDispose {
+                        ControllerFocusEngine.deferNavigationToCompose = false
+                        ControllerManager.updateScreenContext(previousContext)
+                    }
+                }
                 val onBack: (() -> Unit)? = if (!autoSkipProfileSelection) {
                     {
                         skipProfileSelectionEnterAnimation = false
@@ -607,7 +642,11 @@ internal fun AppGate(
                             gateScope.launch {
                                 selectProfile(
                                     profile = profile,
-                                    sync = authState is AuthState.Authenticated,
+                                    sync = if (isDesktop) {
+                                        (authState as? AuthState.Authenticated)?.isAnonymous == false
+                                    } else {
+                                        authState is AuthState.Authenticated
+                                    },
                                 )
                                 gateScreen = AppGateScreen.Main.name
                                 if (!renderMainContent) {

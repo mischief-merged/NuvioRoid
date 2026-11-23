@@ -1,6 +1,7 @@
 package com.nuvio.app.features.downloads
 
-import com.nuvio.app.features.addons.httpGetTextWithHeaders
+import com.nuvio.app.core.memory.SharedLookup
+import com.nuvio.app.features.addons.httpGetSubtitleText
 import com.nuvio.app.features.player.PlayerSubtitleCueParser
 import com.nuvio.app.features.player.AddonSubtitle
 import com.nuvio.app.features.player.loadAddonSubtitles
@@ -13,11 +14,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.atomicfu.locks.SynchronizedObject
-import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -39,7 +36,7 @@ internal object DownloadSubtitles {
 
     /** Fetches the text of a subtitle. Replaced in tests. */
     internal var fetchText: suspend (url: String, headers: Map<String, String>) -> String =
-        { url, headers -> httpGetTextWithHeaders(url, headers) }
+        { url, headers -> httpGetSubtitleText(url, headers) }
 
     /** Asks the subtitle add-ons. Replaced in tests. */
     internal var loadAddon: suspend (List<SubtitleAddonRequest>) -> List<AddonSubtitle> =
@@ -114,15 +111,12 @@ internal object DownloadSubtitles {
         guardedWrite: (action: () -> Unit) -> Boolean = { it(); true },
     ): SubtitleSaveResult = withContext(Dispatchers.Default) {
         // One run per video at a time: a second request waits, then finds little or nothing left to do.
-        runMutex(localVideoUri).withLock { prepareOnce(item, localVideoUri, recheck, nowEpochMs, guardedWrite) }
+        runs.sequential(localVideoUri.trim().removePrefix("file:").trimStart('/')) {
+            prepareOnce(item, localVideoUri, recheck, nowEpochMs, guardedWrite)
+        }
     }
 
-    private val runsGuard = SynchronizedObject()
-    private val runs = mutableMapOf<String, Mutex>()
-
-    private fun runMutex(localVideoUri: String): Mutex = synchronized(runsGuard) {
-        runs.getOrPut(localVideoUri.trim().removePrefix("file:").trimStart('/')) { Mutex() }
-    }
+    private val runs = SharedLookup<String, SubtitleSaveResult>()
 
     private suspend fun prepareOnce(
         item: DownloadItem,

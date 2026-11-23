@@ -4,7 +4,7 @@ import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
 
 internal actual object StreamLinkCacheStorage {
-    private val store = DesktopStorage.store("nuvio_stream_link_cache")
+    private val store = DesktopStorage.store("nuvio_stream_link_cache", cacheEntries = 128)
 
     actual fun loadEntry(hashedKey: String): String? =
         store.getString(ProfileScopedKey.of(hashedKey))

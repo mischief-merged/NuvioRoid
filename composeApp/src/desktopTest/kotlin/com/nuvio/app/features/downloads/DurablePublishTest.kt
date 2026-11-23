@@ -23,6 +23,29 @@ class DurablePublishTest {
 
     private fun part(text: String) = dir.resolve("film.mp4.part").also { Files.writeString(it, text) }
 
+    @Test fun the_published_address_is_saved_before_the_partial_name_is_removed() {
+        val part = part("every byte")
+        var saves = 0
+        val published = publishDurably(part, dir.resolve("film.mp4"), flushFolder = { true }, beforeRemovingPartial = { path ->
+            saves++
+            assertTrue(part.exists())
+            assertEquals("every byte", Files.readString(path))
+            true
+        })
+        assertEquals(1, saves)
+        assertFalse(part.exists())
+        assertEquals("every byte", Files.readString(published))
+    }
+
+    @Test fun an_unsaved_published_address_keeps_both_files_intact() {
+        val part = part("every byte")
+        assertFailsWith<DownloadNotDurable> {
+            publishDurably(part, dir.resolve("film.mp4"), flushFolder = { true }, beforeRemovingPartial = { false })
+        }
+        assertEquals("every byte", Files.readString(part))
+        assertEquals("every byte", Files.readString(dir.resolve("film.mp4")))
+    }
+
     @Test
     fun the_final_name_appears_and_the_partial_name_goes_only_after_the_folder_was_flushed() {
         val part = part("the film")

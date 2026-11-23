@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
  * Review 5 follow-up, 2b: the downloader resumes, cuts back or removes only a partial file it created, proven
  * by the identity it recorded then; and removes a just-published file only while it is still that file.
  */
-class PartialOwnershipTest {
+class PartialOwnershipTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val dir = Files.createTempDirectory("nuvio-partial-own").toRealPath()
     private val payload = Random(7).nextBytes(64 * 1024)
     private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -62,12 +62,12 @@ class PartialOwnershipTest {
 
     @Test
     fun a_partial_that_cannot_be_continued_is_kept_when_the_fresh_download_is_refused_for_lack_of_room() {
-        // The source answers a resume request with the whole file, so the partial would be started over.
+        // The source answers a resume request with the whole file, so the partial cannot be continued.
         val part = dir.resolve("Film.mkv.part").also { Files.write(it, ByteArray(10) { 1 }) }
         val before = DownloadsPlatformDownloader.freeBytesProvider
         DownloadsPlatformDownloader.freeBytesProvider = { 100L }
         try {
-            assertFailsWith<IllegalStateException> {
+            assertFailsWith<NeedsReplacementPartial> {
                 runBlocking { DownloadsPlatformDownloader.transferToTempFile(request("Film.mkv"), part.toFile(), { _, _ -> }, limiter()) }
             }
         } finally {
@@ -78,17 +78,19 @@ class PartialOwnershipTest {
     }
 
     @Test
-    fun the_room_a_discarded_partial_gives_back_counts_towards_the_fresh_download() {
+    fun a_partial_is_kept_when_deleting_it_would_have_made_room() {
         val part = dir.resolve("Film.mkv.part").also { Files.write(it, ByteArray(1024) { 1 }) }
         val before = DownloadsPlatformDownloader.freeBytesProvider
         DownloadsPlatformDownloader.freeBytesProvider = { payload.size - 1024L }
         try {
-            runBlocking { DownloadsPlatformDownloader.transferToTempFile(request("Film.mkv"), part.toFile(), { _, _ -> }, limiter()) }
+            assertFailsWith<NeedsReplacementPartial> {
+                runBlocking { DownloadsPlatformDownloader.transferToTempFile(request("Film.mkv"), part.toFile(), { _, _ -> }, limiter()) }
+            }
         } finally {
             DownloadsPlatformDownloader.freeBytesProvider = before
         }
 
-        assertContentEquals(payload, Files.readAllBytes(part))
+        assertContentEquals(ByteArray(1024) { 1 }, Files.readAllBytes(part))
     }
 
     @Test
@@ -101,9 +103,11 @@ class PartialOwnershipTest {
 
         assertContentEquals(payload, Files.readAllBytes(part))
         assertEquals(listOf(DownloadMover.identityOf(part)), recorded)
-        // A restart from nothing removes only that file, proven by the recorded identity.
+        // A later transfer does not write over that partial. It stays, and the caller starts another file.
         val again = OwnedPartial(recorded.single())
-        runBlocking { DownloadsPlatformDownloader.transferToTempFile(request("Film.mkv"), part.toFile(), { _, _ -> }, limiter(), again) }
+        assertFailsWith<NeedsReplacementPartial> {
+            runBlocking { DownloadsPlatformDownloader.transferToTempFile(request("Film.mkv"), part.toFile(), { _, _ -> }, limiter(), again) }
+        }
         assertContentEquals(payload, Files.readAllBytes(part))
     }
 

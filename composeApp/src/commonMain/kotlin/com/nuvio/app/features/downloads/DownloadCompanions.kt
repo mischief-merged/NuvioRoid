@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.core.network.NetworkStatusRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
@@ -116,7 +117,7 @@ internal class DownloadCompanions(
     private val io: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val lock = SynchronizedObject()
-    private val failedAt = mutableMapOf<String, Long>()
+    private val failedAt = BoundedCache<String, Long>()
     private var backfillRunning = false
 
     /** Starts saving what a download that just finished lacks. Returns at once. */

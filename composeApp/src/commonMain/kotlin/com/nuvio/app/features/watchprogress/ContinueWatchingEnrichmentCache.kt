@@ -1,5 +1,6 @@
 package com.nuvio.app.features.watchprogress
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.features.tracking.WatchProgressSource
 import kotlinx.atomicfu.locks.SynchronizedObject
@@ -78,8 +79,8 @@ internal object ContinueWatchingEnrichmentCache {
 
     private const val storageKey = "cw_enrichment_cache"
     private val cacheLock = SynchronizedObject()
-    private val cachedPayloads = mutableMapOf<CacheScope, CachedEnrichmentPayload?>()
-    private val migratedLegacyProfileIds = mutableSetOf<Int>()
+    private val cachedPayloads = BoundedCache<CacheScope, CachedEnrichmentPayload?>()
+    private val migratedLegacyProfileIds = BoundedCache<Int, Unit>()
     private val _generation = MutableStateFlow(0)
     val generation: StateFlow<Int> = _generation.asStateFlow()
 
@@ -179,7 +180,7 @@ internal object ContinueWatchingEnrichmentCache {
         source: WatchProgressSource,
     ): CachedEnrichmentPayload? = synchronized(cacheLock) {
         val scope = CacheScope(profileId = profileId, source = source)
-        if (cachedPayloads.containsKey(scope)) return@synchronized cachedPayloads[scope]
+        cachedPayloads.lookup(scope)?.let { return@synchronized it.value }
         removeLegacyPayloadOnce(profileId)
         val raw = ContinueWatchingEnrichmentStorage.loadPayload(
             continueWatchingEnrichmentStorageKey(profileId = profileId, source = source),
@@ -201,7 +202,7 @@ internal object ContinueWatchingEnrichmentCache {
     }
 
     private fun removeLegacyPayloadOnce(profileId: Int) {
-        if (!migratedLegacyProfileIds.add(profileId)) return
+        if (migratedLegacyProfileIds.put(profileId, Unit) != null) return
         ContinueWatchingEnrichmentStorage.removePayload(legacyStorageKey(profileId))
     }
 

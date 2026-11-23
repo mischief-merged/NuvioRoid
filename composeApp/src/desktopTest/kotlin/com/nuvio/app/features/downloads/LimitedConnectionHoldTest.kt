@@ -25,7 +25,7 @@ private val lowData = NetworkPathReport.Known(expensive = false, constrained = t
 private val home = NetworkPathReport.Known(expensive = false, constrained = false, networkKey = pathKey("en0/wifi", "192.168.1.1@aa:bb:cc:00:00:05"))
 
 /** The rule alone: when the connection hold holds, and what ends a "Download anyway". */
-class ConnectionHoldRuleTest {
+class ConnectionHoldRuleTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun an_unknown_path_never_holds() {
         val hold = ConnectionHold()
@@ -119,12 +119,12 @@ class ConnectionHoldRuleTest {
         hold.listen { calls++ }
         hold.report(home)
         hold.report(home)
-        assertEquals(0, calls, "nothing changed for a regular network")
+        assertEquals(1, calls, "the current network can now be remembered")
         hold.report(hotspot)
         hold.report(hotspot)
-        assertEquals(1, calls)
-        hold.setEnabled(false)
         assertEquals(2, calls)
+        hold.setEnabled(false)
+        assertEquals(3, calls)
     }
 
     @Test
@@ -272,6 +272,42 @@ class LimitedConnectionDownloadsTest {
     private fun item(id: String) = DownloadsRepository.uiState.value.items.single { it.id == id }
 
     @Test
+    fun travel_pauses_automatic_transfers_keeps_partials_and_allows_manual_downloads() {
+        val automatic = enqueue(1, autoRule = "rule")
+        backend.progress.getValue(automatic)(1234, 10_000)
+        val manual = enqueue(2)
+        hold.setTravelEnabled(true)
+        assertEquals(DownloadStatus.Paused, item(automatic).status)
+        assertEquals(1234L, item(automatic).downloadedBytes)
+        assertEquals(DownloadStatus.Downloading, item(manual).status)
+        val queued = enqueue(3, autoRule = "rule")
+        assertEquals(0, backend.startsOf(queued))
+        hold.setTravelEnabled(false)
+        assertEquals(2, backend.startsOf(automatic))
+        assertEquals(1, backend.startsOf(queued))
+        assertTrue(backend.partialsRemoved.isEmpty())
+    }
+
+    @Test
+    fun sleep_stops_transfers_and_a_new_hotspot_keeps_them_paused_after_wake() {
+        val id = enqueue(1)
+        backend.progress.getValue(id)(4321, 10_000)
+        hold.beginNetworkRecheck()
+        val applied = java.util.concurrent.CountDownLatch(1)
+        ConnectionUpdates.submit { applied.countDown() }
+        assertTrue(applied.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertEquals(DownloadStatus.Paused, item(id).status)
+        DownloadsRepository.resumeDownload(id)
+        assertEquals(1, backend.startsOf(id))
+        hold.report(hotspot)
+        assertEquals(1, backend.startsOf(id))
+        hold.report(home)
+        assertEquals(2, backend.startsOf(id))
+        assertEquals(4321L, backend.partials.getValue(id))
+        assertTrue(backend.partialsRemoved.isEmpty())
+    }
+
+    @Test
     fun on_a_limited_connection_a_new_download_waits_instead_of_starting() {
         hold.report(hotspot)
         val id = enqueue(1)
@@ -396,18 +432,25 @@ class LimitedConnectionDownloadsTest {
         val release = java.util.concurrent.CountDownLatch(1)
         // The check of the finished file runs outside the lock; the hold arrives in the middle of it.
         DownloadsRepository.backend = object : DownloadsBackend by backend {
+            override fun inspectFile(localFileUri: String) =
+                DownloadedFileFacts(exists = true, sizeBytes = 300_000_000L, isVideoContainer = true)
             override fun sampleFrames(localFileUri: String): FrameSamples? {
                 finishing.countDown()
                 release.await(10, java.util.concurrent.TimeUnit.SECONDS)
                 return null
             }
         }
-        val finisher = Thread { backend.success.getValue(id)("file:/tmp/e1.mkv", 10L) }.apply { start() }
-        assertTrue(finishing.await(10, java.util.concurrent.TimeUnit.SECONDS))
-
-        hold.report(hotspot)
-        release.countDown()
-        finisher.join(10_000)
+        val previousRuntime = downloadRuntimeLookup
+        downloadRuntimeLookup = { 45 }
+        val finisher = Thread { backend.success.getValue(id)("file:/tmp/e1.mkv", 300_000_000L) }.apply { start() }
+        try {
+            assertTrue(finishing.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            hold.report(hotspot)
+        } finally {
+            release.countDown()
+            finisher.join(10_000)
+            downloadRuntimeLookup = previousRuntime
+        }
 
         assertTrue(backend.cancelled.isEmpty(), "a finished file was stopped while it was checked")
         assertEquals(DownloadStatus.Completed, item(id).status)
@@ -469,7 +512,7 @@ class LimitedConnectionDownloadsTest {
 }
 
 /** The hold over the real desktop downloader and a slow local server: the bytes of a paused transfer are kept and continued. */
-class LimitedConnectionRealTransferTest {
+class LimitedConnectionRealTransferTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private class RealDownloaderBackend : DownloadsBackend {
         @Volatile
         var payload: String? = null

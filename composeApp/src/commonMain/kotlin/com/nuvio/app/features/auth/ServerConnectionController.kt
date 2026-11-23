@@ -1,13 +1,12 @@
 package com.nuvio.app.features.auth
 
 import com.nuvio.app.core.auth.AuthRepository
-import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.network.ServerConfiguration
 import com.nuvio.app.core.network.ServerConfigurationRepository
 import com.nuvio.app.core.network.ServerDiscoveryException
 import com.nuvio.app.core.network.ServerDiscoveryFailure
 import com.nuvio.app.core.network.ServerDiscoveryService
-import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.isDesktop
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -24,6 +23,18 @@ enum class ServerSwitchFailure {
     Save,
     Restart,
 }
+
+internal sealed interface ServerSwitchResult {
+    data object Completed : ServerSwitchResult
+    data object Cancelled : ServerSwitchResult
+    data class Failed(val reason: ServerSwitchFailure) : ServerSwitchResult
+}
+
+internal class ServerSwitchStageException(
+    val failure: ServerSwitchFailure,
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
 
 data class ServerConnectionUiState(
     val activeServer: ServerConfiguration = ServerConfigurationRepository.active.value,
@@ -74,12 +85,18 @@ object ServerConnectionController {
 
     fun connectDiscovered() {
         val server = _state.value.discoveredServer ?: return
-        switchServer { ServerConfigurationRepository.saveCustom(server) }
+        switchServer(
+            desktopSave = { ServerConfigurationRepository.stageCustom(server) },
+            mobileSave = { ServerConfigurationRepository.saveCustom(server) },
+        )
     }
 
     fun useOfficial() {
         if (!_state.value.activeServer.isCustom) return
-        switchServer(ServerConfigurationRepository::useOfficial)
+        switchServer(
+            desktopSave = ServerConfigurationRepository::stageOfficial,
+            mobileSave = ServerConfigurationRepository::useOfficial,
+        )
     }
 
     fun resetDiscovery() {
@@ -88,6 +105,7 @@ object ServerConnectionController {
         discoveryJob = null
         _state.update {
             it.copy(
+                activeServer = ServerConfigurationRepository.active.value,
                 isDiscovering = false,
                 discoveredServer = null,
                 failure = null,
@@ -97,27 +115,38 @@ object ServerConnectionController {
         }
     }
 
-    private fun switchServer(save: () -> Boolean) {
+    private fun switchServer(
+        desktopSave: () -> Boolean,
+        mobileSave: () -> Boolean,
+    ) {
         if (_state.value.isSwitching) return
         scope.launch {
             _state.update { it.copy(isSwitching = true, failure = null, switchFailure = null) }
             try {
-                if (AuthRepository.prepareForServerSwitch().isFailure) {
-                    _state.update {
-                        it.copy(isSwitching = false, switchFailure = ServerSwitchFailure.SessionClear)
+                when (
+                    val outcome = AuthRepository.switchServerSerialized(
+                        stageOnlyForRestart = isDesktop,
+                        saveConfiguration = if (isDesktop) desktopSave else mobileSave,
+                    )
+                ) {
+                    ServerSwitchResult.Completed -> {
+                        _state.value = ServerConnectionUiState(
+                            activeServer = ServerConfigurationRepository.active.value,
+                        )
                     }
-                    return@launch
+                    ServerSwitchResult.Cancelled -> {
+                        _state.update {
+                            it.copy(
+                                activeServer = ServerConfigurationRepository.active.value,
+                                isSwitching = false,
+                                switchFailure = null,
+                            )
+                        }
+                    }
+                    is ServerSwitchResult.Failed -> {
+                        _state.update { it.copy(isSwitching = false, switchFailure = outcome.reason) }
+                    }
                 }
-                if (!save()) {
-                    _state.update { it.copy(isSwitching = false, switchFailure = ServerSwitchFailure.Save) }
-                    return@launch
-                }
-                SupabaseProvider.reset()
-                AuthRepository.reinitialize()
-                NetworkStatusRepository.requestRefresh(force = true)
-                _state.value = ServerConnectionUiState(
-                    activeServer = ServerConfigurationRepository.active.value,
-                )
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Throwable) {

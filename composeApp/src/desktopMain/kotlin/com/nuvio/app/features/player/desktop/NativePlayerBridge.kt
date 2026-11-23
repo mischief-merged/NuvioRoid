@@ -49,6 +49,20 @@ internal object NativePlayerBridge {
      */
     external fun initGtkEarly(): Boolean
 
+    external fun playbackNetworkIdentity(): String
+    external fun systemTrustPem(): String
+    external fun systemTrustCertificates(): Array<ByteArray>
+    external fun verifyServerCertificates(chain: Array<ByteArray>, hostname: String): Boolean
+    external fun retryUnverified(handle: Long, network: String): Boolean
+    external fun requireVerifiedPlayback()
+    external fun createMac(
+        hostViewPtr: Long, sourceUrl: String, headerLines: Array<String>, playWhenReady: Boolean,
+        initialPositionMs: Long, controlsPageUrl: String, decoderPriority: Int,
+        nvidiaRtxSuperResolutionEnabled: Boolean, inMiniPlayer: Boolean, remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
+        caFile: String, network: String, allowUnverified: Boolean, warning: String,
+    ): Long
+
     external fun create(
         hostViewPtr: Long,
         sourceUrl: String,
@@ -58,8 +72,35 @@ internal object NativePlayerBridge {
         controlsPageUrl: String,
         decoderPriority: Int,
         nvidiaRtxSuperResolutionEnabled: Boolean,
+        nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
+
+    /** macOS only: applies [inMiniPlayer] and [remoteCommandsEnabled] inside init before initial focus or activation. */
+    external fun createMacos(
+        hostViewPtr: Long,
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        controlsPageUrl: String,
+        decoderPriority: Int,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+
+    external fun createHeadlessMacosForTest(
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        inMiniPlayer: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+    external fun activeSyncTimerIntervalSecondsForTest(handle: Long): Double
+    external fun attemptedInitialFocusForTest(handle: Long): Boolean
+    external fun lastNowPlayingRateForTest(handle: Long): Double
 
     /**
      * macOS only. Takes 32 by 32 grey pictures of the local video [path] at [fractions] of its duration
@@ -82,6 +123,12 @@ internal object NativePlayerBridge {
 
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
     external fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
+
+    /** macOS only: enables or releases remote media-key and Now Playing ownership for this player. */
+    external fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean)
+
+    /** macOS only: marks docked mini-player mode so native layout and background timers adapt cleanly. */
+    external fun setMiniPlayerMode(handle: Long, inMiniPlayer: Boolean)
     external fun requestFocus(handle: Long)
     external fun beginWindowDrag(handle: Long)
     external fun setWindowResizable(windowHwnd: Long, enabled: Boolean)
@@ -113,6 +160,21 @@ internal object NativePlayerBridge {
     external fun setAudioLanguages(handle: Long, languages: String)
     external fun selectSubtitleTrack(handle: Long, trackId: Int)
     external fun addSubtitleUrl(handle: Long, url: String)
+    external fun addSubtitleTrack(
+        handle: Long,
+        url: String,
+        title: String,
+        language: String,
+        select: Boolean,
+    )
+    external fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    )
     external fun clearExternalSubtitles(handle: Long)
     external fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int)
     external fun applyWindowChrome(
@@ -152,6 +214,7 @@ internal object NativePlayerBridge {
         fontsDir: String,
         shadowColor: String,
         shadowOffset: Float,
+        shadowBlur: Float,
     )
     external fun warmupWebView2(controlsPageUrl: String): Boolean
     external fun shutdownWebView2Warmup()

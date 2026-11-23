@@ -25,6 +25,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.gestures.stopScroll
@@ -34,9 +35,13 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -50,14 +55,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.home_view_all
+import nuvio.composeapp.generated.resources.poster_image_retry
 import nuvio.composeapp.generated.resources.poster_logo_content_description
 import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
@@ -73,6 +82,9 @@ enum class NuvioViewAllPillSize {
     Default,
     Compact,
 }
+
+/** Stable per-row group key so spatial Up/Down can jump between shelves predictably. */
+private var nextShelfGroupId = 1L
 
 @Composable
 fun <T> NuvioShelfSection(
@@ -95,52 +107,59 @@ fun <T> NuvioShelfSection(
     val duplicateSafeEntries = remember(entries, key) {
         key?.let { entries.withDuplicateSafeLazyKeys(it) }
     }
+    val shelfGroupKey = remember { "shelf_${nextShelfGroupId++}" }
 
     ScreenActivityEffect(state) { active ->
         if (!active) state.stopScroll()
     }
-    Column(
-        modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(tokens.spacing.controlGap + NuvioTokens.Space.s2),
-    ) {
-        if (title.isNotBlank()) {
-            NuvioShelfSectionHeader(
-                title = title,
-                modifier = Modifier.padding(horizontal = headerHorizontalPadding),
-                onViewAllClick = onViewAllClick,
-                onTitleClick = onTitleClick,
-                viewAllPillSize = viewAllPillSize,
-            )
-        }
-        LazyRow(
-            state = state,
-            modifier = rowModifier
-                .nuvioHorizontalScrollBleed(LocalVerticalBarPadding.current)
-                .nuvioDesktopDragScroll(state),
-            contentPadding = rowContentPadding.withVerticalBar(),
-            horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+    com.nuvio.app.controller.ProvideControllerRowLazyListState(state) {
+        androidx.compose.runtime.CompositionLocalProvider(
+            com.nuvio.app.controller.LocalControllerGroupKey provides shelfGroupKey,
         ) {
-            if (duplicateSafeEntries != null) {
-                items(
-                    items = duplicateSafeEntries,
-                    key = { entry -> entry.lazyKey },
-                    contentType = { "poster" },
-                ) { keyedEntry ->
-                    if (animatePlacement) {
-                        Box(modifier = Modifier.animateItem()) { itemContent(keyedEntry.value) }
-                    } else {
-                        itemContent(keyedEntry.value)
-                    }
+            Column(
+                modifier = modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(tokens.spacing.controlGap + NuvioTokens.Space.s2),
+            ) {
+                if (title.isNotBlank()) {
+                    NuvioShelfSectionHeader(
+                        title = title,
+                        modifier = Modifier.padding(horizontal = headerHorizontalPadding),
+                        onViewAllClick = onViewAllClick,
+                        onTitleClick = onTitleClick,
+                        viewAllPillSize = viewAllPillSize,
+                    )
                 }
-            } else {
-                items(
-                    items = entries,
-                    contentType = { "poster" },
-                ) { entry ->
-                    if (animatePlacement) {
-                        Box(modifier = Modifier.animateItem()) { itemContent(entry) }
+                LazyRow(
+                    state = state,
+                    modifier = rowModifier
+                        .nuvioHorizontalScrollBleed(LocalVerticalBarPadding.current)
+                        .nuvioDesktopDragScroll(state),
+                    contentPadding = rowContentPadding.withVerticalBar(),
+                    horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+                ) {
+                    if (duplicateSafeEntries != null) {
+                        itemsIndexed(
+                            items = duplicateSafeEntries,
+                            key = { _, entry -> entry.lazyKey },
+                            contentType = { _, _ -> "poster" },
+                        ) { _, keyedEntry ->
+                            if (animatePlacement) {
+                                Box(modifier = Modifier.animateItem()) { itemContent(keyedEntry.value) }
+                            } else {
+                                itemContent(keyedEntry.value)
+                            }
+                        }
                     } else {
-                        itemContent(entry)
+                        itemsIndexed(
+                            items = entries,
+                            contentType = { _, _ -> "poster" },
+                        ) { _, entry ->
+                            if (animatePlacement) {
+                                Box(modifier = Modifier.animateItem()) { itemContent(entry) }
+                            } else {
+                                itemContent(entry)
+                            }
+                        }
                     }
                 }
             }
@@ -243,6 +262,8 @@ fun NuvioPosterCard(
     bottomLeftLogoUrl: String? = null,
     bottomLeftText: String? = null,
     isWatched: Boolean = false,
+    isAvailableOffline: Boolean = false,
+    isUnavailableOffline: Boolean = false,
     onClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
 ) {
@@ -261,6 +282,7 @@ fun NuvioPosterCard(
         modifier = Modifier
             .desktopPosterHoverScale()
             .then(modifier)
+            .graphicsLayer { alpha = if (isUnavailableOffline) 0.52f else 1f }
             .width(cardWidth),
         verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s6),
     ) {
@@ -280,41 +302,78 @@ fun NuvioPosterCard(
                     zoomImageUrl = imageUrl,
                     zoomCornerRadius = posterCardStyle.cornerRadiusDp.dp,
                     hoverScaleEnabled = false,
+                )
+                .then(
+                    // The name stays when the picture cannot be fetched. A card with no address still has none.
+                    if (!imageUrl.isNullOrBlank()) Modifier.semantics { contentDescription = title }
+                    else Modifier
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            if (imageUrl != null) {
+            var imageAttempt by remember(imageUrl, fallbackImageUrl) { mutableIntStateOf(0) }
+            var imageFailed by remember(imageUrl, fallbackImageUrl, imageAttempt) { mutableStateOf(false) }
+            val showTitleOnFace = posterShowsTitleOnFace(imageUrl, imageFailed)
+            if (imageUrl != null && !imageFailed) {
                 val platformContext = coil3.compose.LocalPlatformContext.current
                 val hasFallback = !fallbackImageUrl.isNullOrBlank() && fallbackImageUrl != imageUrl
-                val imageModel = remember(imageUrl, fallbackImageUrl, platformContext) {
-                    if (hasFallback) {
+                val imageModel = remember(imageUrl, fallbackImageUrl, platformContext, imageAttempt) {
+                    if (!hasFallback && imageAttempt == 0) {
+                        imageUrl
+                    } else {
                         coil3.request.ImageRequest.Builder(platformContext)
                             .data(imageUrl)
-                            .memoryCacheKeyExtras(
-                                mapOf(com.nuvio.app.core.poster.CustomPosterFallbackInterceptor.FALLBACK_URL_KEY to fallbackImageUrl!!)
-                            )
+                            .apply {
+                                if (imageAttempt > 0) {
+                                    memoryCacheKey("$imageUrl#$imageAttempt")
+                                }
+                                if (hasFallback) {
+                                    memoryCacheKeyExtras(
+                                        mapOf(com.nuvio.app.core.poster.CustomPosterFallbackInterceptor.FALLBACK_URL_KEY to fallbackImageUrl!!)
+                                    )
+                                }
+                            }
                             .build()
-                    } else {
-                        imageUrl
                     }
                 }
                 NuvioAsyncImage(
                     model = imageModel,
-                    contentDescription = title,
+                    contentDescription = null,
                     modifier = Modifier.matchParentSize(),
                     contentScale = ContentScale.Crop,
                     desktopAnimation = posterCardStyle.animatedArtworkMode.toDesktopAnimation(),
+                    onError = { imageFailed = true },
                 )
-            } else {
-                Text(
-                    text = title,
+            }
+            if (showTitleOnFace) {
+                Column(
                     modifier = Modifier.padding(horizontal = NuvioTokens.Space.s14),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = tokens.colors.textMuted,
-                    textAlign = TextAlign.Center,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s6),
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = tokens.colors.textMuted,
+                        textAlign = TextAlign.Center,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (!detailLine.isNullOrBlank()) {
+                        Text(
+                            text = detailLine,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = tokens.colors.textMuted,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (!imageUrl.isNullOrBlank() && imageFailed) {
+                        TextButton(onClick = { imageAttempt = nextPosterAttempt(imageAttempt) }) {
+                            Text(text = stringResource(Res.string.poster_image_retry))
+                        }
+                    }
+                }
             }
 
             if (!bottomLeftLogoUrl.isNullOrBlank() || !bottomLeftText.isNullOrBlank()) {
@@ -361,6 +420,7 @@ fun NuvioPosterCard(
                 }
             }
 
+            PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
             NuvioPosterWatchedOverlay(isWatched = isWatched)
         }
         if (shouldShowTitleBelow) {
@@ -409,7 +469,10 @@ private fun NuvioShelfSectionHeader(
                 text = title,
                 modifier = Modifier
                     .weight(1f)
-                    .then(if (onTitleClick != null) Modifier.clickable(onClick = onTitleClick) else Modifier),
+                    .then(if (onTitleClick != null) {
+                        Modifier.nuvioFocusBorder(RoundedCornerShape(NuvioTokens.Radius.md))
+                            .clickable(onClick = onTitleClick)
+                    } else Modifier),
                 style = MaterialTheme.typography.titleLarge,
                 color = tokens.colors.textPrimary,
                 maxLines = 1,
@@ -442,14 +505,14 @@ private fun NuvioViewAllPill(
     val iconSize = if (size == NuvioViewAllPillSize.Compact) NuvioTokens.Icon.sm else tokens.icons.md
     val viewAllText = stringResource(Res.string.home_view_all)
 
+    val pillShape = RoundedCornerShape(NuvioTokens.Radius.xl)
     Box(
         modifier = modifier
             .size(actionSize)
-            .background(
-                color = tokens.colors.surface,
-                shape = RoundedCornerShape(NuvioTokens.Radius.xl),
-            )
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+            .background(color = tokens.colors.surface, shape = pillShape)
+            .then(if (onClick != null) {
+                Modifier.nuvioFocusBorder(pillShape).clickable(onClick = onClick)
+            } else Modifier),
         contentAlignment = Alignment.Center,
     ) {
         Icon(

@@ -40,6 +40,9 @@ import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -92,6 +95,7 @@ import com.nuvio.app.core.ui.dismissNuvioBottomSheet
 import com.nuvio.app.core.ui.withDuplicateSafeLazyKeys
 import com.nuvio.app.core.ui.featherArtwork
 import com.nuvio.app.core.ui.rememberArtworkBackdrop
+import com.nuvio.app.core.ui.platformTouchScroll
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.details.MetaScreenSettingsRepository
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -152,6 +156,11 @@ fun StreamsScreen(
     ) -> Unit = { _, _, _, _ -> },
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    /**
+     * Why the list is open. For [StreamPickPurpose.Download] a tap on a source downloads it in place of
+     * the download that needs another source, the list says so at the top, and nothing in it plays.
+     */
+    pickPurpose: StreamPickPurpose = StreamPickPurpose.Play,
 ) {
     val uiState by StreamsRepository.uiState.collectAsStateWithLifecycle()
     val streamDisplaySettings by remember {
@@ -182,7 +191,7 @@ fun StreamsScreen(
         metaScreenSettings.backgroundMode == MetaScreenBackgroundMode.DominantColor
     remember {
         if (AppFeaturePolicy.downloadsEnabled) {
-            DownloadsRepository.ensureLoaded()
+            DownloadsRepository.ensureLoadedForDisplay()
         }
     }
     val isEpisode = seasonNumber != null && episodeNumber != null
@@ -256,6 +265,47 @@ fun StreamsScreen(
         )
     }
 
+    // The download button, and a tap on a source in download mode: the picked source replaces the
+    // title's download that has no good file.
+    val downloadStream: (StreamItem) -> Unit = { stream ->
+        downloadScope.launch {
+            val outcome = downloadPickedStream(
+                stream = stream,
+                needsResolve = DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream),
+                resolve = { DirectDebridPlaybackResolver.resolveToPlayableStream(stream = it, season = seasonNumber, episode = episodeNumber) },
+                enqueue = { playable ->
+                    DownloadsRepository.enqueueFromStream(
+                        contentType = type,
+                        videoId = videoId,
+                        parentMetaId = parentMetaId,
+                        parentMetaType = parentMetaType,
+                        title = title,
+                        logo = logo,
+                        poster = poster,
+                        background = background,
+                        seasonNumber = seasonNumber,
+                        episodeNumber = episodeNumber,
+                        episodeTitle = episodeTitle,
+                        episodeThumbnail = episodeThumbnail,
+                        stream = playable,
+                        userChoseReplacement = true,
+                    )
+                },
+            )
+            outcome.message?.let { NuvioToastController.show(it) }
+            // Picked for a download: once it is queued, the list has done its job.
+            if (outcome.queued && pickPurpose == StreamPickPurpose.Download) onBack()
+        }
+    }
+    val pickStream: (StreamItem, Long?, Float?) -> Unit = { stream, positionMs, progressFraction ->
+        routeStreamPick(
+            purpose = pickPurpose,
+            stream = stream,
+            play = { onStreamSelected(it, positionMs, progressFraction) },
+            download = downloadStream,
+        )
+    }
+
     if (showLoadingScreen) return
 
     BoxWithConstraints(
@@ -282,9 +332,7 @@ fun StreamsScreen(
                 resumePositionMs = effectiveResumePositionMs,
                 resumeProgressFraction = effectiveResumeProgressFraction,
                 dominantColorEnabled = dominantColorEnabled,
-                onStreamSelected = { stream, positionMs, progressFraction ->
-                    onStreamSelected(stream, positionMs, progressFraction)
-                },
+                onStreamSelected = pickStream,
                 onStreamLongPress = { stream ->
                     streamActionsTarget = StreamActionsTarget(stream = stream)
                 },
@@ -309,9 +357,7 @@ fun StreamsScreen(
                 appendInstantServiceToDefaultName = debridSettings.canResolvePlayableLinks && !debridSettings.hasCustomStreamFormatting,
                 resumePositionMs = effectiveResumePositionMs,
                 resumeProgressFraction = effectiveResumeProgressFraction,
-                onStreamSelected = { stream, positionMs, progressFraction ->
-                    onStreamSelected(stream, positionMs, progressFraction)
-                },
+                onStreamSelected = pickStream,
                 onStreamLongPress = { stream ->
                     streamActionsTarget = StreamActionsTarget(stream = stream)
                 },
@@ -346,7 +392,9 @@ fun StreamsScreen(
                 buttonSize = if (isDesktop) 48.dp else 40.dp,
                 iconSize = if (isDesktop) 24.dp else 20.dp,
             )
-
+            if (pickPurpose == StreamPickPurpose.Download) {
+                StreamDownloadModeBanner(title = title)
+            }
         }
 
 
@@ -391,68 +439,16 @@ fun StreamsScreen(
                     NuvioToastController.show(noDirectStreamLinkText)
                 }
             },
-            onDownload = { stream ->
-                if (DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream)) {
-                    downloadScope.launch {
-                        val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-                            stream = stream,
-                            season = seasonNumber,
-                            episode = episodeNumber,
-                        )
-                        when (resolved) {
-                            is DirectDebridPlayableResult.Success -> {
-                                val result = DownloadsRepository.enqueueFromStream(
-                                    contentType = type,
-                                    videoId = videoId,
-                                    parentMetaId = parentMetaId,
-                                    parentMetaType = parentMetaType,
-                                    title = title,
-                                    logo = logo,
-                                    poster = poster,
-                                    background = background,
-                                    seasonNumber = seasonNumber,
-                                    episodeNumber = episodeNumber,
-                                    episodeTitle = episodeTitle,
-                                    episodeThumbnail = episodeThumbnail,
-                                    stream = resolved.stream,
-                                    userChoseReplacement = true,
-                                )
-                                NuvioToastController.show(result.toastMessage())
-                            }
-                            else -> {
-                                val message = resolved.toastMessage()
-                                if (message != null) {
-                                    NuvioToastController.show(message)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    val result = DownloadsRepository.enqueueFromStream(
-                        contentType = type,
-                        videoId = videoId,
-                        parentMetaId = parentMetaId,
-                        parentMetaType = parentMetaType,
-                        title = title,
-                        logo = logo,
-                        poster = poster,
-                        background = background,
-                        seasonNumber = seasonNumber,
-                        episodeNumber = episodeNumber,
-                        episodeTitle = episodeTitle,
-                        episodeThumbnail = episodeThumbnail,
-                        stream = stream,
-                        userChoseReplacement = true,
-                    )
-                    NuvioToastController.show(result.toastMessage())
-                }
-            },
+            onDownload = downloadStream,
             onOpen = { stream, openExternally ->
-                onStreamActionOpen(
-                    stream,
-                    openExternally,
-                    effectiveResumePositionMs,
-                    effectiveResumeProgressFraction,
+                // In download mode "open" downloads too: nothing in the list plays.
+                routeStreamPick(
+                    purpose = pickPurpose,
+                    stream = stream,
+                    play = {
+                        onStreamActionOpen(it, openExternally, effectiveResumePositionMs, effectiveResumeProgressFraction)
+                    },
+                    download = downloadStream,
                 )
             },
         )
@@ -1248,6 +1244,7 @@ private fun DesktopStreamActionsMenu(
     ) {
         Column(
             modifier = Modifier
+                .platformTouchScroll()
                 .width(244.dp)
                 .shadow(elevation = 14.dp, shape = menuShape)
                 .clip(menuShape)
@@ -1589,5 +1586,28 @@ private fun FooterLoadingBlock(
             ),
             color = MaterialTheme.colorScheme.primary,
         )
+    }
+}
+
+/** The line at the top of the list of sources when it is open to pick a source for a download. */
+@Composable
+internal fun StreamDownloadModeBanner(title: String, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.semantics(mergeDescendants = true) { heading() },
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.92f),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+            Text(
+                text = stringResource(Res.string.streams_pick_to_download),
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+            Text(
+                text = stringResource(Res.string.streams_pick_to_download_hint, title),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
     }
 }

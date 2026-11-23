@@ -16,8 +16,37 @@ import com.nuvio.app.features.trakt.TraktScrobbleRepository
 import com.nuvio.app.features.trakt.TraktTrackingLibraryProvider
 import com.nuvio.app.features.trakt.TraktTrackingProgressProvider
 import com.nuvio.app.features.watching.sync.TraktWatchedSyncAdapter
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+
+internal class SerializedOneTimeBootstrap {
+    private val lock = SynchronizedObject()
+    private val completed = atomic(false)
+    private var inProgress = false
+
+    fun run(initialize: () -> Unit) {
+        if (completed.value) return
+        synchronized(lock) {
+            if (completed.value || inProgress) return
+            inProgress = true
+            try {
+                initialize()
+                completed.value = true
+            } finally {
+                inProgress = false
+            }
+        }
+    }
+}
+
+private val trackingProvidersBootstrap = SerializedOneTimeBootstrap()
 
 fun ensureTrackingProvidersRegistered() {
+    trackingProvidersBootstrap.run(::registerAllTrackingProviders)
+}
+
+private fun registerAllTrackingProviders() {
     MdbListTracker.register()
     TraktAuthRepository.descriptor
     TraktScrobbleRepository.ensureRegistered()

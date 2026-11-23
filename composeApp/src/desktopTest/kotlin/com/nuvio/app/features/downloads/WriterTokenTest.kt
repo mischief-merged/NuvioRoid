@@ -15,7 +15,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** Exactly one writer per download, and no adoption of files by name. */
-class WriterTokenTest {
+class WriterTokenTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val servers = mutableListOf<HttpServer>()
     private val files = mutableListOf<File>()
     private val freeBefore = DownloadsPlatformDownloader.freeBytesProvider
@@ -97,6 +97,8 @@ class WriterTokenTest {
 
         assertTrue(finished.await(20, TimeUnit.SECONDS), events.toString())
         assertTrue(events.indexOf("A-exited") in 0 until events.indexOf("B-writing"), "the second writer started before the first one had exited: $events")
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (WriterTokens.kindOf("one-writer") != null && System.nanoTime() < deadline) Thread.sleep(10)
         assertEquals(null, WriterTokens.kindOf("one-writer"), "the token was kept")
     }
 

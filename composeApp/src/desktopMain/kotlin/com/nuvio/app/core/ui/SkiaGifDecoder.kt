@@ -36,12 +36,13 @@ class SkiaGifDecoder(
     override suspend fun decode(): DecodeResult? {
         // Peek so a decoder that declines (static WebP) leaves the source intact for the next decoder.
         val bytes = withContext(Dispatchers.IO) {
-            source.source().peek().readByteArray()
+            source.source().peek().readBoundedImageBytes()
         }
         if (bytes.isEmpty()) return null
 
         val data = Data.makeFromBytes(bytes)
-        val codec = Codec.makeFromData(data)
+        var retained = false
+        val codec = try { Codec.makeFromData(data) } catch (error: Throwable) { data.close(); throw error }
         try {
             val count = codec.frameCount
             if (count <= 0) return null
@@ -50,16 +51,17 @@ class SkiaGifDecoder(
 
             val w = codec.width
             val h = codec.height
-            if (w <= 0 || h <= 0) return null
+            check(acceptsImageDimensions(w, h, count))
 
             val canAnimate = animate && count > 1 && w.toLong() * h <= MaxAnimatedImagePixels
             // Only GIFs are handled when not animating; other formats belong to Coil's default decoder.
             if (!isGif && !canAnimate) return null
 
-            if (canAnimate) return decodeAnimated(codec, data, bytes, count, w, h, repetitionCount)
+            if (canAnimate) return decodeAnimated(codec, data, bytes, count, w, h, repetitionCount).also { retained = true }
             return decodeStill(codec, w, h)
         } finally {
             codec.close()
+            if (!retained) data.close()
         }
     }
 
@@ -152,19 +154,23 @@ class SkiaGifDecoder(
             val mimeType = result.mimeType
             val fileName = result.source.fileOrNull()?.name
             val isGif = mimeType?.equals("image/gif", ignoreCase = true) == true ||
-                fileName?.endsWith(".gif", ignoreCase = true) == true
+                fileName?.endsWith(".gif", ignoreCase = true) == true || result.source.hasGifHeader()
             val animate = options.extras[NuvioAnimatedImageKey] == true
-            val isWebp = mimeType?.equals("image/webp", ignoreCase = true) == true ||
-                fileName?.endsWith(".webp", ignoreCase = true) == true
             if (!isGif) {
                 // Only animated WebP is claimed, so the many static WebP posters keep using Coil's decoder
                 // without being read or parsed here.
-                if (!animate || !isWebp || !result.source.isAnimatedWebp()) return null
+                if (!animate || !result.source.isAnimatedWebp()) return null
             }
             return SkiaGifDecoder(result.source, animate = animate, isGif = isGif)
         }
     }
 }
+
+private fun ImageSource.hasGifHeader(): Boolean = runCatching {
+    val peek = source().peek()
+    if (!peek.request(6)) return@runCatching false
+    peek.readUtf8(6).let { it == "GIF87a" || it == "GIF89a" }
+}.getOrDefault(false)
 
 /** True when the RIFF/WebP header's VP8X chunk has the animation flag set. Reads 21 bytes without consuming. */
 private fun ImageSource.isAnimatedWebp(): Boolean = runCatching {

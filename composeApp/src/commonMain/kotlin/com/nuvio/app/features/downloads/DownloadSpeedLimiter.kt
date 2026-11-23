@@ -67,6 +67,15 @@ internal object DownloadBandwidth {
     val userCapBytesPerSecond = cap.asStateFlow()
     private val lock = SynchronizedObject()
 
+    // The rate that leaves the link to other traffic (see PoliteDownloads). Null: none.
+    private var yieldCap: Long? = null
+    private var travelCap: Long? = null
+
+    fun setTravelCap(value: Long?) = synchronized(lock) {
+        travelCap = value?.takeIf { it > 0L }
+        limiter.bytesPerSecond = effective(cap.value)
+    }
+
     /** Applies the stored limit to the shared limiter. */
     fun applyStoredLimit() = synchronized(lock) {
         apply(DownloadSpeedStorage.loadBytesPerSecond())
@@ -77,9 +86,23 @@ internal object DownloadBandwidth {
         apply(bytesPerSecond)
     }
 
+    /** Sets the rate downloads yield to; the user's limit stays the ceiling. Null removes it. */
+    fun setYieldCap(bytesPerSecond: Long?) = synchronized(lock) {
+        yieldCap = bytesPerSecond?.takeIf { it > 0L }
+        limiter.bytesPerSecond = effective(cap.value)
+    }
+
     private fun apply(bytesPerSecond: Long?) {
         val value = bytesPerSecond?.takeIf { it > 0L }
-        limiter.bytesPerSecond = value
         cap.value = value
+        limiter.bytesPerSecond = effective(value)
+    }
+
+    /** The lower of the user's limit and the yield rate. */
+    private fun effective(userCap: Long?): Long? {
+        return effectiveDownloadCap(userCap, travelCap, yieldCap)
     }
 }
+
+internal fun effectiveDownloadCap(user: Long?, travel: Long?, yielding: Long?): Long? =
+    listOfNotNull(user, travel, yielding).minOrNull()

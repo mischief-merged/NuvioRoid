@@ -68,22 +68,30 @@ internal enum class EpisodeAvailability {
     Unavailable,
 }
 
-internal fun MetaVideo.availability(nowEpochMs: Long? = null): EpisodeAvailability {
+internal fun MetaVideo.availability(
+    nowEpochMs: Long? = null,
+    offline: Boolean = false,
+    hasLocalDownload: Boolean = false,
+): EpisodeAvailability {
     val aired = if (nowEpochMs == null) {
         isEpisodeReleaseAired(released)
     } else {
         isEpisodeReleaseAired(released, nowEpochMs)
     }
+    val effectiveAvailable = if (offline) hasLocalDownload else available
     return when {
         aired == false -> EpisodeAvailability.NotReleased
-        !available -> EpisodeAvailability.Unavailable
+        !effectiveAvailable -> EpisodeAvailability.Unavailable
         else -> EpisodeAvailability.Playable
     }
 }
 
 /** True when the episode can be played now: listed as available and not dated in the future. */
-internal fun MetaVideo.isPlayableNow(nowEpochMs: Long? = null): Boolean =
-    availability(nowEpochMs) == EpisodeAvailability.Playable
+internal fun MetaVideo.isPlayableNow(
+    nowEpochMs: Long? = null,
+    offline: Boolean = false,
+    hasLocalDownload: Boolean = false,
+): Boolean = availability(nowEpochMs, offline = offline, hasLocalDownload = hasLocalDownload) == EpisodeAvailability.Playable
 
 /** The position of [video] among the episodes of its season, or null when the show does not list it. */
 internal fun MetaDetails.episodeIndexInSeason(video: MetaVideo): Int? =

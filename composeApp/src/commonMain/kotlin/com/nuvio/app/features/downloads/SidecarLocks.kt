@@ -24,11 +24,20 @@ import kotlinx.coroutines.async
  */
 internal object SidecarLocks {
     private val guard = SynchronizedObject()
-    private val locks = mutableMapOf<String, SynchronizedObject>()
+    private class Entry(val monitor: SynchronizedObject = SynchronizedObject(), var users: Int = 0)
+    private val locks = mutableMapOf<String, Entry>()
 
     fun <T> withLock(localVideoUri: String, block: () -> T): T {
-        val lock = synchronized(guard) { locks.getOrPut(keyOf(localVideoUri)) { SynchronizedObject() } }
-        return synchronized(lock) { block() }
+        val key = keyOf(localVideoUri)
+        val entry = synchronized(guard) { locks.getOrPut(key) { Entry() }.also { it.users++ } }
+        return try {
+            synchronized(entry.monitor) { block() }
+        } finally {
+            synchronized(guard) {
+                entry.users--
+                if (entry.users == 0) locks.remove(key)
+            }
+        }
     }
 
     private fun keyOf(uri: String) = uri.trim().removePrefix("file:").trimStart('/')
@@ -56,6 +65,7 @@ internal object SidecarIo {
     /** How long a screen or playback waits for a sidecar read. */
     const val ReadTimeoutMs = 2_000L
 
+    private val permits = kotlinx.coroutines.sync.Semaphore(4)
     private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
 
     suspend fun <T> read(
@@ -63,7 +73,10 @@ internal object SidecarIo {
         dispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO,
         block: () -> T,
     ): T? {
-        val pending = scope.async(dispatcher) { runCatching(block).getOrNull() }
+        if (!permits.tryAcquire()) return null
+        val pending = try { scope.async(dispatcher) { runCatching(block).getOrNull() } }
+        catch (error: Throwable) { permits.release(); throw error }
+        pending.invokeOnCompletion { permits.release() }
         return kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { pending.await() }
     }
 }

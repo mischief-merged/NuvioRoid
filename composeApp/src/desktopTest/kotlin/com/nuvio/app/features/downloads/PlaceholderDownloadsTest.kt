@@ -201,8 +201,8 @@ class PlaceholderDownloadsTest {
 
         assertEquals(DownloadStatus.Failed, only().status)
         assertEquals(DownloadFailureKind.BadFile, only().failureKind)
-        assertEquals("Not the real video: 8.1 MB arrived, the source said 9.5 GB", only().errorMessage)
-        assertEquals(text(Res.string.downloads_error_placeholder_size, "8.1 MB", "9.5 GB"), only().errorMessage)
+        assertEquals("Not the real video: 8.5 MB arrived, the source said 9.5 GB", only().errorMessage)
+        assertEquals(text(Res.string.downloads_error_placeholder_size, "8.5 MB", "9.5 GB"), only().errorMessage)
         assertEquals(listOf("https://example.com/a.mkv"), backend.cancelled)
         assertTrue(backend.partialsRemoved.isNotEmpty())
         assertNull(only().localFileUri)
@@ -249,7 +249,7 @@ class PlaceholderDownloadsTest {
 
         assertEquals(DownloadStatus.Failed, only().status)
         assertEquals(DownloadFailureKind.BadFile, only().failureKind)
-        assertEquals("Not the real video: 8.1 MB is far too small for a film of about 2 hours", only().errorMessage)
+        assertEquals("Not the real video: 8.5 MB is far too small for a film of about 2 hours", only().errorMessage)
         assertEquals(1, backend.cancelled.size)
         assertEquals(1, backend.started.size)
     }
@@ -285,7 +285,7 @@ class PlaceholderDownloadsTest {
 
         assertEquals(DownloadStatus.Failed, only().status)
         assertEquals(DownloadFailureKind.BadFile, only().failureKind)
-        assertEquals("Not the real video: 8.1 MB arrived, the source said 9.5 GB", only().errorMessage)
+        assertEquals("Not the real video: 8.5 MB arrived, the source said 9.5 GB", only().errorMessage)
         // A file that was just fetched and failed its check is removed, as for every other bad file.
         assertEquals(listOf<String?>(uri), backend.removed)
     }
@@ -372,7 +372,7 @@ class PlaceholderDownloadsTest {
         assertEquals(DownloadStatus.Completed, item.status)
         assertEquals(DownloadFramesCheck.NotTheRealVideo, item.framesCheck)
         assertTrue(item.isPlaceholder)
-        assertEquals("Not the real video: 8.1 MB arrived, the source said 9.5 GB", item.errorMessage)
+        assertEquals("Not the real video: 8.5 MB arrived, the source said 9.5 GB", item.errorMessage)
         // The result is saved like a fresh download's, and the claim is kept with the record.
         assertEquals(DownloadVerification.Size, item.verifiedBy)
         assertEquals(9_530_000_000L, item.expectedSizeBytes)
@@ -433,7 +433,7 @@ class PlaceholderDownloadsTest {
 
         assertEquals(RecheckOutcome.Flagged, DownloadsRepository.recheckCompleted("a"))
 
-        assertEquals("Not the real video: 8.1 MB is far too small for a film of about 2 hours", only().errorMessage)
+        assertEquals("Not the real video: 8.5 MB is far too small for a film of about 2 hours", only().errorMessage)
         assertEquals(DownloadFramesCheck.NotTheRealVideo, only().framesCheck)
         assertEquals(emptyList(), backend.removed)
         assertEquals(emptyList(), backend.sampled)

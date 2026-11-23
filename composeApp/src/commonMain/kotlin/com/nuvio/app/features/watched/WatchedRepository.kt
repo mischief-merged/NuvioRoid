@@ -4,8 +4,13 @@ import co.touchlab.kermit.Logger
 import com.nuvio.app.core.auth.AuthRepository
 import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.tracking.ensureTrackingProvidersRegistered
+import com.nuvio.app.features.addons.ADDON_LIBRARY_RESOURCE
+import com.nuvio.app.features.addons.AddonEventDispatcher
+import com.nuvio.app.features.addons.AddonLibraryAction
+import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.servers.ServerWatched
 import com.nuvio.app.features.tracking.TrackingProviderId
@@ -19,6 +24,8 @@ import com.nuvio.app.features.watching.sync.SupabaseWatchedSyncAdapter
 import com.nuvio.app.features.watching.sync.WatchedDeltaEvent
 import com.nuvio.app.features.watching.sync.WatchedSyncAdapter
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
+import com.nuvio.app.features.watchprogress.LocallyFinishedEpisodeAlias
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.CancellationException
@@ -485,16 +492,20 @@ object WatchedRepository {
             }
             return false
         }
-        itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
+        if (source.providerId == null && !AuthRepository.isRemoteAccountAuthenticated()) {
+            return false
+        }
+        val removedByRemote = itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
             val items = source.providerId
                 ?.let { providerId -> providerItems[providerId]?.values.orEmpty() }
                 ?: nuvioItems.values
+            val previousItems = items.toList()
             val dirtyKeys = source.providerId
                 ?.let { providerId -> dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf) }
                 ?: dirtyNuvioKeys
             val merged = mergeWatchedSnapshot(
                 serverItems = serverItems,
-                localItems = items.toList(),
+                localItems = previousItems,
                 dirtyKeys = dirtyKeys,
                 acknowledgeDirtyByPresence = source.providerId != null,
             )
@@ -506,6 +517,12 @@ object WatchedRepository {
             )
             dirtyKeys.clear()
             dirtyKeys += merged.dirtyKeys
+            previousItems.filter { item ->
+                watchedItemKey(item.type, item.id, item.season, item.episode) !in merged.items
+            }
+        }
+        if (removedByRemote.isNotEmpty()) {
+            onItemsUnwatched(removedByRemote)
         }
         fullyWatchedSeriesKeys?.let { keys ->
             setFullyWatchedSeriesKeysForSource(source, keys)
@@ -574,12 +591,15 @@ object WatchedRepository {
             if (!isActiveOperation(operation)) return false
             if (events.isEmpty()) break
 
-            itemsStore.update { nuvioItems, _, dirtyNuvioKeys, _ ->
+            val removedByDelta = itemsStore.update { nuvioItems, _, dirtyNuvioKeys, _ ->
                 applyWatchedDeltaEvents(
                     targetItems = nuvioItems,
                     dirtyKeys = dirtyNuvioKeys,
                     events = events,
                 )
+            }
+            if (removedByDelta.isNotEmpty()) {
+                onItemsUnwatched(removedByDelta)
             }
             cursor = maxOf(cursor, events.maxOf { it.eventId })
             deltaCursorEventId = cursor
@@ -606,7 +626,7 @@ object WatchedRepository {
         targetItems: MutableMap<String, WatchedItem>,
         dirtyKeys: MutableSet<String>,
         events: Collection<WatchedDeltaEvent>,
-    ) {
+    ): List<WatchedItem> {
         var upsertCount = 0
         var deleteCount = 0
         var removedCount = 0
@@ -614,6 +634,7 @@ object WatchedRepository {
         var preservedDirtyCount = 0
         var acknowledgedDirtyCount = 0
         var ignoredCount = 0
+        val removedItems = mutableListOf<WatchedItem>()
 
         events.forEach { event ->
             val key = watchedItemKey(event.contentType, event.contentId, event.season, event.episode)
@@ -664,6 +685,7 @@ object WatchedRepository {
                     }
                     val removedItem = targetItems.remove(matchingKey)
                     if (removedItem != null) {
+                        removedItems += removedItem
                         removedCount += 1
                         if (matchingKey != key) {
                             removedByFallbackKeyCount += 1
@@ -682,6 +704,7 @@ object WatchedRepository {
                 "preservedDirty=$preservedDirtyCount acknowledgedDirty=$acknowledgedDirtyCount " +
                 "ignored=$ignoredCount"
         }
+        return removedItems
     }
 
     private fun findWatchedItemStableDeleteKey(
@@ -759,7 +782,13 @@ object WatchedRepository {
         items.filter { it.isEpisode }.map { it.id }.distinct().forEach {
             ContinueWatchingPreferencesRepository.removeDismissedNextUpKeysForContent(it)
         }
+        val changedItems = if (AddonEventDispatcher.hasEnabledAddonFor(ADDON_LIBRARY_RESOURCE)) {
+            items.filterNot { isWatched(it.id, it.type, it.season, it.episode) }
+        } else {
+            emptyList()
+        }
         markWatched(items = items, trackerHistorySync = WatchedTrackerHistorySync.Mirror)
+        emitAddonWatchedEvents(changedItems, AddonLibraryAction.WATCHED)
     }
 
     internal fun markWatchedFromPlaybackCompletion(item: WatchedItem, syncRemote: Boolean = true) {
@@ -839,13 +868,94 @@ object WatchedRepository {
     }
 
     fun unmarkWatched(items: Collection<WatchedItem>) {
-        unmarkWatched(items = items, syncRemote = true)
+        unmarkWatchedWithAddonEvents(items = items)
     }
 
-    private fun unmarkWatched(items: Collection<WatchedItem>, syncRemote: Boolean) {
+    private fun emitAddonWatchedEvents(items: Collection<WatchedItem>, action: AddonLibraryAction) {
+        items.groupBy { it.type to it.id }.forEach { (key, groupItems) ->
+            val (type, id) = key
+            if (groupItems.any { !it.isEpisode }) {
+                AddonEventDispatcher.library(type = type, id = id, action = action)
+            } else {
+                AddonEventDispatcher.libraryVideos(
+                    type = type,
+                    id = id,
+                    action = action,
+                    videoIds = groupItems.map { item ->
+                        item.videoId?.takeIf(String::isNotBlank) ?: buildPlaybackVideoId(
+                            parentMetaId = item.id,
+                            seasonNumber = item.season,
+                            episodeNumber = item.episode,
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    internal fun unmarkWatchedPreservingAliases(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> = unmarkWatchedWithAddonEvents(
+        items = items,
+        clearLocallyFinished = false,
+        additionalAliases = additionalAliases,
+    )
+
+    private fun unmarkWatchedWithAddonEvents(
+        items: Collection<WatchedItem>,
+        clearLocallyFinished: Boolean = true,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> {
+        val changedItems = if (AddonEventDispatcher.hasEnabledAddonFor(ADDON_LIBRARY_RESOURCE)) {
+            items.filter { isWatched(it.id, it.type, it.season, it.episode) }
+        } else {
+            emptyList()
+        }
+        return unmarkWatched(
+            items = items,
+            syncRemote = true,
+            clearLocallyFinished = clearLocallyFinished,
+            additionalAliases = additionalAliases,
+        ).also {
+            emitAddonWatchedEvents(changedItems, AddonLibraryAction.UNWATCHED)
+        }
+    }
+
+    internal fun finishUnwatchCleanup(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ) {
+        onItemsUnwatched(items = items, additionalAliases = additionalAliases)
+    }
+
+    private fun unmarkWatched(
+        items: Collection<WatchedItem>,
+        syncRemote: Boolean,
+        clearLocallyFinished: Boolean = true,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ): List<WatchedItem> {
         ensureLoaded()
-        if (items.isEmpty()) return
+        if (items.isEmpty()) return emptyList()
         val source = activeSource
+        val aliasesByItem = items.map { watchedItem ->
+            val season = watchedItem.season
+            val episode = watchedItem.episode
+            val aliasParentIds = if (season != null && episode != null) {
+                WatchProgressRepository.locallyFinishedParentAliases(
+                    parentMetaId = watchedItem.id,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                    videoId = watchedItem.videoId,
+                ) + additionalAliases
+                    .filter { it.seasonNumber == season && it.episodeNumber == episode }
+                    .map { it.parentMetaId } +
+                    watchedItem.id.trim()
+            } else {
+                setOf(watchedItem.id.trim())
+            }.filterTo(linkedSetOf()) { it.isNotEmpty() }
+            watchedItem to aliasParentIds
+        }
         val (removedItems, removedExtraKeys) = itemsStore.update { nuvioItems, providerItems, dirtyNuvioKeys, dirtyProviderKeys ->
             val targetItems = source.providerId
                 ?.let { providerId -> providerItems.getOrPut(providerId, ::mutableMapOf) }
@@ -854,14 +964,15 @@ object WatchedRepository {
                 ?.let { providerId -> dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf) }
                 ?: dirtyNuvioKeys
             var extraKeysChanged = false
-            val removed = items.mapNotNull { watchedItem ->
-                val keys = watchedItemKeys(
-                    type = watchedItem.type,
-                    id = watchedItem.id,
-                    season = watchedItem.season,
-                    episode = watchedItem.episode,
-                )
-                val matchingKey = keys.firstOrNull(targetItems::containsKey)
+            val removed = aliasesByItem.flatMap { (watchedItem, aliasParentIds) ->
+                val keys = aliasParentIds.flatMapTo(linkedSetOf()) { parentId ->
+                    watchedItemKeys(
+                        type = watchedItem.type,
+                        id = parentId,
+                        season = watchedItem.season,
+                        episode = watchedItem.episode,
+                    )
+                }
                 source.providerId?.let { providerId ->
                     providerExtraWatchedKeys[providerId]?.let { extraKeys ->
                         val updated = extraKeys - keys
@@ -871,13 +982,15 @@ object WatchedRepository {
                         }
                     }
                 }
-                matchingKey?.let(targetItems::remove)?.let { storeItem ->
-                    if (watchedItem.videoId != null && storeItem.videoId == null) {
-                        storeItem.copy(videoId = watchedItem.videoId)
-                    } else {
-                        storeItem
-                    }
-                }?.also { dirtyKeys.remove(matchingKey) }
+                keys.mapNotNull { matchingKey ->
+                    targetItems.remove(matchingKey)?.let { storeItem ->
+                        if (watchedItem.videoId != null && storeItem.videoId == null) {
+                            storeItem.copy(videoId = watchedItem.videoId)
+                        } else {
+                            storeItem
+                        }
+                    }?.also { dirtyKeys.remove(matchingKey) }
+                }
             }
             removed to extraKeysChanged
         }
@@ -891,6 +1004,85 @@ object WatchedRepository {
                 persist()
             }
             if (syncRemote) pushDeleteToServer(items = items.toList(), source = source)
+        }
+        val unwatchedTargets = (items + removedItems)
+            .distinctBy { listOf(it.id, it.type, it.season, it.episode, it.videoId) }
+        if (clearLocallyFinished) {
+            onItemsUnwatched(items = unwatchedTargets, additionalAliases = additionalAliases)
+        }
+        return unwatchedTargets
+    }
+
+    private fun onItemsUnwatched(
+        items: Collection<WatchedItem>,
+        additionalAliases: Set<LocallyFinishedEpisodeAlias> = emptySet(),
+    ) {
+        val handledAliases = mutableSetOf<LocallyFinishedEpisodeAlias>()
+        items.forEach { item ->
+            val season = item.season
+            val episode = item.episode
+            if (season != null && episode != null) {
+                val clearedAliases = WatchProgressRepository.clearLocallyFinishedEpisode(
+                    parentMetaId = item.id,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                    videoId = item.videoId,
+                )
+                val cancelTargets = buildSet {
+                    val trimmedId = item.id.trim()
+                    if (trimmedId.isNotEmpty()) {
+                        add(LocallyFinishedEpisodeAlias(trimmedId, season, episode))
+                    }
+                    addAll(clearedAliases)
+                    additionalAliases
+                        .filter { it.seasonNumber == season && it.episodeNumber == episode }
+                        .forEach(::add)
+                }
+                handledAliases += cancelTargets
+                cancelTargets
+                    .groupBy(
+                        keySelector = { it.seasonNumber to it.episodeNumber },
+                        valueTransform = { it.parentMetaId },
+                    )
+                    .forEach { (seasonEpisode, parentMetaIds) ->
+                        AutoDownloads.cancelPendingRemovals(
+                            parentMetaIds = parentMetaIds,
+                            seasonNumber = seasonEpisode.first,
+                            episodeNumber = seasonEpisode.second,
+                            videoId = item.videoId,
+                        )
+                    }
+            } else if (!item.type.isSeriesLikeWatchingContentType()) {
+                AutoDownloads.cancelPendingRemovals(
+                    parentMetaId = item.id,
+                    videoId = item.videoId,
+                    onlyNonEpisode = true,
+                )
+            }
+        }
+        val remainingAliases = additionalAliases.filterTo(linkedSetOf()) { it !in handledAliases }
+        if (remainingAliases.isNotEmpty()) {
+            val extraCancelTargets = linkedSetOf<LocallyFinishedEpisodeAlias>()
+            remainingAliases.forEach { alias ->
+                extraCancelTargets += alias
+                extraCancelTargets += WatchProgressRepository.clearLocallyFinishedEpisode(
+                    parentMetaId = alias.parentMetaId,
+                    seasonNumber = alias.seasonNumber,
+                    episodeNumber = alias.episodeNumber,
+                )
+            }
+            extraCancelTargets
+                .groupBy(
+                    keySelector = { it.seasonNumber to it.episodeNumber },
+                    valueTransform = { it.parentMetaId },
+                )
+                .forEach { (seasonEpisode, parentMetaIds) ->
+                    AutoDownloads.cancelPendingRemovals(
+                        parentMetaIds = parentMetaIds,
+                        seasonNumber = seasonEpisode.first,
+                        episodeNumber = seasonEpisode.second,
+                    )
+                }
         }
     }
 
@@ -941,10 +1133,10 @@ object WatchedRepository {
         }
         if (shouldMarkSeriesWatched) {
             if (!hasSeriesWatchedMarker) {
-                markWatched(seriesWatchedItem)
+                markWatched(items = listOf(seriesWatchedItem), trackerHistorySync = WatchedTrackerHistorySync.Mirror)
             }
         } else if (hasSeriesWatchedMarker) {
-            unmarkWatched(seriesWatchedItem)
+            unmarkWatched(items = listOf(seriesWatchedItem), syncRemote = true)
         }
     }
 
@@ -1175,17 +1367,24 @@ object WatchedRepository {
                             },
                         ) ?: return@collectLatest
                         providerExtraWatchedKeys[providerId] = extraKeys
-                        itemsStore.update { _, providerItems, _, dirtyProviderKeys ->
+                        val removedByRemote = itemsStore.update { _, providerItems, _, dirtyProviderKeys ->
+                            val previousItems = providerItems[providerId]?.values.orEmpty().toList()
                             val dirtyKeys = dirtyProviderKeys.getOrPut(providerId, ::mutableSetOf)
                             val merged = mergeWatchedSnapshot(
                                 serverItems = freshItems,
-                                localItems = providerItems[providerId]?.values.orEmpty().toList(),
+                                localItems = previousItems,
                                 dirtyKeys = dirtyKeys,
                                 acknowledgeDirtyByPresence = true,
                             )
                             providerItems[providerId] = merged.items.toMutableMap()
                             dirtyKeys.clear()
                             dirtyKeys += merged.dirtyKeys
+                            previousItems.filter { item ->
+                                watchedItemKey(item.type, item.id, item.season, item.episode) !in merged.items
+                            }
+                        }
+                        if (removedByRemote.isNotEmpty()) {
+                            onItemsUnwatched(removedByRemote)
                         }
                         loadedProviders += providerId
                         providersLoadedFromRemote += providerId

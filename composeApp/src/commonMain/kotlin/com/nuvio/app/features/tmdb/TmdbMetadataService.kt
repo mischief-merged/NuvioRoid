@@ -1,5 +1,6 @@
 package com.nuvio.app.features.tmdb
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.isDesktop
 
 import co.touchlab.kermit.Logger
@@ -43,16 +44,16 @@ object TmdbMetadataService {
         }
     }
 
-    private val enrichmentCache = mutableMapOf<String, TmdbEnrichment>()
+    private val enrichmentCache = BoundedCache<String, TmdbEnrichment>()
     private val enrichmentCacheLock = SynchronizedObject()
-    private val episodeCache = mutableMapOf<String, Map<Pair<Int, Int>, TmdbEpisodeEnrichment>>()
-    private val moreLikeThisCache = mutableMapOf<String, List<MetaPreview>>()
-    private val collectionCache = mutableMapOf<String, Pair<String?, List<MetaPreview>>>()
-    private val trailerCache = mutableMapOf<String, List<MetaTrailer>>()
-    private val personCache = mutableMapOf<String, PersonDetail>()
-    private val entityBrowseCache = mutableMapOf<String, TmdbEntityBrowseData>()
-    private val entityHeaderCache = mutableMapOf<String, TmdbEntityHeader>()
-    private val entityRailCache = mutableMapOf<String, List<MetaPreview>>()
+    private val episodeCache = BoundedCache<String, Map<Pair<Int, Int>, TmdbEpisodeEnrichment>>()
+    private val moreLikeThisCache = BoundedCache<String, List<MetaPreview>>()
+    private val collectionCache = BoundedCache<String, Pair<String?, List<MetaPreview>>>()
+    private val trailerCache = BoundedCache<String, List<MetaTrailer>>()
+    private val personCache = BoundedCache<String, PersonDetail>()
+    private val entityBrowseCache = BoundedCache<String, TmdbEntityBrowseData>()
+    private val entityHeaderCache = BoundedCache<String, TmdbEntityHeader>()
+    private val entityRailCache = BoundedCache<String, List<MetaPreview>>()
     private val backdropCache = linkedMapOf<String, String?>()
     private val backdropCacheMutex = Mutex()
     private val backdropRequests = Semaphore(4)
@@ -340,7 +341,11 @@ object TmdbMetadataService {
     ): List<MetaPreview> {
         val seen = mutableSetOf<Int>()
         return cast
-            .filter { it.mediaType == "tv" && (it.posterPath != null || it.backdropPath != null) }
+            .filter {
+                it.mediaType == "tv" &&
+                    (it.posterPath != null || it.backdropPath != null) &&
+                    !isTalkShowGuestAppearance(it.genreIds.orEmpty(), it.character)
+            }
             .sortedByDescending { it.voteAverage ?: 0.0 }
             .mapNotNull { credit ->
                 if (!seen.add(credit.id)) return@mapNotNull null
@@ -1556,6 +1561,14 @@ private fun englishCreditTitlesById(credits: TmdbPersonCombinedCreditsResponse?)
     return titles
 }
 
+private const val TMDB_TALK_GENRE_ID = 10767
+private val TALK_SHOW_HOST_CHARACTER_REGEX = Regex("\\b(co-?)?host(s|ess)?\\b", RegexOption.IGNORE_CASE)
+
+internal fun isTalkShowGuestAppearance(genreIds: List<Int>, character: String?): Boolean {
+    if (genreIds.none { it == TMDB_TALK_GENRE_ID }) return false
+    return character?.let { TALK_SHOW_HOST_CHARACTER_REGEX.containsMatchIn(it) } != true
+}
+
 internal fun containsCjkOrHangul(text: String): Boolean {
     return text.any { ch ->
         ch in '\u3040'..'\u30FF' ||  // Hiragana + Katakana
@@ -2141,6 +2154,7 @@ private data class TmdbPersonCreditCast(
     @SerialName("first_air_date") val firstAirDate: String? = null,
     @SerialName("vote_average") val voteAverage: Double? = null,
     val popularity: Double? = null,
+    @SerialName("genre_ids") val genreIds: List<Int>? = null,
 )
 
 @Serializable

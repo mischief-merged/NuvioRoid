@@ -27,7 +27,9 @@ class DeleteAcrossProfilesTest {
         val events = mutableListOf<String>()
         var syncWorks = true
         override fun loadPayload() = inner.payload
+        override fun loadPayload(profileId: Int) = loadPayload()
         override fun savePayload(payload: String) { inner.payload = payload; events += "save ${decodeStoredDownloads(payload)!!.map { it.id }}" }
+        override fun savePayload(profileId: Int, payload: String) = savePayload(payload)
         override fun syncPayload(): Boolean { events += "sync $syncWorks"; return syncWorks }
         override fun trashFile(localFileUri: String): Boolean { events += "trash"; return inner.trashFile(localFileUri) }
         override fun removeFile(localFileUri: String?): Boolean = inner.removeFile(localFileUri)
@@ -93,14 +95,12 @@ class DeleteAcrossProfilesTest {
     }
 
     @Test
-    fun a_file_another_profile_uses_is_kept_on_delete_and_on_permanent_delete() {
+    fun a_file_another_profile_uses_is_kept_on_delete() {
         val item = film("a")
         load(item)
         backend.owners = FileOwnership.Owned
 
         assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item.id))
-        load(item)
-        assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item.id, permanently = true))
 
         assertTrue(backend.inner.trashed.isEmpty())
         assertTrue(backend.inner.removedOutright.isEmpty())

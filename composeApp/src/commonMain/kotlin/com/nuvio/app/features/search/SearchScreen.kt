@@ -37,8 +37,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -60,6 +67,13 @@ import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.buildAddonCatalogRefreshSignature
 import com.nuvio.app.features.home.components.HomeCatalogRowSection
+import com.nuvio.app.core.build.AppFeaturePolicy
+import com.nuvio.app.core.ui.userFacingErrorText
+import com.nuvio.app.features.home.EmptyScreenAction
+import com.nuvio.app.features.home.failedEmptyActions
+import com.nuvio.app.features.home.performEmptyAction
+import com.nuvio.app.features.home.setupEmptyActions
+import com.nuvio.app.features.home.visibleEmptyActions
 import com.nuvio.app.features.home.components.HomeEmptyStateCard
 import com.nuvio.app.features.home.components.homeSectionHorizontalPaddingForWidth
 import com.nuvio.app.features.home.components.HomeSkeletonRow
@@ -77,6 +91,7 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_retry
 import nuvio.composeapp.generated.resources.compose_nav_search
 import nuvio.composeapp.generated.resources.home_empty_no_sources_title
+import nuvio.composeapp.generated.resources.home_empty_open_downloads
 import nuvio.composeapp.generated.resources.search_empty_no_sources_message
 import nuvio.composeapp.generated.resources.compose_search_clear
 import nuvio.composeapp.generated.resources.compose_search_discover_title
@@ -100,8 +115,12 @@ fun SearchScreen(
     onPosterLongClick: ((MetaPreview) -> Unit)? = null,
     searchFocusRequestCount: Int = 0,
     scrollToTopRequests: Flow<Unit> = emptyFlow(),
+    onAddSource: () -> Unit = {},
+    onConnectServer: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
 ) {
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
     var isSearchFocused by remember { mutableStateOf(false) }
 
     ScreenActivityEffect(listState) { screenActive ->
@@ -289,13 +308,26 @@ fun SearchScreen(
                                 query = it
                             },
                             placeholder = stringResource(Res.string.compose_search_placeholder),
+                            textStyle = MaterialTheme.typography.bodyLarge.copy(textDirection = TextDirection.Content),
                             shape = RoundedCornerShape(NuvioTokens.Radius.xl),
                             modifier = Modifier
                                 .focusRequester(focusRequester)
-                                .onFocusChanged {
-                                    isSearchFocused = it.isFocused
-                                    if (query.isNotBlank()) focusRequester.captureFocus()
-                                },
+                                .onPreviewKeyEvent { event ->
+                                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                    val fieldKey = when (event.key) {
+                                        Key.Escape -> SearchFieldKey.Escape
+                                        Key.Tab -> SearchFieldKey.Tab
+                                        else -> SearchFieldKey.Other
+                                    }
+                                    if (!searchFieldReleasesFocus(fieldKey)) return@onPreviewKeyEvent false
+                                    focusRequester.freeFocus()
+                                    if (searchFieldConsumesKey(fieldKey)) {
+                                        focusManager.clearFocus()
+                                        isSearchFocused = false
+                                    }
+                                    searchFieldConsumesKey(fieldKey)
+                                }
+                                .onFocusChanged { isSearchFocused = it.isFocused },
                             trailingContent = if (query.isNotBlank()) {
                                 {
                                     IconButton(onClick = { query = "" }) {
@@ -318,7 +350,6 @@ fun SearchScreen(
 
         if (query.isBlank()) {
             if (isSearchFocused && recentSearches.isNotEmpty()) {
-                focusRequester.captureFocus()
                 item(key = "recent_searches") {
                     SearchRecentSection(
                         recentSearches = recentSearches,
@@ -346,6 +377,9 @@ fun SearchScreen(
                             )
                         }
                     },
+                    onAddSource = onAddSource,
+                    onConnectServer = onConnectServer,
+                    onOpenDownloads = onOpenDownloads,
                     watchedKeys = watchedUiState.watchedKeys,
                     fullyWatchedSeriesKeys = fullyWatchedSeriesKeys,
                     onPosterClick = onPosterClick,
@@ -377,6 +411,9 @@ fun SearchScreen(
                                 reason = uiState.emptyStateReason,
                                 errorMessage = uiState.errorMessage,
                                 networkCondition = networkStatusUiState.condition,
+                                onAddSource = onAddSource,
+                                onConnectServer = onConnectServer,
+                                onOpenDownloads = onOpenDownloads,
                                 onRetry = {
                                     if (normalizedQuery.isNotBlank()) {
                                         NetworkStatusRepository.requestRefresh(force = true)
@@ -431,16 +468,45 @@ private fun SearchEmptyStateCard(
     errorMessage: String?,
     networkCondition: NetworkCondition,
     onRetry: (() -> Unit)? = null,
+    onAddSource: () -> Unit = {},
+    onConnectServer: () -> Unit = {},
+    onOpenDownloads: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    if (
-        reason == SearchEmptyStateReason.RequestFailed &&
-        (networkCondition == NetworkCondition.NoInternet || networkCondition == NetworkCondition.ServersUnreachable)
-    ) {
+    val offline = networkCondition == NetworkCondition.NoInternet ||
+        networkCondition == NetworkCondition.ServersUnreachable
+    val needsSetup = reason == SearchEmptyStateReason.NoActiveAddons ||
+        reason == SearchEmptyStateReason.NoSearchCatalogs
+    val failed = reason == SearchEmptyStateReason.RequestFailed
+    val actions = visibleEmptyActions(
+        when {
+            failed -> failedEmptyActions(offline)
+            needsSetup -> setupEmptyActions(offline)
+            else -> emptyList()
+        },
+        AppFeaturePolicy.downloadsEnabled,
+    )
+    val dispatch = { action: EmptyScreenAction ->
+        performEmptyAction(
+            action = action,
+            onAddSource = onAddSource,
+            onConnectServer = onConnectServer,
+            onOpenDownloads = onOpenDownloads,
+            onRetry = { onRetry?.invoke() },
+        )
+    }
+    if (failed && offline) {
+        val showDownloads = actions.contains(EmptyScreenAction.OpenDownloads)
         NuvioNetworkOfflineCard(
             condition = networkCondition,
             modifier = modifier,
             onRetry = onRetry,
+            secondaryActionLabel = if (showDownloads) {
+                stringResource(Res.string.home_empty_open_downloads)
+            } else {
+                null
+            },
+            onSecondaryAction = if (showDownloads) onOpenDownloads else null,
         )
         return
     }
@@ -461,7 +527,10 @@ private fun SearchEmptyStateCard(
 
         SearchEmptyStateReason.RequestFailed -> {
             title = stringResource(Res.string.compose_search_empty_failed_title)
-            message = errorMessage ?: stringResource(Res.string.compose_search_empty_failed_message)
+            message = userFacingErrorText(
+                errorMessage,
+                stringResource(Res.string.compose_search_empty_failed_message),
+            )
         }
 
         SearchEmptyStateReason.NoResults, null -> {
@@ -474,12 +543,8 @@ private fun SearchEmptyStateCard(
         modifier = modifier,
         title = title,
         message = message,
-        actionLabel = if (reason == SearchEmptyStateReason.RequestFailed) {
-            stringResource(Res.string.action_retry)
-        } else {
-            null
-        },
-        onActionClick = if (reason == SearchEmptyStateReason.RequestFailed) onRetry else null,
+        actions = actions,
+        onEmptyAction = dispatch,
     )
 }
 
@@ -514,7 +579,7 @@ private fun SearchRecentSection(
 }
 
 @Composable
-private fun SearchRecentRow(
+internal fun SearchRecentRow(
     query: String,
     onSearchPress: () -> Unit,
     onRemovePress: () -> Unit,
@@ -536,7 +601,7 @@ private fun SearchRecentRow(
         Text(
             text = query,
             modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyLarge,
+            style = MaterialTheme.typography.bodyLarge.copy(textDirection = TextDirection.Content),
             color = MaterialTheme.colorScheme.onBackground,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,

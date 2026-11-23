@@ -19,28 +19,25 @@ import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_error_not_enough_space
 import nuvio.composeapp.generated.resources.downloads_error_not_durable
-import nuvio.composeapp.generated.resources.downloads_error_private_address
 import org.jetbrains.compose.resources.getString
 import java.awt.Desktop
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
 import java.security.MessageDigest
 import nuvio.composeapp.generated.resources.downloads_error_file_checksum
-import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URI
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
-import java.net.http.HttpResponse
-import java.time.Duration
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.createDirectories
 
-private val desktopDownloadHttpClient: HttpClient = HttpClient.newBuilder()
-    .connectTimeout(Duration.ofSeconds(60))
-    .followRedirects(HttpClient.Redirect.NORMAL)
+private val desktopDownloadHttpClient = com.nuvio.app.core.network.guardedHttpClient()
+    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
     .build()
 
 internal actual object DownloadsPlatformDownloader {
@@ -68,6 +65,21 @@ internal actual object DownloadsPlatformDownloader {
 
     internal var waitBeforeRetry: suspend (delayMs: Long) -> Unit = { delay(it) }
 
+    /** Retires a superseded partial file after its replacement finished cleanly. Defaults to the folder's Trash helper. */
+    internal var trashPartial: ((java.nio.file.Path) -> Boolean)? = null
+
+    /** Sends a removed partial to the Trash. Tests replace this so nothing reaches the system Trash. */
+    internal var trashPartialFile: ((Path) -> Boolean)? = null
+
+    /** Sends a removed download to the Trash. Tests replace this so nothing reaches the system Trash. */
+    internal var trashRemovedFile: ((String) -> Boolean)? = null
+
+    /** Most link refreshes tried in a row without making byte progress. */
+    internal var maxLinkRefreshesWithoutProgress: Int = DefaultMaxLinkRefreshesWithoutProgress
+
+    /** Total link refreshes allowed across one download run. */
+    internal var maxTotalLinkRefreshes: Int = DefaultMaxTotalLinkRefreshes
+
     /** A transfer that receives nothing for this long is cut off and tried again. */
     internal var stallTimeoutMs: Long = 60_000L
 
@@ -75,8 +87,8 @@ internal actual object DownloadsPlatformDownloader {
     internal const val StartSubtitlesTimeoutMs = 60_000L
 
     /**
-     * A file is found only where its record says. Nothing is adopted by name or size: a finished record
-     * without an address shows "File not found", and only the user can point it at a file ("Locate the file…").
+     * Finished records are found only at their recorded address. An interrupted transfer checks its
+     * recorded destination in start() before receiving bytes, in case publishing already finished.
      */
     actual fun restoreItem(item: DownloadItem): DownloadItem = item
 
@@ -109,22 +121,124 @@ internal actual object DownloadsPlatformDownloader {
             val downloadsDir = File(location.path.also { if (location.id == DownloadLocations.AppId) it.createDirectories() }.toUri())
             var request = request
             var destination = File(downloadsDir, request.destinationFileName)
-            var tempFile = File(downloadsDir, "${request.destinationFileName}.part")
+            var tempFile = File(downloadsDir, request.item.activePartialFileName)
+            val keptPartials = request.item.supersededPartials.toMutableList()
+            fun retireAcceptedPartials() {
+                if (!request.isCompletionAccepted()) return
+                val retiredKeys = retireKeptPartials(
+                    keptPartials = keptPartials,
+                    fallbackDir = downloadsDir.toPath(),
+                    downloadId = request.item.id,
+                    folders = folders,
+                    trashPartial = trashPartial ?: folders::moveToTrash,
+                )
+                if (retiredKeys.isNotEmpty()) {
+                    keptPartials.removeAll { it.partialFileKey in retiredKeys }
+                    request.onSupersededPartialsRetired(retiredKeys)
+                }
+            }
+            // A previous process may have stopped after publishing but before verification saved Completed.
+            // Check only the recorded address (or the recorded location and name for older records).
+            val recovered = publishedDownloadToVerify(request.item, destination, tempFile)
+            if (recovered != null) {
+                if (!request.mayPublish()) {
+                    onPaused()
+                    return@launch
+                }
+                val uri = recovered.toURI().toString()
+                // Recovery never grants permission to remove an existing finished file, even if checks fail.
+                publishedKeys.remove(uri)
+                if (!request.onPublished(uri, recovered.length(), null)) {
+                    onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
+                    return@launch
+                }
+                onSuccess(uri, request.item.totalBytes ?: recovered.length())
+                retireAcceptedPartials()
+                return@launch
+            }
+            var knownIdentity: SourceFileIdentity? = request.item.totalBytes?.takeIf { it > 0L }?.let { total ->
+                SourceFileIdentity(
+                    totalBytes = total,
+                    eTag = normalizeStrongETag(request.item.sourceETag),
+                    lastModified = normalizeLastModified(request.item.sourceLastModified),
+                )
+            }
+            var pendingFreshVerification: SourceFileIdentity? = if (request.item.pendingLinkVerification) {
+                knownIdentity ?: SourceFileIdentity(null, null, null)
+            } else {
+                null
+            }
             // The partial file is resumed, cut back or removed only when it is this download's own, proven by the
             // identity recorded when it was created. A file of that name that is not: left alone, and this download
             // takes a name that is free.
             val partial = OwnedPartial(request.item.partialFileKey, onCreated = { key -> request.onPartialCreated(key) })
             fun takeFreeName() {
                 val name = freeDownloadName(downloadsDir.toPath(), request.destinationFileName)
-                request = request.copy(item = request.item.copy(fileName = name, partialFileKey = null))
+                request = request.copy(
+                    item = request.item.copy(
+                        fileName = name,
+                        partialFileKey = null,
+                        partialFileName = null,
+                        sourceETag = null,
+                        sourceLastModified = null,
+                        pendingLinkVerification = false,
+                    ),
+                )
                 request.onFileNameChanged(name)
                 destination = File(downloadsDir, name)
                 tempFile = File(downloadsDir, "$name.part")
                 partial.key = null
+                knownIdentity = null
+                pendingFreshVerification = null
+            }
+            fun switchToFreePartialName(keepCurrentPartial: Boolean) {
+                val oldPath = tempFile.toPath()
+                val kept = if (
+                    keepCurrentPartial &&
+                    Files.exists(oldPath, java.nio.file.LinkOption.NOFOLLOW_LINKS) &&
+                    partial.proven(oldPath)
+                ) {
+                    partial.key?.let { key ->
+                        KeptPartialFile(
+                            fileName = tempFile.name,
+                            partialFileKey = key,
+                            locationId = location.id,
+                        )
+                    }
+                } else {
+                    null
+                }
+                if (kept != null && keptPartials.none { it.partialFileKey == kept.partialFileKey }) {
+                    keptPartials += kept
+                }
+                val reserved = (keptPartials.map { it.fileName } + tempFile.name).toSet()
+                val newPartialName = freePartialFileName(downloadsDir.toPath(), request.destinationFileName, reserved)
+                partial.key = null
+                tempFile = File(downloadsDir, newPartialName)
+                knownIdentity = null
+                pendingFreshVerification = null
+                val nextSuperseded = if (kept != null && request.item.supersededPartials.none { it.partialFileKey == kept.partialFileKey }) {
+                    request.item.supersededPartials + kept
+                } else {
+                    request.item.supersededPartials
+                }
+                request = request.copy(
+                    item = request.item.copy(
+                        partialFileKey = null,
+                        partialFileName = newPartialName,
+                        downloadedBytes = 0L,
+                        totalBytes = null,
+                        sourceETag = null,
+                        sourceLastModified = null,
+                        supersededPartials = nextSuperseded,
+                        pendingLinkVerification = false,
+                    ),
+                )
+                request.onSwitchedToNewPartial(newPartialName, kept)
             }
             // A partial file from before identities were recorded is adopted once, only when it is provably this
             // download's (see legacyPartialKey); adoption records its identity and changes nothing else.
-            if (partial.key == null && Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            if (partial.key == null && request.item.partialFileName == null && Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 val profileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
                 runCatching { legacyPartialKey(request.item, profileId, tempFile.toPath(), folders.locations, RepositoryDownloadsHooks.allRecords()) }
                     .getOrNull()?.let { key ->
@@ -132,7 +246,13 @@ internal actual object DownloadsPlatformDownloader {
                         request.onPartialCreated(key)
                     }
             }
-            if (Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) && !partial.proven(tempFile.toPath())) takeFreeName()
+            if (Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) && !partial.proven(tempFile.toPath())) {
+                if (request.item.partialFileName == null) {
+                    takeFreeName()
+                } else {
+                    switchToFreePartialName(keepCurrentPartial = false)
+                }
+            }
 
             // Subtitles are tried now, beside the transfer, so that a partly watched file has them.
             // What cannot be fetched now is tried again when the file is done (DownloadCompanions).
@@ -146,20 +266,74 @@ internal actual object DownloadsPlatformDownloader {
             // periodic disconnects and only fail after repeated attempts that receive nothing while
             // the internet can be reached. Without internet the download waits for it to come back.
             val retries = DownloadRetries(isOffline, waitBeforeRetry)
+            var digestReplacements = 0
+            val refreshBudget = LinkRefreshBudget(
+                maxWithoutProgress = maxLinkRefreshesWithoutProgress,
+                maxTotal = maxTotalLinkRefreshes,
+                initialBytes = tempFile.partialLength(),
+                wait = waitBeforeRetry,
+            )
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val bytesBeforeAttempt = tempFile.partialLength()
+                refreshBudget.noteBytesWritten(bytesBeforeAttempt)
                 try {
                     val transfer = try {
-                        transferToTempFile(request, tempFile, onProgress, partial = partial)
+                        transferToTempFile(
+                            request = request,
+                            tempFile = tempFile,
+                            onProgress = onProgress,
+                            partial = partial,
+                            verifyBeforeJoin = pendingFreshVerification,
+                            onIdentityObserved = { observed ->
+                                val merged = SourceFileIdentity(
+                                    totalBytes = observed.totalBytes?.takeIf { it > 0L } ?: knownIdentity?.totalBytes,
+                                    eTag = observed.eTag ?: knownIdentity?.eTag,
+                                    lastModified = observed.lastModified ?: knownIdentity?.lastModified,
+                                )
+                                knownIdentity = merged
+                                request = request.copy(
+                                    item = request.item.copy(
+                                        totalBytes = merged.totalBytes ?: request.item.totalBytes,
+                                        sourceETag = merged.eTag ?: request.item.sourceETag,
+                                        sourceLastModified = merged.lastModified ?: request.item.sourceLastModified,
+                                    ),
+                                )
+                                request.onSourceIdentityObserved(merged.totalBytes, merged.eTag, merged.lastModified)
+                            },
+                            onJoinVerified = {
+                                pendingFreshVerification = null
+                                request = request.copy(item = request.item.copy(pendingLinkVerification = false))
+                            },
+                        )
                     } catch (_: PartialNotOurs) {
-                        takeFreeName()
+                        if (request.item.partialFileName == null) {
+                            takeFreeName()
+                        } else {
+                            switchToFreePartialName(keepCurrentPartial = false)
+                        }
+                        refreshBudget.recordPartialSwitched()
+                        continue
+                    } catch (_: RefreshNeedsNewPartial) {
+                        switchToFreePartialName(keepCurrentPartial = true)
+                        refreshBudget.recordPartialSwitched()
+                        continue
+                    } catch (_: NeedsReplacementPartial) {
+                        switchToFreePartialName(keepCurrentPartial = true)
+                        refreshBudget.recordPartialSwitched()
                         continue
                     }
                     val totalBytes = transfer.totalBytes
                     if (transfer.digestMatched == false) {
-                        // Not the body the server said it sent. Nothing of it is worth resuming: removed only while it is ours.
-                        partial.removeIfOurs(tempFile.toPath())
-                        error(runBlocking { getString(Res.string.downloads_error_file_checksum) })
+                        // Not the body the server said it sent. The partial stays, and one fresh partial is tried.
+                        // A second mismatch keeps both files and stops.
+                        if (digestReplacements >= 1) {
+                            error(runBlocking { getString(Res.string.downloads_error_file_checksum) })
+                        }
+                        digestReplacements++
+                        switchToFreePartialName(keepCurrentPartial = true)
+                        refreshBudget.recordPartialSwitched()
+                        continue
                     }
                     if (transfer.digestMatched == true) request.onDigestVerified()
 
@@ -171,38 +345,103 @@ internal actual object DownloadsPlatformDownloader {
                         return@launch
                     }
 
-                    // Reported finished only once the file is on disk under its final name, which never replaces
-                    // a file this download did not create (a taken name gets " (2)", " (3)", ...).
-                    val published = try {
-                        publishDurably(tempFile.toPath(), destination.toPath()).toFile()
-                    } catch (_: DownloadNotDurable) {
-                        // The partial file keeps its name: the download is not finished and goes on from it.
-                        onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
-                        return@launch
-                    }
+                    var rememberedUri: String? = null
+                    var rememberedKey: String? = null
+                    try {
+                        // Reported finished only once the file is on disk under its final name, which never replaces
+                        // a file this download did not create (a taken name gets " (2)", " (3)", ...).
+                        val published = try {
+                            publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
+                                val key = rememberPublishedFile(path)
+                                val uri = path.toFile().toURI().toString()
+                                rememberedUri = uri
+                                rememberedKey = key
+                                request.onPublished(uri, Files.size(path), key)
+                            }).toFile()
+                        } catch (_: DownloadNotDurable) {
+                            // The partial file keeps its name: the download is not finished and goes on from it.
+                            onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
+                            return@launch
+                        }
 
-                    val finalSize = published.length()
-                    // Remembered, so that a file found bad right after this can be removed only while it is still this one.
-                    DownloadMover.identityOf(published.toPath())?.let { publishedKeys[published.toURI().toString()] = it }
-                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
-                    return@launch
+                        val finalSize = published.length()
+                        // Remembered, so that a file found bad right after this can be removed only while it is still this one.
+                        val uri = published.toURI().toString()
+                        rememberedUri = uri
+                        rememberedKey = rememberPublishedFile(published.toPath())
+                        onSuccess(uri, totalBytes ?: finalSize)
+                        retireAcceptedPartials()
+                        return@launch
+                    } finally {
+                        val uri = rememberedUri
+                        if (uri != null) {
+                            val key = rememberedKey
+                            if (key != null) publishedKeys.remove(uri, key) else publishedKeys.remove(uri)
+                        }
+                    }
                 } catch (error: CancellationException) {
                     onPaused()
                     throw error
                 } catch (error: TransferStoppedByLimit) {
                     request.limits?.onStopped?.invoke(error.reason)
                     return@launch
+                } catch (error: ExpiredDownloadLinkException) {
+                    val refresher = request.refreshSourceLink
+                    if (refresher == null || !refreshBudget.tryAcquireAttempt(tempFile.partialLength())) {
+                        onFailure("Download failed with HTTP ${error.statusCode}")
+                        return@launch
+                    }
+                    when (val refreshed = refresher(request.item)) {
+                        is SourceLinkRefreshResult.Refreshed -> {
+                            currentCoroutineContext().ensureActive()
+                            val link = refreshed.link
+                            val needsVerification = tempFile.partialLength() > 0L
+                            request = request.copy(
+                                item = request.item.copy(
+                                    sourceUrl = link.url,
+                                    sourceHeaders = link.requestHeaders,
+                                    sourceResponseHeaders = link.responseHeaders,
+                                    sourceFilename = link.filename ?: request.item.sourceFilename,
+                                    sourceFileSizeBytes = link.videoSize?.takeIf { it > 0L } ?: request.item.sourceFileSizeBytes,
+                                    pendingLinkVerification = needsVerification,
+                                ),
+                            )
+                            request.onSourceRefreshed(link, needsVerification)
+                            if (needsVerification) {
+                                pendingFreshVerification = knownIdentity ?: SourceFileIdentity(null, null, null)
+                            }
+                        }
+                        SourceLinkRefreshResult.Unavailable -> {
+                            onFailure("Download failed with HTTP ${error.statusCode}")
+                            return@launch
+                        }
+                        is SourceLinkRefreshResult.Failed -> {
+                            currentCoroutineContext().ensureActive()
+                            if (isOffline()) refreshBudget.refundUnreachableAttempt()
+                            if (!retries.awaitNextAttempt(madeProgress = false)) {
+                                onFailure("Download failed with HTTP ${error.statusCode}")
+                                return@launch
+                            }
+                        }
+                    }
                 } catch (error: IOException) {
+                    if (error is com.nuvio.app.core.network.NetworkPolicyException) {
+                        onFailure(error.message.orEmpty())
+                        return@launch
+                    }
                     // A full disk is still full after a wait, so it is not tried again.
                     if (classifyDownloadFailure(error.message.orEmpty()) == DownloadFailureKind.NotEnoughSpace) {
                         onFailure(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
                         return@launch
                     }
+                    // A network that blocks downloads fails them like this; enough of it makes downloads wait.
+                    transferFailureKind(error)?.let { kind -> reportTransferFailure(request.sourceUrl, kind) }
                     if (!retries.awaitNextAttempt(madeProgress = tempFile.partialLength() > bytesBeforeAttempt)) {
                         onFailure(error.message?.takeIf { it.isNotBlank() && it != "closed" } ?: "Connection lost")
                         return@launch
                     }
                 } catch (error: Throwable) {
+                    transferFailureKind(error)?.let { kind -> reportTransferFailure(request.sourceUrl, kind) }
                     onFailure(error.message ?: "Download failed")
                     return@launch
                 }
@@ -210,6 +449,7 @@ internal actual object DownloadsPlatformDownloader {
             } finally {
                 // Only now, with the file closed, can anything else write or move it.
                 WriterTokens.release(request.item.id)
+                request.onFinished()
             }
         }
 
@@ -219,29 +459,113 @@ internal actual object DownloadsPlatformDownloader {
     /** The identity of each file this downloader published in this run, by address. */
     private val publishedKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
-    /** Removes a file this downloader just published, only while it still has the identity it had then. */
-    fun removeJustPublished(localFileUri: String): Boolean {
-        val key = publishedKeys.remove(localFileUri) ?: return false
+    internal fun rememberPublishedFile(path: java.nio.file.Path): String? =
+        DownloadMover.identityOf(path)?.also { publishedKeys[path.toFile().toURI().toString()] = it }
+
+    /** Uses the saved identity after a restart, or this run's publication identity for older records. */
+    fun removeJustPublished(localFileUri: String, fileKey: String? = null): Boolean =
+        removeJustPublished(localFileUri, fileKey, DownloadsTrash::moveToTrash)
+
+    internal fun removeJustPublished(localFileUri: String, move: (java.nio.file.Path) -> Boolean): Boolean =
+        removeJustPublished(localFileUri, null, move)
+
+    internal fun removeJustPublished(localFileUri: String, fileKey: String?, move: (java.nio.file.Path) -> Boolean): Boolean {
         val path = localFileUri.toLocalFileOrNull()?.toPath() ?: return false
-        return runCatching {
-            if (!Files.isSymbolicLink(path) && DownloadMover.identityOf(path) == key) Files.delete(path)
-            !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
-        }.getOrDefault(false)
+        val uri = path.toFile().toURI().toString()
+        val key = fileKey ?: publishedKeys[uri] ?: return false
+        val moved = trashPublishedFile(path, key, move)
+        if (moved) publishedKeys.remove(uri, key)
+        return moved
     }
 
     actual fun removeFile(localFileUri: String?): Boolean {
         if (localFileUri.isNullOrBlank()) return false
-        val file = localFileUri.toLocalFileOrNull() ?: return false
-        return runCatching { file.delete() }.getOrDefault(false)
+        // A path that cannot be read is not sent anywhere.
+        localFileUri.toLocalFileOrNull() ?: return false
+        val send = trashRemovedFile ?: DownloadsTrash::moveAway
+        return runCatching { send(localFileUri) }.getOrDefault(false)
     }
 
     actual fun removePartialFile(destinationFileName: String): Boolean {
         // Without a record to say where, only the app's own folder: never a file of that name elsewhere.
         // Subtitles saved at the start of a download that never became a file go with it. Never when the file exists.
-        val video = File(appDownloadsDir, destinationFileName)
+        val video = fileInAppDownloads(destinationFileName) ?: return false
         if (!video.exists()) runCatching { DownloadSubtitleStorage(video.toURI().toString()).remove() }
-        val tempFile = File(appDownloadsDir, "$destinationFileName.part")
-        return !tempFile.exists() || runCatching { tempFile.delete() }.getOrDefault(false)
+        val item = DownloadsRepository.loadedProfile()?.let {
+            DownloadsRepository.uiState.value.items.firstOrNull { candidate -> candidate.fileName == destinationFileName }
+        }
+        if (item != null) {
+            DownloadFolders.controller.removePartialOf(item)?.let { return it }
+            return retirePartial(item)
+        }
+        // No record can prove this partial. Leave it where it is.
+        val partial = fileInAppDownloads("$destinationFileName.part") ?: return false
+        return !partial.exists()
+    }
+
+    /**
+     * Moves this download's partial files in the app's own folder to the Trash.
+     * A partial moves only when it is still the file the download recorded and no other download owns it.
+     * Nothing is deleted.
+     */
+    actual fun retirePartial(item: DownloadItem): Boolean {
+        val folder = appDownloadsDir.toPath().toAbsolutePath().normalize()
+        val targets = buildList {
+            add(item.activePartialFileName to item.partialFileKey)
+            item.supersededPartials.forEach { kept ->
+                if (kept.locationId == null || kept.locationId == DownloadLocations.AppId) {
+                    add(kept.fileName to kept.partialFileKey)
+                }
+            }
+        }
+        var allOut = true
+        for ((name, key) in targets) {
+            val partial = pathInFolder(folder, name)
+            if (partial == null || !trashOwnedAppPartial(item, partial, key)) allOut = false
+        }
+        pathInFolder(folder, item.fileName)?.let { video ->
+            if (!Files.exists(video, LinkOption.NOFOLLOW_LINKS)) {
+                runCatching { DownloadSubtitleStorage(video.toUri().toString()).remove() }
+            }
+        }
+        return allOut
+    }
+
+    actual fun retireSupersededPartials(item: DownloadItem): Set<String> {
+        if (item.supersededPartials.isEmpty()) return emptySet()
+        val folders = DesktopDownloads.folders
+        val fallbackDir = folders.locations.locationOfRecord(item.locationId, item.localFileUri).path
+        return retireKeptPartials(
+            keptPartials = item.supersededPartials,
+            fallbackDir = fallbackDir,
+            downloadId = item.id,
+            folders = folders,
+            trashPartial = trashPartial ?: folders::moveToTrash,
+        )
+    }
+
+    private fun trashOwnedAppPartial(item: DownloadItem, path: Path, expectedKey: String?): Boolean {
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return true
+        if (Files.isSymbolicLink(path)) return false
+        if (expectedKey == null || DownloadMover.identityOf(path) != expectedKey) return false
+        val records = RepositoryDownloadsHooks.allRecords() ?: return false
+        val ownership = DownloadOwnership(DesktopDownloads.folders.locations, records)
+        val profileId = RepositoryDownloadsHooks.profileId()
+        if (ownership.otherOwner(profileId, item.id, path) != null) return false
+        val sidecar = path.resolveSibling(DownloadSidecarFiles.sidecarFolderName(path.fileName.toString()))
+        if (ownership.otherOwner(profileId, item.id, sidecar) != null) return false
+        val send = trashPartialFile ?: DownloadsTrash::moveToTrash
+        return runCatching { send(path) }.getOrDefault(false) && !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+    }
+
+    private fun fileInAppDownloads(name: String): File? = pathInFolder(appDownloadsDir.toPath(), name)?.toFile()
+
+    private fun pathInFolder(folder: Path, name: String): Path? {
+        if (name.isBlank() || name == "." || name == ".." || '/' in name || '\\' in name) return null
+        val directory = folder.toAbsolutePath().normalize()
+        val path = directory.resolve(name).normalize()
+        if (path.parent != directory) return null
+        return path
     }
 
     /** The recorded address when a file is there. Never a file found by its name instead. */
@@ -290,90 +614,187 @@ internal actual object DownloadsPlatformDownloader {
         limiter: DownloadSpeedLimiter = DownloadBandwidth.limiter.also { DownloadBandwidth.applyStoredLimit() },
         /** Which partial file is this transfer's own. Callers that made the file themselves may trust it. */
         partial: OwnedPartial = OwnedPartial.trustingCaller(),
-    ): Transferred {
+        verifyBeforeJoin: SourceFileIdentity? = null,
+        onIdentityObserved: (SourceFileIdentity) -> Unit = {},
+        onJoinVerified: () -> Unit = {},
+    ): Transferred = coroutineScope {
         if (Files.exists(tempFile.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) && !partial.proven(tempFile.toPath())) throw PartialNotOurs()
-        // The address check at queue time reads only the text of the URL. Here the name is resolved.
-        if (request.item.autoDownloadRuleKey != null && !resolvesToPublicAddresses(request.sourceUrl)) {
-            error(runBlocking { getString(Res.string.downloads_error_private_address) })
-        }
 
         var resumeFromBytes = tempFile.partialLength()
-        var attemptedRangeRequest = resumeFromBytes > 0L
-        var response = sendDownloadRequest(request, if (attemptedRangeRequest) resumeFromBytes else null)
-
-        if (attemptedRangeRequest && response.statusCode() == 416) {
-            response.body().close()
-            if (!partial.removeIfOurs(tempFile.toPath())) throw PartialNotOurs()
-            resumeFromBytes = 0L
-            attemptedRangeRequest = false
-            response = sendDownloadRequest(request, null)
-        }
-
-        val statusCode = response.statusCode()
-        if (statusCode !in 200..299) {
-            response.body().close()
-            if (statusCode == 408 || statusCode == 429 || statusCode in 500..599) {
-                throw IOException("Download failed with HTTP $statusCode")
+        val needsIdentityVerification = verifyBeforeJoin != null && resumeFromBytes > 0L
+        var verifiedETag = verifyBeforeJoin?.eTag
+        var verifiedLastModified = verifyBeforeJoin?.lastModified
+        var chunksVerified = false
+        if (needsIdentityVerification) {
+            val expectedTotal = verifyBeforeJoin?.totalBytes?.takeIf { it > 0L } ?: throw RefreshNeedsNewPartial()
+            if (verifiedETag == null && verifiedLastModified == null) {
+                val chunkIdentity = verifyChunksMatchPartial(
+                    request = request,
+                    tempFile = tempFile,
+                    partial = partial,
+                    resumeFromBytes = resumeFromBytes,
+                    expectedTotalBytes = expectedTotal,
+                    expectedETag = null,
+                    expectedLastModified = null,
+                )
+                chunksVerified = true
+                verifiedETag = chunkIdentity.eTag
+                verifiedLastModified = chunkIdentity.lastModified
             }
-            error("Download failed with HTTP $statusCode")
         }
+
+        var attemptedRangeRequest = resumeFromBytes > 0L
+        var opened = try {
+            openValidatedBody(request, rangeStart = if (attemptedRangeRequest) resumeFromBytes else null)
+        } catch (rangeError: RangeNotSatisfiableException) {
+            if (!attemptedRangeRequest) error("Download failed with HTTP 416")
+            if (needsIdentityVerification) throw RefreshNeedsNewPartial()
+            if (!partial.proven(tempFile.toPath())) throw PartialNotOurs()
+            throw NeedsReplacementPartial()
+        }
+
+        val active = AtomicBoolean(true)
+        val activeResponse = AtomicReference(opened.response)
+        val cancelConnection = launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            try { awaitCancellation() } finally { if (active.get()) activeResponse.get().cancel() }
+        }
+        try {
+        if (needsIdentityVerification) {
+            val expectedTotal = verifyBeforeJoin!!.totalBytes!!
+            val crHeader = opened.response.header("Content-Range")
+            val contentRange = parseContentRange(crHeader)
+            val candidateTotal = resolveTotalBytes(
+                startingBytes = resumeFromBytes,
+                isPartialResume = opened.statusCode == 206,
+                contentRangeHeader = crHeader,
+                contentLength = opened.response.header("Content-Length")?.toLongOrNull(),
+            )
+            if (opened.statusCode != 206 || contentRange == null || contentRange.start != resumeFromBytes || candidateTotal != expectedTotal) {
+                opened.close()
+                throw RefreshNeedsNewPartial()
+            }
+            when (
+                compareValidators(
+                    expectedETag = verifiedETag,
+                    actualETag = opened.eTag,
+                    expectedLastModified = verifiedLastModified,
+                    actualLastModified = opened.lastModified,
+                )
+            ) {
+                ValidatorVerdict.Matched -> Unit
+                ValidatorVerdict.Conflict -> {
+                    opened.close()
+                    throw RefreshNeedsNewPartial()
+                }
+                ValidatorVerdict.NeedsChunkVerification -> {
+                    if (!chunksVerified) {
+                        opened.close()
+                        val chunkIdentity = verifyChunksMatchPartial(
+                            request = request,
+                            tempFile = tempFile,
+                            partial = partial,
+                            resumeFromBytes = resumeFromBytes,
+                            expectedTotalBytes = expectedTotal,
+                            expectedETag = verifiedETag,
+                            expectedLastModified = verifiedLastModified,
+                        )
+                        verifiedETag = verifiedETag ?: chunkIdentity.eTag ?: opened.eTag
+                        verifiedLastModified = verifiedLastModified ?: chunkIdentity.lastModified ?: opened.lastModified
+
+                        val reOpened = try {
+                            openValidatedBody(request, rangeStart = resumeFromBytes)
+                        } catch (_: RangeNotSatisfiableException) {
+                            throw RefreshNeedsNewPartial()
+                        }
+                        activeResponse.set(reOpened.response)
+                        val reCrHeader = reOpened.response.header("Content-Range")
+                        val reCr = parseContentRange(reCrHeader)
+                        val reTotal = resolveTotalBytes(
+                            startingBytes = resumeFromBytes,
+                            isPartialResume = reOpened.statusCode == 206,
+                            contentRangeHeader = reCrHeader,
+                            contentLength = reOpened.response.header("Content-Length")?.toLongOrNull(),
+                        )
+                        val reConflict = compareValidators(
+                            expectedETag = verifiedETag,
+                            actualETag = reOpened.eTag,
+                            expectedLastModified = verifiedLastModified,
+                            actualLastModified = reOpened.lastModified,
+                        ) == ValidatorVerdict.Conflict
+                        if (reOpened.statusCode != 206 || reCr == null || reCr.start != resumeFromBytes || reTotal != expectedTotal || reConflict) {
+                            reOpened.close()
+                            throw RefreshNeedsNewPartial()
+                        }
+                        opened = reOpened
+                    }
+                }
+            }
+        }
+
+        val response = opened.response
+        val statusCode = opened.statusCode
+        val body = opened.body
 
         val isPartialResume = attemptedRangeRequest && statusCode == 206 && resumeFromBytes > 0L
         val appendToTemp = isPartialResume
         val startingBytes = if (appendToTemp) resumeFromBytes else 0L
-        // An earlier partial that cannot be continued is discarded only after the checks below have
-        // passed, so a download that is refused for lack of room keeps what it already has.
-        val discardPartial = !appendToTemp && tempFile.exists()
-        val reclaimedBytes = if (discardPartial) tempFile.partialLength() else 0L
+        // A server that ignores a range request cannot continue this partial. The file stays where it
+        // is; the caller starts a separate replacement and retires this one only after that is accepted.
+        if (!appendToTemp && tempFile.exists()) {
+            opened.close()
+            if (!partial.proven(tempFile.toPath())) throw PartialNotOurs()
+            throw NeedsReplacementPartial()
+        }
 
         val totalBytes = resolveTotalBytes(
             startingBytes = startingBytes,
             isPartialResume = isPartialResume,
-            contentRangeHeader = response.headers().firstValue("Content-Range").orElse(null),
-            contentLength = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull(),
+            contentRangeHeader = response.header("Content-Range"),
+            contentLength = response.header("Content-Length")?.toLongOrNull(),
         )
         var downloadedBytes = startingBytes
+        val traffic = DownloadTraffic.app
         val reporter = ThrottledProgress(progressIntervalMs, System::nanoTime) { bytes -> onProgress(bytes, totalBytes) }
         // Checked before anything of the body is written, for every download: a file announced as
         // larger than the room on the disk fails with a plain message instead of a system error.
         if (totalBytes != null) {
-            val free = freeBytesFor(request.item)?.plus(reclaimedBytes)
+            val free = freeBytesFor(request.item)
             if (free != null && totalBytes - startingBytes > free) {
-                response.body().close()
+                opened.close()
                 error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
             }
         }
         // Checked before anything of the body is written: a file that is announced as too large for
         // the limits of an automatic download is not started.
         val limits = request.limits
-        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item)?.plus(reclaimedBytes))?.let { reason ->
-            response.body().close()
+        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item))?.let { reason ->
+            opened.close()
             throw TransferStoppedByLimit(reason)
         }
-        if (discardPartial && !partial.removeIfOurs(tempFile.toPath())) {
-            response.body().close()
-            throw PartialNotOurs()
-        }
+        onIdentityObserved(SourceFileIdentity(totalBytes = totalBytes, eTag = opened.eTag, lastModified = opened.lastModified))
+        onJoinVerified()
         onProgress(downloadedBytes, totalBytes)
         val expectedDigest = if (statusCode == 200 && !appendToTemp) {
-            expectedBodyDigest { name -> response.headers().firstValue(name).orElse(null) }
+            expectedBodyDigest { name -> response.header(name) }
         } else {
             null
         }
         val digest = expectedDigest?.let { runCatching { MessageDigest.getInstance(it.algorithm) }.getOrNull() }
 
-        response.body().use { input ->
+        body.use { input ->
             coroutineScope {
                 // A connection that goes silent never ends the read by itself. Closing the body
                 // ends it, and the transfer is then tried again like any other dropped connection.
                 val lastReadAtNanos = AtomicLong(System.nanoTime())
                 val stalled = AtomicBoolean(false)
-                // Cancelling the transfer closes the body, which ends a read that is blocked on a
-                // silent connection, so a pause or a move does not wait for data that never comes.
+                val reading = AtomicBoolean(true)
+                // Cancelling the transfer closes the underlying response stream before the outer
+                // pushback stream, so a read blocked on a silent connection returns at once.
                 val closer = launch {
                     try {
                         awaitCancellation()
                     } finally {
+                        if (reading.get()) response.cancel()
                         runCatching { input.close() }
                     }
                 }
@@ -383,11 +804,14 @@ internal actual object DownloadsPlatformDownloader {
                         delay((timeoutMs / 4).coerceAtLeast(1L))
                         if (System.nanoTime() - lastReadAtNanos.get() > timeoutMs * 1_000_000L) {
                             stalled.set(true)
+                            response.cancel()
                             runCatching { input.close() }
                             break
                         }
                     }
                 }
+                // Counted as a running transfer only while the body is read; the finally below ends it.
+                val trafficToken = traffic.begin(endpointOf(request.sourceUrl))
                 try {
                     openPartial(tempFile.toPath(), appendToTemp).also { if (!appendToTemp) partial.created(tempFile.toPath()) }.use { output ->
                         val buffer = ByteArray(ReadBufferBytes)
@@ -398,6 +822,7 @@ internal actual object DownloadsPlatformDownloader {
                             if (read <= 0) break
                             lastReadAtNanos.set(System.nanoTime())
                             output.write(buffer, 0, read)
+                            traffic.add(read)
                             digest?.update(buffer, 0, read)
                             downloadedBytes += read.toLong()
                             reporter.offer(downloadedBytes)
@@ -421,6 +846,8 @@ internal actual object DownloadsPlatformDownloader {
                     currentCoroutineContext().ensureActive()
                     throw if (stalled.get()) IOException("Connection stalled") else error
                 } finally {
+                    traffic.end(trafficToken)
+                    reading.set(false)
                     stallWatch.cancel()
                     closer.cancel()
                     // The last value is always reported, whether the transfer ended, failed or was stopped.
@@ -434,53 +861,474 @@ internal actual object DownloadsPlatformDownloader {
         if (totalBytes != null && downloadedBytes < totalBytes) {
             throw IOException("Connection closed after $downloadedBytes of $totalBytes bytes")
         }
-        return Transferred(
+        Transferred(
             totalBytes = totalBytes,
             digestMatched = if (digest != null && expectedDigest != null) digest.digest().contentEquals(expectedDigest.value) else null,
         )
+        } finally {
+            active.set(false)
+            cancelConnection.cancel()
+            activeResponse.get().close()
+        }
+    }
+
+    private suspend fun openValidatedBody(
+        request: DownloadPlatformRequest,
+        rangeStart: Long?,
+        rangeEnd: Long? = null,
+    ): ValidatedHttpBody {
+        val response = sendDownloadRequest(request, rangeStart, rangeEnd)
+        val statusCode = response.code
+        if (statusCode == 403 || statusCode == 404 || statusCode == 410) {
+            response.close()
+            throw ExpiredDownloadLinkException(statusCode)
+        }
+        if (statusCode == 416) {
+            val contentRange = response.header("Content-Range")
+            response.close()
+            throw RangeNotSatisfiableException(contentRange)
+        }
+        if (statusCode !in 200..299) {
+            response.close()
+            if (statusCode == 408 || statusCode == 429 || statusCode in 500..599) {
+                throw IOException("Download failed with HTTP $statusCode")
+            }
+            error("Download failed with HTTP $statusCode")
+        }
+        // A web page where a video was asked for: a sign-in page of the network, usually. Its label is read, and
+        // its first bytes, since a portal may send it unlabelled or labelled as a file. Nothing of it is written
+        // and the partial file is left as it is; the transfer is tried again like a dropped connection.
+        // The first bytes are read and pushed back, so the reads that follow come straight from the connection as before.
+        val raw = response.body?.byteStream() ?: run {
+            response.close()
+            throw IOException("Empty response body")
+        }
+        val body = java.io.PushbackInputStream(raw, SniffBytes)
+        val isPage = try {
+            isWebPage(response.header("Content-Type")) ||
+                startsLikeWebPage(peekHead(body) { response.cancel(); runCatching { raw.close() } })
+        } catch (error: Throwable) {
+            runCatching { response.close() }
+            runCatching { raw.close() }
+            runCatching { body.close() }
+            throw error
+        }
+        if (isPage) {
+            runCatching { response.close() }
+            runCatching { raw.close() }
+            runCatching { body.close() }
+            throw PageInsteadOfFile()
+        }
+        return ValidatedHttpBody(
+            response = response,
+            statusCode = statusCode,
+            body = body,
+            eTag = normalizeStrongETag(response.header("ETag")),
+            lastModified = normalizeLastModified(response.header("Last-Modified")),
+        )
+    }
+
+    private suspend fun verifyChunksMatchPartial(
+        request: DownloadPlatformRequest,
+        tempFile: File,
+        partial: OwnedPartial,
+        resumeFromBytes: Long,
+        expectedTotalBytes: Long,
+        expectedETag: String?,
+        expectedLastModified: String?,
+    ): SourceFileIdentity {
+        val firstLen = minOf(resumeFromBytes, VerifyChunkBytes).toInt()
+        val firstIdentity = verifySingleChunkMatch(
+            request = request,
+            tempFile = tempFile,
+            partial = partial,
+            offset = 0L,
+            length = firstLen,
+            allowFull200AtStart = true,
+            expectedTotalBytes = expectedTotalBytes,
+            expectedETag = expectedETag,
+            expectedLastModified = expectedLastModified,
+        )
+        val combinedETag = expectedETag ?: firstIdentity.eTag
+        val combinedLastMod = expectedLastModified ?: firstIdentity.lastModified
+        val lastLen = minOf(resumeFromBytes, VerifyChunkBytes).toInt()
+        val lastOffset = resumeFromBytes - lastLen
+        if (lastOffset > 0L) {
+            val lastIdentity = verifySingleChunkMatch(
+                request = request,
+                tempFile = tempFile,
+                partial = partial,
+                offset = lastOffset,
+                length = lastLen,
+                allowFull200AtStart = false,
+                expectedTotalBytes = expectedTotalBytes,
+                expectedETag = combinedETag,
+                expectedLastModified = combinedLastMod,
+            )
+            return SourceFileIdentity(
+                totalBytes = expectedTotalBytes,
+                eTag = combinedETag ?: lastIdentity.eTag,
+                lastModified = combinedLastMod ?: lastIdentity.lastModified,
+            )
+        }
+        return SourceFileIdentity(
+            totalBytes = expectedTotalBytes,
+            eTag = combinedETag,
+            lastModified = combinedLastMod,
+        )
+    }
+
+    private suspend fun verifySingleChunkMatch(
+        request: DownloadPlatformRequest,
+        tempFile: File,
+        partial: OwnedPartial,
+        offset: Long,
+        length: Int,
+        allowFull200AtStart: Boolean,
+        expectedTotalBytes: Long,
+        expectedETag: String?,
+        expectedLastModified: String?,
+    ): SourceFileIdentity {
+        val expectedBytes = readPartialSlice(tempFile, partial, offset, length)
+        val opened = try {
+            openValidatedBody(request, rangeStart = offset, rangeEnd = offset + length - 1L)
+        } catch (_: RangeNotSatisfiableException) {
+            throw RefreshNeedsNewPartial()
+        }
+        opened.use {
+            val input = opened.body
+            if (compareValidators(expectedETag, opened.eTag, expectedLastModified, opened.lastModified) == ValidatorVerdict.Conflict) {
+                throw RefreshNeedsNewPartial()
+            }
+            val crHeader = opened.response.header("Content-Range")
+            val cl = opened.response.header("Content-Length")?.toLongOrNull()
+            when (opened.statusCode) {
+                206 -> {
+                    val cr = parseContentRange(crHeader) ?: throw RefreshNeedsNewPartial()
+                    if (cr.start != offset || cr.total != expectedTotalBytes) throw RefreshNeedsNewPartial()
+                    if (cl != null && cl != length.toLong()) throw RefreshNeedsNewPartial()
+                }
+                200 -> {
+                    if (!allowFull200AtStart || offset != 0L) throw RefreshNeedsNewPartial()
+                    if (cl != null && cl != expectedTotalBytes) throw RefreshNeedsNewPartial()
+                }
+                else -> throw RefreshNeedsNewPartial()
+            }
+            val remoteBytes = readExactWithStallGuard(input, length, stallTimeoutMs) {
+                opened.response.close()
+            }
+            if (!remoteBytes.contentEquals(expectedBytes)) {
+                throw RefreshNeedsNewPartial()
+            }
+            return SourceFileIdentity(
+                totalBytes = expectedTotalBytes,
+                eTag = opened.eTag,
+                lastModified = opened.lastModified,
+            )
+        }
     }
 
     private suspend fun sendDownloadRequest(
         request: DownloadPlatformRequest,
         rangeStart: Long?,
-    ): HttpResponse<java.io.InputStream> {
-        val builder = HttpRequest.newBuilder()
-            .uri(URI(request.sourceUrl))
-            .timeout(Duration.ofSeconds(60))
-            .GET()
+        rangeEnd: Long? = null,
+    ): DownloadResponse {
+        val builder = okhttp3.Request.Builder().url(request.sourceUrl).get()
         request.sourceHeaders.forEach { (key, value) ->
-            if (key.isNotBlank() && value.isNotBlank()) {
-                builder.header(key, value)
-            }
+            if (key.isNotBlank() && value.isNotBlank()) builder.header(key, value)
         }
-        if (rangeStart != null && rangeStart > 0L) {
-            builder.header("Range", "bytes=$rangeStart-")
+        // Downloads are byte ranges of the original representation.
+        builder.header("Accept-Encoding", "identity")
+        if (rangeStart != null && (rangeStart > 0L || rangeEnd != null)) {
+            val endSpec = rangeEnd?.toString().orEmpty()
+            builder.header("Range", "bytes=$rangeStart-$endSpec")
         }
-        // Interrupted when the transfer is cancelled, so that waiting for a server does not hold it.
-        return runInterruptible(Dispatchers.IO) {
-            desktopDownloadHttpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            val call = desktopDownloadHttpClient.newCall(builder.build())
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : okhttp3.Callback {
+                override fun onFailure(call: okhttp3.Call, e: IOException) {
+                    continuation.resumeWith(Result.failure(e))
+                }
+                override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                    continuation.resume(DownloadResponse(response, call)) { _, value, _ -> value.close() }
+                }
+            })
         }
     }
 }
 
-/** False when the host of [url] cannot be resolved or any of its addresses is not a public one. */
-private fun resolvesToPublicAddresses(url: String): Boolean {
-    val addresses = runCatching { InetAddress.getAllByName(URI(url).host) }.getOrNull()
-    return !addresses.isNullOrEmpty() && addresses.none(::isPrivateNetworkAddress)
+private class DownloadResponse(private val response: okhttp3.Response, private val call: okhttp3.Call) {
+    val code: Int get() = response.code
+    val body: okhttp3.ResponseBody? get() = response.body
+    fun header(name: String): String? = response.header(name)
+    fun cancel() = call.cancel()
+    fun close() { call.cancel(); response.close() }
 }
 
-/** Loopback, link-local, private-network and carrier-shared addresses, and the unspecified address. */
-internal fun isPrivateNetworkAddress(address: InetAddress): Boolean {
-    val bytes = address.address
-    val first = bytes[0].toInt() and 0xff
-    val second = bytes[1].toInt() and 0xff
-    return address.isLoopbackAddress ||
-        address.isAnyLocalAddress ||
-        address.isLinkLocalAddress ||
-        address.isSiteLocalAddress ||
-        (address is Inet6Address && (first and 0xfe) == 0xfc) ||
-        (bytes.size == 4 && (first == 0 || (first == 100 && second in 64..127)))
+private const val DefaultMaxLinkRefreshesWithoutProgress = 3
+private const val DefaultMaxTotalLinkRefreshes = 8
+private const val VerifyChunkBytes = 64L * 1024
+
+internal data class SourceFileIdentity(
+    val totalBytes: Long?,
+    val eTag: String?,
+    val lastModified: String?,
+)
+
+internal class ExpiredDownloadLinkException(val statusCode: Int) : IOException("Download failed with HTTP $statusCode")
+
+internal class RefreshNeedsNewPartial : IOException("Refreshed link is not provably the same file")
+
+/** The partial file cannot be continued. It is kept, and a separate replacement is started. */
+internal class NeedsReplacementPartial : IOException("The partial file cannot be continued")
+
+private class RangeNotSatisfiableException(val contentRangeHeader: String?) : IOException("Download failed with HTTP 416")
+
+private class ValidatedHttpBody(
+    val response: DownloadResponse,
+    val statusCode: Int,
+    val body: java.io.PushbackInputStream,
+    val eTag: String?,
+    val lastModified: String?,
+) : java.io.Closeable {
+    override fun close() {
+        runCatching { body.close() }
+        response.close()
+    }
 }
+
+private data class ContentRangeSpec(
+    val start: Long,
+    val end: Long?,
+    val total: Long?,
+)
+
+private enum class ValidatorVerdict {
+    Matched,
+    Conflict,
+    NeedsChunkVerification,
+}
+
+private class LinkRefreshBudget(
+    private val maxWithoutProgress: Int,
+    private val maxTotal: Int,
+    initialBytes: Long,
+    private val wait: suspend (delayMs: Long) -> Unit,
+) {
+    private var bytesAtLastProgress: Long = initialBytes
+    private var refreshesWithoutProgress: Int = 0
+    private var totalRefreshes: Int = 0
+
+    fun recordPartialSwitched() {
+        bytesAtLastProgress = 0L
+    }
+
+    fun noteBytesWritten(currentBytes: Long) {
+        if (currentBytes > bytesAtLastProgress) {
+            bytesAtLastProgress = currentBytes
+            refreshesWithoutProgress = 0
+        }
+    }
+
+    fun refundUnreachableAttempt() {
+        if (totalRefreshes > 0) totalRefreshes--
+        if (refreshesWithoutProgress > 0) refreshesWithoutProgress--
+    }
+
+    suspend fun tryAcquireAttempt(currentBytes: Long): Boolean {
+        noteBytesWritten(currentBytes)
+        if (totalRefreshes >= maxTotal || refreshesWithoutProgress >= maxWithoutProgress) {
+            return false
+        }
+        val waitAttempt = refreshesWithoutProgress
+        totalRefreshes++
+        refreshesWithoutProgress++
+        if (waitAttempt > 0) {
+            wait(retryDelayMs(waitAttempt))
+        }
+        return true
+    }
+}
+
+private fun compareValidators(
+    expectedETag: String?,
+    actualETag: String?,
+    expectedLastModified: String?,
+    actualLastModified: String?,
+): ValidatorVerdict = when {
+    expectedETag != null && actualETag != null ->
+        if (expectedETag == actualETag) ValidatorVerdict.Matched else ValidatorVerdict.Conflict
+    expectedLastModified != null && actualLastModified != null ->
+        if (expectedLastModified == actualLastModified) ValidatorVerdict.Matched else ValidatorVerdict.Conflict
+    else -> ValidatorVerdict.NeedsChunkVerification
+}
+
+internal fun normalizeStrongETag(value: String?): String? {
+    val trimmed = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    if (trimmed.startsWith("W/", ignoreCase = true)) return null
+    return trimmed
+}
+
+internal fun normalizeLastModified(value: String?): String? =
+    value?.trim()?.takeIf { it.isNotEmpty() }
+
+private fun parseContentRange(headerValue: String?): ContentRangeSpec? {
+    val value = headerValue?.trim().orEmpty()
+    if (!value.startsWith("bytes", ignoreCase = true)) return null
+    val spec = value.substring(5).trim()
+    val slashIndex = spec.indexOf('/')
+    if (slashIndex <= 0 || slashIndex == spec.lastIndex) return null
+    val rangePart = spec.substring(0, slashIndex).trim()
+    val totalPart = spec.substring(slashIndex + 1).trim()
+    val dashIndex = rangePart.indexOf('-')
+    if (dashIndex <= 0 || dashIndex == rangePart.lastIndex) return null
+    val start = rangePart.substring(0, dashIndex).trim().toLongOrNull()?.takeIf { it >= 0L } ?: return null
+    val end = rangePart.substring(dashIndex + 1).trim().toLongOrNull()?.takeIf { it >= start } ?: return null
+    val total = if (totalPart == "*") null else totalPart.toLongOrNull()?.takeIf { it > 0L }
+    return ContentRangeSpec(start = start, end = end, total = total)
+}
+
+private fun readPartialSlice(
+    tempFile: File,
+    partial: OwnedPartial,
+    offset: Long,
+    length: Int,
+): ByteArray {
+    val path = tempFile.toPath()
+    if (!partial.proven(path)) throw PartialNotOurs()
+    val data = ByteArray(length)
+    try {
+        java.nio.channels.FileChannel.open(
+            path,
+            java.nio.file.StandardOpenOption.READ,
+            java.nio.file.LinkOption.NOFOLLOW_LINKS,
+        ).use { channel ->
+            val size = channel.size()
+            if (size < offset + length) throw RefreshNeedsNewPartial()
+            val buffer = java.nio.ByteBuffer.wrap(data)
+            var position = offset
+            while (buffer.hasRemaining()) {
+                val read = channel.read(buffer, position)
+                if (read <= 0) throw RefreshNeedsNewPartial()
+                position += read
+            }
+        }
+    } catch (_: java.nio.file.NoSuchFileException) {
+        throw PartialNotOurs()
+    }
+    return data
+}
+
+private suspend fun readExactWithStallGuard(
+    input: java.io.InputStream,
+    expectedBytes: Int,
+    stallTimeoutMs: Long,
+    cancelCall: () -> Unit,
+): ByteArray = coroutineScope {
+    val lastReadAtNanos = AtomicLong(System.nanoTime())
+    val stalled = AtomicBoolean(false)
+    // The read holds the stream's lock. Closing it first waits out the socket. Cancel the call, then close.
+    val closer = launch {
+        try {
+            awaitCancellation()
+        } finally {
+            runCatching { cancelCall() }
+            runCatching { input.close() }
+        }
+    }
+    val stallWatch = launch {
+        while (true) {
+            delay((stallTimeoutMs / 4).coerceAtLeast(1L))
+            if (System.nanoTime() - lastReadAtNanos.get() > stallTimeoutMs * 1_000_000L) {
+                stalled.set(true)
+                runCatching { cancelCall() }
+                runCatching { input.close() }
+                break
+            }
+        }
+    }
+    val buffer = ByteArray(expectedBytes)
+    var offset = 0
+    try {
+        while (offset < expectedBytes) {
+            currentCoroutineContext().ensureActive()
+            val read = input.read(buffer, offset, expectedBytes - offset)
+            if (read <= 0) break
+            lastReadAtNanos.set(System.nanoTime())
+            offset += read
+        }
+    } catch (error: IOException) {
+        currentCoroutineContext().ensureActive()
+        throw if (stalled.get()) IOException("Connection stalled") else error
+    } finally {
+        stallWatch.cancel()
+        closer.cancel()
+    }
+    if (stalled.get()) throw IOException("Connection stalled")
+    if (offset < expectedBytes) {
+        throw IOException("Connection closed after $offset of $expectedBytes verified bytes")
+    }
+    buffer
+}
+
+internal fun freePartialFileName(
+    folder: java.nio.file.Path,
+    destinationFileName: String,
+    reservedNames: Set<String> = emptySet(),
+): String {
+    val base = destinationFileName.substringBeforeLast('.', destinationFileName)
+    val extension = destinationFileName.substringAfterLast('.', "").let {
+        if (it.isEmpty() || it == destinationFileName) "" else ".$it"
+    }
+    for (n in 2..999) {
+        val candidate = "$base ($n)$extension.part"
+        if (candidate !in reservedNames && !Files.exists(folder.resolve(candidate), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            return candidate
+        }
+    }
+    throw IOException("No free partial name for $destinationFileName")
+}
+
+private fun retireKeptPartials(
+    keptPartials: List<KeptPartialFile>,
+    fallbackDir: java.nio.file.Path,
+    downloadId: String,
+    folders: DesktopDownloadFolders,
+    trashPartial: (java.nio.file.Path) -> Boolean,
+): Set<String> {
+    if (keptPartials.isEmpty()) return emptySet()
+    val repoLoaded = DownloadsRepository.loadedProfile() != null
+    val allRecords = if (repoLoaded) RepositoryDownloadsHooks.allRecords() else null
+    val ownership = allRecords?.let { DownloadOwnership(folders.locations, it) }
+    val activeProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
+    val retired = mutableSetOf<String>()
+    keptPartials.forEach { kept ->
+        val dir = if (kept.locationId != null) {
+            val location = folders.locations.ownerOf(kept.locationId, null) ?: return@forEach
+            if (folders.locations.availability(location) != FolderAvailability.Available) return@forEach
+            location.path
+        } else {
+            fallbackDir
+        }
+        val path = dir.resolve(kept.fileName)
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            retired += kept.partialFileKey
+            return@forEach
+        }
+        if (Files.isSymbolicLink(path)) return@forEach
+        if (DownloadMover.identityOf(path) != kept.partialFileKey) return@forEach
+        if (repoLoaded && ownership == null) return@forEach
+        if (ownership != null && ownership.otherOwner(activeProfileId, downloadId, path) != null) return@forEach
+        if (runCatching { trashPartial(path) }.getOrDefault(false) && !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            retired += kept.partialFileKey
+        }
+    }
+    return retired
+}
+
+internal fun isPrivateNetworkAddress(address: InetAddress): Boolean =
+    com.nuvio.app.core.network.isLocalDestination(address)
 
 private fun openDirectoryWithPlatformCommand(directory: File): Boolean {
     val osName = System.getProperty("os.name").orEmpty().lowercase()
@@ -490,6 +1338,22 @@ private fun openDirectoryWithPlatformCommand(directory: File): Boolean {
         else -> listOf("xdg-open", directory.absolutePath)
     }
     return runCatching { ProcessBuilder(command).start() }.isSuccess
+}
+
+/** A final file at the recorded address, with no partial name left, still needs the usual video checks. */
+internal fun publishedDownloadToVerify(item: DownloadItem, destination: File, partial: File): File? {
+    if (item.status != DownloadStatus.Downloading) return null
+    val file = if (item.localFileUri != null) item.localFileUri.toLocalFileOrNull() ?: return null else destination
+    val nofollow = java.nio.file.LinkOption.NOFOLLOW_LINKS
+    return runCatching {
+        if (!Files.notExists(partial.toPath(), nofollow) ||
+            !Files.notExists(File(file.parentFile, "${file.name}.part").toPath(), nofollow) ||
+            !Files.isRegularFile(file.toPath(), nofollow)
+        ) return null
+        val size = Files.size(file.toPath())
+        val announced = item.totalBytes?.takeIf { it > 0 }
+        if (size <= 0 || size < item.downloadedBytes || announced != null && size != announced) null else file
+    }.getOrNull()
 }
 
 private class DesktopDownloadsTaskHandle(
@@ -617,6 +1481,7 @@ internal fun publishDurably(
     destination: java.nio.file.Path,
     flushFolder: (java.nio.file.Path) -> Boolean = { folder -> !foldersCanBeFlushed || DownloadMover.flushDirectory(folder) },
     link: (java.nio.file.Path, java.nio.file.Path) -> Unit = { name, existing -> Files.createLink(name, existing) },
+    beforeRemovingPartial: (java.nio.file.Path) -> Boolean = { true },
     copy: (java.nio.channels.FileChannel, java.nio.channels.FileChannel) -> Unit = { input, out ->
         var position = 0L
         val size = input.size()
@@ -661,6 +1526,10 @@ internal fun publishDurably(
             removeIfStill(candidate, createdKey)
             throw DownloadNotDurable("The folder of the download could not be flushed")
         }
+        if (!beforeRemovingPartial(candidate)) {
+            // Both names keep their bytes when the record could not be made durable.
+            throw DownloadNotDurable("The finished file address could not be saved")
+        }
         Files.deleteIfExists(part)
         flushFolder(candidate.parent)
         return candidate
@@ -676,7 +1545,7 @@ private fun removeIfStill(path: java.nio.file.Path, key: String?) {
 
 /**
  * The partial file of a download, opened for writing without following a link: appended to when the
- * download resumes it, created with create-new when it starts it (the old one was removed just before),
+ * download resumes it, created with create-new when it starts a new partial,
  * so a link or another file put at that name is never written through or cut short.
  */
 internal fun openPartial(path: java.nio.file.Path, append: Boolean): java.io.OutputStream {
@@ -693,7 +1562,7 @@ internal class PartialNotOurs : IOException("The partial file at that name is no
 
 /**
  * Which partial file is a transfer's own: the one whose identity was recorded when this download created it.
- * Nothing that cannot be proven this way is resumed, cut back or removed.
+ * Nothing that cannot be proven this way is resumed or replaced.
  */
 internal class OwnedPartial(
     @Volatile var key: String?,
@@ -708,13 +1577,6 @@ internal class OwnedPartial(
         val identity = DownloadMover.identityOf(path) ?: return
         key = identity
         onCreated(identity)
-    }
-
-    /** Removes the partial file only while it is proven to be this download's. True when it is gone. */
-    fun removeIfOurs(path: java.nio.file.Path): Boolean {
-        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return true
-        if (!proven(path)) return false
-        return runCatching { Files.delete(path); true }.getOrDefault(false)
     }
 
     companion object {
@@ -734,3 +1596,111 @@ internal fun freeDownloadName(folder: java.nio.file.Path, name: String): String 
     }
     throw IOException("No free name for $name")
 }
+
+/** The rejected file goes to the Trash only while its recorded identity still matches. */
+internal fun trashPublishedFile(path: java.nio.file.Path, key: String, moveToTrash: (java.nio.file.Path) -> Boolean): Boolean =
+    runCatching {
+        if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return@runCatching true
+        if (Files.isSymbolicLink(path) || DownloadMover.identityOf(path) != key) return@runCatching false
+        moveToTrash(path) && !Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+    }.getOrDefault(false)
+
+/** A web page arrived where a video was asked for. Its body is not written. */
+internal class PageInsteadOfFile : IOException("The network sent a web page instead of the video")
+
+/** Whether a response of [contentType] is a web page rather than a file. */
+internal fun isWebPage(contentType: String?): Boolean {
+    val type = contentType?.substringBefore(';')?.trim()?.lowercase() ?: return false
+    return type == "text/html" || type == "application/xhtml+xml"
+}
+
+/**
+ * How [error] failed, in the ways a network that blocks downloads makes transfers fail; null for others. A
+ * refusal or a server error (403, 410, 5xx) is the source's, an expired or removed link: never counted.
+ */
+internal fun transferFailureKind(error: Throwable): TransferFailureKind? {
+    val message = error.message.orEmpty()
+    return when {
+        error is PageInsteadOfFile -> TransferFailureKind.PageInsteadOfFile
+        error is javax.net.ssl.SSLException -> TransferFailureKind.SecureConnection
+        error is IOException && (message.contains("reset", ignoreCase = true) || message.contains("closed", ignoreCase = true)) -> TransferFailureKind.Reset
+        else -> null
+    }
+}
+
+private fun reportTransferFailure(url: String, kind: TransferFailureKind) {
+    val host = runCatching { URI(url).host }.getOrNull() ?: return
+    DesktopPoliteDownloads.onTransferFailure(host, kind)
+}
+
+/** The host and port a transfer talks to, for the round trip probe. */
+internal fun endpointOf(url: String): TransferEndpoint {
+    val uri = runCatching { URI(url) }.getOrNull()
+    val port = uri?.port?.takeIf { it > 0 } ?: if (uri?.scheme.equals("http", ignoreCase = true)) 80 else 443
+    return TransferEndpoint(uri?.host.orEmpty(), port)
+}
+
+/** How many first bytes of a body are looked at for a web page, at most... */
+internal const val SniffBytes = 512
+
+/** ...and waited for, at least (or the end of a shorter body): enough to see past a byte order mark and white space. */
+internal const val SniffMinBytes = 64
+
+/**
+ * The first bytes of [body], which stay to be read. Gives up, by [cancelCall], when nothing comes in time
+ * or the transfer is cancelled. [body] is not closed here: its read holds its own lock, so closing it from
+ * this watcher would wait behind that read and the connection would stay open.
+ */
+internal suspend fun peekHead(body: java.io.PushbackInputStream, cancelCall: () -> Unit): ByteArray = coroutineScope {
+    val sniffing = AtomicBoolean(true)
+    val stalled = AtomicBoolean(false)
+    val guard = launch {
+        delay(DownloadsPlatformDownloader.stallTimeoutMs)
+        if (sniffing.get()) {
+            stalled.set(true)
+            runCatching { cancelCall() }
+        }
+    }
+    val cancelCloser = launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        try {
+            awaitCancellation()
+        } finally {
+            if (sniffing.get()) runCatching { cancelCall() }
+        }
+    }
+    try {
+        val bytes = runInterruptible(Dispatchers.IO) {
+            val head = ByteArray(SniffBytes)
+            var filled = 0
+            while (filled < SniffMinBytes) {
+                val read = body.read(head, filled, SniffBytes - filled)
+                if (read <= 0) break
+                filled += read
+            }
+            if (filled > 0) body.unread(head, 0, filled)
+            head.copyOf(filled)
+        }.also { sniffing.set(false) }
+        if (stalled.get()) throw IOException("Connection stalled")
+        bytes
+    } catch (error: IOException) {
+        currentCoroutineContext().ensureActive()
+        throw if (stalled.get()) IOException("Connection stalled", error) else error
+    } finally {
+        guard.cancel()
+        cancelCloser.cancel()
+    }
+}
+
+/**
+ * Whether a body starts like a web page: after a byte order mark and white space, "<!doctype html", "<html",
+ * "<head", "<body" or "<?xml". No video container starts with "<".
+ */
+internal fun startsLikeWebPage(head: ByteArray): Boolean {
+    var start = 0
+    if (head.size >= 3 && head[0] == 0xEF.toByte() && head[1] == 0xBB.toByte() && head[2] == 0xBF.toByte()) start = 3
+    while (start < head.size && head[start].toInt().toChar().isWhitespace()) start++
+    val text = head.copyOfRange(start, minOf(head.size, start + 16)).decodeToString().lowercase()
+    return listOf("<!doctype html", "<html", "<head", "<body", "<?xml").any { text.startsWith(it) }
+}
+
+internal actual fun isTrustedHomeDownloadHost(host: String): Boolean = com.nuvio.app.core.network.TrustedHomeServers.contains(host)

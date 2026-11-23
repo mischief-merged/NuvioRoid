@@ -151,8 +151,9 @@ button:disabled {
   height: 100%;
 }
 
-.player.cursor-hidden {
-  cursor: none;
+.player.cursor-hidden,
+.player.cursor-hidden * {
+  cursor: none !important;
 }
 
 .player:focus {
@@ -1029,6 +1030,29 @@ button:disabled {
   display: none !important;
 }
 
+/* Docked mini player hides full-screen chrome and overlays while keeping video and subtitles live. */
+.player.mini-mode {
+  cursor: pointer;
+}
+
+.player.mini-mode .top-gradient,
+.player.mini-mode .bottom-gradient,
+.player.mini-mode .header,
+.player.mini-mode .progress,
+.player.mini-mode .center-controls,
+.player.mini-mode .pause-metadata-overlay,
+.player.mini-mode .parental-guide,
+.player.mini-mode .skip-prompt,
+.player.mini-mode .next-episode-card,
+.player.mini-mode .opening-overlay,
+.player.mini-mode .playback-error,
+.player.mini-mode .modal-layer,
+.player.mini-mode .player-toast,
+.player.mini-mode .pip-lock-overlay,
+.player.mini-mode .pip-lock-badge {
+  display: none !important;
+}
+
 .pip-lock-overlay {
   display: none;
   position: absolute;
@@ -1902,6 +1926,30 @@ button:disabled {
   white-space: nowrap;
   text-shadow: 0 2px 12px rgba(0, 0, 0, .7);
   cursor: pointer;
+}
+
+.sleep-remaining {
+  flex: 0 0 auto;
+  color: var(--theme-text-muted, rgba(255, 255, 255, .72));
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, .7);
+}
+
+.sleep-remaining:empty,
+.sleep-remaining[hidden] {
+  display: none;
+}
+
+.action.sleep-active {
+  color: var(--theme-accent);
+}
+
+.track-row.sleep-stop-after {
+  margin-top: 8px;
 }
 
 .action-pill {
@@ -3184,6 +3232,20 @@ button:disabled {
   line-height: 16px;
 }
 
+.episode-offline-badge {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 700;
+  color: #4ade80;
+  background: rgba(74, 222, 128, .14);
+  border: 1px solid rgba(74, 222, 128, .45);
+}
+
 .episode-overview {
   display: -webkit-box !important;
   overflow: hidden !important;
@@ -3764,4 +3826,86 @@ svg {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.shortcuts-panel {
+  width: min(92vw, 760px);
+  max-height: min(86vh, 660px);
+}
+
+.shortcuts-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 24px;
+  padding: 6px 20px 22px;
+  overflow-y: auto;
+}
+
+.shortcuts-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.shortcuts-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, .56);
+  margin-bottom: 2px;
+}
+
+.shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .05);
+  border: 1px solid rgba(255, 255, 255, .08);
+}
+
+.shortcut-desc {
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.3;
+  color: var(--theme-text-primary);
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.shortcut-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .12);
+  border: 1px solid rgba(255, 255, 255, .2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: #fff;
+}
+
+@media (max-width: 640px) {
+  .shortcuts-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

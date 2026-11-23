@@ -17,6 +17,13 @@ interface PlayerEngineController {
     fun retry()
     fun setPlaybackSpeed(speed: Float)
     fun setMuted(muted: Boolean) {}
+    /** Adjusts output volume by [deltaFraction] on a 0..1 scale; true when the platform applied it. */
+    fun adjustVolumeBy(deltaFraction: Float): Boolean = false
+    /**
+     * Plays the listener's volume scaled by [fraction] without remembering the quieter level.
+     * 1 restores the listener's volume. Used while a sleep timer fades the audio out.
+     */
+    fun setVolumeFade(fraction: Float) {}
     fun getAudioTracks(): List<AudioTrack>
     fun getSubtitleTracks(): List<SubtitleTrack>
     fun applyAudioLanguagePreferences(languages: List<String>)
@@ -25,6 +32,7 @@ interface PlayerEngineController {
     fun setSubtitleUri(url: String)
     fun clearExternalSubtitle()
     fun clearExternalSubtitleAndSelect(trackIndex: Int)
+    fun setOnExternalSubtitleLoadFailed(listener: ((String) -> Unit)?) {}
     fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean = false) {}
     fun applySubtitlePreferences(
         preferredLanguage: String,
@@ -69,6 +77,8 @@ enum class PlayerControlsAction {
     ToggleChrome,
     RevealLockedOverlay,
     Back,
+    Minimize,
+    Close,
     TogglePlayback,
     KeyboardTogglePlayback,
     SeekBack,
@@ -135,11 +145,14 @@ data class PlayerControlsState(
     val subtitlesLabel: String = "Subs",
     val audioLabel: String = "Audio",
     val sourcesLabel: String = "Sources",
+    val availableOfflineLabel: String = "Available offline",
     val episodesLabel: String = "Episodes",
     val externalPlayerLabel: String = "External",
     val playLabel: String = "Play",
     val pauseLabel: String = "Pause",
     val closeLabel: String = "Close player",
+    val minimizeLabel: String = "",
+    val isInMiniPlayer: Boolean = false,
     val mutedLabel: String = "",
     val volumeLevelLabelFormat: String = "",
     val lockLabel: String = "Lock player controls",
@@ -309,6 +322,8 @@ data class PlayerControlsState(
     val subtitleAutoSyncIsLoading: Boolean = false,
     val subtitleAutoSyncErrorMessage: String = "",
     val closeModalsToken: Long = 0L,
+    val modalNavigationAction: String = "",
+    val modalNavigationToken: Long = 0L,
     val submitIntroContentKey: String = "",
     val submitIntroSuccessToken: Long = 0L,
     val notificationMessage: String = "",
@@ -323,6 +338,32 @@ data class PlayerControlsState(
     val autoSyncedLabel: String = "Auto synced",
     val streamInfoLabel: String = "Stream info",
     val streamInfoSections: List<PlayerControlInfoSection> = emptyList(),
+    val sleepTimerLabel: String = "Sleep timer",
+    val sleepTimerPanelTitle: String = "Sleep timer",
+    val sleepTimerOffLabel: String = "Off",
+    val sleepTimer15Label: String = "15 minutes",
+    val sleepTimer30Label: String = "30 minutes",
+    val sleepTimer45Label: String = "45 minutes",
+    val sleepTimer60Label: String = "60 minutes",
+    val sleepTimer90Label: String = "90 minutes",
+    val sleepTimerEndLabel: String = "End of episode",
+    val sleepTimerStopAfterLabel: String = "Stop after this episode",
+    val sleepTimerShortcutLabel: String = "Sleep timer (Z)",
+    val sleepTimerOption: String = "off",
+    val sleepTimerStopAfter: Boolean = false,
+    val sleepTimerRemainingLabel: String = "",
+    val sleepTimerFading: Boolean = false,
+    val sleepTimerActive: Boolean = false,
+    val shortcutsLabel: String = "Keyboard shortcuts",
+    val shortcutsGroupPlaybackLabel: String = "Playback",
+    val shortcutsGroupNavigationLabel: String = "Navigation",
+    val shortcutsItems: List<PlayerControlShortcutItem> = emptyList(),
+)
+
+data class PlayerControlShortcutItem(
+    val keys: String = "",
+    val label: String = "",
+    val group: String = "playback",
 )
 
 data class PlayerControlFilterItem(
@@ -374,6 +415,8 @@ data class PlayerControlEpisodeItem(
     val episode: Int = 0,
     val isCurrent: Boolean = false,
     val isWatched: Boolean = false,
+    val isAvailableOffline: Boolean = false,
+    val isEnabled: Boolean = true,
 )
 
 data class PlayerControlAddonSubtitleItem(
@@ -440,6 +483,8 @@ internal fun sanitizePlaybackResponseHeaders(headers: Map<String, String>?): Map
     }
     return sanitized
 }
+
+internal val LocalStartupSubtitlePlan = androidx.compose.runtime.staticCompositionLocalOf<StartupSubtitleSelection?> { null }
 
 @Composable
 expect fun PlatformPlayerSurface(

@@ -14,7 +14,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadSpeedCapTest {
+class DesktopDownloadSpeedCapTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun a_transfer_reports_every_byte_to_its_limiter_and_preserves_the_file() = runBlocking {
         val payload = ByteArray(100_000) { (it % 251).toByte() }
@@ -70,6 +70,26 @@ class DesktopDownloadSpeedCapTest {
         DownloadBandwidth.setUserCap(null)
         assertNull(DownloadSpeedStorage.loadBytesPerSecond())
         assertNull(DownloadBandwidth.limiter.bytesPerSecond)
+    }
+
+    @Test
+    fun travel_and_yield_caps_both_apply_to_the_real_shared_limiter() = keepingTheStoredLimit {
+        try {
+            DownloadBandwidth.setUserCap(null)
+            DownloadBandwidth.setTravelCap(500_000L)
+            assertEquals(500_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.applyStoredLimit()
+            assertEquals(500_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setYieldCap(100_000L)
+            assertEquals(100_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setUserCap(50_000L)
+            assertEquals(50_000L, DownloadBandwidth.limiter.bytesPerSecond)
+            DownloadBandwidth.setTravelCap(null)
+            assertEquals(50_000L, DownloadBandwidth.limiter.bytesPerSecond)
+        } finally {
+            DownloadBandwidth.setTravelCap(null)
+            DownloadBandwidth.setYieldCap(null)
+        }
     }
 
     private inline fun keepingTheStoredLimit(block: () -> Unit) {

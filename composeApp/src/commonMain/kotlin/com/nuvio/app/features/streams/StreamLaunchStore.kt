@@ -19,6 +19,8 @@ data class StreamLaunch(
     val resumeProgressFraction: Float? = null,
     val manualSelection: Boolean = false,
     val startFromBeginning: Boolean = false,
+    /** Why the list is open. [StreamPickPurpose.Download] when a source is picked for a download: nothing plays then. */
+    val pickPurpose: StreamPickPurpose = StreamPickPurpose.Play,
 )
 
 object StreamLaunchStore {

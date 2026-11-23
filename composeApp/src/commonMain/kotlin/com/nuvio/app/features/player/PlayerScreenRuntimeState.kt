@@ -7,11 +7,16 @@ import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.features.addons.AddonPlayerAction
+import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.addons.AddonsUiState
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaScreenSettingsUiState
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.downloads.DownloadItem
+import com.nuvio.app.features.downloads.DownloadSubtitles
+import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsUiState
 import com.nuvio.app.features.p2p.P2pStreamingState
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
@@ -79,8 +84,14 @@ internal data class PendingEngineSwitchTrackPreference(
     val subtitleApplied: Boolean = false,
 )
 
+internal data class PlayerEpisodeCardState(val episode: NextEpisodeInfo, val isPrevious: Boolean)
+
 internal class PlayerScreenRuntime(
     args: PlayerScreenArgs,
+    val episodePlaybackOffline: () -> Boolean = ::isNetworkOffline,
+    val findEpisodeDownload: (String, MetaVideo) -> DownloadItem? = { parentId, video ->
+        DownloadsRepository.findCachedPlayableDownload(parentId, video.season, video.episode, video.id)
+    },
 ) {
     var args by mutableStateOf(args)
 
@@ -115,12 +126,38 @@ internal class PlayerScreenRuntime(
     val initialPositionMs: Long get() = args.initialPositionMs
     val initialProgressFraction: Float? get() = args.initialProgressFraction
     var externalSubtitles by mutableStateOf(args.externalSubtitles)
+    var startupSubtitleSelection by mutableStateOf(args.startupSubtitleSelection)
     val isSeries: Boolean get() = parentMetaType == "series"
 
     lateinit var scope: CoroutineScope
     lateinit var hapticFeedback: HapticFeedback
 
     var playerSettingsUiState by mutableStateOf(PlayerSettingsUiState())
+
+    /** Fresh check that a finished download is still playable. Runs off the UI thread. */
+    var verifyEpisodeDownload: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    }
+
+    /** Address of a downloaded file chosen for playback. */
+    var playableDownloadedUri: (DownloadItem) -> String? = { item ->
+        DownloadsRepository.playableLocalFileUri(item)
+    }
+
+    /** Subtitles prepared before a downloaded episode replaces the one on screen. */
+    var prepareDownloadedSubtitles: suspend (String) -> PreparedStartupSubtitles = { localFileUri ->
+        SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+            localSubtitles = DownloadSubtitles.localSubtitles(localFileUri),
+            settings = playerSettingsUiState,
+            parentMetaId = parentMetaId,
+        )
+    }
+
+    /** A downloaded episode whose file is being checked, or whose subtitles are being prepared. */
+    var downloadedEpisodeSwitch: DownloadedEpisodeSwitch? = null
+
+    /** Keeps a second press from cancelling the check the first press already started. */
+    internal val episodeSwitchLock = Any()
     var p2pSettingsUiState by mutableStateOf(P2pSettingsUiState())
     var p2pStreamingState by mutableStateOf<P2pStreamingState>(P2pStreamingState.Idle)
     var metaScreenSettingsUiState: MetaScreenSettingsUiState = MetaScreenSettingsUiState()
@@ -219,11 +256,21 @@ internal class PlayerScreenRuntime(
     )
     var lastProgressPersistEpochMs by mutableStateOf(0L)
     var previousIsPlaying by mutableStateOf(false)
+    var frozenForQuit by mutableStateOf(false)
     var hasRequestedScrobbleStartForCurrentItem by mutableStateOf(false)
     var scrobbleStartRequestGeneration by mutableStateOf(0L)
     var pendingSeekScrobbleRestart by mutableStateOf(false)
     var hasSentCompletionScrobbleForCurrentItem by mutableStateOf(false)
     var currentTrackingMedia by mutableStateOf<TrackingMediaReference?>(null)
+    var activeAddonPlayerEventTarget: AddonPlayerEventTarget? = null
+    var lastAddonPlayerAction: AddonPlayerAction? = null
+    /** Where Stremio player tracking events are sent. Tests replace it to record events. */
+    var dispatchAddonPlayerEvent: (
+        target: AddonPlayerEventTarget,
+        action: AddonPlayerAction,
+        currentTimeMs: Long,
+        durationMs: Long,
+    ) -> Unit = com.nuvio.app.features.addons.AddonEventDispatcher::player
 
     var showSourcesPanel by mutableStateOf(false)
     var showEpisodesPanel by mutableStateOf(false)
@@ -243,6 +290,8 @@ internal class PlayerScreenRuntime(
     var submitIntroStatusMessage by mutableStateOf<String?>(null)
     var playerControlsPendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)
     var playerControlsCloseModalsToken by mutableStateOf(0L)
+    var playerControlsModalNavigationAction by mutableStateOf("")
+    var playerControlsModalNavigationToken by mutableStateOf(0L)
     var playerControlsSubmitIntroSuccessToken by mutableStateOf(0L)
     var playerNotificationMessage by mutableStateOf("")
     var playerNotificationToken by mutableStateOf(0L)
@@ -271,6 +320,16 @@ internal class PlayerScreenRuntime(
     var nextEpisodeAutoPlayCountdown by mutableStateOf<Int?>(null)
     var nextEpisodeAutoPlayJob by mutableStateOf<Job?>(null)
     var nextEpisodeAutoPlayAutomatic by mutableStateOf(false)
+    var sleepTimer by mutableStateOf(SleepTimerState())
+    var sleepTimerRemainingLabel by mutableStateOf("")
+    var lastSleepTimerEpisodeKey: String? = null
+    var nextEpisodeAutoPlayTarget by mutableStateOf<PlayerEpisodeCardState?>(null)
+    val episodeCardState: PlayerEpisodeCardState?
+        get() = (nextEpisodeAutoPlayTarget ?: nextEpisodeInfo?.let {
+            PlayerEpisodeCardState(it, isPrevious = false)
+        })?.takeIf {
+            isSeries && (showNextEpisodeCard || nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null)
+        }
     var nextEpisodePreloadJob by mutableStateOf<Job?>(null)
     var nextEpisodePreloadTriggered by mutableStateOf(false)
     var pendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)
@@ -282,9 +341,9 @@ internal class PlayerScreenRuntime(
     var autoSelectedSourceUrl: String? = args.sourceUrl.takeIf { args.sourceAutoSelected && it.isNotBlank() }
     var sourceFallbackAttempts = 0
     val sourceFallbackTriedKeys = mutableSetOf<String>()
-    var sourceFallbackJob: Job? = null
+    var sourceFallbackJob by mutableStateOf<Job?>(null)
     /** Set when the user presses Back, so a source that is still being looked up is not started after leaving. */
-    var sourceFailoverCancelled = false
+    var sourceFailoverCancelled by mutableStateOf(false)
     /** The source being tried in place of one that failed, named on the loading screen until it plays. */
     var sourceFailoverTryingName by mutableStateOf<String?>(null)
     /** Set when a failed source was replaced; the message that it plays now is shown on its first frame. */
@@ -298,13 +357,27 @@ internal class PlayerScreenRuntime(
     /** How many seeks the runtime asked the player for, and the target of the latest (null when relative). The stall watch reads them. */
     var seekRequestCount = 0L
     var lastSeekTargetMs: Long? = null
+    /** True when a paused seek was requested and watch progress must sync again once the delayed native snapshot lands. */
+    var awaitingPausedSeekSnapshot = false
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
+    /** The source confirmed as a placeholder clip; never receives tracking events. */
+    var placeholderDetectedUrl: String? = null
     /** The source whose first seconds were checked for being a placeholder, so each is checked once. */
     var placeholderCheckedUrl: String? = null
     var placeholderCheckStateUrl: String? = null
     var placeholderCheckState: PlaceholderCheckState? = null
     var placeholderWarnedUrl: String? = null
+    /** Remote source whose duration settled over stable non-loading snapshots for tracking add-ons. */
+    var addonTrackingDurationSettledUrl: String? = null
+    var addonTrackingDurationStateUrl: String? = null
+    var addonTrackingDurationState: TrackingDurationSettleState? = null
+    /** Monotonic clock in milliseconds for the placeholder check. Tests replace it to step time. */
+    var placeholderNowMs: () -> Long = ::defaultPlaceholderNowMs
+    /** Current network condition for the placeholder check. Tests replace it to simulate offline playback. */
+    var placeholderNetworkCondition: () -> com.nuvio.app.core.network.NetworkCondition = {
+        com.nuvio.app.core.network.NetworkStatusRepository.uiState.value.condition
+    }
     /** Where moving on to another source finds the sources: the player's own search. Tests give their own list. */
     var failoverSourceSearch: FailoverSourceSearch = FailoverSourceSearch.Player
 
@@ -313,6 +386,17 @@ internal class PlayerScreenRuntime(
     var showVideoSettingsModal by mutableStateOf(false)
     var showStreamInfo by mutableStateOf(false)
     var showPartyPanel by mutableStateOf(false)
+    /** True while an embedded desktop native controls popup (audio, subtitles, speed, etc.) is open. */
+    var nativeControlsModalOpen by mutableStateOf(false)
+    /** Written from composition so a late native popup event can be ignored once the full player is gone. */
+    var pictureInPictureActive: Boolean = false
+
+    /**
+     * Nested [com.nuvio.app.features.player.dismissOpenPlayerOverlay] calls on this player.
+     * Dismiss invokes the local back handler, and the session handler is that handler, so a
+     * nested call must not invoke it again.
+     */
+    internal var overlayDismissDepth: Int = 0
     var partyPanelToken by mutableStateOf(0L)
     var partyMessage by mutableStateOf("")
     var partyMessageToken by mutableStateOf(0L)

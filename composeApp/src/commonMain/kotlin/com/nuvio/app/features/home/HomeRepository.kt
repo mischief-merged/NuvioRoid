@@ -8,6 +8,7 @@ import com.nuvio.app.features.catalog.CatalogPage
 import com.nuvio.app.features.catalog.fetchCatalogPage
 import com.nuvio.app.features.catalog.mergeCatalogItems
 import com.nuvio.app.core.poster.CustomPosterUrlRepository
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.poster.reapplyCustomPosterUrls
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.features.collection.Collection
@@ -33,6 +34,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlin.math.absoluteValue
 import kotlin.random.Random
+import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.catalog_load_failed
+import org.jetbrains.compose.resources.getString
 
 object HomeRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -84,13 +88,22 @@ object HomeRepository {
         activeJob?.cancel()
         _uiState.update { it.copy(isLoading = true, errorMessage = null) }
         activeJob = scope.launch {
+            val settingsSnapshot = HomeCatalogSettingsRepository.snapshot()
             val prioritizedRequests = prioritizeDefinitions(
                 definitions = requests,
-                snapshot = HomeCatalogSettingsRepository.snapshot(),
+                snapshot = settingsSnapshot,
             )
             val loadedSections = linkedMapOf<String, HomeCatalogSection>().apply {
                 putAll(cachedSections)
             }
+            val heroSourceKeys = prioritizedRequests
+                .filter { definition ->
+                    settingsSnapshot.heroEnabled &&
+                        settingsSnapshot.preferences[definition.key]?.heroSourceEnabled != false
+                }
+                .mapTo(mutableSetOf(), HomeCatalogDefinition::cacheKey)
+            val attemptedKeys = mutableSetOf<String>()
+            var heroSourcesPublished = false
             var firstErrorMessage: String? = null
             var batchIndex = 0
 
@@ -112,17 +125,28 @@ object HomeRepository {
                     loadedSections[cacheKey] = section
                 }
                 if (firstErrorMessage == null) {
-                    firstErrorMessage = results.firstNotNullOfOrNull { (_, result) ->
+                    val raw = results.firstNotNullOfOrNull { (_, result) ->
                         result.exceptionOrNull()?.message
                     }
+                    if (raw != null) {
+                        firstErrorMessage = userFacingFailure(raw, getString(Res.string.catalog_load_failed))
+                    }
                 }
+                batch.mapTo(attemptedKeys, HomeCatalogDefinition::cacheKey)
+                val heroSourcesResolved = attemptedKeys.containsAll(heroSourceKeys)
                 cachedSections = loadedSections.toMap()
                 lastErrorMessage = firstErrorMessage
-                if (batchIndex == 0 || (batchIndex + 1) % HOME_CATALOG_PUBLISH_INTERVAL == 0) {
+                if (
+                    batchIndex == 0 ||
+                    (batchIndex + 1) % HOME_CATALOG_PUBLISH_INTERVAL == 0 ||
+                    (heroSourcesResolved && !heroSourcesPublished)
+                ) {
                     publishCurrentState(
                         isLoading = true,
                         requestKey = requestKey,
+                        heroSourcesResolved = heroSourcesResolved,
                     )
+                    heroSourcesPublished = heroSourcesResolved
                 }
                 batchIndex++
             }
@@ -177,6 +201,7 @@ object HomeRepository {
     private fun publishCurrentState(
         isLoading: Boolean,
         requestKey: String?,
+        heroSourcesResolved: Boolean = !isLoading,
     ) {
         val snapshot = HomeCatalogSettingsRepository.snapshot()
         val preferences = snapshot.preferences
@@ -204,6 +229,16 @@ object HomeRepository {
                     title = customTitle.ifBlank { definition.titleFor(snapshot.showCatalogType) },
                 )
             }
+
+        if (snapshot.heroEnabled && !heroSourcesResolved) {
+            _uiState.value = HomeUiState(
+                isLoading = isLoading,
+                heroItems = _uiState.value.heroItems,
+                sections = sections,
+                errorMessage = if (sections.isEmpty()) lastErrorMessage else null,
+            )
+            return
+        }
 
         val catalogHeroItems = if (snapshot.heroEnabled) {
             val heroRandom = Random((requestKey?.hashCode() ?: 0).absoluteValue + 1)

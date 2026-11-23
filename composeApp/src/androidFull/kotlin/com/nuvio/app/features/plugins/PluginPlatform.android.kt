@@ -55,3 +55,5 @@ internal fun currentPluginPlatform(): String = "android"
 internal fun currentPluginPlatformTags(): Set<String> = setOf(currentPluginPlatform())
 
 internal fun currentEpochMillis(): Long = System.currentTimeMillis()
+
+internal suspend fun fetchPluginText(url: String): String = com.nuvio.app.features.addons.httpGetText(url)

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.simkl
 
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.home.PosterShape
@@ -52,7 +53,7 @@ private data class SimklDetailDto(
 object SimklRelatedRepository {
     private val log = Logger.withTag("SimklRelated")
     private val json = Json { ignoreUnknownKeys = true }
-    private val cache = mutableMapOf<String, TimedCache>()
+    private val cache = BoundedCache<String, TimedCache>()
 
     suspend fun getRelated(
         meta: MetaDetails,

@@ -40,6 +40,8 @@ expect fun ManagePlayerPictureInPicture(
 
 expect fun togglePlayerPictureInPicture()
 
+expect fun exitPlayerPictureInPicture()
+
 @Composable
 expect fun rememberIsInPictureInPicture(): Boolean
 

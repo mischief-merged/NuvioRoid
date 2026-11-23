@@ -38,6 +38,24 @@ class DesktopDownloadFoldersTest {
     private fun fileOf(item: DownloadItem): Path = world.appFolder.resolve(item.fileName)
 
     @Test
+    fun published_files_waiting_for_checks_are_never_moved_as_partial_files() {
+        val drive = world.driveLocation("Archive")
+        for ((index, status) in listOf(DownloadStatus.Paused, DownloadStatus.Downloading).withIndex()) {
+            val pending = episode("A", index + 1, status).copy(awaitingCheck = true)
+            val original = Files.readAllBytes(fileOf(pending))
+            val hooks = Hooks(listOf(pending))
+            val report = controller(hooks).move(setOf(pending.id), drive.path.toString())
+            assertEquals(0, report.moved)
+            assertEquals(listOf(MoveFailureReason.Busy), report.failures.map { it.reason })
+            assertEquals(pending.locationId, hooks.items.single().locationId)
+            assertEquals(pending.localFileUri, hooks.items.single().localFileUri)
+            assertTrue(hooks.items.single().awaitingCheck)
+            assertContentEquals(original, Files.readAllBytes(fileOf(pending)))
+            assertFalse(Files.exists(drive.path.resolve(pending.fileName)))
+        }
+    }
+
+    @Test
     fun moving_one_show_moves_its_episodes_and_leaves_every_other_download_alone() {
         val showA = (1..3).map { episode("A", it) }
         val showB = (1..2).map { episode("B", it) }
@@ -509,5 +527,63 @@ class DesktopDownloadFoldersTest {
         assertEquals(drive.id, folders.placementFor(emptyList(), "new", isEpisode = true))
         assertTrue(fileOf(item).exists())
         assertFalse(folders.setDefault(world.root.resolve("not-there").toString()))
+    }
+
+    @Test
+    fun moving_active_partial_off_an_external_folder_retains_the_folder_while_superseded_partials_remain_there() {
+        val first = world.driveLocation("One")
+        val second = world.driveLocation("Two")
+        val superseded = first.path.resolve("A S01E01.mp4.part").also { Files.write(it, ByteArray(1_024) { 1 }) }
+        val active = first.path.resolve("A S01E01 (2).mp4.part").also { Files.write(it, ByteArray(2_048) { 2 }) }
+        val item = episodeItem("A", 1, status = DownloadStatus.Paused, bytes = 2_048L).copy(
+            locationId = first.id,
+            partialFileName = active.fileName.toString(),
+            partialFileKey = DownloadMover.identityOf(active),
+            supersededPartials = listOf(
+                KeptPartialFile(superseded.fileName.toString(), DownloadMover.identityOf(superseded)!!, locationId = null),
+            ),
+        )
+        val hooks = Hooks(listOf(item))
+        val folders = controller(hooks)
+
+        val report = folders.move(setOf(item.id), second.path.toString())
+
+        assertEquals(1, report.moved)
+        assertTrue(second.path.resolve(active.fileName).exists())
+        assertTrue(superseded.exists())
+        assertTrue(first.id in world.locations.all().map { it.id }, "location holding superseded partial was forgotten")
+        val relocated = hooks.items().single()
+        assertEquals(first.id, relocated.supersededPartials.single().locationId)
+
+        // Once the superseded partial is retired and cleared from the record, the next move can forget the empty drive.
+        assertTrue(world.trash.send(superseded))
+        hooks.setList(hooks.profileId(), listOf(relocated.copy(supersededPartials = emptyList())))
+        folders.move(setOf(item.id), world.appFolder.toString())
+
+        assertFalse(first.id in world.locations.all().map { it.id })
+    }
+
+    @Test
+    fun refresh_survives_a_throwing_volume_store_lookup_for_volume_key() {
+        val drive = world.driveLocation("Archive")
+        val folders = DesktopDownloadFolders(
+            locations = world.locations,
+            validator = world.validator,
+            mover = world.mover(),
+            hooks = Hooks(emptyList()),
+            freeSpaceOf = { 500_000_000L },
+            fileStoreKeyOf = { path ->
+                if (path == drive.path) throw java.io.IOException("volume gone")
+                "store:${path.fileName}"
+            },
+        )
+
+        folders.refresh()
+
+        val state = folders.state.value
+        val driveInfo = assertNotNull(state.location(drive.id))
+        assertEquals(drive.id, driveInfo.volumeKey)
+        assertNotNull(state.totalFreeBytes)
+        assertTrue(state.totalFreeBytes!! > 0L)
     }
 }

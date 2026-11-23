@@ -122,6 +122,7 @@ internal fun PlayerControlsShell(
     onAudioClick: () -> Unit,
     onVideoSettingsClick: (() -> Unit)? = null,
     onSourcesClick: (() -> Unit)? = null,
+    sourcesLabel: String = stringResource(Res.string.compose_player_sources),
     onEpisodesClick: (() -> Unit)? = null,
     chapters: List<PlayerChapter> = emptyList(),
     onChaptersClick: (() -> Unit)? = null,
@@ -323,6 +324,7 @@ internal fun PlayerControlsShell(
                     onSubtitleClick = onSubtitleClick,
                     onAudioClick = onAudioClick,
                     onSourcesClick = onSourcesClick,
+                    sourcesLabel = sourcesLabel,
                     onEpisodesClick = onEpisodesClick,
                     chapters = chapters,
                     onChaptersClick = onChaptersClick,
@@ -376,6 +378,7 @@ internal fun PlayerControlsShell(
                         onSubtitleClick = onSubtitleClick,
                         onAudioClick = onAudioClick,
                         onSourcesClick = onSourcesClick,
+                        sourcesLabel = sourcesLabel,
                         onEpisodesClick = onEpisodesClick,
                         onChaptersClick = onChaptersClick,
                         onNextEpisodeClick = onNextEpisodeClick,
@@ -713,6 +716,7 @@ private fun ProgressControls(
     onSubtitleClick: () -> Unit,
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)? = null,
+    sourcesLabel: String = stringResource(Res.string.compose_player_sources),
     onEpisodesClick: (() -> Unit)? = null,
     chapters: List<PlayerChapter> = emptyList(),
     onChaptersClick: (() -> Unit)? = null,
@@ -785,7 +789,7 @@ private fun ProgressControls(
                     }
                     if (onSourcesClick != null) {
                         PlayerActionPillButton(
-                            label = stringResource(Res.string.compose_player_sources),
+                            label = sourcesLabel,
                             painter = sourcePainter,
                             onClick = onSourcesClick,
                         )

@@ -58,7 +58,7 @@ class DownloadFrameCheckTest {
             if (finishOnItsOwn) {
                 // Reports from a thread of its own, as a real transfer does, after start has returned.
                 val url = request.item.sourceUrl
-                thread { Thread.sleep(50); onSuccess(url, 1_000) }
+                thread { Thread.sleep(50); onSuccess(url, 300_000_000) }
             }
             return object : DownloadsTaskHandle {
                 override fun cancel() = Unit
@@ -92,19 +92,22 @@ class DownloadFrameCheckTest {
 
     private val backend = FakeBackend()
     private val realBackend = DownloadsRepository.backend
+    private val realRuntime = downloadRuntimeLookup
     private val uri = "file:/downloads/episode.mkv"
-    private val video = DownloadedFileFacts(exists = true, sizeBytes = 1_000, isVideoContainer = true)
+    private val video = DownloadedFileFacts(exists = true, sizeBytes = 300_000_000, isVideoContainer = true)
 
     @BeforeTest
     fun use_an_in_memory_store() {
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
+        downloadRuntimeLookup = { 45 }
     }
 
     @AfterTest
     fun restore_the_real_repository() {
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = realBackend
+        downloadRuntimeLookup = realRuntime
     }
 
     private fun text(resource: StringResource) = runBlocking { getString(resource) }
@@ -137,7 +140,7 @@ class DownloadFrameCheckTest {
         )
         backend.files[uri] = file
         backend.frames[uri] = samples
-        backend.finish!!(uri, 1_000)
+        backend.finish!!(uri, 300_000_000)
     }
 
     @Test

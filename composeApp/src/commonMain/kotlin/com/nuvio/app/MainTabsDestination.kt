@@ -182,7 +182,7 @@ internal fun MainTabsDestination(
         Scaffold(
             modifier = Modifier
                 .fillMaxSize()
-                .alpha(if (initialHomeReady) 1f else 0f),
+                .alpha(startupContentAlpha(initialHomeReady)),
             containerColor = Color.Transparent,
             contentWindowInsets = WindowInsets(0),
             bottomBar = {

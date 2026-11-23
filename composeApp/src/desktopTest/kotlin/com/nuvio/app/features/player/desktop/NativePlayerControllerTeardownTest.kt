@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.desktop
 
+import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -14,7 +15,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-private val failNativeCreate: NativePlayerCreate = { _, _, _, _, _, _, _, _, _ ->
+private val failNativeCreate: NativePlayerCreate = { _, _, _, _, _, _, _, _, _, _ ->
     error("native create must not run in lifecycle unit tests")
 }
 
@@ -29,7 +30,7 @@ class NativePlayerControllerTeardownTest {
             nativeCreate = failNativeCreate,
             nativeDispose = { handle -> events += "disposed-$handle" },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation {
             events += "released"
@@ -78,7 +79,7 @@ class NativePlayerControllerTeardownTest {
         val disposedHandles = Collections.synchronizedList(mutableListOf<Long>())
         val controller = NativePlayerController(
             host = NativePlayerHost(),
-            nativeCreate = { _, source, _, _, _, _, _, _, _ ->
+            nativeCreate = { _, source, _, _, _, _, _, _, _, _ ->
                 createdSources += source
                 when (source) {
                     sourceA -> {
@@ -458,7 +459,7 @@ class NativePlayerControllerTeardownTest {
                 error("host resolution must be rejected")
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.dispose()
         assertTrue(disposeStarted.await(2, TimeUnit.SECONDS))
@@ -492,7 +493,7 @@ class NativePlayerControllerTeardownTest {
                 error("dispose failed")
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.dispose()
         assertTrue(disposeAttempted.await(2, TimeUnit.SECONDS))
@@ -516,7 +517,7 @@ class NativePlayerControllerTeardownTest {
             nativeCreate = failNativeCreate,
             nativeDispose = { error("dispose failed") },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation(
             onReleased = { completions.incrementAndGet() },
@@ -551,7 +552,7 @@ class NativePlayerControllerTeardownTest {
                 allowDispose.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation { released.countDown() }
 
@@ -578,7 +579,7 @@ class NativePlayerControllerTeardownTest {
             },
             releaseTimeoutMs = 50L,
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation(
             onReleased = { completed.incrementAndGet() },
@@ -647,7 +648,7 @@ class NativePlayerControllerTeardownTest {
                 unblock.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
         repeat(2) {
             controller.releaseBeforeNavigation {
                 assertTrue(SwingUtilities.isEventDispatchThread())
@@ -695,7 +696,7 @@ class NativePlayerControllerTeardownTest {
                 allowDispose.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
         val create = thread(isDaemon = true, name = "test-native-create") {
             createStarted.countDown()
             allowCreate.await()
@@ -836,6 +837,342 @@ class NativePlayerControllerTeardownTest {
         assertEquals(1, failures.get())
         assertEquals(0, completions.get())
     }
+
+    @Test
+    fun coordinatorSerializesUnboundDisposeBeforeNextControllerCreates() {
+        val coordinator = NativePlayerLifecycleCoordinator()
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val disposeStarted = CountDownLatch(1)
+        val allowDispose = CountDownLatch(1)
+        val secondCreated = CountDownLatch(1)
+        val first = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = { handle ->
+                events += "dispose-start-$handle"
+                disposeStarted.countDown()
+                allowDispose.await()
+                events += "dispose-end-$handle"
+            },
+            lifecycleCoordinator = coordinator,
+        )
+        first.assignNativeHandleForTest(101L)
+
+        val second = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = { _, source, _, _, _, _, _, _, _, _ ->
+                events += "create-$source"
+                secondCreated.countDown()
+                202L
+            },
+            nativeDispose = { handle -> events += "dispose-second-$handle" },
+            isHostDisplayable = { true },
+            resolveHostView = { 1L },
+            lifecycleCoordinator = coordinator,
+        )
+
+        first.dispose()
+        assertTrue(disposeStarted.await(2, TimeUnit.SECONDS))
+
+        second.attach(
+            sourceUrl = "https://example.invalid/next.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        SwingUtilities.invokeAndWait {}
+        assertFalse(secondCreated.await(100, TimeUnit.MILLISECONDS))
+
+        allowDispose.countDown()
+        assertTrue(secondCreated.await(2, TimeUnit.SECONDS))
+        assertEquals(
+            listOf(
+                "dispose-start-101",
+                "dispose-end-101",
+                "create-https://example.invalid/next.mp4",
+            ),
+            events.toList(),
+        )
+
+        val releasedSecond = CountDownLatch(1)
+        second.releaseBeforeNavigation { releasedSecond.countDown() }
+        assertTrue(releasedSecond.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun coordinatorSerializesSupersededCreateDisposalBeforeNextControllerCreates() {
+        val coordinator = NativePlayerLifecycleCoordinator()
+        val events = Collections.synchronizedList(mutableListOf<String>())
+        val firstCreateStarted = CountDownLatch(1)
+        val allowFirstCreate = CountDownLatch(1)
+        val secondCreated = CountDownLatch(1)
+
+        val first = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ ->
+                events += "create-1-start"
+                firstCreateStarted.countDown()
+                allowFirstCreate.await()
+                events += "create-1-end"
+                111L
+            },
+            nativeDispose = { handle -> events += "dispose-1-$handle" },
+            isHostDisplayable = { true },
+            resolveHostView = { 1L },
+            lifecycleCoordinator = coordinator,
+        )
+        val second = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ ->
+                events += "create-2"
+                secondCreated.countDown()
+                222L
+            },
+            nativeDispose = { handle -> events += "dispose-2-$handle" },
+            isHostDisplayable = { true },
+            resolveHostView = { 1L },
+            lifecycleCoordinator = coordinator,
+        )
+
+        first.attach(
+            sourceUrl = "https://example.invalid/first.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        assertTrue(firstCreateStarted.await(2, TimeUnit.SECONDS))
+
+        // Unbound unmount calls dispose() while first's create is still in flight.
+        first.dispose()
+
+        second.attach(
+            sourceUrl = "https://example.invalid/second.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        SwingUtilities.invokeAndWait {}
+        assertFalse(secondCreated.await(100, TimeUnit.MILLISECONDS))
+
+        allowFirstCreate.countDown()
+        assertTrue(secondCreated.await(2, TimeUnit.SECONDS))
+        assertEquals(
+            listOf("create-1-start", "create-1-end", "dispose-1-111", "create-2"),
+            events.toList(),
+        )
+
+        val releasedSecond = CountDownLatch(1)
+        second.releaseBeforeNavigation { releasedSecond.countDown() }
+        assertTrue(releasedSecond.await(2, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun coordinatorRemovesCompletedWorkersImmediatelyAndDoesNotRetainClosedControllers() {
+        val coordinator = NativePlayerLifecycleCoordinator()
+        val disposedLatch = CountDownLatch(1)
+
+        fun createAndCloseViaRelease(): Pair<WeakReference<NativePlayerController>, WeakReference<NativePlayerHost>> {
+            val host = NativePlayerHost()
+            val controller = NativePlayerController(
+                host = host,
+                nativeCreate = failNativeCreate,
+                nativeDispose = { disposedLatch.countDown() },
+                lifecycleCoordinator = coordinator,
+            )
+            controller.assignNativeHandleForTest(301L)
+            val released = CountDownLatch(1)
+            controller.releaseBeforeNavigation { released.countDown() }
+            assertTrue(released.await(2, TimeUnit.SECONDS))
+            return WeakReference(controller) to WeakReference(host)
+        }
+
+        fun createAndCloseViaDispose(): WeakReference<NativePlayerController> {
+            val done = CountDownLatch(1)
+            val controller = NativePlayerController(
+                host = NativePlayerHost(),
+                nativeCreate = failNativeCreate,
+                nativeDispose = { done.countDown() },
+                lifecycleCoordinator = coordinator,
+            )
+            controller.assignNativeHandleForTest(302L)
+            controller.dispose()
+            assertTrue(done.await(2, TimeUnit.SECONDS))
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (coordinator.trackedWorkerCountForTest != 0 && System.nanoTime() < deadline) {
+                Thread.sleep(10)
+            }
+            return WeakReference(controller)
+        }
+
+        val (releasedControllerRef, releasedHostRef) = createAndCloseViaRelease()
+        assertTrue(disposedLatch.await(2, TimeUnit.SECONDS))
+        val releaseDrainDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (coordinator.trackedWorkerCountForTest != 0 && System.nanoTime() < releaseDrainDeadline) {
+            Thread.sleep(10)
+        }
+        assertEquals(0, coordinator.trackedWorkerCountForTest, "completed release worker must remove itself without a subsequent playback")
+
+        val disposedControllerRef = createAndCloseViaDispose()
+        assertEquals(0, coordinator.trackedWorkerCountForTest, "completed dispose worker must remove itself without a subsequent playback")
+
+        repeat(8) {
+            System.gc()
+            if (releasedControllerRef.get() == null && releasedHostRef.get() == null && disposedControllerRef.get() == null) {
+                return@repeat
+            }
+            Thread.sleep(25)
+        }
+        assertNull(releasedControllerRef.get(), "coordinator must not retain closed controller after releaseBeforeNavigation")
+        assertNull(releasedHostRef.get(), "coordinator must not retain closed host after releaseBeforeNavigation")
+        assertNull(disposedControllerRef.get(), "coordinator must not retain closed controller after dispose")
+    }
+
+    @Test
+    fun reparentedPipHostIsPreservedAcrossSourceReplacementAndMidCreateTransitions() {
+        val mainHost = NativePlayerHost()
+        val pipHost = NativePlayerHost()
+        val createdHostPointers = Collections.synchronizedList(mutableListOf<Long>())
+        val reparentedHandles = Collections.synchronizedList(mutableListOf<Pair<Long, Long>>())
+        val nextHandle = AtomicInteger(10)
+        val allowThirdCreate = CountDownLatch(1)
+        val thirdCreateStarted = CountDownLatch(1)
+
+        val backend = object : NativePlayerBackend by NoOpNativePlayerBackend {
+            override fun create(
+                hostViewPtr: Long,
+                sourceUrl: String,
+                headerLines: Array<String>,
+                playWhenReady: Boolean,
+                initialPositionMs: Long,
+                controlsPageUrl: String,
+                decoderPriority: Int,
+                nvidiaRtxSuperResolutionEnabled: Boolean,
+                nvidiaRtxHdrEnabled: Boolean,
+                eventSink: NativePlayerEventSink,
+                inMiniPlayer: Boolean,
+                remoteCommandsEnabled: Boolean,
+            ): Long {
+                createdHostPointers += hostViewPtr
+                if (sourceUrl.endsWith("ep3.mp4")) {
+                    thirdCreateStarted.countDown()
+                    allowThirdCreate.await(3, TimeUnit.SECONDS)
+                }
+                return nextHandle.incrementAndGet().toLong()
+            }
+
+            override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean {
+                reparentedHandles += handle to hostViewPtr
+                return true
+            }
+        }
+
+        val controller = NativePlayerController(
+            host = mainHost,
+            backend = backend,
+            isHostDisplayable = { true },
+            resolveHostView = { 100L },
+            isComponentDisplayable = { true },
+            resolveComponentView = { component -> if (component === pipHost) 200L else 100L },
+        )
+
+        // 1. Initial episode attaches in the main host (100L).
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep1.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep1Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 1 && System.nanoTime() < ep1Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(100L), createdHostPointers.toList())
+
+        // 2. Enter PiP: reparents handle 11L to pipHost (200L).
+        SwingUtilities.invokeAndWait {
+            assertTrue(controller.reparentSurface(pipHost))
+            controller.setPictureInPictureActive(true)
+        }
+        assertEquals(listOf(11L to 200L), reparentedHandles.toList())
+
+        // 3. Episode/source replacement (dispose + attach, matching NativePlayerSurface) creates handle 12L in pipHost (200L).
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep2.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep2Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 2 && System.nanoTime() < ep2Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(
+            listOf(100L, 200L),
+            createdHostPointers.toList(),
+            "replacement handle created during PiP must target the floating PiP host rather than the 1dp main-window anchor",
+        )
+
+        // 4. Exit PiP mid-create of ep3: handle 13L starts creating in pipHost (200L) and reparents back to mainHost (100L) on completion.
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep3.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        assertTrue(thirdCreateStarted.await(3, TimeUnit.SECONDS))
+        SwingUtilities.invokeAndWait {
+            assertTrue(controller.reparentSurface(mainHost))
+            controller.setPictureInPictureActive(false)
+        }
+        allowThirdCreate.countDown()
+        val ep3Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (reparentedHandles.size < 2 && System.nanoTime() < ep3Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(11L to 200L, 13L to 100L), reparentedHandles.toList())
+
+        // 5. Subsequent source attaches back in mainHost (100L).
+        controller.dispose()
+        controller.attach(
+            sourceUrl = "https://example.invalid/ep4.mp4",
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        val ep4Deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+        while (createdHostPointers.size < 4 && System.nanoTime() < ep4Deadline) {
+            Thread.sleep(10)
+        }
+        SwingUtilities.invokeAndWait {}
+        assertEquals(listOf(100L, 200L, 200L, 100L), createdHostPointers.toList())
+        controller.releaseBeforeNavigation {}
+    }
 }
 
 private fun NativePlayerController.pendingSourceForTest(): Any? =
@@ -848,13 +1185,6 @@ private fun NativePlayerController.startTrackedDisposeForTest(value: Long) {
     javaClass.getDeclaredMethod("startTrackedDisposeLocked", Long::class.javaPrimitiveType).also { method ->
         method.isAccessible = true
         method.invoke(this, value)
-    }
-}
-
-private fun NativePlayerController.setNativeHandleForTest(value: Long) {
-    javaClass.getDeclaredField("handle").also { field ->
-        field.isAccessible = true
-        field.setLong(this, value)
     }
 }
 

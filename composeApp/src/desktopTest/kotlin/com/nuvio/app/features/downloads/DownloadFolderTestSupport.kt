@@ -198,6 +198,11 @@ internal class LocationsBackend(private val world: FolderWorld) : DownloadsBacke
 
     override fun inspectFile(localFileUri: String): DownloadedFileFacts? = inspectDownloadedFile(localFileUri)
 
+    override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult {
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        return if (trashFile(localFileUri)) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.NotMoved
+    }
+
     override fun trashFile(localFileUri: String): Boolean {
         if (trashSucceeds) trashed += localFileUri
         return trashSucceeds
@@ -217,6 +222,18 @@ internal class LocationsBackend(private val world: FolderWorld) : DownloadsBacke
         placementForNewDownload(items, parentMetaId, isEpisode, world.locations.defaultLocation().id) {
             world.locations.locationOfRecord(it.locationId, it.localFileUri).id
         }
+
+    override val supportsDiskScan: Boolean = true
+
+    override fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult = DownloadDiskScanner(
+        locations = world.locations,
+        allRecords = { profileId, items -> items.map { RecordRef.of(profileId, it) } },
+    ).scan(activeProfileId, inMemoryItems, nextDownloadId, nowEpochMs)
 }
 
 internal fun storedPayload(items: List<DownloadItem>): String {

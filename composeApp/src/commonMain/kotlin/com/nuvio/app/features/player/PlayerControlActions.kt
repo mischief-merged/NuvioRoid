@@ -112,6 +112,7 @@ internal fun PlayerControlActions(
     onSubtitleClick: () -> Unit,
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)?,
+    sourcesLabel: String = stringResource(Res.string.compose_player_sources),
     onEpisodesClick: (() -> Unit)?,
     onChaptersClick: (() -> Unit)?,
     onNextEpisodeClick: (() -> Unit)?,
@@ -129,6 +130,7 @@ internal fun PlayerControlActions(
         onSubtitleClick = onSubtitleClick,
         onAudioClick = onAudioClick,
         onSourcesClick = onSourcesClick,
+        sourcesLabel = sourcesLabel,
         onEpisodesClick = onEpisodesClick,
         onChaptersClick = onChaptersClick,
         onNextEpisodeClick = onNextEpisodeClick,
@@ -230,6 +232,7 @@ internal fun playerControlActions(
     onSubtitleClick: () -> Unit,
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)?,
+    sourcesLabel: String = stringResource(Res.string.compose_player_sources),
     onEpisodesClick: (() -> Unit)?,
     onChaptersClick: (() -> Unit)?,
     onNextEpisodeClick: (() -> Unit)?,
@@ -263,7 +266,7 @@ internal fun playerControlActions(
         },
         onSourcesClick?.let {
             PlayerControlAction(
-                stringResource(Res.string.compose_player_sources), it,
+                sourcesLabel, it,
                 painter = appIconPainter(AppIconResource.PlayerSource),
             )
         },

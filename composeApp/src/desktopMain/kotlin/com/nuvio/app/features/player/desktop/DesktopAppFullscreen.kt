@@ -50,10 +50,15 @@ private object DesktopAppFullscreen {
         }
     }
 
+    fun exitFullscreen(window: Window? = null) {
+        if (!isFullscreen(window)) return
+        toggle(window)
+    }
+
     fun isFullscreen(window: Window? = null): Boolean =
         fullscreenStateProvider?.invoke(window) == true
 
-    private fun notifyChanged() {
+    fun notifyChanged() {
         _changes.value += 1
     }
 }
@@ -66,6 +71,14 @@ internal fun registerDesktopAppFullscreenToggle(
 
 internal fun toggleDesktopAppFullscreen(window: Window? = null) {
     DesktopAppFullscreen.toggle(window)
+}
+
+internal fun exitDesktopAppFullscreen(window: Window? = null) {
+    DesktopAppFullscreen.exitFullscreen(window)
+}
+
+internal fun notifyDesktopAppFullscreenChanged() {
+    DesktopAppFullscreen.notifyChanged()
 }
 
 internal fun isDesktopAppFullscreen(window: Window? = null): Boolean =

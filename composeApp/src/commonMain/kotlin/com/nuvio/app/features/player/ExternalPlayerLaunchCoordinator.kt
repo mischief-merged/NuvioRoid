@@ -1,6 +1,9 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.features.downloads.DownloadSubtitles
+import com.nuvio.app.features.downloads.OfflineSkipTimes
+import com.nuvio.app.features.downloads.SidecarIo
 import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.player.skip.SkipIntroRepository
 import kotlinx.coroutines.CoroutineScope
@@ -18,6 +21,39 @@ import nuvio.composeapp.generated.resources.player_external_loading_subtitles
 import org.jetbrains.compose.resources.getString
 
 private const val SkipSegmentResolveTimeoutMs = 4_000L
+
+/**
+ * Marks [launch] as playing, runs [prepare], then calls [open] only when this
+ * launch is still the current one and no replacement prompt is waiting on it.
+ * Subtitle and skip-segment lookup can take several seconds after the in-app
+ * session is gone; a newer playback start, or a choice that is still open,
+ * must win, and the older lookup must not open a second player.
+ */
+internal suspend fun launchPreparedExternalPlayback(
+    sessions: PlayerSessionController,
+    launch: PlayerLaunch,
+    prepare: suspend () -> Unit,
+    open: suspend () -> Boolean,
+): Boolean {
+    val token = sessions.beginExternalPlayback(launch)
+    return completeExternalPlayback(sessions, token, prepare, open)
+}
+
+internal suspend fun completeExternalPlayback(
+    sessions: PlayerSessionController,
+    token: Long,
+    prepare: suspend () -> Unit,
+    open: suspend () -> Boolean,
+): Boolean {
+    try {
+        if (!sessions.isCurrentExternalPlayback(token)) return false
+        prepare()
+        if (!sessions.awaitExternalOpenAllowed(token)) return false
+        return open()
+    } finally {
+        sessions.finishExternalPlayback(token)
+    }
+}
 
 // Skip resolution runs on an app-lifetime scope rather than the caller's (often
 // composition-bound) scope, so navigating to the external player cannot cancel an
@@ -55,8 +91,10 @@ suspend fun prepareExternalPlayerLaunch(
                         languageMatchesPreference(it.language, preferredLanguage) ||
                             (secondaryLanguage != null && languageMatchesPreference(it.language, secondaryLanguage))
                     }
+                    .ifEmpty { downloadedSubtitles }
                     .map { SubtitleInput(it.url, it.name ?: it.language, it.language) }
-                    .ifEmpty { null }
+            } else if (NetworkStatusRepository.uiState.value.isNoInternet) {
+                null
             } else {
                 SubtitleForwarder.fetchForExternalPlayer(
                     type = type,
@@ -81,7 +119,16 @@ suspend fun prepareExternalPlayerLaunch(
     }
 
     val skipSegmentsDeferred = if (sendSkipSegments) {
-        async { resolveSkipSegmentsJson(type, videoId, request.season, request.episode, contentId) }
+        async {
+            resolveSkipSegmentsJson(
+                type = type,
+                videoId = videoId,
+                season = request.season,
+                episode = request.episode,
+                contentId = contentId,
+                localSourceUrl = request.sourceUrl,
+            )
+        }
     } else {
         null
     }
@@ -105,13 +152,21 @@ suspend fun prepareExternalPlayerLaunch(
  * intentionally independent of the in-app skip-intro toggle (requireSkipIntroEnabled = false):
  * this is its own opt-in setting.
  */
-private suspend fun resolveSkipSegmentsJson(
+internal suspend fun resolveSkipSegmentsJson(
     type: String,
     videoId: String,
     season: Int?,
     episode: Int?,
     contentId: String?,
+    localSourceUrl: String? = null,
+    isOffline: Boolean = NetworkStatusRepository.uiState.value.isNoInternet,
+    readSavedSkipIntervals: (String) -> List<SkipInterval> = { OfflineSkipTimes.app.saved(it) },
 ): String? {
+    if (!localSourceUrl.isNullOrBlank() && localSourceUrl.startsWith("file:")) {
+        val saved = SidecarIo.read { readSavedSkipIntervals(localSourceUrl) }.orEmpty()
+        if (saved.isNotEmpty()) return saved.toSkipSegmentsJson()
+    }
+    if (isOffline) return null
     val imdbFromContent = contentId?.takeIf { it.startsWith("tt") }
     val intervals = skipResolveScope.async {
         withTimeoutOrNull(SkipSegmentResolveTimeoutMs) {

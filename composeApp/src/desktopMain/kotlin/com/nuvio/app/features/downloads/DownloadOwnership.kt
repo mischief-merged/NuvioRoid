@@ -6,6 +6,13 @@ import java.nio.file.Path
 import java.text.Normalizer
 import java.util.Locale
 
+/**
+ * Profile id used only while judging ownership of a file named in an account archive.
+ * No live profile uses it, so a new download that reuses an old id still counts as
+ * someone else and cannot take the archived file.
+ */
+internal const val ArchivedDownloadProfileId = -1
+
 /** What a move needs to know of one record of one profile. */
 internal data class RecordRef(
     val profileId: Int,
@@ -14,12 +21,24 @@ internal data class RecordRef(
     val locationId: String?,
     val localFileUri: String?,
     val fileName: String,
+    val partialFileName: String? = null,
+    val supersededPartials: List<KeptPartialFile> = emptyList(),
 ) {
     val label: String get() = fileName.ifBlank { id }
+    val activePartialFileName: String get() = partialFileName?.takeIf { it.isNotBlank() } ?: "$fileName.part"
 
     companion object {
         fun of(profileId: Int, item: DownloadItem) =
-            RecordRef(profileId, item.id, item.status == DownloadStatus.Completed, item.locationId, item.localFileUri, item.fileName)
+            RecordRef(
+                profileId = profileId,
+                id = item.id,
+                completed = item.status == DownloadStatus.Completed,
+                locationId = item.locationId,
+                localFileUri = item.localFileUri,
+                fileName = item.fileName,
+                partialFileName = item.partialFileName,
+                supersededPartials = item.supersededPartials,
+            )
     }
 }
 
@@ -30,7 +49,11 @@ internal data class RecordRef(
  * Unicode NFC, letter case ignored (macOS and Windows volumes usually ignore it; on a volume that does
  * not, this only refuses more).
  */
-internal class DownloadOwnership(private val locations: DownloadLocations, records: List<RecordRef>) {
+internal class DownloadOwnership(
+    private val locations: DownloadLocations,
+    records: List<RecordRef>,
+    private val pathKey: (Path) -> String = ::keyOf,
+) {
     private class Claim(val owner: RecordRef, val key: String)
 
     private val claims: List<Claim> = records.flatMap(::claimsOf)
@@ -48,16 +71,29 @@ internal class DownloadOwnership(private val locations: DownloadLocations, recor
             ).distinct()
         } else {
             val owner = locations.locationOfRecord(record.locationId, null).path
-            if (record.fileName.isBlank()) emptyList() else listOf(owner.resolve(record.fileName + ".part"), owner.resolve(record.fileName))
+            val base = if (record.fileName.isBlank()) {
+                emptyList()
+            } else {
+                listOf(owner.resolve(record.activePartialFileName), owner.resolve(record.fileName))
+            }
+            val kept = record.supersededPartials.mapNotNull { entry ->
+                val keptName = entry.fileName.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                locations.locationOfRecord(entry.locationId ?: record.locationId, null).path.resolve(keptName)
+            }
+            // A published file can have taken a free name while its record still awaits checks.
+            (base + kept + listOfNotNull(
+                record.localFileUri?.let(DownloadLocations::fileOfUri)?.toPath(),
+                locations.recordedPath(record.locationId, record.localFileUri),
+            )).distinct()
         }
         val videos = files.filterNot { it.fileName.toString().endsWith(".part") }
-        return files.map { Claim(record, keyOf(it)) } +
-            videos.map { Claim(record, keyOf(it.resolveSibling(DownloadSidecarFiles.sidecarFolderName(it.fileName.toString())))) }
+        return files.map { Claim(record, pathKey(it)) } +
+            videos.map { Claim(record, pathKey(it.resolveSibling(DownloadSidecarFiles.sidecarFolderName(it.fileName.toString())))) }
     }
 
     /** The record, other than [profileId]/[id], that owns [path], or null. */
     fun otherOwner(profileId: Int, id: String, path: Path): RecordRef? {
-        val key = keyOf(path)
+        val key = pathKey(path)
         fun other(r: RecordRef) = !(r.profileId == profileId && r.id == id)
         val names = generateSequence(path) { it.parent }.mapNotNull { it.fileName?.toString() }.map(::nameKey).toSet()
         unplaced.firstOrNull { (r, name) -> other(r) && (name in names || names.any { it.startsWith("$name.subtitles") }) }?.let { return it.first }
@@ -106,7 +142,7 @@ internal fun legacyPartialKey(
     records: List<RecordRef>?,
 ): String? {
     if (item.partialFileKey != null || item.status == DownloadStatus.Completed || item.downloadedBytes <= 0L) return null
-    val own = locations.locationOfRecord(item.locationId, null).path.resolve(item.fileName + ".part").toAbsolutePath().normalize()
+    val own = locations.locationOfRecord(item.locationId, null).path.resolve(item.activePartialFileName).toAbsolutePath().normalize()
     if (partial.toAbsolutePath().normalize() != own) return null
     if (Files.isSymbolicLink(own) || !Files.isRegularFile(own, LinkOption.NOFOLLOW_LINKS)) return null
     val known = records ?: return null

@@ -1,6 +1,7 @@
 package com.nuvio.app.features.catalog
 
 import com.nuvio.app.core.ui.rememberAnimatedArtworkAnimation
+import com.nuvio.app.controller.RegisterControllerVerticalScroll
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import com.nuvio.app.core.ui.NuvioBackButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -38,6 +40,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
@@ -54,6 +57,8 @@ import com.nuvio.app.core.format.formatReleaseDateForDisplay
 import com.nuvio.app.core.ui.NuvioDesktopVerticalScrollbar
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
 import com.nuvio.app.core.ui.NuvioPosterWatchedOverlay
+import com.nuvio.app.features.downloads.PosterAvailableOfflineOverlay
+import com.nuvio.app.features.downloads.rememberOfflineDownloadIndex
 import com.nuvio.app.core.ui.PosterLandscapeAspectRatio
 import com.nuvio.app.core.ui.catalogPosterBaseWidthDp
 import com.nuvio.app.core.ui.desktopPageHorizontalPaddingForWidth
@@ -64,6 +69,7 @@ import com.nuvio.app.core.ui.nuvioCardDepth
 import com.nuvio.app.core.ui.posterCardClickable
 import com.nuvio.app.core.ui.posterGridColumnCountForViewport
 import com.nuvio.app.core.ui.NuvioLoadingIndicator
+import com.nuvio.app.core.ui.userFacingErrorText
 import com.nuvio.app.core.ui.SkeletonPoster
 import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.core.ui.posterCardClickable
@@ -117,6 +123,9 @@ fun CatalogScreen(
         initialFirstVisibleItemIndex = initialScrollPosition.firstVisibleItemIndex,
         initialFirstVisibleItemScrollOffset = initialScrollPosition.firstVisibleItemScrollOffset,
     )
+
+    // Lets the controller spatial engine scroll this grid when focus reaches the bottom edge.
+    val scrollViewportModifier = RegisterControllerVerticalScroll(lazyGridState = gridState)
     var headerHeightPx by remember { mutableIntStateOf(0) }
     var observedOfflineState by remember { mutableStateOf(false) }
 
@@ -208,7 +217,7 @@ fun CatalogScreen(
             LazyVerticalGrid(
                 columns = gridCells,
                 state = gridState,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().then(scrollViewportModifier),
                 contentPadding = PaddingValues(
                     start = pageHorizontalPadding,
                     top = with(androidx.compose.ui.platform.LocalDensity.current) { headerHeightPx.toDp() } + 12.dp,
@@ -281,7 +290,11 @@ fun CatalogScreen(
                             )
                         }
                     }
-                    if (uiState.isLoading) {
+                    if (catalogShowsLoadMoreRetry(uiState)) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            CatalogLoadMoreRetry(onRetry = { CatalogRepository.loadMore() })
+                        }
+                    } else if (uiState.isLoading) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             CatalogLoadingFooter()
                         }
@@ -378,10 +391,15 @@ private fun CatalogPosterTile(
         onLongClick = onLongClick,
         modifier = Modifier.fillMaxWidth(),
     ) {
+        val offlineIndex = rememberOfflineDownloadIndex()
+        val networkStatus by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
+        val isAvailableOffline = offlineIndex.hasMeta(item.id)
+        val isUnavailableOffline = networkStatus.isNoInternet && !isAvailableOffline
         Column(
             modifier = Modifier
                 .desktopPosterHoverScale()
-                .then(it),
+                .then(it)
+                .graphicsLayer { alpha = if (isUnavailableOffline) 0.52f else 1f },
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Box(
@@ -425,6 +443,7 @@ private fun CatalogPosterTile(
                         desktopAnimation = rememberAnimatedArtworkAnimation(),
                     )
                 }
+                PosterAvailableOfflineOverlay(isAvailableOffline = isAvailableOffline)
                 NuvioPosterWatchedOverlay(isWatched = isWatched)
             }
             if (!hideLabels) {
@@ -509,10 +528,28 @@ private fun CatalogEmptyState(
         title = stringResource(
             if (loadFailed) Res.string.catalog_load_failed_title else Res.string.catalog_empty_title,
         ),
-        message = errorMessage ?: stringResource(Res.string.catalog_empty_message),
+        message = if (loadFailed) {
+            userFacingErrorText(errorMessage, stringResource(Res.string.catalog_load_failed))
+        } else {
+            stringResource(Res.string.catalog_empty_message)
+        },
         actionLabel = if (loadFailed) stringResource(Res.string.action_retry) else null,
         onActionClick = if (loadFailed) onRetry else null,
     )
+}
+
+@Composable
+private fun CatalogLoadMoreRetry(onRetry: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        TextButton(onClick = onRetry) {
+            Text(text = stringResource(Res.string.catalog_load_more_retry))
+        }
+    }
 }
 
 @Composable

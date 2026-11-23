@@ -3,6 +3,7 @@ package com.nuvio.app.features.details.components
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -23,9 +25,12 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CheckCircleOutline
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -45,6 +50,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.AppIconResource
 import com.nuvio.app.core.ui.appIconPainter
+import com.nuvio.app.core.ui.nuvioFocusBorder
 import com.nuvio.app.core.ui.secondaryClick
 import com.nuvio.app.core.ui.backdropControlColor
 import nuvio.composeapp.generated.resources.Res
@@ -74,6 +80,7 @@ fun DetailActionButtons(
     playLabel: String = stringResource(Res.string.action_play),
     playEnabled: Boolean = true,
     pinnedAction: DetailSecondaryAction? = null,
+    streamInsteadAction: DetailSecondaryAction? = null,
     secondaryActions: List<DetailSecondaryAction> = emptyList(),
     actionsMenuLabel: String = stringResource(Res.string.details_actions_menu_label),
     isTablet: Boolean = false,
@@ -95,7 +102,14 @@ fun DetailActionButtons(
 
     Box(
         modifier = modifier
-            .widthIn(max = if (isTablet) 520.dp else 420.dp)
+            .widthIn(
+                max = when {
+                    isTablet && streamInsteadAction != null -> 640.dp
+                    isTablet -> 520.dp
+                    streamInsteadAction != null -> 480.dp
+                    else -> 420.dp
+                },
+            )
             .fillMaxWidth()
             .height(buttonHeight),
     ) {
@@ -109,7 +123,8 @@ fun DetailActionButtons(
             Surface(
                 modifier = Modifier
                     .weight(1f)
-                    .height(buttonHeight),
+                    .height(buttonHeight)
+                    .nuvioFocusBorder(playShape),
                 shape = playShape,
                 color = if (playEnabled) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.surfaceVariant,
                 contentColor = if (playEnabled) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
@@ -142,6 +157,34 @@ fun DetailActionButtons(
                             MaterialTheme.typography.titleMedium
                         } else {
                             MaterialTheme.typography.titleSmall
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+
+            if (streamInsteadAction != null) {
+                Spacer(modifier = Modifier.width(10.dp))
+                OutlinedButton(
+                    onClick = streamInsteadAction.onClick,
+                    modifier = Modifier.height(buttonHeight),
+                    shape = playShape,
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.32f),
+                    ),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = backdropControlColor(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f)),
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                    ),
+                ) {
+                    Text(
+                        text = streamInsteadAction.label,
+                        style = if (isTablet) {
+                            MaterialTheme.typography.titleSmall
+                        } else {
+                            MaterialTheme.typography.labelLarge
                         },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -206,7 +249,8 @@ fun DetailActionButtons(
 
             if (hasSecondaryActions) {
                 Surface(
-                    modifier = Modifier.size(iconButtonSize),
+                    modifier = Modifier
+                        .size(iconButtonSize),
                     shape = CircleShape,
                     color = if (actionsExpanded) {
                         MaterialTheme.colorScheme.onBackground
@@ -222,6 +266,7 @@ fun DetailActionButtons(
                     Box(
                         modifier = Modifier
                             .size(iconButtonSize)
+                            .nuvioFocusBorder(CircleShape)
                             .clickable(role = Role.Button) {
                                 hapticFeedback.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 actionsExpanded = !actionsExpanded
@@ -259,6 +304,7 @@ fun DetailActions(
     onSaveClick: () -> Unit,
     onSaveLongClick: (() -> Unit)?,
     downloadAction: DetailSecondaryAction? = null,
+    streamInsteadAction: DetailSecondaryAction? = null,
 ) {
     val shuffleAction = onShuffleClick?.let { onClick ->
         DetailSecondaryAction(
@@ -273,6 +319,7 @@ fun DetailActions(
         playEnabled = playEnabled,
         // The download action is one click away, beside Play, unless shuffle holds that place.
         pinnedAction = shuffleAction?.takeIf { shuffleEnabled } ?: downloadAction,
+        streamInsteadAction = streamInsteadAction,
         secondaryActions = buildList {
             if (!shuffleEnabled) shuffleAction?.let(::add)
             if (shuffleEnabled && shuffleAction != null) downloadAction?.let(::add)

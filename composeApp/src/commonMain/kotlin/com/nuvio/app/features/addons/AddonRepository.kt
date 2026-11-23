@@ -1,7 +1,10 @@
 package com.nuvio.app.features.addons
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.auth.AuthRepository
+import com.nuvio.app.core.auth.AuthState
 import com.nuvio.app.core.network.SupabaseProvider
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.sync.putSyncOriginClientId
 import com.nuvio.app.features.profiles.ProfileRepository
 import io.github.jan.supabase.postgrest.postgrest
@@ -109,7 +112,17 @@ object AddonRepository {
         _uiState.value = AddonsUiState()
     }
 
+    internal fun setAddonsForTest(addons: List<ManagedAddon>) {
+        initialized = true
+        _uiState.value = AddonsUiState(addons = addons)
+    }
+
     suspend fun pullFromServer(profileId: Int) {
+        val expectedUserId = (AuthRepository.state.value as? AuthState.Authenticated)
+            ?.takeUnless { it.isAnonymous }
+            ?.userId
+            ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
         currentProfileId = resolveEffectiveProfileId(profileId)
         log.i { "pullFromServer() — profileId=$profileId, initialized=$initialized" }
         runCatching {
@@ -120,6 +133,7 @@ object AddonRepository {
                     order("sort_order", Order.ASCENDING)
                 }
                 .decodeList<AddonRow>()
+            if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return@runCatching
 
             val rowsByUrl = linkedMapOf<String, AddonRow>()
             rows.forEach { row ->
@@ -168,6 +182,28 @@ object AddonRepository {
         }
     }
 
+    private val _pendingTrackingConsent = MutableStateFlow<AddonManifest?>(null)
+    val pendingTrackingConsent: StateFlow<AddonManifest?> = _pendingTrackingConsent.asStateFlow()
+
+    fun requestTrackingConsent(manifest: AddonManifest) {
+        _pendingTrackingConsent.value = manifest
+    }
+
+    fun dismissTrackingConsent() {
+        _pendingTrackingConsent.value = null
+    }
+
+    suspend fun installWithTrackingConsent(manifest: AddonManifest): AddAddonResult {
+        _pendingTrackingConsent.value = null
+        if (isUsingPrimaryAddonsFromSecondaryProfile()) {
+            return AddAddonResult.Error(getString(Res.string.profile_primary_addons_required))
+        }
+        if (_uiState.value.addons.any { it.manifestUrl == manifest.transportUrl }) {
+            return AddAddonResult.Error(getString(Res.string.addon_already_installed))
+        }
+        return installManifest(manifest.transportUrl, manifest)
+    }
+
     suspend fun addAddon(rawUrl: String): AddAddonResult {
         if (isUsingPrimaryAddonsFromSecondaryProfile()) {
             return AddAddonResult.Error(getString(Res.string.profile_primary_addons_required))
@@ -176,7 +212,9 @@ object AddonRepository {
         val manifestUrl = try {
             normalizeManifestUrl(rawUrl)
         } catch (error: IllegalArgumentException) {
-            return AddAddonResult.Error(error.message ?: getString(Res.string.addon_invalid_url))
+            return AddAddonResult.Error(
+                userFacingFailure(error.message, getString(Res.string.addon_invalid_url)),
+            )
         }
 
         if (_uiState.value.addons.any { it.manifestUrl == manifestUrl }) {
@@ -192,9 +230,18 @@ object AddonRepository {
                 )
             }
         } catch (error: Throwable) {
-            return AddAddonResult.Error(error.message ?: getString(Res.string.addon_load_manifest_failed))
+            return AddAddonResult.Error(
+                userFacingFailure(error.message, getString(Res.string.addon_load_manifest_failed)),
+            )
         }
 
+        if (manifest.isTrackingAddon) {
+            return AddAddonResult.TrackingConsentRequired(manifest)
+        }
+        return installManifest(manifestUrl, manifest)
+    }
+
+    private fun installManifest(manifestUrl: String, manifest: AddonManifest): AddAddonResult {
         _uiState.update { current ->
             current.copy(
                 addons = current.addons + ManagedAddon(
@@ -303,6 +350,12 @@ object AddonRepository {
                         payload = payload,
                     )
                 }
+                val failureMessage = result.exceptionOrNull()?.let { error ->
+                    userFacingFailure(
+                        error.message,
+                        getString(Res.string.addon_load_manifest_failed),
+                    )
+                }
 
                 _uiState.update { current ->
                     current.copy(
@@ -318,10 +371,10 @@ object AddonRepository {
                                             errorMessage = null,
                                         )
                                     },
-                                    onFailure = { error ->
+                                    onFailure = {
                                         addon.copy(
                                             isRefreshing = false,
-                                            errorMessage = error.message ?: getString(Res.string.addon_load_manifest_failed),
+                                            errorMessage = failureMessage,
                                         )
                                     },
                                 )

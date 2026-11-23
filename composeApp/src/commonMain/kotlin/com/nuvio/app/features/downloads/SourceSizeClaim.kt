@@ -1,6 +1,8 @@
 package com.nuvio.app.features.downloads
 
 import com.nuvio.app.features.streams.StreamItem
+import kotlin.math.abs
+import kotlin.math.round
 
 /*
  * The size a source says its file has, read from the text it shows when it does not state one in a
@@ -158,15 +160,42 @@ internal fun formatDecimalSize(bytes: Long): String {
     }
 }
 
-/** A size as the Downloads list shows it, in units of 1024 under the names KB, MB and GB: "8.1 MB". */
-internal fun formatListedSize(bytes: Long): String {
-    if (bytes <= 0L) return "0 B"
+internal enum class DecimalByteScale(val suffix: String) {
+    Bytes("B"),
+    Kilobytes("KB"),
+    Megabytes("MB"),
+    Gigabytes("GB"),
+}
+
+internal data class DecimalByteSize(val amount: String, val scale: DecimalByteScale)
+
+/**
+ * A size in decimal units, 1000 bytes to a kilobyte, the way the storage limit and macOS Finder
+ * count. One decimal place, rounded, so a limit of 250 GB is shown as 250.0 GB and not 232.8.
+ */
+internal fun decimalByteSize(bytes: Long): DecimalByteSize {
+    if (bytes <= 0L) return DecimalByteSize("0", DecimalByteScale.Bytes)
     val value = bytes.toDouble()
-    fun one(amount: Double) = "${(amount * 10.0).toInt() / 10.0}"
-    return when {
-        value >= Kibi * Kibi * Kibi -> "${one(value / (Kibi * Kibi * Kibi))} GB"
-        value >= Kibi * Kibi -> "${one(value / (Kibi * Kibi))} MB"
-        value >= Kibi -> "${one(value / Kibi)} KB"
-        else -> "$bytes B"
+    val kilo = 1000.0
+    val mega = kilo * 1000.0
+    val giga = mega * 1000.0
+    fun scaled(amount: Double, scale: DecimalByteScale): DecimalByteSize {
+        // A decimal count reprints the point ("10.0.0"), so the rounded tenths stay a whole number.
+        val tenths = round(amount * 10.0).toLong()
+        val whole = tenths / 10
+        val fraction = abs(tenths % 10)
+        return DecimalByteSize("$whole.$fraction", scale)
     }
+    return when {
+        value >= giga -> scaled(value / giga, DecimalByteScale.Gigabytes)
+        value >= mega -> scaled(value / mega, DecimalByteScale.Megabytes)
+        value >= kilo -> scaled(value / kilo, DecimalByteScale.Kilobytes)
+        else -> DecimalByteSize(bytes.toString(), DecimalByteScale.Bytes)
+    }
+}
+
+/** A size as the Downloads list shows it, in decimal units: "8.5 MB". */
+internal fun formatListedSize(bytes: Long): String {
+    val size = decimalByteSize(bytes)
+    return "${size.amount} ${size.scale.suffix}"
 }

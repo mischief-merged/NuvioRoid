@@ -3,11 +3,15 @@ package com.nuvio.app.features.downloads
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /** Called by the native monitor, on a queue of its own, with the path traffic takes now. */
 internal fun interface NetworkPathListener {
+    fun onSleep() {}
+    fun onWake() {}
     fun onPath(satisfied: Boolean, expensive: Boolean, constrained: Boolean, interfaces: String, gateways: String)
 }
 
@@ -29,6 +33,9 @@ internal class MacNetworkPathDetector(
     private val isMac: Boolean = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT).contains("mac"),
     private val loadLibrary: () -> Unit = NativePlayerBridge::ensureLoaded,
     private val native: NativePathMonitor = NativePathMonitor.Real,
+    private val onSleep: () -> Unit = {},
+    private val onWake: () -> Unit = {},
+    private val onPathChanged: () -> Unit = {},
 ) : NetworkPathDetector {
     /** The two native calls, replaceable in tests. */
     internal interface NativePathMonitor {
@@ -43,6 +50,8 @@ internal class MacNetworkPathDetector(
 
     private val log = Logger.withTag("NetworkPath")
     private var executor: ExecutorService? = null
+    private val generation = AtomicLong()
+    private val pathRevision = AtomicLong()
 
     @Synchronized
     override fun start(onReport: (NetworkPathReport) -> Unit): Boolean {
@@ -53,10 +62,23 @@ internal class MacNetworkPathDetector(
         }
         val started = try {
             loadLibrary()
-            native.start { satisfied, expensive, constrained, interfaces, gateways ->
-                val report = pathReport(satisfied, expensive, constrained, interfaces, gateways)
-                runCatching { reports.execute { runCatching { onReport(report) }.onFailure { log.w(it) { "a path report failed" } } } }
-            }
+            val current = generation.incrementAndGet()
+            native.start(object : NetworkPathListener {
+                override fun onPath(satisfied: Boolean, expensive: Boolean, constrained: Boolean, interfaces: String, gateways: String) {
+                    val report = pathReport(satisfied, expensive, constrained, interfaces, gateways)
+                    val revision = pathRevision.incrementAndGet()
+                    onPathChanged.invoke()
+                    runCatching { reports.execute {
+                        if (generation.get() == current && pathRevision.get() == revision) runCatching { onReport(report) }
+                            .onFailure { log.w(it) { "a path report failed" } }
+                    } }
+                }
+                override fun onSleep() {
+                    generation.incrementAndGet()
+                    onSleep.invoke()
+                }
+                override fun onWake() { onWake.invoke() }
+            })
         } catch (error: Throwable) {
             // UnsatisfiedLinkError from a bridge without the monitor, or the library not loading at all.
             log.w(error) { "network path monitor unavailable" }
@@ -72,6 +94,7 @@ internal class MacNetworkPathDetector(
 
     @Synchronized
     override fun stop() {
+        generation.incrementAndGet()
         val running = executor ?: return
         executor = null
         runCatching { native.stop() }
@@ -100,25 +123,86 @@ internal fun pathReport(
     )
 }
 
-/** Watches the network path for the app's connection hold. Started once when the app starts. */
-internal object DesktopLimitedConnections {
-    @Volatile
+/** Serializes sleep and fresh reports; a check begun before another sleep cannot release its hold. */
+internal class WakeNetworkRecheck(
+    private val hold: ConnectionHold,
+    private val checkQuality: suspend () -> Unit,
+) {
+    private val lock = Any()
+    private var generation = 0L
+    private var sleeping = false
+
+    fun sleep() = synchronized(lock) {
+        generation++
+        sleeping = true
+        hold.beginNetworkRecheck()
+    }
+
+    fun wake() = synchronized(lock) {
+        generation++
+        sleeping = false
+        hold.beginNetworkRecheck()
+    }
+
+    fun pathChanged() = synchronized(lock) { generation++ }
+
+    suspend fun report(report: NetworkPathReport) {
+        val token = synchronized(lock) { if (sleeping) return else generation }
+        if (hold.state.value.checkingNetwork) {
+            if (report !is NetworkPathReport.Known || report.networkKey.isBlank()) return
+            checkQuality()
+        }
+        synchronized(lock) {
+            if (!sleeping && token == generation) hold.report(report, notifyInBackground = true)
+        }
+    }
+}
+
+/** Owns one monitor at a time; callers restart it on a background thread. */
+internal class NetworkPathMonitorSession(
+    private val hold: ConnectionHold,
+    private val recheck: WakeNetworkRecheck,
+    private val createDetector: () -> NetworkPathDetector,
+) {
     private var detector: NetworkPathDetector? = null
 
-    /** Starts watching on a thread of its own (loading the native library takes a moment). Never throws. */
-    fun install(
-        hold: ConnectionHold = LimitedConnections.hold,
-        newDetector: () -> NetworkPathDetector = { MacNetworkPathDetector() },
-    ) {
-        Thread {
-            runCatching {
-                val started = newDetector()
-                if (started.start(hold::report)) detector = started else hold.report(NetworkPathReport.Unknown)
+    @Synchronized
+    fun restart() {
+        runCatching {
+            detector?.stop()
+            val next = createDetector()
+            detector = next
+            if (!next.start { report -> runBlocking { recheck.report(report) } }) {
+                hold.networkMonitorUnavailable()
             }
-        }.apply {
-            name = "nuvio-network-path-start"
-            isDaemon = true
-            start()
+        }.onFailure {
+            hold.networkMonitorUnavailable()
         }
+    }
+}
+
+/** Watches network changes and restarts the path monitor on wake for a fresh report. */
+internal object DesktopLimitedConnections {
+    fun install() {
+        val hold = LimitedConnections.hold
+        val recheck = WakeNetworkRecheck(hold, DesktopPoliteDownloads::recheckAfterWake)
+        lateinit var session: NetworkPathMonitorSession
+        fun startMonitor() {
+            Thread { session.restart() }.apply {
+                name = "nuvio-network-path-start"
+                isDaemon = true
+                start()
+            }
+        }
+        session = NetworkPathMonitorSession(hold, recheck) {
+            MacNetworkPathDetector(
+                onSleep = recheck::sleep,
+                onPathChanged = recheck::pathChanged,
+                onWake = { recheck.wake(); startMonitor() },
+            )
+        }
+        // No restored transfer starts before the initial path is known, either.
+        hold.beginNetworkRecheck()
+        startMonitor()
     }
 }

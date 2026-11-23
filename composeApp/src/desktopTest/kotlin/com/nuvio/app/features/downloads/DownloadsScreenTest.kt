@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -19,8 +20,19 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.features.settings.LocalOpenSettingsPage
+import com.nuvio.app.features.settings.SettingsPage
+import com.nuvio.app.features.settings.SettingsSectionFocus
 import com.nuvio.app.core.ui.NuvioToastController
 import kotlinx.coroutines.runBlocking
+import nuvio.composeapp.generated.resources.downloads_kept
+import nuvio.composeapp.generated.resources.downloads_undo_keep
+import nuvio.composeapp.generated.resources.downloads_keep_description
+import nuvio.composeapp.generated.resources.downloads_held_download_anyway
+import nuvio.composeapp.generated.resources.travel_mode_off
+import nuvio.composeapp.generated.resources.travel_mode_on
+import nuvio.composeapp.generated.resources.travel_status
+import nuvio.composeapp.generated.resources.downloads_checking_network
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_cancel
 import nuvio.composeapp.generated.resources.downloads_announce_checking
@@ -79,7 +91,9 @@ import nuvio.composeapp.generated.resources.downloads_failed_next_not_enough_spa
 import nuvio.composeapp.generated.resources.downloads_failed_next_other
 import nuvio.composeapp.generated.resources.downloads_failed_next_source_refused
 import nuvio.composeapp.generated.resources.downloads_empty_title
+import nuvio.composeapp.generated.resources.downloads_check_all
 import nuvio.composeapp.generated.resources.downloads_open_directory
+import nuvio.composeapp.generated.resources.downloads_open_settings
 import nuvio.composeapp.generated.resources.downloads_result_picture_ok
 import nuvio.composeapp.generated.resources.downloads_store_problem_earlier_copy
 import nuvio.composeapp.generated.resources.downloads_store_problem_not_saving
@@ -88,6 +102,9 @@ import nuvio.composeapp.generated.resources.downloads_store_problem_title
 import nuvio.composeapp.generated.resources.downloads_retry_all_failed
 import nuvio.composeapp.generated.resources.downloads_status_failed_reason
 import nuvio.composeapp.generated.resources.downloads_try_source_again
+import nuvio.composeapp.generated.resources.downloads_pick_source_myself
+import nuvio.composeapp.generated.resources.downloads_source_search_none_found
+import nuvio.composeapp.generated.resources.downloads_source_search_waiting
 import nuvio.composeapp.generated.resources.downloads_status_auto
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.PluralStringResource
@@ -160,6 +177,7 @@ class DownloadsScreenTest {
 
     private val backend = FakeBackend()
     private val realBackend = DownloadsRepository.backend
+    private val connection = ConnectionHold()
 
     private fun clearBatchRuns() {
         SeasonDownloadDefaultsStorage.saveBatchRunsPayload(com.nuvio.app.features.profiles.ProfileRepository.activeProfileId, "")
@@ -177,6 +195,7 @@ class DownloadsScreenTest {
         clearBatchRuns()
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = realBackend
+        SettingsSectionFocus.clear()
     }
 
     private fun text(resource: StringResource, vararg arguments: Any) = runBlocking { getString(resource, *arguments) }
@@ -223,10 +242,13 @@ class DownloadsScreenTest {
     private fun showPayload(withChooseSource: Boolean = true) {
         compose.setContent {
             NuvioTheme {
-                DownloadsScreen(
+                DownloadsScreenContent(
                     onBack = {},
                     onOpenDownload = {},
                     showAutoDownloads = false,
+                    connectionHold = connection,
+                    rechecks = DownloadRechecks.app,
+                    sourceSearches = SourceReplacements.progress,
                     onChooseAnotherSource = if (withChooseSource) ({ chooseSourceFor = it }) else null,
                     openDownloadsFolder = {
                         folderOpened++
@@ -239,9 +261,54 @@ class DownloadsScreenTest {
         }
     }
 
-    private fun failedRow(id: String, kind: String?, message: String, episode: Int = 3) = stored(
+    @Test
+    fun the_travel_header_applies_download_changes_off_the_ui_thread() {
+        val clickThread = Thread.currentThread()
+        val updates = java.util.concurrent.LinkedBlockingQueue<Thread>()
+        connection.listen { updates.put(Thread.currentThread()) }
+        show()
+        var uiThread: Thread? = null
+        compose.runOnIdle { uiThread = Thread.currentThread() }
+        compose.onNodeWithText(text(Res.string.travel_mode_off)).performClick()
+        val appliedOn = updates.poll(5, java.util.concurrent.TimeUnit.SECONDS)
+        kotlin.test.assertNotNull(appliedOn)
+        kotlin.test.assertNotEquals(clickThread, appliedOn)
+        kotlin.test.assertNotEquals(uiThread, appliedOn)
+    }
+
+    @Test
+    fun travel_toggle_and_active_rules_are_visible_in_downloads() {
+        show()
+        compose.onNodeWithText(text(Res.string.travel_mode_off)).performClick()
+        compose.waitUntil(5000) { connection.state.value.travel.enabled }
+        compose.onNodeWithText(text(Res.string.travel_mode_on)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.travel_status, 1000)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.travel_mode_on)).performClick()
+        compose.waitUntil(5000) { !connection.state.value.travel.enabled }
+        compose.onNodeWithText(text(Res.string.travel_mode_off)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.travel_status, 1000)).assertDoesNotExist()
+    }
+
+    @Test
+    fun the_sleep_hold_is_visible_and_cannot_offer_download_anyway() {
+        connection.beginNetworkRecheck()
+        show()
+        compose.onAllNodesWithText(text(Res.string.downloads_checking_network)).onFirst().assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_held_download_anyway)).assertDoesNotExist()
+    }
+
+    private fun failedRow(
+        id: String,
+        kind: String?,
+        message: String,
+        episode: Int = 3,
+        noWorkingSourceFound: Boolean = false,
+        ruleKey: String? = null,
+    ) = stored(
         id, "Failed", episode = episode,
-        extra = ""","errorMessage":"$message"${kind?.let { ""","failureKind":"$it"""" }.orEmpty()}""",
+        extra = ""","errorMessage":"$message"${kind?.let { ""","failureKind":"$it"""" }.orEmpty()}""" +
+            (if (noWorkingSourceFound) ""","noWorkingSourceFound":true""" else "") +
+            (ruleKey?.let { ""","autoDownloadRuleKey":"$it"""" }.orEmpty()),
     )
 
     @Test
@@ -320,31 +387,35 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun a_file_that_failed_its_check_says_why_and_offers_another_source_before_the_same_one() {
+    fun a_file_that_failed_its_check_says_why_and_that_another_source_will_be_tried() {
         show(failedRow("a", "BadFile", "The downloaded video is blank"))
 
         compose.onNodeWithText(text(Res.string.downloads_status_failed_reason, "The downloaded video is blank")).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_failed_next_bad_file)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_try_source_again)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_waiting)).assertIsDisplayed()
+        // The app looks for another source by itself first: no choice is asked of the user yet.
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.action_retry)).assertDoesNotExist()
     }
 
     @Test
-    fun choosing_another_source_hands_over_the_failed_download() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"))
+    fun picking_a_source_after_none_was_found_hands_over_the_failed_download() {
+        show(failedRow("a", "BadFile", "The downloaded video is blank", noWorkingSourceFound = true))
 
-        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_none_found)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).performClick()
 
         assertEquals("a", chooseSourceFor?.id)
-        assertEquals(0, backend.started.count { it == "a" }, "choosing another source fetched the old one again")
+        assertEquals(0, backend.started.count { it == "a" }, "picking another source fetched the old one again")
     }
 
     @Test
-    fun trying_the_same_source_again_is_a_separate_labelled_action() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"))
+    fun trying_the_same_source_again_is_a_separate_labelled_action_for_an_automatic_download() {
+        // A download of an automatic rule is retried by its rule, so its row keeps the user's own actions.
+        show(failedRow("a", "BadFile", "The downloaded video is blank", ruleKey = "rule"))
         val startsBefore = backend.started.count { it == "a" }
 
+        compose.onNodeWithText(text(Res.string.downloads_failed_next_bad_file)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertIsDisplayed()
         compose.onNodeWithText(text(Res.string.downloads_try_source_again)).performClick()
 
         compose.waitForIdle()
@@ -354,10 +425,11 @@ class DownloadsScreenTest {
 
     @Test
     fun without_a_way_to_open_the_sources_the_action_is_not_offered() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"), withChooseSource = false)
+        show(failedRow("a", "BadFile", "The downloaded video is blank", noWorkingSourceFound = true), withChooseSource = false)
 
+        compose.onNodeWithText(text(Res.string.downloads_source_search_none_found)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertDoesNotExist()
-        compose.onNodeWithText(text(Res.string.downloads_try_source_again)).assertIsDisplayed()
     }
 
     @Test
@@ -384,7 +456,7 @@ class DownloadsScreenTest {
         show(failedRow("a", "SourceRefused", "Download failed with HTTP 404"))
 
         compose.onNodeWithText("HTTP", substring = true).assertDoesNotExist()
-        compose.onNodeWithText(text(Res.string.downloads_failed_next_source_refused)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_waiting)).assertIsDisplayed()
     }
 
     @Test
@@ -477,7 +549,7 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun without_a_system_trash_the_dialog_says_the_file_is_held_for_days() {
+    fun without_a_system_trash_the_dialog_says_the_file_stays_in_the_holding_folder() {
         backend.usesSystemTrash = false
         show(completedEpisode("a"))
         openShow()
@@ -563,25 +635,31 @@ class DownloadsScreenTest {
         override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
         override var usesSystemTrash = true
         val kept = mutableListOf<String>()
+        override val keptDownloadIds = MutableStateFlow<Set<String>>(emptySet())
 
         override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
         override fun turnOff(profileId: Int, ruleKey: String) = Unit
         override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
         override fun keepDownload(profileId: Int, downloadId: String) {
             kept += downloadId
+            keptDownloadIds.value += downloadId
+            removals.value = removals.value.filterNot { it.downloadId == downloadId }
+        }
+        override fun undoKeepDownload(profileId: Int, downloadId: String) {
+            keptDownloadIds.value -= downloadId
         }
         override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
         override fun checkNow() = Unit
     }
 
-    private fun showShowWith(controller: AutoDownloadController, vararg items: String) {
+    private fun showShowWith(controller: AutoDownloadController, vararg items: String, showId: String? = "tt1") {
         backend.payload = """{"items":[${items.joinToString(",")}]}"""
         compose.setContent {
             NuvioTheme {
                 DownloadsScreenContent(
                     onBack = {},
                     onOpenDownload = {},
-                    initialShowId = "tt1",
+                    initialShowId = showId,
                     showAutoDownloads = false,
                     autoDownloads = controller,
                 )
@@ -600,7 +678,7 @@ class DownloadsScreenTest {
         showShowWith(controller, completedEpisode("a"), completedEpisode("b", episode = 4))
 
         compose.onNodeWithText(text(Res.plurals.downloads_row_deletes_in_hours, 20)).assertIsDisplayed()
-        // Only the episode with a scheduled deletion has the line and the button.
+        // Only the episode with a scheduled deletion has the countdown.
         compose.onAllNodesWithText(text(Res.plurals.downloads_row_deletes_in_hours, 20)).assertCountEquals(1)
         compose.onNodeWithContentDescription(keepDescription())
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
@@ -620,11 +698,29 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun an_episode_with_nothing_scheduled_has_no_deletion_line_or_keep_button() {
+    fun an_episode_with_nothing_scheduled_can_be_kept_and_keep_can_be_undone() {
         showShowWith(SchedulingController(), completedEpisode("a"))
 
-        compose.onNodeWithContentDescription(keepDescription()).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertDoesNotExist()
+        compose.onNodeWithContentDescription(keepDescription()).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_undo_keep)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertDoesNotExist()
+        compose.onNodeWithContentDescription(keepDescription()).assertHasClickAction()
+    }
+
+    @Test
+    fun a_manual_movie_shows_its_countdown_and_lasting_keep_action() {
+        val controller = SchedulingController()
+        controller.removals.value = listOf(AutoDownloadRemoval("movie", null, DownloadsClock.nowEpochMs() + 10 * 60_000L))
+        showShowWith(controller, stored("movie", "Completed", season = null, episode = null), showId = null)
+        compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertIsDisplayed()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_keep_description, "Pantheon")).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_row_deletes_soon)).assertDoesNotExist()
+        compose.onNodeWithText(text(Res.string.downloads_undo_keep)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_kept)).assertDoesNotExist()
+        assertEquals(listOf("movie"), controller.kept)
     }
 
     private fun pressDelete(name: String = "Pantheon S02E03") {
@@ -672,6 +768,43 @@ class DownloadsScreenTest {
         showPayload()
 
         compose.onNodeWithText(text(Res.string.downloads_store_problem_not_saving)).assertIsDisplayed()
+    }
+
+    @Test
+    fun the_header_checks_downloads_opens_the_folder_and_opens_download_settings() {
+        SettingsSectionFocus.clear()
+        val opened = mutableListOf<SettingsPage>()
+        backend.payload = null
+        compose.setContent {
+            CompositionLocalProvider(LocalOpenSettingsPage provides { page -> opened += page }) {
+                NuvioTheme {
+                    DownloadsScreen(
+                        onBack = {},
+                        onOpenDownload = {},
+                        showAutoDownloads = false,
+                        openDownloadsFolder = {
+                            folderOpened++
+                            true
+                        },
+                    )
+                }
+            }
+        }
+
+        compose.onNodeWithContentDescription(text(Res.string.downloads_check_all)).assertIsDisplayed().assertHasClickAction()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_open_directory)).assertIsDisplayed().performClick()
+        compose.onNodeWithText(text(Res.string.downloads_open_settings)).assertIsDisplayed().performClick()
+
+        assertEquals(1, folderOpened)
+        assertEquals(listOf(SettingsPage.Playback), opened)
+        assertEquals(SettingsSectionFocus.PlaybackDownloads, SettingsSectionFocus.pending)
+    }
+
+    @Test
+    fun download_settings_is_absent_where_settings_cannot_be_opened() {
+        show()
+
+        compose.onNodeWithText(text(Res.string.downloads_open_settings)).assertDoesNotExist()
     }
 
     @Test

@@ -33,6 +33,9 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_cancel
 import nuvio.composeapp.generated.resources.downloads_auto_check_now
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_description
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_message_trash
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_message_held
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_description
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_message_held
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_message_trash
@@ -77,6 +80,7 @@ import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 import org.junit.Rule
 import kotlin.test.Test
+import kotlin.test.assertTrue
 import kotlin.test.assertEquals
 
 @OptIn(ExperimentalTestApi::class)
@@ -195,84 +199,14 @@ class AutoDownloadSectionTest {
     }
 
     @Test
-    fun the_storage_limit_is_shown_with_its_description_and_current_value() {
+    fun the_storage_limit_is_not_at_the_top_of_the_section() {
         controller.rules.value = listOf(rule)
         controller.storageLimitGb.value = 50
         show()
 
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_profile_description)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_value, 50)).assertIsDisplayed()
-    }
-
-    @Test
-    fun the_storage_limit_is_a_button_named_by_its_title_with_the_limit_as_state() {
-        controller.rules.value = listOf(rule)
-        show()
-
-        compose.onNodeWithContentDescription(text(Res.string.downloads_auto_storage_limit))
-            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
-            .assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text(Res.string.downloads_auto_storage_limit_value, 50)))
-            .assertHasClickAction()
-    }
-
-    @Test
-    fun the_limit_is_chosen_with_the_keyboard_from_named_radio_buttons_of_one_group() {
-        controller.rules.value = listOf(rule)
-        show()
-        compose.onNodeWithContentDescription(text(Res.string.downloads_auto_storage_limit))
-            .requestFocus()
-            .performKeyInput { pressKey(Key.Enter) }
-        val radioButton = SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.RadioButton)
-
-        (listOf(text(Res.string.downloads_auto_storage_limit_none)) + listOf(10, 25, 50, 100, 250).map { text(Res.string.downloads_auto_storage_limit_value, it) })
-            .forEach { name ->
-                compose.onNode(hasContentDescription(name) and radioButton)
-                    .assert(hasAnyAncestor(SemanticsMatcher.keyIsDefined(SemanticsProperties.SelectableGroup)))
-            }
-        compose.onNode(hasContentDescription(text(Res.string.downloads_auto_storage_limit_value, 250)) and radioButton)
-            .requestFocus()
-            .performKeyInput { pressKey(Key.Enter) }
-
-        assertEquals(listOf<Pair<Int, Int?>>(profile to 250), controller.limitsSet)
-    }
-
-    @Test
-    fun no_limit_is_shown_in_words() {
-        controller.rules.value = listOf(rule)
-        controller.storageLimitGb.value = null
-        show()
-
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_none)).assertIsDisplayed()
-    }
-
-    @Test
-    fun the_picker_offers_every_limit_and_saves_the_chosen_one_for_the_profile_it_was_opened_for() {
-        controller.rules.value = listOf(rule)
-        show()
-
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).performClick()
-        compose.onNode(hasText(text(Res.string.downloads_auto_storage_limit_value, 50)) and hasAnyAncestor(isDialog())).assertIsSelected()
-        listOf(10, 25, 100, 250).forEach {
-            compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_value, it)).assertExists()
-        }
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_none)).assertExists()
-        compose.runOnIdle { shownProfile = otherProfile }
-        compose.waitForIdle()
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_value, 100)).performClick()
-
-        assertEquals(listOf<Pair<Int, Int?>>(profile to 100), controller.limitsSet)
-    }
-
-    @Test
-    fun choosing_no_limit_saves_no_limit() {
-        controller.rules.value = listOf(rule)
-        show()
-
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).performClick()
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_none)).performClick()
-
-        assertEquals(listOf<Pair<Int, Int?>>(profile to null), controller.limitsSet)
+        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).assertDoesNotExist()
+        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_profile_description)).assertDoesNotExist()
+        compose.onNodeWithText(text(Res.string.downloads_auto_section_title)).assertIsDisplayed()
     }
 
     private val hour = 3_600_000L
@@ -387,7 +321,7 @@ class AutoDownloadSectionTest {
     }
 
     @Test
-    fun the_question_says_the_file_will_be_deleted_for_good_when_there_is_no_trash() {
+    fun the_question_says_the_file_stays_when_there_is_no_trash() {
         controller.usesSystemTrash = false
         scheduleRemoval(inMs = 5 * hour)
         show()
@@ -395,6 +329,32 @@ class AutoDownloadSectionTest {
         compose.onNodeWithContentDescription(text(Res.string.downloads_auto_delete_now_description, "Show", 1, 4)).performClick()
 
         compose.onNodeWithText(text(Res.string.downloads_auto_delete_now_message_held, "Show", 1, 4)).assertIsDisplayed()
+    }
+
+    @Test
+    fun a_movie_confirmation_says_the_file_stays_without_trash() {
+        showMovieConfirmation(usesTrash = false)
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_held, "Show")).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_trash, "Show")).assertDoesNotExist()
+    }
+
+    @Test
+    fun a_movie_confirmation_says_the_file_moves_when_trash_is_available() {
+        showMovieConfirmation(usesTrash = true)
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_trash, "Show")).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_held, "Show")).assertDoesNotExist()
+    }
+
+    private fun showMovieConfirmation(usesTrash: Boolean) {
+        controller.usesSystemTrash = usesTrash
+        scheduleRemoval(inMs = 5 * hour)
+        downloads.value = DownloadsUiState(listOf(downloads.value.items.single().copy(
+            contentType = "movie", parentMetaType = "movie", seasonNumber = null, episodeNumber = null, autoDownloadRuleKey = null,
+        )))
+        controller.removals.value = controller.removals.value.map { it.copy(ruleKey = null) }
+        show()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_movie_delete_now_description, "Show")).performClick()
+        assertTrue(controller.deletedNow.isEmpty())
     }
 
     @Test
@@ -463,43 +423,42 @@ class AutoDownloadSectionTest {
     }
 
     @Test
-    fun the_storage_limit_and_check_now_stay_when_automatic_downloads_exist_but_no_rule_does() {
+    fun check_now_stays_when_automatic_downloads_exist_but_no_rule_does() {
         downloads.value = DownloadsUiState(listOf(testDownload(4, DownloadStatus.Completed, ruleKey = rule.key)))
         show()
 
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).assertDoesNotExist()
         compose.onNodeWithContentDescription(text(Res.string.downloads_auto_check_now)).assertIsDisplayed()
         compose.onNodeWithText(text(Res.string.downloads_auto_no_rules)).assertIsDisplayed()
     }
 
     @Test
-    fun the_storage_limit_stays_when_it_was_changed_and_no_rule_exists() {
+    fun a_changed_storage_limit_alone_does_not_keep_the_section_on_screen() {
+        downloads.value = DownloadsUiState(emptyList())
         controller.storageLimitGb.value = 100
         show()
 
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_value, 100)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_auto_section_title)).assertDoesNotExist()
     }
 
     @Test
-    fun the_limit_says_it_counts_only_automatic_downloads_and_is_per_profile() {
-        controller.rules.value = listOf(rule)
-        show()
-
-        compose.onNodeWithText(text(Res.string.downloads_auto_storage_limit_profile_description)).assertIsDisplayed()
-    }
-
-    @Test
-    fun the_section_is_shown_for_rules_automatic_downloads_history_or_a_changed_limit_only() {
-        assertEquals(false, autoDownloadSectionShown(false, false, false, 50))
-        assertEquals(true, autoDownloadSectionShown(true, false, false, 50))
-        assertEquals(true, autoDownloadSectionShown(false, true, false, 50))
-        assertEquals(true, autoDownloadSectionShown(false, false, true, 50))
-        assertEquals(true, autoDownloadSectionShown(false, false, false, null))
-        assertEquals(true, autoDownloadSectionShown(false, false, false, 250))
+    fun the_section_is_shown_for_rules_automatic_downloads_or_history_only() {
+        assertEquals(false, autoDownloadSectionShown(false, false, false))
+        assertEquals(true, autoDownloadSectionShown(true, false, false))
+        assertEquals(true, autoDownloadSectionShown(false, true, false))
+        assertEquals(true, autoDownloadSectionShown(false, false, true))
     }
 
     private fun recent(episode: Int, agoMs: Long) = AutoDownloadDeleted("Show", 1, episode, atEpochMs = shownNow - agoMs)
+
+    @Test
+    fun a_manual_movie_removed_today_is_shown_without_episode_numbers_or_rules() {
+        controller.recentlyDeleted.value = listOf(AutoDownloadDeleted("Movie", atEpochMs = shownNow))
+        show()
+        compose.onNodeWithText(text(Res.string.downloads_auto_recent_heading)).assertIsDisplayed()
+        compose.onNodeWithText("Movie • " + text(Res.string.downloads_auto_recent_today)).assertIsDisplayed()
+        compose.onNodeWithText("S0 E0", substring = true).assertDoesNotExist()
+    }
 
     @Test
     fun an_episode_deleted_after_watching_is_listed_under_recently_deleted_for_a_week() {

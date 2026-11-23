@@ -28,4 +28,10 @@ internal actual object SeasonDownloadDefaultsStorage {
     actual fun saveBatchRunsPayload(profileId: Int, payload: String) {
         NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(batchRunsKey, profileId))
     }
+    actual fun loadTripQueue(profileId: Int): String? =
+        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of("trip_queue", profileId))
+
+    actual fun saveTripQueue(profileId: Int, payload: String) {
+        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of("trip_queue", profileId))
+    }
 }

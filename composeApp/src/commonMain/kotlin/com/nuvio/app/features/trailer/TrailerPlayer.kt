@@ -12,6 +12,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -22,6 +23,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.NuvioLoadingIndicator
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.player.EnterImmersivePlayerMode
 import com.nuvio.app.features.player.PlatformPlayerSurface
 import com.nuvio.app.features.player.PlayerControlsAction
@@ -47,10 +49,14 @@ internal fun TrailerPlayer(
     onToggleFullscreen: (() -> Unit)? = null,
     onEscapeFullscreen: (() -> Unit)? = null,
 ) {
+    val activePlayerSession by ActivePlayerSessionRegistry.isActive.collectAsState()
     val error = errorMessage ?: state.error
-    EnterImmersivePlayerMode(keepScreenAwake = error == null && state.playWhenReady && !state.snapshot.isEnded)
+    val canMountSurface = source != null && !isLoading && error == null && !activePlayerSession
+    EnterImmersivePlayerMode(
+        keepScreenAwake = !activePlayerSession && error == null && state.playWhenReady && !state.snapshot.isEnded,
+    )
     Box(modifier = modifier.background(Color.Black), contentAlignment = Alignment.Center) {
-        if (source != null && !isLoading && error == null) {
+        if (canMountSurface && source != null) {
             TrailerPlaybackSurface(
                 source = source,
                 state = state,
@@ -61,7 +67,7 @@ internal fun TrailerPlayer(
             )
         }
         when {
-            error == null && (isLoading || source != null && state.snapshot.isLoading) -> {
+            error == null && (isLoading || canMountSurface && state.snapshot.isLoading) -> {
                 NuvioLoadingIndicator()
             }
             error != null -> Column(
@@ -88,7 +94,7 @@ internal fun TrailerPlayer(
         }
         TrailerPlayerControls(
             state = state,
-            canControlPlayback = source != null && !isLoading && error == null,
+            canControlPlayback = canMountSurface,
             title = title,
             onExitFullscreen = onExitFullscreen,
         )
@@ -134,7 +140,7 @@ private fun TrailerPlaybackSurface(
         resizeMode = resizeMode,
         useNativeController = false,
         onPlayerControlsAction = { action ->
-            action == PlayerControlsAction.Back && onBack.invokeIfPresent()
+            (action == PlayerControlsAction.Back || action == PlayerControlsAction.Close) && onBack.invokeIfPresent()
         },
         onPlayerControlsEvent = { type, value ->
             type == "toggleFullscreen" &&

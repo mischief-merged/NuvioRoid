@@ -1,5 +1,6 @@
 package com.nuvio.app.features.trakt
 
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.httpGetTextWithHeaders
@@ -100,8 +101,8 @@ object TraktProgressRepository {
     private var lastKnownEpisodeActivityFingerprint: String? = null
     private var lastKnownActivityFingerprint: String? = null
     private val episodeProgressMutex = Mutex()
-    private val episodeProgressFetchedAtMsByContentId = mutableMapOf<String, Long>()
-    private val episodeProgressLastAttemptAtMsByContentId = mutableMapOf<String, Long>()
+    private val episodeProgressFetchedAtMsByContentId = BoundedCache<String, Long>()
+    private val episodeProgressLastAttemptAtMsByContentId = BoundedCache<String, Long>()
     private val inFlightEpisodeProgressContentIds = mutableSetOf<String>()
     private var watchedShowEpisodesById: Map<String, Set<Pair<Int, Int>>> = emptyMap()
     private var showIdToTraktPathId: Map<String, String> = emptyMap()

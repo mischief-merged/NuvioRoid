@@ -4,6 +4,7 @@ import java.awt.Canvas
 import java.awt.Color
 import java.awt.Cursor
 import java.awt.Graphics
+import java.awt.GraphicsEnvironment
 import java.awt.Point
 import java.awt.Toolkit
 import java.awt.event.ComponentAdapter
@@ -25,8 +26,12 @@ internal class NativePlayerHost : Canvas() {
 
     private companion object {
         val hiddenCursor: Cursor by lazy {
-            val image = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
-            Toolkit.getDefaultToolkit().createCustomCursor(image, Point(0, 0), "nuvio-hidden-cursor")
+            if (GraphicsEnvironment.isHeadless()) {
+                Cursor.getDefaultCursor()
+            } else {
+                val image = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB)
+                Toolkit.getDefaultToolkit().createCustomCursor(image, Point(0, 0), "nuvio-hidden-cursor")
+            }
         }
     }
 

@@ -1,16 +1,19 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.debrid.DirectDebridPlayableResult
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.debrid.toastMessage
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.details.SavedDetails
 import com.nuvio.app.features.downloads.DownloadItem
-import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.p2p.P2pStreamingEngine
+import com.nuvio.app.features.player.skip.NextEpisodeInfo
+import com.nuvio.app.features.player.skip.PlayerNextEpisodeRules
 import com.nuvio.app.features.servers.ServerPlayback
 import com.nuvio.app.features.servers.serverPlaybackMessage
 import com.nuvio.app.features.streams.StreamBehaviorHints
@@ -21,27 +24,52 @@ import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.youtube_resolution_failed
 import org.jetbrains.compose.resources.getString
 
+private fun PlayerScreenRuntime.streamSubtitleRequestForSwitch(
+    stream: StreamItem,
+    targetVideoId: String,
+): StartupSubtitleRequest = StartupSubtitleRequest(
+    type = contentType ?: parentMetaType,
+    videoId = targetVideoId,
+    parentMetaId = parentMetaId,
+    settings = playerSettingsUiState,
+    streamExternalSubtitles = stream.externalSubtitles,
+    videoHash = stream.behaviorHints.videoHash,
+    videoSizeBytes = stream.behaviorHints.videoSize,
+    filename = stream.behaviorHints.filename,
+)
+
 internal fun PlayerScreenRuntime.resolveDebridForPlayer(
     stream: StreamItem,
     season: Int?,
     episode: Int?,
-    onResolved: (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onResolved: (StreamItem, PreparedStartupSubtitles) -> Unit,
     onStale: () -> Unit,
 ): Boolean {
     if (!DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream)) return false
     scope.launch {
-        val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
-            stream = stream,
-            season = season,
-            episode = episode,
+        val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = {
+                DirectDebridPlaybackResolver.resolveToPlayableStream(
+                    stream = stream,
+                    season = season,
+                    episode = episode,
+                )
+            },
+            extractStreamSubtitles = { result ->
+                (result as? DirectDebridPlayableResult.Success)?.stream?.externalSubtitles.orEmpty()
+            },
         )
         when (resolved) {
-            is DirectDebridPlayableResult.Success -> onResolved(resolved.stream)
+            is DirectDebridPlayableResult.Success -> onResolved(resolved.stream, preparedSubs)
             else -> {
                 resolved.toastMessage()?.let { NuvioToastController.show(it) }
                 if (resolved == DirectDebridPlayableResult.Stale) {
@@ -55,13 +83,21 @@ internal fun PlayerScreenRuntime.resolveDebridForPlayer(
 
 internal fun PlayerScreenRuntime.prepareServerForPlayer(
     stream: StreamItem,
-    onPrepared: suspend (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onPrepared: suspend (StreamItem, PreparedStartupSubtitles) -> Unit,
 ): Boolean {
     if (!stream.needsServerPreparation) return false
     scope.launch {
-        runCatching { ServerPlayback.prepare(stream) }
-            .onFailure { if (it is CancellationException) throw it }
-            .onSuccess { onPrepared(it) }
+        val (result, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = {
+                runCatching { ServerPlayback.prepare(stream) }
+                    .onFailure { if (it is CancellationException) throw it }
+            },
+            extractStreamSubtitles = { res -> res.getOrNull()?.externalSubtitles.orEmpty() },
+        )
+        result
+            .onSuccess { onPrepared(it, preparedSubs) }
             .onFailure { NuvioToastController.show(it.serverPlaybackMessage()) }
     }
     return true
@@ -69,16 +105,20 @@ internal fun PlayerScreenRuntime.prepareServerForPlayer(
 
 internal fun PlayerScreenRuntime.resolveYouTubeForPlayer(
     stream: StreamItem,
-    onResolved: (StreamItem) -> Unit,
+    targetVideoId: String = activeVideoId.orEmpty(),
+    onResolved: (StreamItem, PreparedStartupSubtitles) -> Unit,
 ): Boolean {
     if (stream.youTubeIdToResolve == null) return false
     scope.launch {
-        val resolved = YouTubeStreamResolver.Default.resolve(stream)
+        val (resolved, preparedSubs) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+            request = streamSubtitleRequestForSwitch(stream, targetVideoId),
+            resolveSource = { YouTubeStreamResolver.Default.resolve(stream) },
+        )
         if (resolved == null) {
             NuvioToastController.show(getString(Res.string.youtube_resolution_failed))
             return@launch
         }
-        onResolved(resolved)
+        onResolved(resolved, preparedSubs)
     }
     return true
 }
@@ -272,7 +312,7 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
         return
     }
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = resolveEpisodeResume(epVideoId, episode)
@@ -284,6 +324,8 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
     )
     externalSubtitles = stream.externalSubtitles
     activeSourceUrl = p2pSentinelUrl(infoHash, stream.p2pFileIdx)
+    // A torrent is never an auto-selected source here, so the episode has nothing to fall back from.
+    restartSourceFallback(activeSourceUrl, autoSelection = null)
     activeSourceAudioUrl = null
     activeSourceHeaders = emptyMap()
     activeSourceResponseHeaders = emptyMap()
@@ -299,18 +341,19 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
 internal fun PlayerScreenRuntime.switchToSource(
     stream: StreamItem,
     saveForReuse: Boolean = true,
+    preparedSubtitles: PreparedStartupSubtitles? = null,
 ) {
     // Even picking the source that is playing now ends a lookup for a replacement.
     restartSourceFailoverAfterUserChoice()
-    if (prepareServerForPlayer(stream) { switchToSource(it) }) return
+    if (prepareServerForPlayer(stream) { resolved, subs -> switchToSource(resolved, saveForReuse = saveForReuse, preparedSubtitles = subs) }) return
     // The resolved URL expires after a few hours, so it isn't kept for reuse.
-    if (resolveYouTubeForPlayer(stream) { switchToSource(it, saveForReuse = false) }) return
+    if (resolveYouTubeForPlayer(stream) { resolved, subs -> switchToSource(resolved, saveForReuse = false, preparedSubtitles = subs) }) return
     if (
         resolveDebridForPlayer(
             stream = stream,
             season = activeSeasonNumber,
             episode = activeEpisodeNumber,
-            onResolved = { switchToSource(it) },
+            onResolved = { resolved, subs -> switchToSource(resolved, saveForReuse = saveForReuse, preparedSubtitles = subs) },
             onStale = {
                 val vid = activeVideoId
                 if (vid != null) {
@@ -336,6 +379,17 @@ internal fun PlayerScreenRuntime.switchToSource(
         activeSourceIdentityKey = sourceIdentityKey ?: activeSourceIdentityKey
         return
     }
+    val targetVideoId = activeVideoId.orEmpty()
+    if (preparedSubtitles == null) {
+        showSourcesPanel = false
+        scope.launch {
+            val subs = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                streamSubtitleRequestForSwitch(stream, targetVideoId),
+            )
+            switchToSource(stream, saveForReuse = saveForReuse, preparedSubtitles = subs)
+        }
+        return
+    }
     val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
     flushWatchProgress()
     stopActiveP2pStream()
@@ -343,7 +397,8 @@ internal fun PlayerScreenRuntime.switchToSource(
     if (saveForReuse && playerSettingsUiState.streamReuseLastLinkEnabled && currentVideoId != null) {
         saveDirectStreamForReuse(stream, url, currentVideoId, activeSeasonNumber, activeEpisodeNumber)
     }
-    externalSubtitles = stream.externalSubtitles
+    externalSubtitles = preparedSubtitles.subtitles
+    startupSubtitleSelection = preparedSubtitles.selection
     activeSourceUrl = url
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -368,16 +423,38 @@ internal fun PlayerScreenRuntime.switchToSource(
     PlayerStreamsRepository.pauseSearchForPlayback()
 }
 
+/**
+ * @param autoSelection non-null when auto source selection picked [stream]: the sources it tried
+ * before it, so the fallback to the next matching source goes on from them.
+ */
 internal fun PlayerScreenRuntime.switchToEpisodeStream(
     stream: StreamItem,
     episode: MetaVideo,
     serverResumeMs: Long? = null,
     saveForReuse: Boolean = true,
+    autoSelection: PlayerSourceFallbackTried? = null,
+    preparedSubtitles: PreparedStartupSubtitles? = null,
 ) {
-    if (prepareServerForPlayer(stream) { switchToEpisodeStream(it, episode, serverResumeMs = newerServerResumeMs(it, episode)) }) return
     if (
-        resolveYouTubeForPlayer(stream) { resolved ->
-            switchToEpisodeStream(resolved, episode, saveForReuse = false)
+        prepareServerForPlayer(stream, targetVideoId = episode.id) { resolved, subs ->
+            switchToEpisodeStream(
+                stream = resolved,
+                episode = episode,
+                serverResumeMs = newerServerResumeMs(resolved, episode),
+                autoSelection = autoSelection,
+                preparedSubtitles = subs,
+            )
+        }
+    ) return
+    if (
+        resolveYouTubeForPlayer(stream, targetVideoId = episode.id) { resolved, subs ->
+            switchToEpisodeStream(
+                resolved,
+                episode,
+                saveForReuse = false,
+                autoSelection = autoSelection,
+                preparedSubtitles = subs,
+            )
         }
     ) return
     if (
@@ -385,7 +462,15 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
             stream = stream,
             season = episode.season,
             episode = episode.episode,
-            onResolved = { resolvedStream -> switchToEpisodeStream(resolvedStream, episode) },
+            targetVideoId = episode.id,
+            onResolved = { resolvedStream, subs ->
+                switchToEpisodeStream(
+                    resolvedStream,
+                    episode,
+                    autoSelection = autoSelection,
+                    preparedSubtitles = subs,
+                )
+            },
             onStale = {
                 PlayerStreamsRepository.loadEpisodeStreams(
                     type = contentType ?: parentMetaType,
@@ -403,16 +488,34 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     }
     if (openExternalSourceUrl(stream)) return
     val url = stream.playableDirectUrl ?: return
+    if (preparedSubtitles == null) {
+        scope.launch {
+            val subs = SubtitleStartupCoordinator.prepareStreamSubtitles(
+                streamSubtitleRequestForSwitch(stream, episode.id),
+            )
+            switchToEpisodeStream(
+                stream = stream,
+                episode = episode,
+                serverResumeMs = serverResumeMs,
+                saveForReuse = saveForReuse,
+                autoSelection = autoSelection,
+                preparedSubtitles = subs,
+            )
+        }
+        return
+    }
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = serverResumeMs?.let { EpisodeResume(positionMs = it, fraction = null) } ?: resolveEpisodeResume(epVideoId, episode)
     if (saveForReuse && playerSettingsUiState.streamReuseLastLinkEnabled) {
         saveDirectStreamForReuse(stream, url, epVideoId, episode.season, episode.episode)
     }
-    externalSubtitles = stream.externalSubtitles
+    externalSubtitles = preparedSubtitles.subtitles
+    startupSubtitleSelection = preparedSubtitles.selection
     activeSourceUrl = url
+    restartSourceFallback(url, autoSelection)
     activeSourceAudioUrl = null
     activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
     activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
@@ -421,12 +524,23 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     applyEpisodeStreamMetadata(stream, episode, resume)
 }
 
-internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: DownloadItem, episode: MetaVideo) {
-    val localFileUri = DownloadsRepository.playableLocalFileUri(downloadItem) ?: return
-    restartSourceFailoverAfterUserChoice(newVideo = true)
-    resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
-    stopActiveP2pStream()
+internal enum class DownloadedEpisodeSwitchResult { Accepted, Pending, Rejected }
+
+internal class DownloadedEpisodeSwitch(val episodeId: String, val job: Job)
+
+internal fun PlayerScreenRuntime.switchToDownloadedEpisode(
+    downloadItem: DownloadItem,
+    episode: MetaVideo,
+    continuePending: Boolean = false,
+    isStillValid: () -> Boolean = { true },
+): DownloadedEpisodeSwitchResult {
+    val localFileUri = playableDownloadedUri(downloadItem) ?: return DownloadedEpisodeSwitchResult.Rejected
+    if (!isStillValid()) return DownloadedEpisodeSwitchResult.Rejected
+    val inFlight = synchronized(episodeSwitchLock) { downloadedEpisodeSwitch }
+    if (inFlight != null && inFlight.job.isActive) {
+        if (inFlight.episodeId == episode.id && !continuePending) return DownloadedEpisodeSwitchResult.Pending
+        if (!(continuePending && inFlight.episodeId == episode.id)) inFlight.job.cancel()
+    }
 
     val fallbackVideoId = buildPlaybackVideoId(
         parentMetaId = parentMetaId,
@@ -435,103 +549,225 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
         fallbackVideoId = episode.id,
     )
     val resolvedVideoId = episode.id.takeIf { it.isNotBlank() } ?: fallbackVideoId
-    val epEntry = WatchProgressRepository.progressForVideo(
-        videoId = resolvedVideoId,
-        parentMetaId = parentMetaId,
-        seasonNumber = episode.season,
-        episodeNumber = episode.episode,
-    )
-        ?.takeIf { !it.isCompleted }
-    val epResumeFraction = epEntry?.progressPercent
-        ?.takeIf { it > 0f }
-        ?.let { (it / 100f).coerceIn(0f, 1f) }
-    val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
-
-    externalSubtitles = DownloadSubtitles.localSubtitles(localFileUri)
-    activeSourceUrl = localFileUri
-    activeSourceAudioUrl = null
-    activeSourceHeaders = emptyMap()
-    activeSourceResponseHeaders = emptyMap()
-    activeStreamType = null
-    activeSourceIdentityKey = null
-    activeSourceFilename = null
-    activeStreamTitle = downloadItem.streamTitle.ifBlank {
-        episode.title.ifBlank { title }
+    val job = scope.launch(start = CoroutineStart.LAZY) {
+        val prepared = prepareDownloadedSubtitles(localFileUri)
+        if (!isStillValid()) return@launch
+        // The file can be removed or moved while the subtitles are prepared. Then the episode on screen
+        // keeps playing, and the subtitles prepared for the old address are never used with another one.
+        if (playableDownloadedUri(downloadItem) != localFileUri) return@launch
+        restartSourceFailoverAfterUserChoice(newVideo = true)
+        resetEpisodePanelAndNextEpisodeState()
+        flushProgressForEpisodeChange(episode)
+        stopActiveP2pStream()
+        val epEntry = WatchProgressRepository.progressForVideo(
+            videoId = resolvedVideoId,
+            parentMetaId = parentMetaId,
+            seasonNumber = episode.season,
+            episodeNumber = episode.episode,
+        )
+            ?.takeIf { !it.isCompleted }
+        val epResumeFraction = epEntry?.progressPercent
+            ?.takeIf { it > 0f }
+            ?.let { (it / 100f).coerceIn(0f, 1f) }
+        val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
+        externalSubtitles = prepared.subtitles
+        startupSubtitleSelection = prepared.selection
+        activeSourceUrl = localFileUri
+        restartSourceFallback(activeSourceUrl, autoSelection = null)
+        activeSourceAudioUrl = null
+        activeSourceHeaders = emptyMap()
+        activeSourceResponseHeaders = emptyMap()
+        activeStreamType = null
+        activeSourceIdentityKey = null
+        activeSourceFilename = null
+        activeStreamTitle = downloadItem.streamTitle.ifBlank {
+            episode.title.ifBlank { title }
+        }
+        activeStreamSubtitle = downloadItem.streamSubtitle
+        activeStreamFilename = sourceFilenameFromUrl(localFileUri)
+        activeProviderName = downloadItem.providerName.ifBlank { downloadedLabel }
+        activeProviderAddonId = downloadItem.providerAddonId
+        activeStream = null
+        currentStreamBingeGroup = null
+        activeSubtitleExtras = null
+        currentStreamFilename = null
+        currentStreamInfoHash = null
+        activeSeasonNumber = episode.season
+        activeEpisodeNumber = episode.episode
+        activeEpisodeTitle = episode.title
+        activeEpisodeThumbnail = episode.thumbnail
+        activePauseDescription = episode.overview
+        activeVideoId = resolvedVideoId
+        activeInitialPositionMs = epResumePositionMs
+        activeInitialProgressFraction = epResumeFraction
+        controlsVisible = true
     }
-    activeStreamSubtitle = downloadItem.streamSubtitle
-    activeStreamFilename = sourceFilenameFromUrl(localFileUri)
-    activeProviderName = downloadItem.providerName.ifBlank { downloadedLabel }
-    activeProviderAddonId = downloadItem.providerAddonId
-    activeStream = null
-    currentStreamBingeGroup = null
-    activeSubtitleExtras = null
-    currentStreamFilename = null
-    currentStreamInfoHash = null
-    activeSeasonNumber = episode.season
-    activeEpisodeNumber = episode.episode
-    activeEpisodeTitle = episode.title
-    activeEpisodeThumbnail = episode.thumbnail
-    activePauseDescription = episode.overview
-    activeVideoId = resolvedVideoId
-    activeInitialPositionMs = epResumePositionMs
-    activeInitialProgressFraction = epResumeFraction
-    controlsVisible = true
+    synchronized(episodeSwitchLock) {
+        downloadedEpisodeSwitch = DownloadedEpisodeSwitch(episode.id, job)
+    }
+    job.invokeOnCompletion {
+        synchronized(episodeSwitchLock) {
+            if (downloadedEpisodeSwitch?.job === job) downloadedEpisodeSwitch = null
+        }
+    }
+    job.start()
+    return DownloadedEpisodeSwitchResult.Accepted
 }
 
-internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false) {
-    if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return
-    nextEpisodePreloadTriggered = false
-    val playbackKey = activePlaybackKey
-    val nextVideoId = nextEpisodeInfo?.takeIf { it.hasAired }?.videoId ?: return
-    fun isCurrentRequest(): Boolean = playbackKey == activePlaybackKey &&
-        nextEpisodeInfo?.videoId == nextVideoId &&
-        (!automatic || (
-            playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
-                !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
-            ))
-    if (!isCurrentRequest()) return
-    nextEpisodeAutoPlayAutomatic = automatic
+internal fun PlayerScreenRuntime.resolvePlayablePreviousEpisode(): MetaVideo? {
+    if (!isSeries || playerMetaVideos.isEmpty()) return null
+    val previous = PlayerNextEpisodeRules.resolvePreviousEpisode(
+        videos = playerMetaVideos,
+        currentSeason = activeSeasonNumber,
+        currentEpisode = activeEpisodeNumber,
+    ) ?: return null
+    if (previous.season == null || previous.episode == null) return null
+    if (!PlayerNextEpisodeRules.hasEpisodeAired(previous.released)) return null
+    return previous
+}
 
-    scope.launchPlayerNextEpisodeAutoPlay(
-        previousJob = nextEpisodeAutoPlayJob,
-        nextEpisodeInfo = nextEpisodeInfo,
-        allEpisodes = playerMetaVideos,
-        parentMetaId = parentMetaId,
-        parentMetaType = parentMetaType,
-        contentType = contentType,
-        settings = playerSettingsUiState,
-        currentStreamBingeGroup = currentStreamBingeGroup,
-        onDownloadedEpisodeSelected = { item, episode ->
-            if (isCurrentRequest()) switchToDownloadedEpisode(item, episode)
+internal fun PlayerScreenRuntime.playNextEpisode(
+    automatic: Boolean = false,
+    onNoEpisodeSwitch: () -> Unit = {},
+): Boolean {
+    val targetInfo = nextEpisodeInfo?.takeIf { it.hasAired } ?: return false
+    return playTargetEpisode(
+        targetInfo = targetInfo,
+        automatic = automatic,
+        onNoEpisodeSwitch = onNoEpisodeSwitch,
+        isStillValid = { playbackKey ->
+            playbackKey == activePlaybackKey &&
+                nextEpisodeInfo?.videoId == targetInfo.videoId &&
+                (!automatic || (
+                    playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
+                        !nextEpisodeCardDismissed &&
+                        isAtNextEpisodeThreshold() &&
+                        !sleepTimer.blocksAutomaticNextEpisode()
+                    ))
         },
-        onEpisodeStreamSelected = { stream, episode ->
-            if (isCurrentRequest()) switchToEpisodeStream(stream, episode)
-        },
-        onManualSelectionRequired = { nextVideo ->
-            if (isCurrentRequest()) {
-                nextEpisodeCardDismissed = true
-                episodeStreamsPanelState = EpisodeStreamsPanelState(
-                    showStreams = true,
-                    selectedEpisode = nextVideo,
-                )
-                showEpisodesPanel = true
-            }
-        },
-        onSearchingChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySearching = it
-        },
-        onSourceNameChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySourceName = it
-        },
-        onCountdownChanged = {
-            if (playbackKey == activePlaybackKey) nextEpisodeAutoPlayCountdown = it
-        },
-        onNextEpisodeCardVisibleChanged = {
-            if (playbackKey == activePlaybackKey) showNextEpisodeCard = it
-        },
-    )?.let { job ->
-        nextEpisodeAutoPlayJob = job
+    )
+}
+
+internal fun PlayerScreenRuntime.playPreviousEpisode(onNoEpisodeSwitch: () -> Unit = {}): Boolean {
+    val previous = resolvePlayablePreviousEpisode() ?: return false
+    val season = previous.season ?: return false
+    val episode = previous.episode ?: return false
+    val targetInfo = NextEpisodeInfo(
+        videoId = previous.id,
+        season = season,
+        episode = episode,
+        title = previous.title,
+        thumbnail = previous.thumbnail,
+        overview = previous.overview,
+        released = previous.released,
+        hasAired = true,
+        isWatched = false,
+        unairedMessage = null,
+    )
+    return playTargetEpisode(
+        targetInfo = targetInfo,
+        automatic = false,
+        isPrevious = true,
+        onNoEpisodeSwitch = onNoEpisodeSwitch,
+        isStillValid = { playbackKey -> playbackKey == activePlaybackKey },
+    )
+}
+
+private fun PlayerScreenRuntime.playTargetEpisode(
+    targetInfo: NextEpisodeInfo,
+    automatic: Boolean,
+    isPrevious: Boolean = false,
+    onNoEpisodeSwitch: () -> Unit = {},
+    isStillValid: (PlaybackKey) -> Boolean,
+): Boolean {
+    if (automatic && sleepTimer.blocksAutomaticNextEpisode()) {
+        cancelNextEpisodeAutoPlay()
+        return false
     }
+    var downloadedEpisodeSelected = false
+    val job = synchronized(episodeSwitchLock) {
+        val pending = downloadedEpisodeSwitch
+        if (pending != null && pending.job.isActive) return true
+        if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return true
+        nextEpisodePreloadTriggered = false
+        val playbackKey = activePlaybackKey
+        fun isCurrentRequest(): Boolean = isStillValid(playbackKey)
+        if (!isCurrentRequest()) return false
+        nextEpisodeAutoPlayAutomatic = automatic
+        val started = scope.launchPlayerNextEpisodeAutoPlay(
+            previousJob = nextEpisodeAutoPlayJob,
+            nextEpisodeInfo = targetInfo,
+            allEpisodes = playerMetaVideos,
+            parentMetaId = parentMetaId,
+            parentMetaType = parentMetaType,
+            contentType = contentType,
+            settings = playerSettingsUiState,
+            currentStreamBingeGroup = currentStreamBingeGroup,
+            isOffline = episodePlaybackOffline,
+            findDownloadedEpisode = { findEpisodeDownload(parentMetaId, it) },
+            verifyDownloadedEpisode = verifyEpisodeDownload,
+            onDownloadVerificationJob = { verification ->
+                downloadedEpisodeSwitch = DownloadedEpisodeSwitch(targetInfo.videoId, verification)
+                verification.invokeOnCompletion {
+                    synchronized(episodeSwitchLock) {
+                        if (downloadedEpisodeSwitch?.job === verification) downloadedEpisodeSwitch = null
+                    }
+                }
+            },
+            onOfflineDownloadDeclined = {
+                if (!automatic) onNoEpisodeSwitch()
+            },
+            onDownloadedEpisodeSelected = { item, episode ->
+                if (isCurrentRequest()) {
+                    when (switchToDownloadedEpisode(item, episode, continuePending = true) { isCurrentRequest() }) {
+                        DownloadedEpisodeSwitchResult.Accepted,
+                        DownloadedEpisodeSwitchResult.Pending,
+                        -> downloadedEpisodeSelected = true
+                        DownloadedEpisodeSwitchResult.Rejected -> Unit
+                    }
+                }
+            },
+            onEpisodeStreamSelected = { stream, episode, tried ->
+                // Auto source selection picked it, whether or not the user asked for the episode.
+                if (isCurrentRequest()) switchToEpisodeStream(stream, episode, autoSelection = tried)
+            },
+            onManualSelectionRequired = { targetVideo ->
+                if (isCurrentRequest()) {
+                    nextEpisodeCardDismissed = true
+                    episodeStreamsPanelState = EpisodeStreamsPanelState(
+                        showStreams = true,
+                        selectedEpisode = targetVideo,
+                    )
+                    showEpisodesPanel = true
+                }
+            },
+            onSearchingChanged = {
+                if (playbackKey == activePlaybackKey) {
+                    if (it) nextEpisodeAutoPlayTarget = PlayerEpisodeCardState(targetInfo, isPrevious)
+                    nextEpisodeAutoPlaySearching = it
+                }
+            },
+            onSourceNameChanged = {
+                if (playbackKey == activePlaybackKey) nextEpisodeAutoPlaySourceName = it
+            },
+            onCountdownChanged = {
+                if (playbackKey == activePlaybackKey) nextEpisodeAutoPlayCountdown = it
+            },
+            onNextEpisodeCardVisibleChanged = {
+                if (playbackKey == activePlaybackKey) showNextEpisodeCard = it
+            },
+        )
+        if (started != null) {
+            nextEpisodeAutoPlayJob = started
+            started.invokeOnCompletion {
+                if (nextEpisodeAutoPlayJob === started && playbackKey == activePlaybackKey) {
+                    nextEpisodeAutoPlayTarget = null
+                }
+            }
+        }
+        started
+    }
+    return downloadedEpisodeSelected || job != null || downloadedEpisodeSwitch?.job?.isActive == true
 }
 
 internal fun PlayerScreenRuntime.openSourcesPanel() {
@@ -548,10 +784,22 @@ internal fun PlayerScreenRuntime.openSourcesPanel() {
     controlsVisible = false
 }
 
+internal suspend fun loadPlayerMetaVideos(
+    type: String,
+    id: String,
+    isOffline: Boolean = NetworkStatusRepository.uiState.value.isNoInternet,
+): List<MetaVideo> = if (isOffline) {
+    SavedDetails.metaFor(type, id)?.videos ?: emptyList()
+} else {
+    MetaDetailsRepository.fetch(type, id)?.videos
+        ?: SavedDetails.metaFor(type, id)?.videos
+        ?: emptyList()
+}
+
 internal fun PlayerScreenRuntime.openEpisodesPanel() {
     if (playerMetaVideos.isEmpty()) {
         scope.launch {
-            playerMetaVideos = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.videos ?: emptyList()
+            playerMetaVideos = loadPlayerMetaVideos(parentMetaType, parentMetaId)
         }
     }
     showEpisodesPanel = true
@@ -561,6 +809,19 @@ internal fun PlayerScreenRuntime.openEpisodesPanel() {
 }
 
 private data class EpisodeResume(val positionMs: Long, val fraction: Float?)
+
+private fun PlayerScreenRuntime.flushProgressForEpisodeChange(episode: MetaVideo) {
+    flushWatchProgress(
+        leavingEpisode = isLeavingPlaybackEpisode(
+            currentVideoId = activeVideoId,
+            currentSeason = activeSeasonNumber,
+            currentEpisode = activeEpisodeNumber,
+            nextVideoId = episode.id,
+            nextSeason = episode.season,
+            nextEpisode = episode.episode,
+        ),
+    )
+}
 
 private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
     showNextEpisodeCard = false
@@ -604,7 +865,6 @@ private fun PlayerScreenRuntime.applyEpisodeStreamMetadata(
     episode: MetaVideo,
     resume: EpisodeResume,
 ) {
-    restartSourceFailoverAfterUserChoice(newVideo = true)
     activeSourceIdentityKey = stream.playerSourceIdentityKey()
     activeSourceFilename = stream.behaviorHints.filename
     activeStreamTitle = stream.streamLabel

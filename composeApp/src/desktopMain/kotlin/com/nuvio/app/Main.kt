@@ -1,10 +1,17 @@
 package com.nuvio.app
 
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_ok
 import nuvio.composeapp.generated.resources.app_already_open
+import nuvio.composeapp.generated.resources.quit_blocked_title
 import com.nuvio.app.features.autosync.AutoSyncPreferencesDesktop
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.awt.SwingWindow
 import androidx.compose.ui.configureSwingGlobalsForCompose
@@ -14,11 +21,17 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import com.nuvio.app.features.downloads.flushDownloadProgressOnExit
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import org.jetbrains.compose.resources.painterResource
+import org.jetbrains.compose.resources.stringResource
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.application
@@ -26,34 +39,59 @@ import androidx.compose.ui.window.rememberWindowState
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.deeplink.handleAppUrl
 import com.nuvio.app.core.diagnostics.SentryInitializer
+import com.nuvio.app.core.storage.DesktopAccountDataLifecycle
+import com.nuvio.app.core.storage.DesktopLifecycleUiState
+import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.core.ui.ProvideDesktopWindowInsets
+import com.nuvio.app.core.ui.nuvio
+import com.nuvio.app.core.ui.platformTouchScroll
 import com.nuvio.app.features.discordrpc.DiscordPresenceManager
+import com.nuvio.app.features.downloads.DownloadRechecks
+import com.nuvio.app.features.downloads.DownloadStatus
+import com.nuvio.app.features.downloads.DownloadTraffic
 import com.nuvio.app.features.downloads.DownloadsRepository
+import com.nuvio.app.features.downloads.MacDownloadPowerNative
+import com.nuvio.app.features.downloads.SourceReplacements
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.plugins.configureDesktopQuickJsLibrary
+import com.nuvio.app.features.player.ActivePlayerSessionRegistry
 import com.nuvio.app.features.player.PlatformPlayerSurface
 import com.nuvio.app.features.player.desktop.DesktopAppFullscreenController
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopWindowGeometry
 import com.nuvio.app.features.player.desktop.DesktopWindowModeStorage
+import com.nuvio.app.features.player.desktop.WindowGeometryWrites
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
+import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.player.desktop.applyNativeDesktopWindowChrome
 import com.nuvio.app.features.player.desktop.configureMacosWindowBeforePeer
 import com.nuvio.app.features.player.desktop.installDesktopAppFullscreenShortcuts
 import com.nuvio.app.features.player.desktop.macosTitleBarDoubleClick
+import com.nuvio.app.features.player.desktop.notifyDesktopAppFullscreenChanged
 import com.nuvio.app.features.player.desktop.MacosAppMenuBar
 import com.nuvio.app.features.player.desktop.preloadNativePlayerBridgeAsync
 import com.nuvio.app.features.player.desktop.registerDesktopAppFullscreenToggle
 import com.nuvio.app.features.player.desktop.trackMaximizedBoundsForCurrentScreen
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.AppIconRepository
+import com.nuvio.app.features.settings.BackgroundDownloadPreferences
 import com.nuvio.app.features.settings.applyDesktopRendererPreference
 import com.nuvio.app.features.settings.transparentPreviewResource
 import java.awt.Desktop
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.awt.Color as AwtColor
 import javax.swing.JComponent
+import javax.swing.SwingUtilities
+import java.awt.desktop.AppReopenedListener
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import nuvio.composeapp.generated.resources.downloads_sleep_reason
 
 private val NuvioDesktopNativeBackground = AwtColor(0x0D, 0x0D, 0x0D)
 private const val MacosDarkAquaAppearance = "NSAppearanceNameDarkAqua"
@@ -65,6 +103,7 @@ fun main(args: Array<String>) {
         showAlreadyOpen()
         return
     }
+    DesktopAccountDataLifecycle.bootstrapAndInstall()
     // On Linux, initialize GTK BEFORE AWT/Compose/Skia to prevent GdkDisplayManager
     // type registration conflict (Skiko partially loads GDK without full GTK init).
     if (System.getProperty("os.name", "").lowercase().contains("linux")) {
@@ -78,19 +117,36 @@ fun main(args: Array<String>) {
     installDesktopOpenUriHandler()
     handleDesktopLaunchArgs(args)
     preloadNativePlayerBridgeAsync()
-    // Load cached profile data synchronously so the profile color is available
-    // on the very first Compose frame (matching Android's SharedPreferences behavior).
-    ProfileRepository.loadCachedProfiles()
-    // Settles a folder move that was cut short, before the list of downloads is read.
-    runCatching { com.nuvio.app.features.downloads.DesktopDownloads.install() }
-    // Watches for hotspots and Low Data Mode networks, on which downloads wait (when the setting is on).
-    runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
     AppIconRepository.ensureLoaded()
-    AutoSyncPreferencesDesktop.initialize()
-    DiscordPresenceManager.start()
+    if (DesktopAccountDataLifecycle.uiState.value == DesktopLifecycleUiState.Ready) {
+        // Load cached profile data synchronously so the profile color is available
+        // on the very first Compose frame (matching Android's SharedPreferences behavior).
+        ProfileRepository.loadCachedProfiles()
+        // The quality checker is ready before a fresh path can release the startup or wake hold.
+        runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
+        runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
+        // Settles a folder move that was cut short, before the list of downloads is read.
+        runCatching {
+            com.nuvio.app.features.downloads.DesktopDownloads.install(
+                skipInitialRecovery = DesktopAccountDataLifecycle.didArchiveOnStartup,
+            )
+        }
+        AutoSyncPreferencesDesktop.initialize()
+        DiscordPresenceManager.start()
+        // A killed process still flushes the last download progress. The window close path does the same.
+        Runtime.getRuntime().addShutdownHook(Thread({ flushDownloadProgressOnExit() }, "download-exit-checkpoint"))
+    }
 
     application {
+        DisposableEffect(Unit) {
+            val watchdog = com.nuvio.app.core.memory.HeapWatchdog()
+            onDispose { watchdog.close() }
+        }
         val appIconState by AppIconRepository.state.collectAsState()
+        val lifecycleUiState by DesktopAccountDataLifecycle.uiState.collectAsState()
+        val quitError by DesktopAccountDataLifecycle.quitError.collectAsState()
+        val quitErrorTitle by DesktopAccountDataLifecycle.quitErrorTitle.collectAsState()
+        val appScope = rememberCoroutineScope()
         val smokePlayerUrl = (
             System.getProperty("nuvio.desktop.smokePlayerUrl")
                 ?: System.getenv("NUVIO_DESKTOP_SMOKE_PLAYER_URL")
@@ -139,24 +195,126 @@ fun main(args: Array<String>) {
             placement = initialPlacement,
         )
         val fullscreenController = remember { DesktopAppFullscreenController() }
-        val closeApplication = {
-            P2pStreamingEngine.shutdown()
-            DiscordPresenceManager.shutdown()
-            SentryInitializer.close()
-            exitApplication()
-        }
-        // The number of running downloads the user is being asked about, or null when no question is open.
-        var askedAboutDownloads by remember { mutableStateOf<Int?>(null) }
-        // Closing the window, or quitting from the menu, asks first only while downloads are running.
-        val requestClose = {
-            when (val decision = quitDecision(activeDownloadCount(DownloadsRepository.uiState.value.items))) {
-                QuitDecision.QuitNow -> closeApplication()
-                is QuitDecision.AskFirst -> askedAboutDownloads = decision.activeDownloads
+        // One save for position and size, after the window has stopped moving.
+        val geometryWrites = remember {
+            WindowGeometryWrites { maximized, geometry ->
+                DesktopWindowModeStorage.saveSnapshot(maximized, geometry)
             }
+        }
+        val isMac = DesktopHostOs.current == DesktopHostOs.MACOS
+        val trayProgress by remember {
+            DownloadsRepository.uiState
+                .map { downloadTrayProgress(it.items) }
+                .distinctUntilChanged()
+        }.collectAsState(remember { downloadTrayProgress(DownloadsRepository.uiState.value.items) })
+        val keepAfterClose by BackgroundDownloadPreferences.keepAfterClose.collectAsState()
+        val rechecking by DownloadRechecks.app.isRunning.collectAsState()
+        val replacementSearches by SourceReplacements.progress.collectAsState()
+        var windowVisible by remember { mutableStateOf(true) }
+        var mainWindow by remember { mutableStateOf<androidx.compose.ui.awt.ComposeWindow?>(null) }
+        val showWindow = {
+            windowVisible = true
+            windowState.isMinimized = false
+            SwingUtilities.invokeLater {
+                mainWindow?.let { it.isVisible = true; it.toFront(); it.requestFocus() }
+            }
+        }
+        val sleepReason = stringResource(Res.string.downloads_sleep_reason)
+        val sleepGuard = remember(isMac, sleepReason) {
+            if (isMac) runCatching { MacDownloadPowerNative.guard(sleepReason) }
+                .onFailure { System.err.println("Download sleep prevention could not start: ${it.message}") }
+                .getOrNull() else null
+        }
+        LaunchedEffect(sleepGuard) {
+            val guard = sleepGuard ?: return@LaunchedEffect
+            withContext(Dispatchers.IO) {
+                coroutineScope {
+                    launch { DownloadTraffic.app.activeCount.collect { guard.update(it) } }
+                    // Checks battery state if notifications are unavailable.
+                    while (true) {
+                        delay(5_000)
+                        guard.update(DownloadTraffic.app.activeCount.value)
+                    }
+                }
+            }
+        }
+        DisposableEffect(sleepGuard) {
+            onDispose { sleepGuard?.close() }
+        }
+        // Confirmed quit still waits for the account gates and the last download save.
+        // The player session is then closed and its native shutdown is awaited before the process exits.
+        val quitCoordinator = rememberDesktopQuitCoordinator(
+            appScope = appScope,
+            onExitApplication = {
+                geometryWrites.flushNow()
+                sleepGuard?.close()
+                val closeAndExit = {
+                    performDesktopQuit(exitApplication = ::exitApplication)
+                }
+                if (SwingUtilities.isEventDispatchThread()) {
+                    closeAndExit()
+                } else {
+                    SwingUtilities.invokeAndWait(closeAndExit)
+                }
+            },
+        )
+        val requestExit: (Boolean) -> Unit = requestExit@{ explicitQuit ->
+            if (quitCoordinator.isQuitting) return@requestExit
+            val running = activeDownloadCount(DownloadsRepository.uiState.value.items)
+            when (downloadCloseDecision(
+                running = running,
+                keepAfterClose = keepAfterClose,
+                isMac = isMac,
+                explicitQuit = explicitQuit,
+                backgroundWork = rechecking || replacementSearches.isNotEmpty(),
+            )) {
+                DownloadCloseDecision.QuitNow -> quitCoordinator.confirmQuitNow()
+                DownloadCloseDecision.HideWindow -> windowVisible = false
+                DownloadCloseDecision.AskToQuit -> {
+                    showWindow()
+                    quitCoordinator.askAboutQuit(running)
+                }
+            }
+        }
+        val requestClose = { requestExit(false) }
+        val requestQuit = { requestExit(true) }
+        val currentShow by rememberUpdatedState(showWindow)
+        val currentQuit by rememberUpdatedState(requestQuit)
+        DisposableEffect(isMac) {
+            val desktop = if (isMac && Desktop.isDesktopSupported()) Desktop.getDesktop() else null
+            val reopen = AppReopenedListener { SwingUtilities.invokeLater { currentShow() } }
+            desktop?.addAppEventListener(reopen)
+            if (desktop?.isSupported(Desktop.Action.APP_QUIT_HANDLER) == true) {
+                desktop.setQuitHandler { _, response ->
+                    response.cancelQuit()
+                    SwingUtilities.invokeLater { currentQuit() }
+                }
+            }
+            onDispose {
+                desktop?.removeAppEventListener(reopen)
+                if (desktop?.isSupported(Desktop.Action.APP_QUIT_HANDLER) == true) desktop.setQuitHandler(null)
+            }
+        }
+
+        if (isMac && (trayProgress.running > 0 || trayProgress.paused > 0 || !windowVisible)) {
+            DesktopDownloadTray(
+                progress = trayProgress,
+                onShow = showWindow,
+                onPause = { appScope.launch(Dispatchers.IO) { DownloadsRepository.pauseActiveDownloads() }; Unit },
+                onResume = {
+                    appScope.launch(Dispatchers.IO) {
+                        DownloadsRepository.uiState.value.items.filter { it.status == DownloadStatus.Paused }
+                            .forEach { DownloadsRepository.resumeDownload(it.id) }
+                    }
+                    Unit
+                },
+                onQuit = requestQuit,
+            )
         }
 
         SwingWindow(
             onCloseRequest = requestClose,
+            visible = windowVisible,
             title = if (smokePlayerUrl == null) "NuvioRoid" else "Nuvio Player Smoke",
             state = windowState,
             icon = painterResource(appIconState.selected.transparentPreviewResource),
@@ -167,6 +325,7 @@ fun main(args: Array<String>) {
                 onMinimizeRequest = { windowState.isMinimized = true },
             )
             SideEffect {
+                mainWindow = window
                 window.background = NuvioDesktopNativeBackground
                 window.rootPane.background = NuvioDesktopNativeBackground
                 window.contentPane.background = NuvioDesktopNativeBackground
@@ -185,6 +344,7 @@ fun main(args: Array<String>) {
             LaunchedEffect(window) {
                 applyNativeDesktopWindowChrome(window)
                 installLinuxExtendedMouseButtons()
+                installWindowsTouchScroll()
                 // Windows fullscreen is emulated natively and isn't reflected by
                 // WindowPlacement, so it must be re-applied once the window peer exists.
                 fullscreenController.applyRestoredFullscreenState(window, windowState, wasFullscreenOnLastExit)
@@ -192,34 +352,60 @@ fun main(args: Array<String>) {
             LaunchedEffect(windowState) {
                 // Covers OS-driven placement changes too (e.g. the native macOS
                 // green-button fullscreen toggle), not just our own shortcuts.
-                if (DesktopHostOs.current != DesktopHostOs.WINDOWS) {
-                    snapshotFlow { windowState.placement }
-                        .collect { placement ->
+                snapshotFlow { windowState.placement }
+                    .collect { placement ->
+                        if (DesktopHostOs.current != DesktopHostOs.WINDOWS) {
                             DesktopWindowModeStorage.saveWasFullscreen(placement == WindowPlacement.Fullscreen)
                         }
-                }
+                        notifyDesktopAppFullscreenChanged()
+                    }
             }
             LaunchedEffect(windowState) {
                 // Only persist geometry while windowed: fullscreen/native-Windows-fullscreen
                 // coordinates aren't a meaningful "windowed position" to restore later.
+                // The save waits until the window has stayed still, so a drag writes once.
                 snapshotFlow { Triple(windowState.placement, windowState.position, windowState.size) }
                     .collect { (placement, position, size) ->
                         val isFullscreen = fullscreenController.isFullscreen(window, windowState)
-                        if (!isFullscreen && restoresMaximizedWindowPlacement) {
-                            DesktopWindowModeStorage.saveWasMaximized(placement == WindowPlacement.Maximized)
+                        val maximized = if (!isFullscreen && restoresMaximizedWindowPlacement) {
+                            placement == WindowPlacement.Maximized
+                        } else {
+                            null
                         }
                         val isWindowed = placement == WindowPlacement.Floating && !isFullscreen
-                        if (isWindowed && position.isSpecified) {
-                            DesktopWindowModeStorage.saveWindowedGeometry(
-                                DesktopWindowGeometry(
-                                    x = position.x.value,
-                                    y = position.y.value,
-                                    width = size.width.value,
-                                    height = size.height.value,
-                                ),
+                        val geometry = if (isWindowed && position.isSpecified) {
+                            DesktopWindowGeometry(
+                                x = position.x.value,
+                                y = position.y.value,
+                                width = size.width.value,
+                                height = size.height.value,
                             )
+                        } else {
+                            null
+                        }
+                        if (maximized != null || geometry != null) {
+                            geometryWrites.note(maximized, geometry)
                         }
                     }
+            }
+            LaunchedEffect(geometryWrites) {
+                // Wakes only while a position is waiting, then waits until the window has stayed still.
+                // A failed save is tried again after the same quiet interval. Closing still writes once.
+                while (isActive) {
+                    geometryWrites.wakeups().receive()
+                    while (isActive) {
+                        val wait = geometryWrites.millisUntilDue() ?: break
+                        if (wait > 0L) {
+                            delay(wait)
+                            continue
+                        }
+                        if (geometryWrites.flushIfDue()) break
+                        delay(geometryWrites.quietMs)
+                    }
+                }
+            }
+            DisposableEffect(geometryWrites) {
+                onDispose { geometryWrites.flushNow() }
             }
             DisposableEffect(window, windowState) {
                 val unregisterFullscreenToggle = registerDesktopAppFullscreenToggle(
@@ -247,23 +433,56 @@ fun main(args: Array<String>) {
             }
 
             if (smokePlayerUrl == null) {
+                ClickableHandCursor(window)
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .platformTouchScroll()
                         .macosTitleBarDoubleClick(window = window, windowState = windowState),
                 ) {
-                    ProvideDesktopWindowInsets(
-                        isFullscreen = windowState.placement == WindowPlacement.Fullscreen,
-                    ) {
-                        MiddleClickAutoscroll { App() }
-                    }
-                    askedAboutDownloads?.let { running ->
-                        AppEnvironment {
-                            QuitWithDownloadsDialog(
-                                activeDownloads = running,
-                                onQuit = closeApplication,
-                                onKeepOpen = { askedAboutDownloads = null },
-                            )
+                    when (val currentLifecycle = lifecycleUiState) {
+                        DesktopLifecycleUiState.Ready -> {
+                            ProvideDesktopWindowInsets(
+                                isFullscreen = windowState.placement == WindowPlacement.Fullscreen,
+                            ) {
+                                MiddleClickAutoscroll { App() }
+                            }
+                            quitCoordinator.askedAboutDownloads?.let { running ->
+                                AppEnvironment {
+                                    QuitWithDownloadsDialog(
+                                        activeDownloads = running,
+                                        onQuit = quitCoordinator.confirmQuitNow,
+                                        onKeepOpen = quitCoordinator.keepOpen,
+                                    )
+                                }
+                            }
+                            quitError?.let { errorMessage ->
+                                AppEnvironment {
+                                    NuvioStatusModal(
+                                        title = quitErrorTitle ?: stringResource(Res.string.quit_blocked_title),
+                                        message = errorMessage,
+                                        isVisible = true,
+                                        confirmText = stringResource(Res.string.action_ok),
+                                        onConfirm = DesktopAccountDataLifecycle::clearQuitError,
+                                    )
+                                }
+                            }
+                        }
+                        is DesktopLifecycleUiState.Blocked -> {
+                            NuvioTheme {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.nuvio.colors.background)
+                                        .padding(32.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = currentLifecycle.message,
+                                        color = MaterialTheme.nuvio.colors.textPrimary,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -273,6 +492,7 @@ fun main(args: Array<String>) {
                 NuvioTheme {
                     PlatformPlayerSurface(
                         sourceUrl = smokePlayerUrl,
+                        useNativeController = true,
                         modifier = Modifier.fillMaxSize(),
                         onControllerReady = {},
                         onSnapshot = {},
@@ -280,6 +500,41 @@ fun main(args: Array<String>) {
                     )
                 }
             }
+        }
+    }
+    NativePlayerLifecycleCoordinator.Default.shutdownAllAndAwait()
+}
+
+internal fun performDesktopQuit(
+    coordinator: NativePlayerLifecycleCoordinator = NativePlayerLifecycleCoordinator.Default,
+    shutdownServices: () -> Unit = {
+        P2pStreamingEngine.shutdown()
+        DiscordPresenceManager.shutdown()
+        SentryInitializer.close()
+    },
+    timeoutMs: Long = 5_000L,
+    exitApplication: () -> Unit,
+) {
+    val completed = AtomicBoolean(false)
+    ActivePlayerSessionRegistry.closeActiveSessionBeforeQuit {
+        Thread(
+            {
+                coordinator.shutdownAllAndAwait(timeoutMs)
+                if (!completed.compareAndSet(false, true)) return@Thread
+                val finish = {
+                    shutdownServices()
+                    exitApplication()
+                }
+                if (SwingUtilities.isEventDispatchThread()) {
+                    finish()
+                } else {
+                    SwingUtilities.invokeLater(finish)
+                }
+            },
+            "nuvio-desktop-quit",
+        ).apply {
+            isDaemon = false
+            start()
         }
     }
 }

@@ -27,6 +27,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import nuvio.composeapp.generated.resources.downloads_delete_setting_save_failed
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast
+import nuvio.composeapp.generated.resources.downloads_movie_scheduled_toast_soon
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_auto_delete_failed_toast
 import nuvio.composeapp.generated.resources.downloads_auto_delete_not_connected_toast
@@ -59,6 +62,9 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
     }
 }
 
+private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
+internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
 /** What the interface needs from automatic downloads. */
@@ -69,13 +75,18 @@ internal interface AutoDownloadController {
     /** The storage limit for automatic downloads, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?>
 
+    val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
+    val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
+    fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
+    fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
+
     /** The watched episodes that are going to be removed. */
     val removals: StateFlow<List<AutoDownloadRemoval>>
 
     /** The watched episodes that were removed recently, oldest first. Only the last week is worth showing. */
     val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = NoDeletedEpisodes
 
-    /** False when removed files are held in the downloads folder and then deleted for good. */
+    /** False when removed files stay in the holding folder until you remove them. */
     val usesSystemTrash: Boolean
 
     /**
@@ -142,14 +153,7 @@ internal object AutoDownloads : AutoDownloadController {
             MetaDetailsRepository.fetch(rule.parentMetaType, rule.parentMetaId, cacheResult = false, useCached = false)
                 ?.releasedBatchEpisodes(CurrentDateProvider.todayIsoDate())
         },
-        isWatched = { rule, episode ->
-            WatchedRepository.isWatched(
-                id = rule.parentMetaId,
-                type = rule.parentMetaType,
-                season = episode.seasonNumber,
-                episode = episode.episodeNumber,
-            )
-        },
+        isWatched = ::isEpisodeWatchedForAutoDownload,
         downloads = { DownloadsRepository.uiState.value.items },
         seasonDefaults = SeasonDownloadDefaultsRepository::load,
         startBatch = SeasonBatchDownloads::start,
@@ -174,15 +178,16 @@ internal object AutoDownloads : AutoDownloadController {
                 episodeNumber = item.episodeNumber,
             )?.isCompleted == true
         },
-        isInPlayer = { item ->
-            playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
-        },
+        isInPlayer = ::isPlaying,
         hasLaterEpisode = { rule, item -> engine.knownEpisodes(rule.key)?.let { hasLaterReleasedEpisode(item, it) } },
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
     )
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
+
+    override val deleteAfterWatchingMode get() = store.deleteAfterWatchingMode
+    override val keptDownloadIds get() = store.keptDownloadIds
 
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
@@ -295,6 +300,18 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    override fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) {
+        scope.launch {
+            if (!runCatching { store.setDeleteAfterWatchingMode(profileId, mode) }.getOrDefault(false)) {
+                NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
+            }
+        }
+    }
+
+    override fun undoKeepDownload(profileId: Int, downloadId: String) {
+        scope.launch { runCatching { deleteAfterWatching.undoKeep(profileId, downloadId) } }
+    }
+
     override fun keepDownload(profileId: Int, downloadId: String) {
         scope.launch { runCatching { deleteAfterWatching.keep(profileId, downloadId) } }
     }
@@ -316,10 +333,14 @@ internal object AutoDownloads : AutoDownloadController {
 
     /** Whether the player has the file of [item] open. A download that is playing is not moved. */
     fun isPlaying(item: DownloadItem): Boolean =
-        playingFileUri.value?.let { DownloadsRepository.findCompletedDownloadByLocalFile(it)?.id == item.id } == true
+        playingFileUri.value?.let { playing ->
+            // The row can be temporarily absent while its removal is being saved.
+            item.localFileUri?.let { DownloadsRepository.backend.isSameFile(playing, it) } == true ||
+                DownloadsRepository.findCompletedDownloadByLocalFile(playing)?.id == item.id
+        } == true
 
-    /** The player opened or closed a local file. A download that is open is not removed. */
-    fun onLocalFileOpened(localFileUri: String) {
+    /** Record playback and cancel a removal without waiting for its disk work. */
+    fun onLocalFileOpened(localFileUri: String) = WatchedRemovalGuard.signalChange {
         playingFileUri.value = localFileUri
     }
 
@@ -359,6 +380,59 @@ internal object AutoDownloads : AutoDownloadController {
         }
     }
 
+    /** Cancels pending watched removals when content is unwatched or its playback progress is cleared. */
+    fun cancelPendingRemovals(
+        parentMetaId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
+        cancelPendingRemovals(
+            parentMetaIds = listOf(parentMetaId),
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            videoId = videoId,
+            onlyNonEpisode = onlyNonEpisode,
+        )
+    }
+
+    /** Cancels pending watched removals matching any alias of unwatched or cleared content. */
+    fun cancelPendingRemovals(
+        parentMetaIds: Collection<String>,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+        onlyNonEpisode: Boolean = false,
+    ) {
+        if (!isAvailable) return
+        val normalizedParents = parentMetaIds
+            .map { it.trim() }
+            .filterTo(linkedSetOf()) { it.isNotEmpty() }
+        val normalizedVideoId = videoId?.trim()?.takeIf { it.isNotEmpty() }
+        if (normalizedParents.isEmpty() && normalizedVideoId == null) return
+        val profileId = ProfileRepository.activeProfileId
+        runCatching {
+            val cancelled = deleteAfterWatching.cancelForContent(
+                profileId = profileId,
+                parentMetaIds = normalizedParents,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = normalizedVideoId,
+                onlyNonEpisode = onlyNonEpisode,
+            )
+            if (cancelled) {
+                scope.launch {
+                    runCatching {
+                        store.currentRules()
+                            .filter { it.parentMetaId.trim() in normalizedParents }
+                            .forEach { engine.refreshStatus(profileId, it.key) }
+                    }
+                }
+            }
+        }
+    }
+
     /** Says that [item] will be deleted, with a Keep button for as long as the message stays. */
     private suspend fun announceScheduledDeletion(profileId: Int, item: DownloadItem) {
         val due = store.removals(profileId).firstOrNull { it.downloadId == item.id } ?: return
@@ -395,8 +469,34 @@ internal object AutoDownloads : AutoDownloadController {
     private const val PlaybackCheckDelayMs = 5_000L
 }
 
+/**
+ * Whether [episode] counts as watched for an automatic-download rule: either marked watched in
+ * history or finished by local playback on this device during this install (never a cloud-synced
+ * or tracker-synced progress row).
+ */
+internal fun isEpisodeWatchedForAutoDownload(
+    rule: AutoDownloadRule,
+    episode: SeasonBatchEpisode,
+    isWatchedInHistory: (id: String, type: String, season: Int, episode: Int) -> Boolean = { id, type, season, number ->
+        WatchedRepository.isWatched(id = id, type = type, season = season, episode = number)
+    },
+    isLocallyFinishedOnDevice: (parentMetaId: String, season: Int, episode: Int) -> Boolean = { parentMetaId, season, number ->
+        WatchProgressRepository.isEpisodeLocallyFinished(
+            parentMetaId = parentMetaId,
+            seasonNumber = season,
+            episodeNumber = number,
+        )
+    },
+): Boolean =
+    isWatchedInHistory(rule.parentMetaId, rule.parentMetaType, episode.seasonNumber, episode.episodeNumber) ||
+        isLocallyFinishedOnDevice(rule.parentMetaId, episode.seasonNumber, episode.episodeNumber)
+
 /** What is said when finishing [item] schedules its deletion in about [hours] hours. */
-private suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+internal suspend fun scheduledDeletionMessage(item: DownloadItem, hours: Int): String {
+    if (!item.isEpisode) {
+        return if (hours < 1) getString(Res.string.downloads_movie_scheduled_toast_soon, item.title)
+        else getPluralString(Res.plurals.downloads_movie_scheduled_toast, hours, item.title, hours)
+    }
     val season = item.seasonNumber ?: 0
     val episode = item.episodeNumber ?: 0
     return if (hours < 1) {

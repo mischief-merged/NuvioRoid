@@ -130,4 +130,99 @@ class AutoDownloadPlannerTest {
 
         assertEquals(listOf(hour, 3 * hour, 12 * hour, 24 * hour, 24 * hour), (1..5).map(::autoDownloadRetryDelayMs))
     }
+
+    @Test
+    fun next_unwatched_does_not_count_episodes_waiting_for_deletion_toward_keep_count() {
+        val downloads = listOf(
+            testDownload(1, DownloadStatus.Completed),
+            testDownload(2, DownloadStatus.Completed),
+            testDownload(3, DownloadStatus.Completed),
+        )
+
+        val plan = planAutoDownload(
+            rule = testRule(keepCount = 3),
+            released = released,
+            isWatched = { false },
+            downloads = downloads,
+            pendingRemovalDownloadIds = setOf("tt1-1-1", "tt1-1-2"),
+        )
+
+        assertEquals(listOf(3, 4, 5), plan.window.numbers())
+        assertEquals(listOf(4, 5), plan.toDownload.numbers())
+    }
+
+    @Test
+    fun latest_released_treats_episodes_waiting_for_deletion_as_watched() {
+        val downloads = listOf(
+            testDownload(7, DownloadStatus.Completed),
+            testDownload(8, DownloadStatus.Completed),
+        )
+
+        val plan = planAutoDownload(
+            rule = testRule(keepCount = 3, scope = AutoDownloadScope.LatestReleased),
+            released = released,
+            isWatched = { false },
+            downloads = downloads,
+            pendingRemovalDownloadIds = setOf("tt1-1-7"),
+        )
+
+        assertEquals(listOf(6, 8), plan.window.numbers())
+        assertEquals(listOf(6), plan.toDownload.numbers())
+    }
+
+    @Test
+    fun a_pending_removal_for_a_placeholder_does_not_count_as_watched_and_still_fetches_its_replacement() {
+        val markedPlaceholder = testDownload(1, DownloadStatus.Completed).copy(
+            framesCheck = DownloadFramesCheck.NotTheRealVideo,
+        )
+        val tinyPlaceholder = testDownload(2, DownloadStatus.Completed).copy(
+            downloadedBytes = 421_667,
+        )
+        val realCopy = testDownload(3, DownloadStatus.Completed)
+
+        val nextUnwatched = planAutoDownload(
+            rule = testRule(keepCount = 3),
+            released = released,
+            isWatched = { false },
+            downloads = listOf(markedPlaceholder, tinyPlaceholder, realCopy),
+            pendingRemovalDownloadIds = setOf("tt1-1-1", "tt1-1-2"),
+        )
+
+        assertEquals(listOf(1, 2, 3), nextUnwatched.window.numbers())
+        assertEquals(listOf(1, 2), nextUnwatched.toDownload.numbers())
+
+        val latestPlaceholder = testDownload(7, DownloadStatus.Completed).copy(
+            framesCheck = DownloadFramesCheck.NotTheRealVideo,
+        )
+        val latest = planAutoDownload(
+            rule = testRule(keepCount = 3, scope = AutoDownloadScope.LatestReleased),
+            released = released,
+            isWatched = { false },
+            downloads = listOf(latestPlaceholder, testDownload(8, DownloadStatus.Completed)),
+            pendingRemovalDownloadIds = setOf("tt1-1-7"),
+        )
+
+        assertEquals(listOf(6, 7, 8), latest.window.numbers())
+        assertEquals(listOf(6, 7), latest.toDownload.numbers())
+    }
+
+    @Test
+    fun a_pending_removal_for_an_incomplete_download_does_not_count_as_watched() {
+        val downloads = listOf(
+            testDownload(1, DownloadStatus.Downloading),
+            testDownload(2, DownloadStatus.Paused),
+            testDownload(3, DownloadStatus.Failed),
+        )
+
+        val plan = planAutoDownload(
+            rule = testRule(keepCount = 3),
+            released = released,
+            isWatched = { false },
+            downloads = downloads,
+            pendingRemovalDownloadIds = setOf("tt1-1-1", "tt1-1-2", "tt1-1-3"),
+        )
+
+        assertEquals(listOf(1, 2, 3), plan.window.numbers())
+        assertEquals(listOf(3), plan.toDownload.numbers())
+    }
 }

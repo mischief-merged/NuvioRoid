@@ -75,6 +75,8 @@ internal data class DownloadLocationInfo(
     val usedBytes: Long = totalBytes,
     /** The location is away, so [usedBytes] is what was known when it was last there. */
     val usedIsLastKnown: Boolean = false,
+    /** Locations on the same volume share their free-space budget. */
+    val volumeKey: String = id,
 )
 
 internal data class DownloadFolderState(
@@ -230,6 +232,12 @@ internal interface DownloadFolderController {
 
     fun refresh()
 
+    /**
+     * True while a screen is showing folder sizes, so they stay current. False leaves the watcher
+     * checking only that folders can be reached.
+     */
+    fun setUsageWatched(watched: Boolean) = Unit
+
     /** The folder path the app keeps its own downloads in. */
     fun appFolderPath(): String
 
@@ -253,6 +261,9 @@ internal interface DownloadFolderController {
     /** Removes the partial file of [item] from its own location only. Null where locations are not handled. */
     fun removePartialOf(item: DownloadItem): Boolean? = null
 
+    /** Removes only the active partial file of [item], leaving any superseded partials intact. */
+    fun removeActivePartialOf(item: DownloadItem): Boolean? = removePartialOf(item)
+
     /** Removes the extra copy of a leftover after checking it is equal and the record points at the other. Null text means done. */
     fun removeExtraCopy(leftoverId: String): LeftoverOutcome = LeftoverOutcome.Refused
     fun keepBoth(leftoverId: String) = Unit
@@ -267,7 +278,7 @@ internal interface DownloadFolderController {
     fun discardFile(localFileUri: String): Boolean? = null
 
     /** Removes a file the downloader just published, only while it is that file. Null where locations are not handled. */
-    fun removeJustPublished(localFileUri: String): Boolean? = null
+    fun removeJustPublished(localFileUri: String, fileKey: String? = null): Boolean? = null
 
     /** Opens the native file picker. Blocks until it closes. Null when cancelled. */
     fun pickFile(): String? = null
@@ -278,6 +289,17 @@ internal interface DownloadFolderController {
      * any profile uses it. Nothing is moved, copied or deleted.
      */
     fun adoptFile(item: DownloadItem, path: String): Boolean = false
+
+    /** Whether a folder move is currently running. */
+    val isMoveRunning: Boolean get() = false
+
+    /** Scans every available storage location for completed downloads whose records are missing. */
+    fun scanDownloadsOnDisk(
+        activeProfileId: Int,
+        inMemoryItems: List<DownloadItem>,
+        nextDownloadId: (Long) -> String,
+        nowEpochMs: Long,
+    ): DiskScanResult = DiskScanResult()
 }
 
 internal enum class FileOwnership {
@@ -341,14 +363,42 @@ internal object WriterTokens {
 internal object ItemLocks {
     private val lock = kotlinx.atomicfu.locks.SynchronizedObject()
     private val held = mutableSetOf<String>()
+    private val watchedOnRelease = mutableSetOf<String>()
+    private var releaseListener: (() -> Unit)? = null
+
+    fun setReleaseListener(listener: (() -> Unit)?) {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            releaseListener = listener
+        }
+    }
 
     fun tryAcquire(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) { held.add(id) }
 
     fun release(id: String) {
-        kotlinx.atomicfu.locks.synchronized(lock) { held.remove(id) }
+        val listenerToNotify = kotlinx.atomicfu.locks.synchronized(lock) {
+            held.remove(id)
+            if (watchedOnRelease.remove(id)) releaseListener else null
+        }
+        listenerToNotify?.invoke()
     }
 
     fun isHeld(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) { id in held }
+
+    /**
+     * Returns true and marks [id] for a release notification when [id] is currently held.
+     * Both happen under [lock] so a scan cannot check a held item and miss its unlock.
+     */
+    fun watchIfHeld(id: String): Boolean = kotlinx.atomicfu.locks.synchronized(lock) {
+        if (id !in held) return@synchronized false
+        watchedOnRelease.add(id)
+        true
+    }
+
+    fun clearWatched() {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            watchedOnRelease.clear()
+        }
+    }
 
     inline fun <T> withLock(id: String, busy: () -> T, block: () -> T): T {
         if (!tryAcquire(id)) return busy()

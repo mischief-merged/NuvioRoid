@@ -1,9 +1,12 @@
 package com.nuvio.app.features.addons
 
 import com.nuvio.app.core.storage.DesktopStorage
-import com.nuvio.app.core.network.DesktopIPv4FirstDns
+import com.nuvio.app.core.network.guardedHttpClient
+import com.nuvio.app.core.network.readBounded
+import com.nuvio.app.core.network.MetadataMaxBytes
+import com.nuvio.app.core.network.PluginMaxBytes
+import com.nuvio.app.core.network.SubtitleMaxBytes
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -11,13 +14,11 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.network_empty_response_body
 import nuvio.composeapp.generated.resources.network_request_failed_http
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import org.jetbrains.compose.resources.getString
 import java.io.ByteArrayOutputStream
-import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
 internal actual object AddonStorage {
@@ -43,8 +44,7 @@ internal actual object AddonStorage {
     }
 }
 
-internal val desktopHttpClient = OkHttpClient.Builder()
-    .dns(DesktopIPv4FirstDns())
+internal val desktopHttpClient = guardedHttpClient()
     .connectTimeout(60, TimeUnit.SECONDS)
     .readTimeout(60, TimeUnit.SECONDS)
     .writeTimeout(60, TimeUnit.SECONDS)
@@ -52,7 +52,27 @@ internal val desktopHttpClient = OkHttpClient.Builder()
     .followSslRedirects(true)
     .build()
 
-private const val truncationSuffix = "\n...[truncated]"
+internal val desktopTextClient = desktopHttpClient.newBuilder().callTimeout(60, TimeUnit.SECONDS).build()
+internal val desktopHttpCalls = DesktopHttpCalls()
+
+private val pluginDeliveryClient = guardedHttpClient(httpsOnly = true)
+    .connectTimeout(60, TimeUnit.SECONDS)
+    .readTimeout(60, TimeUnit.SECONDS)
+    .callTimeout(90, TimeUnit.SECONDS)
+    .build()
+
+internal suspend fun getPluginText(url: String): String {
+    val request = Request.Builder().url(url).build()
+    val (status, payload) = desktopHttpCalls.execute(pluginDeliveryClient, request) { response ->
+        val body = response.body
+        response.code to if (body == null) null else String(
+            body.readBounded(PluginMaxBytes),
+            body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8,
+        )
+    }
+    if (status !in 200..299) error(getString(Res.string.network_request_failed_http, status))
+    return payload ?: error(getString(Res.string.network_empty_response_body))
+}
 
 actual suspend fun httpGetText(url: String): String =
     executeTextRequest(
@@ -81,6 +101,9 @@ actual suspend fun httpGetTextWithHeaders(
         url = url,
         headers = mapOf("Accept" to "application/json") + headers,
     )
+
+actual suspend fun httpGetSubtitleText(url: String, headers: Map<String, String>): String =
+    executeTextRequest("GET", url, headers, maxBytes = SubtitleMaxBytes)
 
 actual suspend fun httpPostJsonWithHeaders(
     url: String,
@@ -116,7 +139,7 @@ actual suspend fun httpRequestRaw(
     }
     val request = buildDesktopRequest(method, url, headers, body, bodyBytes)
 
-    client.newCall(request).execute().use { response ->
+    desktopHttpCalls.execute(client, request) { response ->
         val limited = readResponseBodyLimited(response.body, maxResponseBodyBytes)
         RawHttpResponse(
             status = response.code,
@@ -139,18 +162,15 @@ private suspend fun executeTextRequest(
     url: String,
     headers: Map<String, String> = emptyMap(),
     body: String = "",
+    maxBytes: Int = MetadataMaxBytes,
 ): String = withContext(Dispatchers.IO) {
     val request = buildDesktopRequest(method, url, headers, body)
-    desktopHttpClient.newCall(request).execute().use { response ->
-        val payload = readResponseBody(response.body)
-        if (!response.isSuccessful) {
-            error(runBlocking { getString(Res.string.network_request_failed_http, response.code) })
-        }
-        if (payload.isBlank()) {
-            throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
-        }
-        payload
+    val (status, payload) = desktopHttpCalls.execute(desktopTextClient, request) { response ->
+        response.code to readResponseBody(response.body, maxBytes)
     }
+    if (status !in 200..299) error(getString(Res.string.network_request_failed_http, status))
+    if (payload.isBlank()) throw IllegalStateException(getString(Res.string.network_empty_response_body))
+    payload
 }
 
 private fun buildDesktopRequest(
@@ -195,50 +215,34 @@ private fun Map<String, String>.withoutAcceptEncoding(): Map<String, String> =
 private fun Map<String, String>.getHeaderIgnoreCase(name: String): String? =
     entries.firstOrNull { (key, _) -> key.equals(name, ignoreCase = true) }?.value
 
-private data class LimitedReadResult(
-    val bytes: ByteArray,
-    val truncated: Boolean,
-)
-
-private fun readAtMostBytes(stream: InputStream, maxBytes: Int): LimitedReadResult {
-    val out = ByteArrayOutputStream(minOf(maxBytes, 16 * 1024))
-    val buffer = ByteArray(8 * 1024)
-    var remaining = maxBytes
-    var truncated = false
-
-    while (remaining > 0) {
-        val read = stream.read(buffer, 0, minOf(buffer.size, remaining))
-        if (read <= 0) break
-        out.write(buffer, 0, read)
-        remaining -= read
-    }
-
-    if (remaining == 0) {
-        truncated = stream.read() != -1
-    }
-
-    return LimitedReadResult(out.toByteArray(), truncated)
-}
-
 private class LimitedBody(val text: String, val bytes: ByteArray)
 
 private fun readResponseBodyLimited(body: ResponseBody?, maxBytes: Int): LimitedBody {
     if (body == null) return LimitedBody("", ByteArray(0))
-    val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
-    val readResult = body.byteStream().use { stream ->
-        readAtMostBytes(stream, maxBytes.coerceAtLeast(0))
+    val limit = maxBytes.coerceAtLeast(0)
+    // Honor the caller's explicit limit, including library and cloud lists. Plugin fetches
+    // supply their own small limit and keep the preview/truncation contract.
+    val output = ByteArrayOutputStream(minOf(limit, 16 * 1024))
+    var truncated = false
+    body.byteStream().use { input ->
+        val buffer = ByteArray(8192)
+        var remaining = limit
+        while (remaining > 0) {
+            val count = input.read(buffer, 0, minOf(buffer.size, remaining))
+            if (count < 0) break
+            output.write(buffer, 0, count)
+            remaining -= count
+        }
+        truncated = input.read() >= 0
     }
-    val decoded = runCatching {
-        String(readResult.bytes, charset)
-    }.getOrElse {
-        String(readResult.bytes, Charsets.UTF_8)
-    }
-    return LimitedBody(if (readResult.truncated) decoded + truncationSuffix else decoded, readResult.bytes)
+    val bytes = output.toByteArray()
+    val text = String(bytes, body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8)
+    return LimitedBody(if (truncated) text + "\n...[truncated]" else text, bytes)
 }
 
-private fun readResponseBody(body: ResponseBody?): String {
+internal fun readResponseBody(body: ResponseBody?, maxBytes: Int = 16 * 1024 * 1024): String {
     if (body == null) return ""
-    val bytes = body.bytes()
+    val bytes = body.readBounded(maxBytes)
     return runCatching {
         val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
         String(bytes, charset)

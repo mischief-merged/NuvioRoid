@@ -141,4 +141,15 @@ internal class SourceStartClock(nowMs: Long) {
         lastReadMs = nowMs
         restarted = false
     }
+
+    fun holdUntil(nowMs: Long) {
+        val gap = nowMs - lastReadMs
+        if (gap > 0L) {
+            startedAtMs += gap
+        } else if (gap < 0L) {
+            startedAtMs = nowMs
+        }
+        lastReadMs = nowMs
+        restarted = false
+    }
 }

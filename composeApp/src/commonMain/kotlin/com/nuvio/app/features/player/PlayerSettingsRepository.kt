@@ -126,6 +126,7 @@ data class PlayerSettingsUiState(
     val iosSaturation: Int = 0,
     val iosGamma: Int = 0,
     val nvidiaRtxSuperResolutionEnabled: Boolean = false,
+    val nvidiaRtxHdrEnabled: Boolean = false,
 )
 
 /** How many further sources falling back may try after the auto-selected one fails, by default and at most. */
@@ -255,6 +256,7 @@ object PlayerSettingsRepository {
     private var iosSaturation = 0
     private var iosGamma = 0
     private var nvidiaRtxSuperResolutionEnabled = false
+    private var nvidiaRtxHdrEnabled = false
 
     fun ensureLoaded() {
         if (hasLoaded) return
@@ -359,6 +361,7 @@ object PlayerSettingsRepository {
         iosSaturation = 0
         iosGamma = 0
         nvidiaRtxSuperResolutionEnabled = false
+        nvidiaRtxHdrEnabled = false
         publish()
     }
 
@@ -407,8 +410,8 @@ object PlayerSettingsRepository {
                 ?: SubtitleStyleState.DEFAULT.outlineColor,
             outlineEnabled = PlayerSettingsStorage.loadSubtitleOutlineEnabled()
                 ?: SubtitleStyleState.DEFAULT.outlineEnabled,
-            outlineWidth = PlayerSettingsStorage.loadSubtitleOutlineWidth()
-                ?: SubtitleStyleState.DEFAULT.outlineWidth,
+            outlineWidth = (PlayerSettingsStorage.loadSubtitleOutlineWidth()
+                ?: SubtitleStyleState.DEFAULT.outlineWidth).coerceIn(subtitleOutlineWidthRange),
             bold = PlayerSettingsStorage.loadSubtitleBold()
                 ?: SubtitleStyleState.DEFAULT.bold,
             fontSizeSp = (PlayerSettingsStorage.loadSubtitleFontSizeSp()
@@ -552,6 +555,7 @@ object PlayerSettingsRepository {
         iosSaturation = PlayerSettingsStorage.loadIosSaturation() ?: 0
         iosGamma = PlayerSettingsStorage.loadIosGamma() ?: 0
         nvidiaRtxSuperResolutionEnabled = PlayerSettingsStorage.loadNvidiaRtxSuperResolutionEnabled() ?: false
+        nvidiaRtxHdrEnabled = PlayerSettingsStorage.loadNvidiaRtxHdrEnabled() ?: false
         publish()
     }
 
@@ -715,6 +719,7 @@ object PlayerSettingsRepository {
         ensureLoaded()
         val normalized = style.copy(
             fontSizeSp = style.fontSizeSp.coerceIn(subtitleFontSizeRangeSp),
+            outlineWidth = style.outlineWidth.coerceIn(subtitleOutlineWidthRange),
             bottomOffset = style.bottomOffset.coerceIn(0, 200),
             appearance = style.appearance.normalized(),
         )
@@ -1217,6 +1222,14 @@ object PlayerSettingsRepository {
         PlayerSettingsStorage.saveNvidiaRtxSuperResolutionEnabled(enabled)
     }
 
+    fun setNvidiaRtxHdrEnabled(enabled: Boolean) {
+        ensureLoaded()
+        if (nvidiaRtxHdrEnabled == enabled) return
+        nvidiaRtxHdrEnabled = enabled
+        publish()
+        PlayerSettingsStorage.saveNvidiaRtxHdrEnabled(enabled)
+    }
+
     fun setLibassRenderType(renderType: String) {
         ensureLoaded()
         if (libassRenderType == renderType) return
@@ -1499,6 +1512,7 @@ object PlayerSettingsRepository {
             iosSaturation = iosSaturation,
             iosGamma = iosGamma,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
+            nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled,
         )
     }
 

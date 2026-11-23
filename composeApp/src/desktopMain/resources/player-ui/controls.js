@@ -26,6 +26,7 @@ const toggleLabel = document.getElementById("toggleLabel");
 const nextEpisodeButton = document.getElementById("nextEpisodeButton");
 const nextEpisodeButtonLabel = document.getElementById("nextEpisodeButtonLabel");
 const fullscreenButton = document.getElementById("fullscreenButton");
+const minimizeButton = document.getElementById("minimizeButton");
 const pipButton = document.getElementById("pipButton");
 const fullscreenIcon = document.getElementById("fullscreenIcon");
 const title = document.getElementById("title");
@@ -83,6 +84,11 @@ const streamInfoButton = document.getElementById("streamInfoButton");
 const streamInfoLabel = document.getElementById("streamInfoLabel");
 const streamInfoModal = document.getElementById("streamInfoModal");
 const streamInfoContent = document.getElementById("streamInfoContent");
+const shortcutsButton = document.getElementById("shortcutsButton");
+const shortcutsModal = document.getElementById("shortcutsModal");
+const shortcutsModalTitle = document.getElementById("shortcutsModalTitle");
+const shortcutsCloseButton = document.getElementById("shortcutsCloseButton");
+const shortcutsGrid = document.getElementById("shortcutsGrid");
 const chaptersPanelTitle = document.getElementById("chaptersPanelTitle");
 const chaptersCloseButton = document.getElementById("chaptersCloseButton");
 const chapterList = document.getElementById("chapterList");
@@ -91,6 +97,12 @@ const subtitleModal = document.getElementById("subtitleModal");
 const speedModal = document.getElementById("speedModal");
 const speedOptionList = document.getElementById("speedOptionList");
 const speedPanelTitle = document.getElementById("speedPanelTitle");
+const sleepModal = document.getElementById("sleepModal");
+const sleepOptionList = document.getElementById("sleepOptionList");
+const sleepPanelTitle = document.getElementById("sleepPanelTitle");
+const sleepTimerButton = document.getElementById("sleepTimerButton");
+const sleepTimerLabel = document.getElementById("sleepTimerLabel");
+const sleepRemaining = document.getElementById("sleepRemaining");
 const audioPanelTitle = document.getElementById("audioPanelTitle");
 const audioTrackList = document.getElementById("audioTrackList");
 const subtitleTrackList = document.getElementById("subtitleTrackList");
@@ -230,11 +242,14 @@ let state = {
   subtitlesLabel: "Subs",
   audioLabel: "Audio",
   sourcesLabel: "Sources",
+  availableOfflineLabel: "Available offline",
   episodesLabel: "Episodes",
   externalPlayerLabel: "External",
   playLabel: "Play",
   pauseLabel: "Pause",
   closeLabel: "Close player",
+  minimizeLabel: "",
+  isInMiniPlayer: false,
   lockLabel: "Lock player controls",
   unlockLabel: "Unlock player controls",
   submitIntroLabel: "Submit Intro",
@@ -317,6 +332,10 @@ let state = {
   isPlaying: false,
   isLoading: true,
   controlsVisible: true,
+  shortcutsLabel: "Keyboard shortcuts",
+  shortcutsGroupPlaybackLabel: "Playback",
+  shortcutsGroupNavigationLabel: "Navigation",
+  shortcutsItems: [],
   parentalWarnings: [],
   showParentalGuide: false,
   showOpeningOverlay: false,
@@ -391,6 +410,8 @@ let state = {
   subtitleColorSwatches: [],
   subtitleOutlineColorSwatches: [],
   closeModalsToken: 0,
+  modalNavigationAction: "",
+  modalNavigationToken: 0,
   submitIntroContentKey: "",
   notificationMessage: "",
   notificationToken: 0,
@@ -399,6 +420,8 @@ let isScrubbing = false;
 let scrubPositionMs = 0;
 let tapTimer = 0;
 let activeModal = "";
+let activeModalFocusKey = "";
+let activeModalFocusIndex = -1;
 let pressedButton = null;
 let focusedActionCommand = "";
 let sourceFilterId = "";
@@ -431,6 +454,7 @@ let submitIntroDraft = {
   status: "",
 };
 let hasReceivedPlayerControls = false;
+let lastKotlinControlsVisible = undefined;
 let parentalGuideRunId = 0;
 let parentalGuideStartedKey = "";
 let parentalGuideCompletedKey = "";
@@ -450,6 +474,7 @@ let chromeInteractionLastNotedAt = 0;
 let isChromePointerInside = false;
 let isChromePointerDown = false;
 let isChromeFocusInside = false;
+let lastSentChromeInteracting = false;
 let hiddenCursorTimer = 0;
 let hiddenCursorTemporarilyVisible = false;
 let cursorActivityLastSentAt = 0;
@@ -514,10 +539,13 @@ const setPipLocked = locked => {
 const prefersReducedMotion = window.matchMedia &&
   window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const modalTransitionMs = prefersReducedMotion ? 1 : 240;
-const chromeAutoHideDelayMs = 3500;
+const chromeAutoHideDelayMs = 3000;
 const chromeActivityThrottleMs = 300;
 const hiddenCursorHideDelayMs = 3000;
 const cursorActivityThrottleMs = 100;
+let lastPointerMoveX = null;
+let lastPointerMoveY = null;
+let lastCursorWakeSentWhileHidden = false;
 const playerToastDurationMs = 1400;
 const chromeInteractionSelector = [
   "button",
@@ -1048,11 +1076,13 @@ const rangePositionMs = () => {
 const modalByName = {
   audio: audioModal,
   subtitles: subtitleModal,
+  sleep: sleepModal,
   speed: speedModal,
   sources: sourceModal,
   episodes: episodesModal,
   chapters: chaptersModal,
   streamInfo: streamInfoModal,
+  shortcuts: shortcutsModal,
   submitIntro: submitIntroModal,
   p2pConsent: p2pConsentModal,
   party: partyModal,
@@ -1100,6 +1130,11 @@ const setModalVisibility = (modal, visible, animated = true) => {
 const closePlayerModal = (notifyDismiss = false, animated = true) => {
   const closingModal = activeModal;
   activeModal = "";
+  activeModalFocusKey = "";
+  activeModalFocusIndex = -1;
+  if (closingModal) {
+    send("nativeModalState", 0);
+  }
   if (fontPickerOpen) setFontPickerOpen(false);
   modalElements.forEach(modal => {
     setModalVisibility(modal, false, animated);
@@ -1109,7 +1144,11 @@ const closePlayerModal = (notifyDismiss = false, animated = true) => {
   }
   if (closingModal === "episodes") onEpisodesModalClosed();
   if (closingModal === "party") onPartyModalClosed();
+  syncNativeChromeInteraction();
   renderChrome();
+  if (state.controlsVisible) {
+    noteChromeActivity(true);
+  }
 };
 
 const openPlayerModal = modal => {
@@ -1118,9 +1157,22 @@ const openPlayerModal = modal => {
     closePlayerModal(false);
     return;
   }
+  const wasOpen = Boolean(activeModal);
+  const modalChanged = activeModal !== modal;
   if (activeModal === "party" && modal !== "party") onPartyModalClosed();
   if (modal === "party" && activeModal !== "party") onPartyModalOpened();
   activeModal = modal;
+  if (modalChanged) {
+    activeModalFocusKey = "";
+    activeModalFocusIndex = -1;
+  }
+  if (!wasOpen) {
+    send("nativeModalState", 1);
+  }
+  clearChromeAutoHideTimer();
+  syncNativeChromeInteraction();
+  hiddenCursorTemporarilyVisible = false;
+  syncHiddenCursor();
   if (modal === "submitIntro") {
     const contentKey = state.submitIntroContentKey || "";
     if (submitIntroDraft.contentKey !== contentKey) {
@@ -1185,6 +1237,75 @@ const speedOptions = [
   { value: 1.75, label: "1.75x" },
   { value: 2.0, label: "2x" },
 ];
+
+const sleepTimerChoices = () => [
+  { value: 0, wire: "off", label: state.sleepTimerOffLabel || "Off" },
+  { value: 15, wire: "15", label: state.sleepTimer15Label || "15 minutes" },
+  { value: 30, wire: "30", label: state.sleepTimer30Label || "30 minutes" },
+  { value: 45, wire: "45", label: state.sleepTimer45Label || "45 minutes" },
+  { value: 60, wire: "60", label: state.sleepTimer60Label || "60 minutes" },
+  { value: 90, wire: "90", label: state.sleepTimer90Label || "90 minutes" },
+  { value: -1, wire: "end", label: state.sleepTimerEndLabel || "End of episode" },
+];
+
+let sleepOptionSignature = "";
+
+const sleepOptionSignatureNow = () => [
+  state.sleepTimerPanelTitle || state.sleepTimerLabel || "",
+  state.sleepTimerOption || "off",
+  state.sleepTimerStopAfter ? "1" : "0",
+  state.sleepTimerOffLabel || "",
+  state.sleepTimer15Label || "",
+  state.sleepTimer30Label || "",
+  state.sleepTimer45Label || "",
+  state.sleepTimer60Label || "",
+  state.sleepTimer90Label || "",
+  state.sleepTimerEndLabel || "",
+  state.sleepTimerStopAfterLabel || "",
+].join("|");
+
+const renderSleepOptionList = () => {
+  if (!sleepOptionList) return;
+  const signature = sleepOptionSignatureNow();
+  if (signature === sleepOptionSignature && sleepOptionList.childElementCount > 0) return;
+  sleepOptionSignature = signature;
+  sleepOptionList.textContent = "";
+  if (sleepPanelTitle) {
+    sleepPanelTitle.textContent = state.sleepTimerPanelTitle || state.sleepTimerLabel || "Sleep timer";
+  }
+  const selectedWire = String(state.sleepTimerOption || "off");
+  sleepTimerChoices().forEach(choice => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `track-row${selectedWire === choice.wire ? " selected" : ""}`;
+    row.addEventListener("click", event => {
+      event.stopPropagation();
+      send("sleepTimerOption", choice.value);
+      window.setTimeout(closePlayerModal, 120);
+    });
+    const labelElement = document.createElement("span");
+    labelElement.className = "track-label";
+    labelElement.textContent = choice.label;
+    row.appendChild(labelElement);
+    row.appendChild(buildCheckIcon());
+    sleepOptionList.appendChild(row);
+  });
+
+  const stopAfter = document.createElement("button");
+  stopAfter.type = "button";
+  stopAfter.className = `track-row sleep-stop-after${state.sleepTimerStopAfter ? " selected" : ""}`;
+  stopAfter.addEventListener("click", event => {
+    event.stopPropagation();
+    send("toggleStopAfterEpisode", 0);
+    window.setTimeout(closePlayerModal, 120);
+  });
+  const stopLabel = document.createElement("span");
+  stopLabel.className = "track-label";
+  stopLabel.textContent = state.sleepTimerStopAfterLabel || "Stop after this episode";
+  stopAfter.appendChild(stopLabel);
+  stopAfter.appendChild(buildCheckIcon());
+  sleepOptionList.appendChild(stopAfter);
+};
 
 const renderSpeedOptionList = () => {
   if (!speedOptionList) return;
@@ -1305,6 +1426,7 @@ const appendSubtitleLanguageRow = item => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `track-row subtitle-language-row${item.key === activeSubtitleLanguageKey ? " selected" : ""}`;
+  row.dataset.navKey = `sub-lang:${item.key}`;
   row.addEventListener("click", event => {
     event.stopPropagation();
     activeSubtitleLanguageKey = item.key;
@@ -1316,7 +1438,10 @@ const appendSubtitleLanguageRow = item => {
     if (event.detail === 0 && item.key !== "__off__") {
       window.requestAnimationFrame(() => {
         const firstOption = addonSubtitleList.querySelector('.track-row:not([disabled]):not([hidden])');
-        if (firstOption) firstOption.focus();
+        if (firstOption) {
+          activeModalFocusKey = firstOption.dataset.navKey || "";
+          firstOption.focus();
+        }
       });
     }
   });
@@ -1338,6 +1463,7 @@ const appendSubtitleOptionRow = option => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `track-row subtitle-option-row${selected ? " selected" : ""}`;
+  row.dataset.navKey = `sub-opt:${option.id}`;
   row.addEventListener("click", event => {
     event.stopPropagation();
     pendingSubtitleOptionId = option.id;
@@ -1387,6 +1513,7 @@ const appendSubtitleOptionsEmptyState = (label, fetch = false) => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = "track-row subtitle-fetch-row";
+  row.dataset.navKey = "sub-fetch";
   row.addEventListener("click", event => {
     event.stopPropagation();
     send("fetchAddonSubtitles", 0);
@@ -1454,15 +1581,19 @@ const sameRgb = (left, right) => {
   return a.red === b.red && a.green === b.green && a.blue === b.blue;
 };
 
-const renderSwatches = (container, colors, selectedColor, eventType) => {
+const renderSwatches = (container, colors, selectedColor, eventType, accessibleName) => {
   container.textContent = "";
   const items = Array.isArray(colors) ? colors : [];
+  const name = accessibleName || "Color";
   items.forEach((color, index) => {
     const parsed = parseArgb(color);
+    const selected = sameRgb(color, selectedColor);
     const swatch = document.createElement("button");
     swatch.type = "button";
-    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${sameRgb(color, selectedColor) ? " selected" : ""}`;
+    swatch.className = `swatch${parsed.alpha === 0 ? " transparent" : ""}${selected ? " selected" : ""}`;
     swatch.style.setProperty("--swatch", parsed.css);
+    swatch.setAttribute("aria-label", `${name} ${index + 1}`);
+    if (selected) swatch.setAttribute("aria-pressed", "true");
     swatch.addEventListener("click", event => {
       event.stopPropagation();
       send(eventType, index);
@@ -1492,6 +1623,7 @@ const renderAutoSyncCues = () => {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "sync-cue";
+    row.setAttribute("aria-label", `${cue.timeLabel || ""} ${cue.text || ""}`.trim() || "Subtitle line");
     row.addEventListener("click", event => {
       event.stopPropagation();
       send("subtitleAutoSyncCue", Number(cue.index) || 0);
@@ -1521,9 +1653,13 @@ const renderSubtitleStylePanel = () => {
   outlineLabel.textContent = state.outlineLabel || "Outline";
   outlineToggle.textContent = style.outlineEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
   outlineToggle.classList.toggle("primary", Boolean(style.outlineEnabled));
+  outlineToggle.setAttribute("aria-pressed", String(Boolean(style.outlineEnabled)));
+  outlineToggle.setAttribute("aria-label", `${state.outlineLabel || "Outline"}, ${outlineToggle.textContent}`);
   boldLabel.textContent = state.boldLabel || "Bold";
   boldToggle.textContent = style.bold ? (state.onLabel || "On") : (state.offLabel || "Off");
   boldToggle.classList.toggle("primary", Boolean(style.bold));
+  boldToggle.setAttribute("aria-pressed", String(Boolean(style.bold)));
+  boldToggle.setAttribute("aria-label", `${state.boldLabel || "Bold"}, ${boldToggle.textContent}`);
   bottomOffsetLabel.textContent = state.bottomOffsetLabel || "Bottom Offset";
   bottomOffsetValue.textContent = String(Number(style.bottomOffset) || 0);
   subtitleColorLabel.textContent = state.colorLabel || "Color";
@@ -1535,20 +1671,23 @@ const renderSubtitleStylePanel = () => {
   subtitleFontLabel.textContent = state.fontLabel || "Font";
   const activeFont = (state.subtitleFonts || []).find(font => font.id === (style.fontId || "default"));
   subtitleFontName.textContent = activeFont ? activeFont.label : ((state.subtitleFonts || [])[0] || {}).label || "";
+  subtitleFontRow.setAttribute("aria-label", `${state.fontLabel || "Font"}, ${subtitleFontName.textContent}`.replace(/,\s*$/, ""));
   renderFontPicker();
   shadowLabel.textContent = state.shadowLabel || "Drop shadow";
   shadowToggle.textContent = style.shadowEnabled ? (state.onLabel || "On") : (state.offLabel || "Off");
   shadowToggle.classList.toggle("primary", Boolean(style.shadowEnabled));
+  shadowToggle.setAttribute("aria-pressed", String(Boolean(style.shadowEnabled)));
+  shadowToggle.setAttribute("aria-label", `${state.shadowLabel || "Drop shadow"}, ${shadowToggle.textContent}`);
   shadowOpacityLabel.textContent = state.shadowOpacityLabel || "Shadow opacity";
   shadowOpacityValue.textContent = `${Number(style.shadowOpacity) || 0}%`;
   shadowSizeLabel.textContent = state.shadowSizeLabel || "Shadow size";
   shadowSizeValue.textContent = String(Number(style.shadowSize) || 1);
-  renderSwatches(subtitleColorSwatches, state.subtitleColorSwatches, style.textColor, "subtitleTextColor");
-  renderSwatches(outlineColorSwatches, state.subtitleColorSwatches, style.outlineColor, "subtitleOutlineColor");
+  renderSwatches(subtitleColorSwatches, state.subtitleColorSwatches, style.textColor, "subtitleTextColor", "Subtitle text color");
+  renderSwatches(outlineColorSwatches, state.subtitleColorSwatches, style.outlineColor, "subtitleOutlineColor", "Subtitle outline color");
   backgroundColorLabel.textContent = state.backgroundColorLabel || "Background Color";
   backgroundOpacityLabel.textContent = state.backgroundOpacityLabel || "Background opacity";
   backgroundOpacityValue.textContent = `${Math.round((parseArgb(style.backgroundColor).alpha / 255) * 100)}%`;
-  renderSwatches(backgroundColorSwatches, state.subtitleColorSwatches, style.backgroundColor, "subtitleBackgroundColor");
+  renderSwatches(backgroundColorSwatches, state.subtitleColorSwatches, style.backgroundColor, "subtitleBackgroundColor", "Subtitle background color");
   outlineColorSection.hidden = !style.outlineEnabled;
   shadowOpacitySection.hidden = !style.shadowEnabled;
   shadowSizeSection.hidden = !style.shadowEnabled;
@@ -1914,11 +2053,15 @@ const renderSourceVirtualRows = () => {
       send("selectSource", Number(selected.index) || 0);
       window.setTimeout(closePlayerModal, 120);
     });
+    row.dataset.navKey = `src:${Number(item.index) || index}`;
     wrapper.appendChild(row);
     fragment.appendChild(wrapper);
     rendered.push({ index, wrapper });
   }
   sourceVirtualSpacer.appendChild(fragment);
+  if (activeModal === "sources") {
+    restoreActiveModalFocus();
+  }
 
   window.requestAnimationFrame(() => {
     let changed = false;
@@ -2000,10 +2143,14 @@ const renderSourceModal = (modalOpened = false) => {
 const appendEpisodeRow = (container, item) => {
   const row = document.createElement("button");
   row.type = "button";
-  row.className = `track-row episode-row${item.isCurrent ? " selected" : ""}`;
+  const isDisabled = item.isEnabled === false;
+  row.disabled = isDisabled;
+  row.className = `track-row episode-row${item.isCurrent ? " selected" : ""}${isDisabled ? " disabled" : ""}`;
+  row.dataset.navKey = `ep:${Number(item.index) || 0}`;
   if (item.isCurrent) row.setAttribute("aria-current", "true");
   row.addEventListener("click", event => {
     event.stopPropagation();
+    if (isDisabled) return;
     send("selectEpisode", Number(item.index) || 0);
   });
 
@@ -2041,6 +2188,12 @@ const appendEpisodeRow = (container, item) => {
     released.className = "episode-release";
     released.textContent = item.released;
     copy.appendChild(released);
+  }
+  if (item.isAvailableOffline) {
+    const offline = document.createElement("span");
+    offline.className = "episode-offline-badge";
+    offline.textContent = state.availableOfflineLabel || "Available offline";
+    copy.appendChild(offline);
   }
   if (item.overview) {
     const overview = document.createElement("span");
@@ -2330,6 +2483,7 @@ const renderChaptersModal = (modalOpened = false) => {
       const row = document.createElement("button");
       row.type = "button";
       row.className = "chapter-row";
+      row.dataset.navKey = `ch:${index}`;
       row.addEventListener("click", event => {
         event.stopPropagation();
         send("selectChapter", index);
@@ -2413,17 +2567,151 @@ const renderChapterMarks = () => {
   setText(chapterTitle, index >= 0 && state.chapterTitleEnabled !== false ? chapters[index].title : "");
 };
 
+const getActiveModalElement = () => {
+  if (!activeModal) return null;
+  return isPartyConfirmOpen() ? partyConfirm : modalByName[activeModal];
+};
+
+const getModalFocusableElements = modalEl => {
+  if (!modalEl) return [];
+  return Array.from(modalEl.querySelectorAll('button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])'))
+    .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+};
+
+const captureActiveModalFocus = () => {
+  const modalEl = getActiveModalElement();
+  if (!modalEl) return;
+  const active = document.activeElement;
+  if (!active || !modalEl.contains(active)) return;
+  const focusable = getModalFocusableElements(modalEl);
+  const index = focusable.indexOf(active);
+  if (index >= 0) {
+    activeModalFocusKey = active.dataset.navKey || "";
+    activeModalFocusIndex = index;
+  }
+};
+
+const resolveStoredModalFocusElement = (modalEl, focusable = getModalFocusableElements(modalEl)) => {
+  if (!modalEl || !focusable.length) return null;
+  if (activeModalFocusKey) {
+    const byKey = focusable.find(el => el.dataset.navKey === activeModalFocusKey);
+    if (byKey) return byKey;
+  }
+  if (activeModalFocusIndex >= 0) {
+    return focusable[Math.min(activeModalFocusIndex, focusable.length - 1)] || null;
+  }
+  return null;
+};
+
+const restoreActiveModalFocus = () => {
+  const modalEl = getActiveModalElement();
+  if (!modalEl || (!activeModalFocusKey && activeModalFocusIndex < 0)) return;
+  const active = document.activeElement;
+  if (active && modalEl.contains(active)) return;
+  const target = resolveStoredModalFocusElement(modalEl);
+  if (target) {
+    target.focus({ preventScroll: true });
+  }
+};
+
+const defaultShortcutOverlayItems = [
+  { keys: "Space / K", label: "Play or pause", group: "playback" },
+  { keys: "Left / Right", label: "Seek back or forward 10 s", group: "playback" },
+  { keys: "Up / Down", label: "Turn volume up or down", group: "playback" },
+  { keys: "M", label: "Mute or unmute", group: "playback" },
+  { keys: "F", label: "Enter or exit fullscreen", group: "navigation" },
+  { keys: "Esc", label: "Exit fullscreen or close panel", group: "navigation" },
+  { keys: "S", label: "Skip intro when shown", group: "playback" },
+  { keys: "N", label: "Next episode", group: "navigation" },
+  { keys: "?", label: "Show or hide shortcuts", group: "navigation" },
+  { keys: "C", label: "Subtitles", group: "navigation" },
+  { keys: "A", label: "Audio tracks", group: "navigation" },
+  { keys: "`", label: "Playback speed", group: "playback" },
+  { keys: "/", label: "Reset speed to 1x", group: "playback" },
+  { keys: "E", label: "Episodes", group: "navigation" },
+  { keys: "Q", label: "Sources", group: "navigation" },
+  { keys: "P", label: "Picture-in-Picture", group: "navigation" },
+];
+
+const renderShortcutsModal = () => {
+  if (!shortcutsGrid) return;
+  const titleText = state.shortcutsLabel || "Keyboard shortcuts";
+  if (shortcutsModalTitle) shortcutsModalTitle.textContent = titleText;
+  if (shortcutsCloseButton) shortcutsCloseButton.textContent = state.panelCloseLabel || "Close";
+  if (shortcutsModal) shortcutsModal.setAttribute("aria-label", titleText);
+
+  const items = Array.isArray(state.shortcutsItems) && state.shortcutsItems.length > 0
+    ? state.shortcutsItems
+    : defaultShortcutOverlayItems;
+  const groups = [
+    { key: "playback", title: state.shortcutsGroupPlaybackLabel || "Playback" },
+    { key: "navigation", title: state.shortcutsGroupNavigationLabel || "Navigation" },
+  ];
+
+  shortcutsGrid.textContent = "";
+  groups.forEach(group => {
+    const groupItems = items.filter(item => (item.group || "playback") === group.key);
+    if (groupItems.length === 0) return;
+
+    const section = document.createElement("div");
+    section.className = "shortcuts-group";
+
+    const heading = document.createElement("div");
+    heading.className = "shortcuts-group-title";
+    heading.textContent = group.title;
+    section.appendChild(heading);
+
+    const list = document.createElement("div");
+    list.className = "shortcuts-list";
+
+    groupItems.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "shortcut-row";
+
+      const desc = document.createElement("span");
+      desc.className = "shortcut-desc";
+      desc.textContent = item.label || "";
+
+      const keysWrap = document.createElement("span");
+      keysWrap.className = "shortcut-keys";
+      String(item.keys || "").split(" / ").forEach((token, idx) => {
+        if (idx > 0) {
+          const sep = document.createElement("span");
+          sep.textContent = "/";
+          sep.style.opacity = "0.5";
+          sep.style.fontSize = "12px";
+          keysWrap.appendChild(sep);
+        }
+        const kbd = document.createElement("kbd");
+        kbd.className = "shortcut-key";
+        kbd.textContent = token.trim();
+        keysWrap.appendChild(kbd);
+      });
+
+      row.append(desc, keysWrap);
+      list.appendChild(row);
+    });
+
+    section.appendChild(list);
+    shortcutsGrid.appendChild(section);
+  });
+};
+
 const renderActiveModal = (modalOpened = false) => {
+  captureActiveModalFocus();
   if (activeModal === "audio") renderAudioTrackList();
   if (activeModal === "subtitles") renderSubtitleModal();
+  if (activeModal === "sleep") renderSleepOptionList();
   if (activeModal === "speed") renderSpeedOptionList();
   if (activeModal === "sources") renderSourceModal(modalOpened);
   if (activeModal === "episodes") renderEpisodesModal(modalOpened);
   if (activeModal === "chapters") renderChaptersModal(modalOpened);
   if (activeModal === "streamInfo") renderStreamInfoModal();
+  if (activeModal === "shortcuts") renderShortcutsModal();
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
   if (activeModal === "party") renderPartyModal();
+  restoreActiveModalFocus();
 };
 
 window.nuvioNativeViewportChanged = () => {
@@ -2438,8 +2726,13 @@ window.nuvioNativeViewportChanged = () => {
 };
 
 window.nuvioNativeResizeEnded = () => {
+  pipPointerDown = false;
+  clearSuppressNextRootClick();
   window.clearTimeout(nativeViewportTimer);
   root.classList.remove("native-resizing");
+  if (document.body.style.cursor && document.body.style.cursor.includes("resize")) {
+    document.body.style.cursor = "";
+  }
   noteChromeActivity(true);
   syncSkipPromptPlacement(skipPrompt.classList.contains("visible"));
   if (activeModal) renderActiveModal();
@@ -2631,13 +2924,12 @@ const isChromeInteractionTarget = target =>
   Boolean(target && target.closest && target.closest(chromeInteractionSelector));
 
 const isInteractingWithChrome = () =>
-  Boolean(isChromePointerInside || isChromePointerDown || isChromeFocusInside);
+  Boolean(isChromePointerDown || isScrubbing || isTextEntryTarget(document.activeElement) || isChromeFocusInside);
 
 const canAutoHideChrome = showOpening => Boolean(
   state.controlsVisible &&
   !state.isLoading &&
   !activeModal &&
-  !isScrubbing &&
   !isInteractingWithChrome() &&
   !playbackErrorText() &&
   !showOpening,
@@ -2648,10 +2940,8 @@ const currentChromeAutoHideKey = showOpening => {
   return [
     chromeAutoHideActivity,
     state.controlsVisible ? "visible" : "hidden",
-    state.isPlaying ? "playing" : "paused",
     state.isLoading ? "loading" : "ready",
     activeModal || "none",
-    isScrubbing ? "scrubbing" : "idle",
     isInteractingWithChrome() ? "interacting" : "idle-controls",
     showOpening ? "opening" : "ready",
   ].join(":");
@@ -2664,8 +2954,15 @@ const clearChromeAutoHideTimer = () => {
 };
 
 const shouldHideCursorForIdleChrome = () => Boolean(
+  !state.isInMiniPlayer &&
   !playbackErrorText() &&
-  !state.controlsVisible,
+  !state.controlsVisible &&
+  !activeModal &&
+  !isChromePointerDown &&
+  !isScrubbing &&
+  !state.isLoading &&
+  !isOpeningOverlayActive() &&
+  !isTextEntryTarget(document.activeElement),
 );
 
 const clearHiddenCursorTimer = () => {
@@ -2680,12 +2977,27 @@ const syncHiddenCursor = () => {
     root.classList.remove("cursor-hidden");
     return;
   }
-  root.classList.toggle("cursor-hidden", !hiddenCursorTemporarilyVisible);
+  const hidden = !hiddenCursorTemporarilyVisible;
+  root.classList.toggle("cursor-hidden", hidden);
+  if (hidden && !state.isInPip && document.body.style.cursor && document.body.style.cursor.includes("resize")) {
+    document.body.style.cursor = "";
+  }
 };
 
 const noteCursorActivity = () => {
   if (!shouldHideCursorForIdleChrome()) {
+    lastCursorWakeSentWhileHidden = false;
     syncHiddenCursor();
+    return;
+  }
+
+  if (!state.isLocked && !isOpeningOverlayActive()) {
+    lastCursorWakeSentWhileHidden = true;
+    cursorActivityLastSentAt = window.performance ? window.performance.now() : Date.now();
+    chromeAutoHideActivity += 1;
+    state = { ...state, controlsVisible: true };
+    renderChrome();
+    send("cursorActivity", 0);
     return;
   }
 
@@ -2696,10 +3008,12 @@ const noteCursorActivity = () => {
   hiddenCursorTimer = window.setTimeout(() => {
     hiddenCursorTimer = 0;
     hiddenCursorTemporarilyVisible = false;
+    lastCursorWakeSentWhileHidden = false;
     syncHiddenCursor();
   }, hiddenCursorHideDelayMs);
 
-  if (now - cursorActivityLastSentAt >= cursorActivityThrottleMs) {
+  if (!lastCursorWakeSentWhileHidden || now - cursorActivityLastSentAt >= cursorActivityThrottleMs) {
+    lastCursorWakeSentWhileHidden = true;
     cursorActivityLastSentAt = now;
     send("cursorActivity", 0);
   }
@@ -2707,6 +3021,8 @@ const noteCursorActivity = () => {
 
 const hideChromeFromAutoTimer = () => {
   if (!canAutoHideChrome(isOpeningOverlayActive())) return;
+  lastCursorWakeSentWhileHidden = false;
+  hiddenCursorTemporarilyVisible = false;
   state = { ...state, controlsVisible: false };
   renderChrome();
   send("hideChrome", 0);
@@ -2730,34 +3046,61 @@ const syncChromeAutoHideTimer = showOpening => {
   }, chromeAutoHideDelayMs);
 };
 
+const isChromeHoldBlockingAutoHide = () =>
+  Boolean(isChromePointerDown || isScrubbing || activeModal || isTextEntryTarget(document.activeElement) || isChromeFocusInside);
+
+const syncNativeChromeInteraction = () => {
+  const interacting = isChromeHoldBlockingAutoHide();
+  if (interacting === lastSentChromeInteracting) return;
+  lastSentChromeInteracting = interacting;
+  send("chromeInteraction", interacting ? 1 : 0);
+};
+
 const noteChromeActivity = (force = false) => {
   if (!state.controlsVisible) return;
   const now = window.performance ? window.performance.now() : Date.now();
+  chromeAutoHideActivity += 1;
+  syncChromeAutoHideTimer(isOpeningOverlayActive());
   if (!force && now - chromeInteractionLastNotedAt < chromeActivityThrottleMs) {
-    syncChromeAutoHideTimer(isOpeningOverlayActive());
     return;
   }
   chromeInteractionLastNotedAt = now;
-  chromeAutoHideActivity += 1;
-  syncChromeAutoHideTimer(isOpeningOverlayActive());
-  send("keepChromeVisible", 0);
+  send("keepChromeVisible", isChromeHoldBlockingAutoHide() ? 1 : 0);
 };
 
 const updateChromePointerInside = inside => {
-  if (isChromePointerInside === inside) return;
   isChromePointerInside = inside;
-  noteChromeActivity(true);
+};
+
+const flushStuckScrubbingIfNeeded = () => {
+  if (!isScrubbing || partySeekTimer) return;
+  isScrubbing = false;
+  scrubPositionMs = rangePositionMs();
+  send("scrubFinish", scrubPositionMs);
 };
 
 const finishChromePointerInteraction = event => {
   isChromePointerDown = false;
-  if (event && event.type !== "pointercancel") {
-    isChromePointerInside = isChromeInteractionTarget(event.target);
-  } else {
-    isChromePointerInside = false;
-  }
+  isChromePointerInside = event && event.type !== "pointercancel"
+    ? isChromeInteractionTarget(event.target)
+    : false;
   clearPressedButton();
-  noteChromeActivity(true);
+  if (!activeModal && !isTextEntryTarget(document.activeElement)) {
+    focusShortcutRoot();
+  }
+  syncNativeChromeInteraction();
+  window.setTimeout(() => {
+    if (!isChromePointerDown) {
+      flushStuckScrubbingIfNeeded();
+      isChromeFocusInside = isTextEntryTarget(document.activeElement);
+      syncNativeChromeInteraction();
+      if (state.controlsVisible) {
+        noteChromeActivity(true);
+      } else {
+        syncHiddenCursor();
+      }
+    }
+  }, 0);
 };
 
 const renderChrome = () => {
@@ -2767,7 +3110,12 @@ const renderChrome = () => {
   const isPlaying = Boolean(state.isPlaying);
   const showError = renderPlaybackError();
   root.classList.toggle("pip-mode", Boolean(state.isInPip));
+  root.classList.toggle("mini-mode", Boolean(state.isInMiniPlayer));
   if (!state.isInPip && isPipLocked) setPipLocked(false);
+  if (state.isInMiniPlayer && activeModal) {
+    closePlayerModal(false, false);
+    return;
+  }
   root.classList.toggle("chrome-hidden", Boolean(showError || !state.controlsVisible));
   root.classList.toggle("modal-open", Boolean(activeModal));
   root.classList.toggle("info-open", activeModal === "streamInfo");
@@ -2794,6 +3142,12 @@ const renderChrome = () => {
   setActionButtonLabel("audio", state.audioLabel || "Audio");
   setActionButtonLabel("sources", state.sourcesLabel || "Sources");
   setActionButtonLabel("episodes", state.episodesLabel || "Episodes");
+  if (minimizeButton) {
+    const minimizeLabel = String(state.minimizeLabel || "").trim();
+    setAttr(minimizeButton, "aria-label", minimizeLabel);
+    setAttr(minimizeButton, "title", minimizeLabel);
+    minimizeButton.hidden = !minimizeLabel || Boolean(state.isInPip) || Boolean(state.isInMiniPlayer);
+  }
   if (pipButton) {
     const pipLabel = String(state.pipLabel || "").trim();
     setAttr(pipButton, "aria-label", pipLabel);
@@ -2816,6 +3170,15 @@ const renderChrome = () => {
   setActionButtonLabel("chapters", state.chaptersLabel || "Chapters");
   setTextContent(streamInfoLabel, state.streamInfoLabel || "Stream info");
   setActionButtonLabel("streamInfo", state.streamInfoLabel || "Stream info");
+  const sleepLabel = state.sleepTimerShortcutLabel || state.sleepTimerLabel || "Sleep timer";
+  setTextContent(sleepTimerLabel, state.sleepTimerLabel || "Sleep timer");
+  setActionButtonLabel("sleepTimer", sleepLabel);
+  if (sleepTimerButton) {
+    setAttr(sleepTimerButton, "aria-label", sleepLabel);
+    setAttr(sleepTimerButton, "title", sleepLabel);
+    sleepTimerButton.classList.toggle("sleep-active", Boolean(state.sleepTimerActive));
+  }
+  setText(sleepRemaining, state.sleepTimerRemainingLabel || "");
   renderChapterMarks();
   if (!hasChapters && activeModal === "chapters") closePlayerModal(false);
   syncActionFocusState();
@@ -2839,8 +3202,14 @@ const renderChrome = () => {
   }
   syncFullscreenButtons();
   setAttr(backButton, "aria-label", state.closeLabel || "Close player");
+  setAttr(openingBackButton, "aria-label", state.closeLabel || "Close player");
   setAttr(submitIntroButton, "aria-label", state.submitIntroLabel || "Submit Intro");
   setAttr(videoSettingsButton, "aria-label", state.videoSettingsLabel || "Video settings");
+  if (shortcutsButton) {
+    const shortcutsText = state.shortcutsLabel || "Keyboard shortcuts";
+    setAttr(shortcutsButton, "aria-label", shortcutsText);
+    setAttr(shortcutsButton, "title", `${shortcutsText} (?)`);
+  }
   setProgress(positionMs, durationMs, bufferedPositionMs);
   if (showError) {
     skipPrompt.classList.remove("visible", "show-progress");
@@ -3014,9 +3383,10 @@ const finishPartySeek = () => {
   render();
 };
 
-const fineSeek = isForward => {
+const fineSeek = (isForward, stepMsOverride) => {
   const direction = isForward ? "forward" : "backward";
-  const stepMs = isForward ? 1000 : -1000;
+  const step = Math.max(500, Number(stepMsOverride) || 1000);
+  const stepMs = isForward ? step : -step;
 
   if (fineSeekDirection === direction) {
     fineSeekAccumulatedMs += stepMs;
@@ -3131,13 +3501,11 @@ document.addEventListener("pointerdown", event => {
   if (interactingWithChrome) {
     isChromePointerDown = true;
     isChromePointerInside = true;
+    syncNativeChromeInteraction();
     noteChromeActivity(true);
-  }
-  if (!isTextEntryTarget(event.target) && !isInteractiveControlTarget(event.target)) {
+  } else if (!isTextEntryTarget(event.target)) {
     focusShortcutRoot();
-    if (!interactingWithChrome) {
-      noteChromeActivity(true);
-    }
+    noteChromeActivity(true);
   }
   const button = event.target.closest("button");
   if (!button || button.disabled) return;
@@ -3147,22 +3515,35 @@ document.addEventListener("pointerdown", event => {
 }, true);
 
 document.addEventListener("pointermove", event => {
-  noteCursorActivity();
+  const sameCoords =
+    lastPointerMoveX !== null &&
+    event.clientX === lastPointerMoveX &&
+    event.clientY === lastPointerMoveY;
+  lastPointerMoveX = event.clientX;
+  lastPointerMoveY = event.clientY;
+  if (sameCoords) return;
+
   const inside = isChromeInteractionTarget(event.target);
   updateChromePointerInside(inside);
-  if (inside) {
+  if (state.controlsVisible) {
     noteChromeActivity();
+  } else {
+    noteCursorActivity();
   }
 }, true);
 
 document.addEventListener("pointerup", finishChromePointerInteraction, true);
 document.addEventListener("pointercancel", finishChromePointerInteraction, true);
+document.addEventListener("lostpointercapture", finishChromePointerInteraction, true);
 document.addEventListener("dragend", clearPressedButton, true);
-document.addEventListener("pointerleave", () => {
-  updateChromePointerInside(false);
+document.addEventListener("pointerleave", event => {
+  if (event.target === document.documentElement || event.target === document) {
+    isChromePointerInside = false;
+  }
 }, true);
 document.addEventListener("focusin", event => {
-  isChromeFocusInside = isChromeInteractionTarget(event.target);
+  isChromeFocusInside = isTextEntryTarget(event.target);
+  syncNativeChromeInteraction();
   const actionButton = event.target.closest && event.target.closest(".action-pill .action");
   if (actionButton) {
     setFocusedActionButton(actionButton, { focus: false });
@@ -3173,21 +3554,33 @@ document.addEventListener("focusin", event => {
 }, true);
 document.addEventListener("focusout", () => {
   window.setTimeout(() => {
-    isChromeFocusInside = isChromeInteractionTarget(document.activeElement);
-    noteChromeActivity(true);
+    isChromeFocusInside = isTextEntryTarget(document.activeElement);
+    syncNativeChromeInteraction();
+    syncChromeAutoHideTimer(isOpeningOverlayActive());
   }, 0);
 }, true);
-window.addEventListener("blur", () => {
+const resetTransientPointerAndFocusState = () => {
   isChromePointerInside = false;
   isChromePointerDown = false;
   isChromeFocusInside = false;
+  lastPointerMoveX = null;
+  lastPointerMoveY = null;
   clearPressedButton();
+  flushStuckScrubbingIfNeeded();
+  syncNativeChromeInteraction();
   syncChromeAutoHideTimer(isOpeningOverlayActive());
+  syncHiddenCursor();
   clearSpeedBoostTimers();
   releaseFilterRowPointerCaptures();
   if (isHoldSpeedActive || isSpaceBoosting || isSpeedBoosting) {
     suppressNextRootClick = true;
     stopSpeedBoost();
+  }
+};
+window.addEventListener("blur", resetTransientPointerAndFocusState);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    resetTransientPointerAndFocusState();
   }
 });
 
@@ -3239,6 +3632,10 @@ document.querySelectorAll("[data-command]").forEach(button => {
       streamInfoSignature = "";
       send("streamInfo", 0);
       openPlayerModal("streamInfo");
+      return;
+    }
+    if (command === "sleepTimer") {
+      openPlayerModal("sleep");
       return;
     }
     if (command === "submitIntro") {
@@ -3521,6 +3918,22 @@ p2pConsentEnableButton.addEventListener("click", event => {
   send("enableP2pForPlayerControls", 0);
 });
 
+if (shortcutsButton) {
+  shortcutsButton.addEventListener("click", event => {
+    event.stopPropagation();
+    if (activeModal === "shortcuts") closePlayerModal(true);
+    else openPlayerModal("shortcuts");
+  });
+}
+
+if (shortcutsCloseButton) {
+  shortcutsCloseButton.addEventListener("click", event => {
+    event.stopPropagation();
+    closePlayerModal(true);
+    focusShortcutRoot();
+  });
+}
+
 skipPrompt.addEventListener("click", event => {
   event.stopPropagation();
   send("skipInterval", 0);
@@ -3559,12 +3972,14 @@ volumeSlider.addEventListener("input", event => {
   if (nextLevel > 0) {
     preMuteVolumeLevel = nextLevel;
   }
+  sleepFadeVolumeLatch = false;
   syncVolumeControl();
   showPlayerToast(volumeToastLabel());
   send("volumeChange", nextLevel);
 });
 
 let preMuteVolumeLevel = 1.0;
+let sleepFadeVolumeLatch = false;
 let subtitlesHidden = false;
 
 function showHiddenSubtitles() {
@@ -3573,16 +3988,26 @@ function showHiddenSubtitles() {
   send("subtitleVisibility", 1);
 }
 
-volumeButton.addEventListener("click", () => {
-  noteChromeActivity();
-  if (state.volumeLevel > 0) {
-    preMuteVolumeLevel = state.volumeLevel;
+const currentVolumeOrDefault = () =>
+  typeof state.volumeLevel === "number" && Number.isFinite(state.volumeLevel)
+    ? clampVolumeLevel(state.volumeLevel)
+    : 1.0;
+
+const toggleVolumeMute = () => {
+  const currentLevel = currentVolumeOrDefault();
+  if (currentLevel > 0) {
+    preMuteVolumeLevel = currentLevel;
     state.volumeLevel = 0;
   } else {
     state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
   }
   syncVolumeControl();
   send("volumeChangeTemporary", state.volumeLevel);
+};
+
+volumeButton.addEventListener("click", () => {
+  noteChromeActivity(true);
+  toggleVolumeMute();
 });
 
 timeLabel.addEventListener("click", () => {
@@ -3596,7 +4021,20 @@ window.playerUpdate = update => {
   const positionMs = Math.round((Number(update.position) || 0) * 1000);
   const bufferedPositionMs = Math.round((Number(update.bufferedPosition) || 0) * 1000);
   const reportedVolumeLevel = Number(update.volumeLevel);
-  const volumeLevel = Number.isFinite(reportedVolumeLevel)
+  const fading = Boolean(state.sleepTimerFading);
+  let acceptReportedVolume = !fading && !sleepFadeVolumeLatch;
+  if (sleepFadeVolumeLatch && !fading && Number.isFinite(reportedVolumeLevel)) {
+    // The fade puts back the level on screen, including a mute. The level from before mute is not this.
+    const listenerLevel = typeof state.volumeLevel === "number" ? state.volumeLevel : null;
+    if (
+      listenerLevel !== null &&
+      Math.abs(clampVolumeLevel(reportedVolumeLevel) - clampVolumeLevel(listenerLevel)) < 0.05
+    ) {
+      sleepFadeVolumeLatch = false;
+      acceptReportedVolume = true;
+    }
+  }
+  const volumeLevel = acceptReportedVolume && Number.isFinite(reportedVolumeLevel)
     ? clampVolumeLevel(reportedVolumeLevel)
     : state.volumeLevel;
   const audioTracks = normalizeTracks(update.audioTracks);
@@ -3635,7 +4073,7 @@ window.playerUpdate = update => {
     appliedRememberedVolume = true;
     syncVolumeControl();
   }
-  if (typeof volumeLevel === "number" && volumeLevel > 0) {
+  if (acceptReportedVolume && typeof volumeLevel === "number" && volumeLevel > 0) {
     preMuteVolumeLevel = volumeLevel;
   }
   if (subtitleTracksChanged && activeModal === "subtitles") {
@@ -3654,8 +4092,151 @@ window.playerUpdate = update => {
   }
 };
 
+const handleNativeModalNavigation = action => {
+  if (!activeModal) return;
+  noteChromeActivity(true);
+  if (activeModal === "sources" && sourceVirtualRenderRaf) {
+    window.cancelAnimationFrame(sourceVirtualRenderRaf);
+    renderSourceVirtualRows();
+  }
+  const modalEl = getActiveModalElement();
+  if (!modalEl) return;
+
+  if (action === "select") {
+    const active = document.activeElement;
+    if (active && modalEl.contains(active) && !active.disabled && !active.hidden && (active.offsetWidth > 0 || active.offsetHeight > 0)) {
+      active.click();
+      return;
+    }
+    const stored = resolveStoredModalFocusElement(modalEl);
+    if (stored) {
+      stored.focus({ preventScroll: true });
+      stored.click();
+      return;
+    }
+    const preferred =
+      modalEl.querySelector('.subtitle-language-row.selected:not([disabled]):not([hidden]), .track-row.selected:not([disabled]):not([hidden]), button.primary:not([disabled]):not([hidden])') ||
+      modalEl.querySelector('button:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])');
+    if (preferred && (preferred.offsetWidth > 0 || preferred.offsetHeight > 0)) {
+      preferred.focus();
+      preferred.click();
+    }
+    return;
+  }
+
+  if ((activeModal === "episodes" || activeModal === "sources") && (action === "left" || action === "right")) {
+    const chips = Array.from(modalEl.querySelectorAll('.filter-chip:not([hidden])')).filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+    if (chips.length > 0) {
+      let selectedIndex = chips.findIndex(el => el.classList.contains('selected'));
+      if (selectedIndex === -1) selectedIndex = 0;
+      const nextIndex = action === "right"
+        ? (selectedIndex < chips.length - 1 ? selectedIndex + 1 : 0)
+        : (selectedIndex > 0 ? selectedIndex - 1 : chips.length - 1);
+      if (nextIndex !== selectedIndex) {
+        chips[nextIndex].focus();
+        chips[nextIndex].click();
+      }
+      return;
+    }
+  }
+
+  if (activeModal === "audio" && (action === "up" || action === "down")) {
+    if (state.audioTracks && state.audioTracks.length > 0) {
+      const currentIndex = state.audioTracks.findIndex(t => t.selected);
+      const nextIndex = action === "up"
+        ? (currentIndex > 0 ? currentIndex - 1 : state.audioTracks.length - 1)
+        : (currentIndex >= 0 && currentIndex < state.audioTracks.length - 1 ? currentIndex + 1 : 0);
+      if (nextIndex !== currentIndex && nextIndex >= 0) {
+        send("selectAudioTrack", trackIdValue(state.audioTracks[nextIndex]));
+      }
+    }
+    return;
+  }
+
+  if (activeModal === "speed" && (action === "up" || action === "down")) {
+    const currentSpeedStr = String(state.playbackSpeedLabel || "1x");
+    let currentIndex = pendingSpeedIndex !== null ? pendingSpeedIndex : speedOptions.findIndex(o => currentSpeedStr.startsWith(o.label.split(" ")[0]));
+    if (currentIndex >= 0) {
+      currentIndex = action === "up"
+        ? (currentIndex > 0 ? currentIndex - 1 : speedOptions.length - 1)
+        : (currentIndex < speedOptions.length - 1 ? currentIndex + 1 : 0);
+      pendingSpeedIndex = currentIndex;
+      window.clearTimeout(pendingSpeedTimer);
+      pendingSpeedTimer = window.setTimeout(() => pendingSpeedIndex = null, 1000);
+      queueSettingToast("speed");
+      send("setPlaybackSpeed", speedOptions[currentIndex].value);
+    }
+    return;
+  }
+
+  const focusable = getModalFocusableElements(modalEl);
+  if (!focusable.length) return;
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const storedEl = activeIndex >= 0 ? null : resolveStoredModalFocusElement(modalEl, focusable);
+  const storedIndex = storedEl ? focusable.indexOf(storedEl) : -1;
+  const currentIndex = activeIndex >= 0 ? activeIndex : storedIndex;
+  const baseIndex = currentIndex >= 0
+    ? currentIndex
+    : focusable.findIndex(el => el.classList.contains('selected'));
+  const startIndex = baseIndex >= 0 ? baseIndex : 0;
+  const nextIndex = (action === "down" || action === "right")
+    ? (currentIndex >= 0 || baseIndex >= 0 ? (startIndex + 1) % focusable.length : 0)
+    : (currentIndex >= 0 || baseIndex >= 0 ? (startIndex > 0 ? startIndex - 1 : focusable.length - 1) : focusable.length - 1);
+  const nextEl = focusable[nextIndex];
+  activeModalFocusKey = nextEl.dataset.navKey || "";
+  activeModalFocusIndex = nextIndex;
+  nextEl.focus();
+  if (typeof nextEl.scrollIntoView === "function") {
+    nextEl.scrollIntoView({ block: "nearest" });
+  }
+};
+
+const sleepClockFields = new Set([
+  "sleepTimerRemainingLabel",
+  "isPlaying",
+  "isLoading",
+  "durationMs",
+  "positionMs",
+  "bufferedPositionMs",
+  "volumeLevel",
+]);
+
+const sameControlValue = (left, right) => {
+  if (Object.is(left, right)) return true;
+  if (typeof left === "number" && typeof right === "number") {
+    return left === right || (Number.isNaN(left) && Number.isNaN(right));
+  }
+  if (left == null || right == null || typeof left !== "object" || typeof right !== "object") return false;
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch (error) {
+    return false;
+  }
+};
+
+// The countdown changes every second. Rebuilding the open menus for that tick steals focus.
+const onlySleepClockChanged = (current, next) => {
+  if (!next || typeof next !== "object") return false;
+  const keys = Object.keys(next);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (sleepClockFields.has(key)) continue;
+    if (!sameControlValue(current[key], next[key])) return false;
+  }
+  return !sameControlValue(current.sleepTimerRemainingLabel, next.sleepTimerRemainingLabel);
+};
+
 window.playerControls = nextState => {
+  if (hasReceivedPlayerControls && onlySleepClockChanged(state, nextState)) {
+    state = {
+      ...state,
+      sleepTimerRemainingLabel: nextState.sleepTimerRemainingLabel || "",
+    };
+    setText(sleepRemaining, state.sleepTimerRemainingLabel || "");
+    return;
+  }
   const previousCloseToken = Number(state.closeModalsToken) || 0;
+  const previousModalNavToken = Number(state.modalNavigationToken) || 0;
   const previousSubmitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
   const previousNotificationToken = Number(state.notificationToken) || 0;
   const previousResizeLabel = state.resizeModeLabel || "";
@@ -3669,21 +4250,37 @@ window.playerControls = nextState => {
     ? state.isPlaying
     : pendingIsPlaying;
   const currentVolumeLevel = hasReceivedPlayerControls ? state.volumeLevel : undefined;
+  const wasFading = Boolean(state.sleepTimerFading);
+  const incomingControlsVisible = Boolean(nextState.controlsVisible);
+  const kotlinControlsVisibleChanged =
+    !hasReceivedPlayerControls || incomingControlsVisible !== lastKotlinControlsVisible;
+  lastKotlinControlsVisible = incomingControlsVisible;
+  const resolvedControlsVisible = kotlinControlsVisibleChanged
+    ? incomingControlsVisible
+    : Boolean(state.controlsVisible);
   state = {
     ...state,
     ...nextState,
+    controlsVisible: resolvedControlsVisible,
     isPlaying: currentPlaybackState,
     volumeLevel: currentVolumeLevel ?? nextState.volumeLevel,
   };
-  if (typeof state.volumeLevel === "number" && state.volumeLevel > 0) {
+  if (wasFading && !state.sleepTimerFading) {
+    sleepFadeVolumeLatch = true;
+  }
+  if (!state.sleepTimerFading && !sleepFadeVolumeLatch && typeof state.volumeLevel === "number" && state.volumeLevel > 0) {
     preMuteVolumeLevel = state.volumeLevel;
   }
   hasReceivedPlayerControls = true;
   const closeToken = Number(state.closeModalsToken) || 0;
+  const modalNavToken = Number(state.modalNavigationToken) || 0;
   const submitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
   if (closeToken !== previousCloseToken) {
     closePlayerModal();
   }
+  const pendingModalNavAction = (modalNavToken !== previousModalNavToken && activeModal && state.modalNavigationAction)
+    ? state.modalNavigationAction
+    : "";
   if (submitIntroSuccessToken !== previousSubmitIntroSuccessToken) {
     submitIntroDraft.segmentType = "intro";
     submitIntroDraft.startTime = "00:00";
@@ -3711,6 +4308,9 @@ window.playerControls = nextState => {
   }
   const preventModalAutoScrolling = activeModal === "sources" || activeModal === "episodes";
   render(preventModalAutoScrolling);
+  if (pendingModalNavAction && activeModal) {
+    handleNativeModalNavigation(pendingModalNavAction);
+  }
   if (pendingSettingToastCommand === "resize" && (state.resizeModeLabel || "") !== previousResizeLabel) {
     pendingSettingToastCommand = "";
     showPlayerToast(settingToastLabel("resize"), { icon: "icon-aspect" });
@@ -3769,19 +4369,6 @@ const clearSuppressNextRootClick = () => {
   if (suppressClickTimer) {
     window.clearTimeout(suppressClickTimer);
     suppressClickTimer = null;
-  }
-};
-
-window.nuvioNativeViewportChanged = () => {
-  root.classList.add("native-resizing");
-};
-
-window.nuvioNativeResizeEnded = () => {
-  pipPointerDown = false;
-  clearSuppressNextRootClick();
-  root.classList.remove("native-resizing");
-  if (document.body.style.cursor && document.body.style.cursor.includes("resize")) {
-    document.body.style.cursor = "";
   }
 };
 
@@ -3883,7 +4470,7 @@ root.addEventListener("contextmenu", event => {
 });
 
 root.addEventListener("pointerdown", event => {
-  if (!canSpeedBoostStart() || state.isInPip || playbackErrorText() || isControlsSurfaceEvent(event)) return;
+  if (!canSpeedBoostStart() || state.isInPip || state.isInMiniPlayer || playbackErrorText() || isControlsSurfaceEvent(event)) return;
   if (event.button !== 0) return;
 
   rootPointerStartX = event.clientX;
@@ -3979,6 +4566,13 @@ window.addEventListener("blur", () => {
 
 root.addEventListener("click", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (suppressNextRootClick) {
     clearSuppressNextRootClick();
@@ -4037,6 +4631,13 @@ if (pipLockBadge) {
 
 root.addEventListener("dblclick", event => {
   if (event.button !== 0) return;
+  if (state.isInMiniPlayer) {
+    event.preventDefault();
+    event.stopPropagation();
+    window.clearTimeout(tapTimer);
+    send("restoreMiniPlayer", 0);
+    return;
+  }
   if (isPipLocked) return;
   if (playbackErrorText() || isControlsSurfaceEvent(event)) return;
   event.preventDefault();
@@ -4049,31 +4650,28 @@ root.addEventListener("dblclick", event => {
 });
 
 root.addEventListener("wheel", event => {
-  if (playbackErrorText() || activeModal) return;
+  if (state.isInMiniPlayer || playbackErrorText() || activeModal) return;
   const isProgressTarget = Boolean(event.target.closest("#seek, .time-row, .time-pill, .scrub"));
+  const delta = event.deltaY !== 0 ? Math.sign(event.deltaY) * -1 : Math.sign(event.deltaX);
+  if (delta === 0) return;
+  event.preventDefault();
+  noteChromeActivity();
   if (isProgressTarget || event.shiftKey) {
-    event.preventDefault();
-    noteChromeActivity();
-    const delta = event.deltaY !== 0 ? Math.sign(event.deltaY) * -1 : Math.sign(event.deltaX);
-    if (delta !== 0) {
-      fineSeek(delta > 0);
-    }
+    fineSeek(delta > 0, 5000);
     return;
   }
-  event.preventDefault();
-  const delta = Math.sign(event.deltaY) * -1;
-  if (delta !== 0) {
-    sendKeyboardVolume(delta);
-  }
+  sendKeyboardVolume(delta);
 }, { passive: false });
 
 document.addEventListener("keyup", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Alt" || event.key === "Control" || event.key === "Meta" || event.metaKey || event.ctrlKey || event.altKey) {
     clearSpaceHoldTimerAndStopSpeedBoost();
     return;
   }
   if (event.code === "Space") {
     if (clearSpaceHoldTimerAndStopSpeedBoost()) return;
+    if (playbackErrorText()) return;
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     if (activeModal || isTextEntryTarget(event.target)) return;
     event.preventDefault();
@@ -4083,7 +4681,12 @@ document.addEventListener("keyup", event => {
   }
 });
 
+const isSkipPromptShown = () =>
+  Boolean(skipPrompt && skipPrompt.classList.contains("visible")) ||
+  Boolean(state.skipPromptVisible && !state.skipPromptDismissed && !skipPromptAutoHidden);
+
 document.addEventListener("keydown", event => {
+  if (state.isInMiniPlayer) return;
   if (event.key === "Escape" && isPartyConfirmOpen()) {
     event.preventDefault();
     closePartyConfirm();
@@ -4123,6 +4726,19 @@ document.addEventListener("keydown", event => {
     return;
   }
   if (isTextEntryTarget(event.target)) {
+    return;
+  }
+
+  const isShortcutsToggleKey = event.key === "?" || (event.code === "Slash" && event.shiftKey);
+  if (isShortcutsToggleKey) {
+    clearSpaceHoldTimerAndStopSpeedBoost();
+    event.preventDefault();
+    if (activeModal === "shortcuts") {
+      closePlayerModal(true);
+      focusShortcutRoot();
+    } else {
+      openPlayerModal("shortcuts");
+    }
     return;
   }
 
@@ -4236,13 +4852,19 @@ document.addEventListener("keydown", event => {
     return;
   }
 
+  if (event.code === "KeyZ" && !event.shiftKey) {
+    event.preventDefault();
+    if (activeModal === "sleep") closePlayerModal(true);
+    else openPlayerModal("sleep");
+    return;
+  }
   if (event.code === "KeyA") {
     event.preventDefault();
     if (activeModal === "audio") closePlayerModal(true);
     else openPlayerModal("audio");
     return;
   }
-  if (event.code === "KeyS") {
+  if (event.code === "KeyC") {
     event.preventDefault();
     if (activeModal === "subtitles") closePlayerModal(true);
     else openPlayerModal("subtitles");
@@ -4275,7 +4897,15 @@ document.addEventListener("keydown", event => {
     return;
   }
 
-  if (event.code === "Enter" && state.skipPromptVisible) {
+  if (event.code === "KeyS") {
+    if (isSkipPromptShown()) {
+      event.preventDefault();
+      focusShortcutRoot();
+      send("skipInterval", 0);
+    }
+    return;
+  }
+  if (event.code === "Enter" && isSkipPromptShown()) {
     const activeEl = document.activeElement;
     if (!activeEl || activeEl.tagName === "BODY" || activeEl === root) {
       event.preventDefault();
@@ -4283,7 +4913,7 @@ document.addEventListener("keydown", event => {
       return;
     }
   }
-  if (event.shiftKey && event.code === "KeyN") {
+  if (event.code === "KeyN") {
     event.preventDefault();
     send("playNextEpisode", 0);
     return;
@@ -4333,14 +4963,7 @@ document.addEventListener("keydown", event => {
   }
   if (event.code === "KeyM") {
     event.preventDefault();
-    if (state.volumeLevel > 0) {
-      preMuteVolumeLevel = state.volumeLevel;
-      state.volumeLevel = 0;
-    } else {
-      state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
-    }
-    syncVolumeControl();
-    send("volumeChangeTemporary", state.volumeLevel);
+    toggleVolumeMute();
     showPlayerToast(volumeToastLabel(0), { icon: state.volumeLevel > 0 ? "icon-volume" : "icon-volume-muted" });
     return;
   }
@@ -4394,7 +5017,7 @@ document.addEventListener("keydown", event => {
     }
     return;
   }
-  if (event.code === "Slash") {
+  if (!event.shiftKey && event.code === "Slash") {
     event.preventDefault();
     pendingSpeedIndex = speedOptions.findIndex(o => o.value === 1.0);
     window.clearTimeout(pendingSpeedTimer);
@@ -4404,8 +5027,12 @@ document.addEventListener("keydown", event => {
     return;
   }
 
-  if (canSpeedBoostStart() && event.code === "Space") {
+  if (event.code === "Space") {
     event.preventDefault();
+    focusShortcutRoot();
+    if (!canSpeedBoostStart()) {
+      return;
+    }
     if (event.repeat) {
       if (!isSpeedBoosting) {
         isSpaceBoosting = true;

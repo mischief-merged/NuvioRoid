@@ -16,14 +16,16 @@ internal class UsageResult(
 /**
  * Measures what downloads really take on disk: the sizes of the files of finished and unfinished
  * downloads, partial files and companion files included, not the sizes that were announced. Only files
- * that belong to a download in the list are counted. The result is cached; [current] measures again when
- * the set of downloads or a location's state changed, while transfers run at most every [whileRunningMs],
- * and at most [maxAgeMs] apart. It must be called off the interface thread.
+ * that belong to a download in the list are counted. The result is cached. [current] measures again when
+ * the set of downloads or a location's state changed, or when [invalidate] was called because a transfer
+ * finished or a move ended. While someone is watching sizes and a transfer is running, it also measures
+ * again after [whileRunningMs]. Otherwise it measures again only after [maxAgeMs], so an idle caller
+ * does not walk the folder more than once a minute. It must be called off the interface thread.
  */
 internal class DownloadStorageUsage(
     private val locations: DownloadLocations,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val whileRunningMs: Long = 5_000L,
+    private val whileRunningMs: Long = 30_000L,
     private val maxAgeMs: Long = 60_000L,
     private val timeoutMs: Long = 5_000L,
 ) {
@@ -42,8 +44,17 @@ internal class DownloadStorageUsage(
         forced = true
     }
 
+    /**
+     * [watching] is true while the downloads screen (or the folder setting) is open. A running
+     * transfer then refreshes sizes every [whileRunningMs]. With it false, progress alone never
+     * walks the folder.
+     */
     @Synchronized
-    fun current(items: List<DownloadItem>, availability: Map<String, FolderAvailability>): UsageResult {
+    fun current(
+        items: List<DownloadItem>,
+        availability: Map<String, FolderAvailability>,
+        watching: Boolean = false,
+    ): UsageResult {
         val print = listOf(
             items.map { listOf(it.id, it.status, it.locationId, it.localFileUri, it.fileName) },
             availability.toSortedMap().toList(),
@@ -51,7 +62,8 @@ internal class DownloadStorageUsage(
         val now = clock()
         val running = items.any { it.status == DownloadStatus.Downloading }
         val due = cached == null || forced || print != fingerprint ||
-            now - cachedAt >= maxAgeMs || (running && now - cachedAt >= whileRunningMs)
+            now - cachedAt >= maxAgeMs ||
+            (watching && running && now - cachedAt >= whileRunningMs)
         if (due) {
             cached = measure(items, availability)
             cachedAt = now
@@ -66,7 +78,9 @@ internal class DownloadStorageUsage(
         val result = mutableMapOf<String, LocationUsage>()
         var auto = 0L
         val byLocation = items.groupBy { locations.locationOfRecord(it.locationId, it.localFileUri).id }
-        locations.all().forEach { location ->
+        val currentLocations = locations.all()
+        lastKnown.keys.retainAll(currentLocations.map { it.id }.toSet())
+        currentLocations.forEach { location ->
             val members = byLocation[location.id].orEmpty()
             if (availability[location.id] != FolderAvailability.Available) {
                 // Away: the size it had when it was last seen, or what the records say.
@@ -74,7 +88,7 @@ internal class DownloadStorageUsage(
                 result[location.id] = LocationUsage(known, lastKnown = true)
                 return@forEach
             }
-            val sizes = FsGuard.call(timeoutMs, null) { sizesIn(location.path, members) }
+            val sizes = FsGuard.call(timeoutMs, null) { sizesIn(location.id, location.path, members) }
             if (sizes == null) {
                 result[location.id] = LocationUsage(lastKnown[location.id] ?: members.sumOf { it.moveBytes }, lastKnown = true)
             } else {
@@ -88,15 +102,21 @@ internal class DownloadStorageUsage(
     }
 
     /** Size on disk of each item of [members] that lives in [root]: one listing of the folder serves all of them. */
-    private fun sizesIn(root: Path, members: List<DownloadItem>): Map<String, Long> {
+    private fun sizesIn(locationId: String, root: Path, members: List<DownloadItem>): Map<String, Long> {
         val listing = runCatching { Files.list(root).use { it.toList() } }.getOrDefault(emptyList())
             .associateBy { it.fileName.toString() }
         return members.associate { item ->
             val video = item.localFileUri?.let(DownloadLocations::fileOfUri)?.name ?: item.fileName
-            val own = if (item.status == DownloadStatus.Completed) video else item.fileName + ".part"
+            val own = if (item.status == DownloadStatus.Completed) video else item.activePartialFileName
             var total = sizeOf(listing[own])
             if (item.status == DownloadStatus.Completed) {
                 total += sizeOf(listing[DownloadSidecarFiles.sidecarFolderName(video)])
+            } else {
+                item.supersededPartials.forEach { kept ->
+                    if (kept.locationId == null || kept.locationId == locationId) {
+                        total += sizeOf(listing[kept.fileName])
+                    }
+                }
             }
             item.id to total
         }

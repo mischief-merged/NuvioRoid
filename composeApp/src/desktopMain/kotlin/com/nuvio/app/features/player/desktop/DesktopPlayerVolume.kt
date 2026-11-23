@@ -11,3 +11,14 @@ internal fun resolveDesktopPlayerVolumeLevel(
     rememberedLevel: Float,
 ): Float =
     (requestedLevel ?: currentLevel ?: rememberedLevel).coerceDesktopPlayerVolumeLevel()
+
+/**
+ * Output level for one step of a sleep-timer fade.
+ * Scales [audibleLevel], the level being heard now. A mute is zero and stays zero.
+ * [rememberedLevel] is the slider, including the level from before a mute, and is not the fade base.
+ */
+internal fun sleepTimerFadeOutputLevel(
+    audibleLevel: Float,
+    rememberedLevel: Float,
+    fraction: Float,
+): Float = (audibleLevel * fraction.coerceIn(0f, 1f)).coerceDesktopPlayerVolumeLevel()

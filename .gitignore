@@ -22,6 +22,9 @@ node_modules/
 logs/
 analysis/
 Docs
+!/docs/
+/docs/*
+!/docs/RELEASING.md
 SUPPORTER_COSMETICS.md
 supabase/migrations/
 keystore/

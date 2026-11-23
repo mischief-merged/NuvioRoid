@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -47,6 +48,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.controller.RegisterControllerVerticalScroll
 import com.nuvio.app.isDesktop
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioBackButton
@@ -92,6 +94,7 @@ fun TmdbEntityBrowseScreen(
     var uiState by remember(entityKind, entityId) {
         mutableStateOf<EntityBrowseUiState>(EntityBrowseUiState.Loading)
     }
+    var loadAttempt by remember(entityKind, entityId) { mutableIntStateOf(0) }
     val watchedUiState by remember {
         WatchedRepository.ensureLoaded()
         WatchedRepository.uiState
@@ -99,22 +102,26 @@ fun TmdbEntityBrowseScreen(
     val fullyWatchedSeriesKeys by WatchedRepository.fullyWatchedSeriesKeys.collectAsStateWithLifecycle()
     val loadFailedMessage = stringResource(Res.string.details_browse_load_failed, entityName)
 
-    LaunchedEffect(entityKind, entityId) {
+    LaunchedEffect(detailLoadKey("$entityKind:$entityId", loadAttempt)) {
         uiState = EntityBrowseUiState.Loading
-        val data = TmdbMetadataService.fetchEntityBrowse(
-            entityKind = entityKind,
-            entityId = entityId,
-            sourceType = sourceType,
-            fallbackName = entityName,
-        )
-        uiState = if (data != null) {
-            val pattern = com.nuvio.app.core.poster.CustomPosterUrlRepository.let { repo ->
-                repo.ensureLoaded()
-                repo.patternForScreen(com.nuvio.app.core.poster.CustomPosterScreen.DETAILS)
+        when (
+            val outcome = loadOrFail(loadAttempt, loadFailedMessage) {
+                TmdbMetadataService.fetchEntityBrowse(
+                    entityKind = entityKind,
+                    entityId = entityId,
+                    sourceType = sourceType,
+                    fallbackName = entityName,
+                )
             }
-            EntityBrowseUiState.Success(data.withCustomPosterUrls(pattern))
-        } else {
-            EntityBrowseUiState.Error(loadFailedMessage)
+        ) {
+            is DetailLoadOutcome.Ready -> {
+                val pattern = com.nuvio.app.core.poster.CustomPosterUrlRepository.let { repo ->
+                    repo.ensureLoaded()
+                    repo.patternForScreen(com.nuvio.app.core.poster.CustomPosterScreen.DETAILS)
+                }
+                uiState = EntityBrowseUiState.Success(outcome.value.withCustomPosterUrls(pattern))
+            }
+            is DetailLoadOutcome.Failed -> uiState = EntityBrowseUiState.Error(outcome.message)
         }
     }
 
@@ -127,7 +134,7 @@ fun TmdbEntityBrowseScreen(
                 is EntityBrowseUiState.Loading -> EntityBrowseSkeleton()
                 is EntityBrowseUiState.Error -> EntityBrowseError(
                     message = state.message,
-                    onRetry = { uiState = EntityBrowseUiState.Loading },
+                    onRetry = { loadAttempt = nextDetailAttempt(loadAttempt) },
                 )
                 is EntityBrowseUiState.Success -> EntityBrowseContent(
                     data = state.data,
@@ -240,10 +247,12 @@ private fun EntityBrowseContent(
                 }
             } else {
                 val scrollState = rememberScrollState()
+                val scrollViewportModifier = RegisterControllerVerticalScroll(scrollState = scrollState)
                 Box(modifier = Modifier.fillMaxSize()) {
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
+                            .then(scrollViewportModifier)
                             .verticalScroll(scrollState)
                             .windowInsetsPadding(WindowInsets.statusBars)
                             .padding(top = 56.dp),
@@ -325,6 +334,7 @@ private fun WideEntityBrowseContent(
             }
         } else {
             val scrollState = rememberScrollState()
+            val scrollViewportModifier = RegisterControllerVerticalScroll(scrollState = scrollState)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -333,6 +343,7 @@ private fun WideEntityBrowseContent(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
+                        .then(scrollViewportModifier)
                         .verticalScroll(scrollState)
                         .padding(start = 40.dp, bottom = 40.dp),
                     verticalArrangement = Arrangement.spacedBy(34.dp),

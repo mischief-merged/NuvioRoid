@@ -11,8 +11,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.nuvio.app.core.time.isEpisodeReleaseAired
+import com.nuvio.app.features.details.EpisodeAvailability
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.details.availability
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.episodes_unavailable
 import org.jetbrains.compose.resources.stringResource
@@ -20,9 +21,11 @@ import org.jetbrains.compose.resources.stringResource
 @Composable
 internal fun EpisodeAvailabilityBadge(
     video: MetaVideo,
+    isOffline: Boolean = false,
+    isAvailableOffline: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    if (video.available && isEpisodeReleaseAired(video.released) != false) return
+    if (video.availability(offline = isOffline, hasLocalDownload = isAvailableOffline) == EpisodeAvailability.Playable) return
 
     Text(
         text = stringResource(Res.string.episodes_unavailable).uppercase(),

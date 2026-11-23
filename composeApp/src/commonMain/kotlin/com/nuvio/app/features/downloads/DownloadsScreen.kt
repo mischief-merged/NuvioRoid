@@ -10,17 +10,20 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -28,7 +31,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -50,22 +58,29 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.network.NetworkStatusRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.compose.resources.StringResource
+import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import com.nuvio.app.core.ui.NuvioActionLabel
 import com.nuvio.app.core.ui.NuvioScreen
 import com.nuvio.app.core.ui.NuvioScreenHeader
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.core.ui.PlatformBackHandler
+import com.nuvio.app.core.ui.PlatformModalBackHandler
+import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.LocalOpenSettingsPage
 import com.nuvio.app.features.settings.SettingsPage
+import com.nuvio.app.features.settings.SettingsSectionFocus
+import com.nuvio.app.features.watched.WatchedRepository
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.pluralStringResource
@@ -75,6 +90,7 @@ import org.jetbrains.compose.resources.stringResource
 fun DownloadsScreen(
     onBack: () -> Unit,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     initialShowId: String? = null,
     onNavigateToShow: ((showId: String, title: String) -> Unit)? = null,
     onBackFromShow: (() -> Unit)? = null,
@@ -99,6 +115,7 @@ fun DownloadsScreen(
     DownloadsScreenContent(
         onBack = onBack,
         onOpenDownload = onOpenDownload,
+        onOpenDetails = onOpenDetails,
         initialShowId = initialShowId,
         onNavigateToShow = onNavigateToShow,
         onBackFromShow = onBackFromShow,
@@ -111,6 +128,7 @@ fun DownloadsScreen(
         onOpenShowDetails = onOpenShowDetails,
         episodeLinks = episodeLinks,
         rechecks = DownloadRechecks.app,
+        sourceSearches = SourceReplacements.progress,
     )
 }
 
@@ -118,6 +136,7 @@ fun DownloadsScreen(
 internal fun DownloadsScreenContent(
     onBack: () -> Unit,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     initialShowId: String? = null,
     onNavigateToShow: ((showId: String, title: String) -> Unit)? = null,
     onBackFromShow: (() -> Unit)? = null,
@@ -144,11 +163,34 @@ internal fun DownloadsScreenContent(
     rechecks: DownloadRechecks? = null,
     /** Whether downloads wait because the connection is limited. */
     connectionHold: ConnectionHold = LimitedConnections.hold,
+    /** Overrides the library custom poster pattern. Null reads from CustomPosterUrlRepository. */
+    posterPatternOverride: String? = null,
+    /** Whether downloads are slowed down to leave the connection to other apps. */
+    politeState: kotlinx.coroutines.flow.StateFlow<PoliteState> = PoliteDownloadsHost.state,
+    /**
+     * The app's own searches for another source, by title. Null where the app does not look for another
+     * source by itself: a bad source then offers only the user's own choices.
+     */
+    sourceSearches: kotlinx.coroutines.flow.StateFlow<Map<String, SourceSearchProgress>>? = null,
+    runtimeMinutes: (DownloadItem) -> Int? = ::runtimeMinutesOfDownload,
+    tripDeps: TripReadyDeps = TripReadyDeps(),
+    nowEpochMs: () -> Long = { DownloadsClock.nowEpochMs() },
 ) {
     val uiState by remember {
-        DownloadsRepository.ensureLoaded()
-        DownloadsRepository.uiState
+        DownloadsRepository.ensureLoadedForDisplay()
+        DownloadsRepository.uiState.map { it.withoutProgress() }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = DownloadsRepository.uiState.value.withoutProgress())
+    val watchProgressState by remember {
+        WatchProgressRepository.ensureLoaded()
+        WatchProgressRepository.uiState
     }.collectAsStateWithLifecycle()
+    val watchedState by remember {
+        WatchedRepository.ensureLoaded()
+        WatchedRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val watchStatusOf = remember(watchProgressState, watchedState) {
+        { item: DownloadItem -> item.watchStatus(watchProgressState) }
+    }
     val checkScope = rememberCoroutineScope()
     val checkClearText = stringResource(Res.string.downloads_check_all_clear)
     val checkNothingText = stringResource(Res.string.downloads_check_all_nothing)
@@ -157,25 +199,26 @@ internal fun DownloadsScreenContent(
     LaunchedEffect(rechecks) {
         rechecks?.checkOnScreen(DownloadsRepository.uiState.value.items)
     }
-    val checkAgain: ((DownloadItem) -> Unit)? = rechecks?.let { checks ->
-        { item: DownloadItem -> checkScope.launch { checks.checkAgain(item) } }
+    val checkAgain: ((DownloadItem) -> Unit)? = remember(rechecks, checkScope) {
+        rechecks?.let { checks -> { item: DownloadItem -> checkScope.launch { checks.checkAgain(item) }; Unit } }
     }
     LaunchedEffect(uiState.completedItems.size) {
         DownloadsRepository.markCompletedSeen()
     }
     val network by NetworkStatusRepository.uiState.collectAsStateWithLifecycle()
     val scheduledRemovals by (autoDownloads?.removals ?: NoScheduledRemovals).collectAsStateWithLifecycle()
+    val keptDownloadIds by (autoDownloads?.keptDownloadIds ?: NoKeptDownloads).collectAsStateWithLifecycle()
     val removalByDownload = remember(scheduledRemovals) { scheduledRemovals.associateBy { it.downloadId } }
     val activeProfileId = ProfileRepository.activeProfileId
     val anyDownloading = uiState.items.any { it.status == DownloadStatus.Downloading }
     val needsClock = anyDownloading || removalByDownload.isNotEmpty()
     // Read again every few seconds while something downloads, so a transfer that went silent shows it,
     // and while a deletion is waiting, so the hours left stay right.
-    val now by produceState(initialValue = DownloadsClock.nowEpochMs(), needsClock) {
-        value = DownloadsClock.nowEpochMs()
+    val now = produceState(initialValue = nowEpochMs(), needsClock) {
+        value = nowEpochMs()
         while (needsClock) {
             delay(StatusRefreshMs)
-            value = DownloadsClock.nowEpochMs()
+            value = nowEpochMs()
         }
     }
     val folderState by folders.state.collectAsStateWithLifecycle()
@@ -187,32 +230,71 @@ internal fun DownloadsScreenContent(
     // A file the user picked for a download without one, waiting for the user to confirm it.
     var locatePick by remember { mutableStateOf<Pair<DownloadItem, String>?>(null) }
     val locateScope = rememberCoroutineScope()
-    var permanentDeletionId by remember { mutableStateOf<String?>(null) }
+    var scanningDisk by remember { mutableStateOf(false) }
+    val canScanDisk = folders.supported || DownloadsRepository.canScanDisk()
     // Looking at the volumes can take a while on a drive that is failing, so never on this thread.
+    DisposableEffect(folders) {
+        if (folders.supported) folders.setUsageWatched(true)
+        onDispose { if (folders.supported) folders.setUsageWatched(false) }
+    }
     LaunchedEffect(folders) { if (folders.supported) withContext(Dispatchers.Default) { folders.refresh() } }
-    val extras = if (folders.supported) {
-        RowExtras(
-            folderState = folderState,
-            locationIdOf = folders::locationIdOf,
-            selecting = selecting,
-            selected = selectedIds,
-            onToggleSelected = { ids ->
-                selectedIds = if (ids.all { it in selectedIds }) selectedIds - ids else selectedIds + ids
-            },
-            onMove = { ids -> moveRequest = MoveRequest.MoveItems(ids) },
-            onChooseLocation = { chooseLocationFor = it },
-            onLocateFile = { item ->
-                locateScope.launch {
-                    val picked = withContext(Dispatchers.Default) { folders.pickFile() }
-                    if (picked != null) locatePick = item to picked
-                }
-            },
-        )
-    } else {
-        null
+    val extras = remember(folders, folderState, selecting, selectedIds) {
+        if (folders.supported) {
+            RowExtras(
+                folderState = folderState,
+                locationIdOf = folders::locationIdOf,
+                selecting = selecting,
+                selected = selectedIds,
+                onToggleSelected = { ids ->
+                    selectedIds = if (ids.all { it in selectedIds }) selectedIds - ids else selectedIds + ids
+                },
+                onMove = { ids -> moveRequest = MoveRequest.MoveItems(ids) },
+                onChooseLocation = { chooseLocationFor = it },
+                onLocateFile = { item ->
+                    locateScope.launch {
+                        val picked = withContext(Dispatchers.Default) { folders.pickFile() }
+                        if (picked != null) locatePick = item to picked
+                    }
+                },
+            )
+        } else {
+            null
+        }
     }
     val holdState by connectionHold.state.collectAsStateWithLifecycle()
-    val clock = RowClock(nowEpochMs = now, offline = network.isOfflineLike, extras = extras, limitedBy = holdState.reason)
+    val polite by politeState.collectAsStateWithLifecycle()
+    val searches = sourceSearches?.collectAsStateWithLifecycle()?.value
+    val onKeep = remember(autoDownloads, activeProfileId) {
+        autoDownloads?.let { controller -> { id: String -> controller.keepDownload(activeProfileId, id) } }
+    }
+    val onUndoKeep = remember(autoDownloads, activeProfileId) {
+        autoDownloads?.let { controller -> { id: String -> controller.undoKeepDownload(activeProfileId, id) } }
+    }
+    val clock = remember(
+        now,
+        runtimeMinutes,
+        network.isOfflineLike,
+        extras,
+        holdState.reason,
+        removalByDownload,
+        keptDownloadIds,
+        onKeep,
+        onUndoKeep,
+        searches,
+    ) {
+        RowClock(
+            nowEpochMs = now,
+            runtimeMinutes = runtimeMinutes,
+            offline = network.isOfflineLike,
+            extras = extras,
+            limitedBy = holdState.reason,
+            removals = removalByDownload,
+            keptDownloadIds = keptDownloadIds,
+            onKeep = onKeep,
+            onUndoKeep = onUndoKeep,
+            searches = searches,
+        )
+    }
     // What the list builder needs is read here, in composition, once. A list builder that reads state
     // itself is run again whenever that state changes, also in the middle of a layout pass, which the
     // lazy list does not survive (an item count that changes between two lookups of one pass).
@@ -232,41 +314,137 @@ internal fun DownloadsScreenContent(
         DownloadBandwidth.userCapBytesPerSecond
     }.collectAsStateWithLifecycle()
     val openSettingsPage = LocalOpenSettingsPage.current
+    val openDownloadSettings = openSettingsPage?.let { open ->
+        {
+            SettingsSectionFocus.request(SettingsSectionFocus.PlaybackDownloads)
+            open(SettingsPage.Playback)
+        }
+    }
 
     var selectedShowId by rememberSaveable(initialShowId) { mutableStateOf(initialShowId) }
+    var showingTripReady by rememberSaveable { mutableStateOf(false) }
     var downloadPendingDeletionId by rememberSaveable { mutableStateOf<String?>(null) }
     val openDownloadsDirectoryFailedText = stringResource(Res.string.downloads_open_directory_failed)
     val deleteScope = rememberCoroutineScope()
 
-    val completedEpisodes = remember(uiState.items) {
-        uiState.completedItems
+    val tripReadyActive = showingTripReady && selectedShowId == null
+    val tripController = if (showingTripReady) {
+        val liveUiState by DownloadsRepository.uiState.collectAsStateWithLifecycle()
+        rememberTripReadyController(
+            active = tripReadyActive,
+            uiState = liveUiState,
+            folderState = folderStateNow,
+            locationIdOf = if (folders.supported) folders::locationIdOf else { item -> item.locationId.orEmpty() },
+            addressRequired = folders.supported,
+            holdState = holdState,
+            offline = network.isOfflineLike,
+            nowEpochMs = now.value,
+            rechecks = rechecks,
+            tripDeps = tripDeps,
+        )
+    } else {
+        null
+    }
+
+    val allEpisodes = remember(uiState.items) {
+        uiState.items
             .filter { it.isEpisode }
             .sortedForSeriesDownloads()
     }
 
-    val selectedShowTitle = remember(selectedShowId, completedEpisodes) {
+    val selectedShowTitle = remember(selectedShowId, allEpisodes) {
         selectedShowId?.let { showId ->
-            completedEpisodes.firstOrNull { it.parentMetaId == showId }?.title
+            allEpisodes.firstOrNull { it.parentMetaId == showId }?.title
         }
+    }
+
+    PlatformBackHandler(enabled = selectedShowId != null && onBackFromShow == null) {
+        selectedShowId = null
+    }
+
+    val deleteDownload: (String) -> Unit = remember { { downloadPendingDeletionId = it } }
+    val openShow: (String, String) -> Unit = remember(onNavigateToShow) {
+        { showId, title -> onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId } }
+    }
+    val completedRoot = remember(uiState.completedItems) { CompletedGroups(uiState.completedItems) }
+    val showGroups = remember(allEpisodes, selectedShowId) {
+        allEpisodes.filter { it.parentMetaId == selectedShowId }
+            .groupBy { it.seasonNumber ?: 0 }.toList()
+            .sortedWith(compareBy<Pair<Int, List<DownloadItem>>> { if (it.first == 0) 0 else 1 }.thenBy { it.first })
     }
 
     NuvioScreen {
         stickyHeader {
             NuvioScreenHeader(
-                title = if (selectedShowId == null) {
-                    stringResource(Res.string.compose_settings_root_downloads_title)
-                } else {
-                    selectedShowTitle ?: stringResource(Res.string.downloads_show_downloads)
+                title = when {
+                    selectedShowId != null -> selectedShowTitle ?: stringResource(Res.string.downloads_show_downloads)
+                    showingTripReady -> stringResource(Res.string.downloads_trip_ready_title)
+                    else -> stringResource(Res.string.compose_settings_root_downloads_title)
                 },
                 onBack = {
-                    if (selectedShowId != null) {
-                        onBackFromShow?.invoke() ?: run { selectedShowId = null }
-                    } else {
-                        onBack()
+                    when {
+                        selectedShowId != null -> onBackFromShow?.invoke() ?: run { selectedShowId = null }
+                        showingTripReady -> showingTripReady = false
+                        else -> onBack()
                     }
                 },
                 actions = {
-                    if (extras != null && uiState.completedItems.isNotEmpty()) {
+                    val headerColor = MaterialTheme.nuvio.colors.textPrimary
+                    if (com.nuvio.app.isDesktop) {
+                        FilterChip(
+                            selected = holdState.travel.enabled,
+                            onClick = { connectionHold.updateInBackground { setTravelEnabled(!state.value.travel.enabled) } },
+                            label = { Text(stringResource(if (holdState.travel.enabled) Res.string.travel_mode_on else Res.string.travel_mode_off)) },
+                        )
+                    }
+                    if (selectedShowId == null && !showingTripReady && canScanDisk) {
+                        TextButton(
+                            enabled = !scanningDisk,
+                            onClick = {
+                                scanningDisk = true
+                                checkScope.launch {
+                                    try {
+                                        val controllerScanner = if (folders.supported) folders::scanDownloadsOnDisk else null
+                                        val summary = withContext(Dispatchers.IO) {
+                                            DownloadsRepository.findDownloadsOnDisk(controllerScanner)
+                                        }
+                                        if (folders.supported) {
+                                            withContext(Dispatchers.IO) { folders.refresh() }
+                                        }
+                                        NuvioToastController.show(scanSummaryToast(summary))
+                                    } finally {
+                                        scanningDisk = false
+                                    }
+                                }
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(
+                                    if (scanningDisk) Res.string.downloads_find_on_disk_scanning else Res.string.downloads_find_on_disk,
+                                ),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
+                    if (selectedShowId == null && !showingTripReady) {
+                        val tripReadyDescription = stringResource(Res.string.downloads_trip_ready_button_description)
+                        TextButton(
+                            onClick = {
+                                selecting = false
+                                selectedIds = emptySet()
+                                showingTripReady = true
+                            },
+                            modifier = Modifier.semantics { contentDescription = tripReadyDescription },
+                        ) {
+                            Text(
+                                text = stringResource(Res.string.downloads_trip_ready_button),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
+                    if (!showingTripReady && extras != null && uiState.completedItems.isNotEmpty()) {
                         TextButton(
                             onClick = {
                                 selecting = !selecting
@@ -276,6 +454,23 @@ internal fun DownloadsScreenContent(
                             Text(
                                 text = stringResource(if (selecting) Res.string.downloads_select_done else Res.string.downloads_select),
                                 style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
+                    if (openDownloadSettings != null) {
+                        TextButton(onClick = openDownloadSettings) {
+                            Icon(
+                                imageVector = Icons.Rounded.Settings,
+                                contentDescription = null,
+                                tint = headerColor,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = stringResource(Res.string.downloads_open_settings),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
                             )
                         }
                     }
@@ -298,6 +493,7 @@ internal fun DownloadsScreenContent(
                             Icon(
                                 imageVector = Icons.Rounded.Refresh,
                                 contentDescription = checkAllText,
+                                tint = headerColor,
                             )
                         }
                     }
@@ -311,6 +507,7 @@ internal fun DownloadsScreenContent(
                         Icon(
                             imageVector = Icons.Rounded.Folder,
                             contentDescription = stringResource(Res.string.downloads_open_directory),
+                            tint = headerColor,
                         )
                     }
                 },
@@ -323,26 +520,64 @@ internal fun DownloadsScreenContent(
             }
         }
 
-        if (selectedShowId == null) {
+        if (tripController != null && selectedShowId == null) {
+            tripReadyContent(
+                state = tripController,
+                onOpenShow = { showId, title ->
+                    onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId }
+                },
+                onOpenDownload = onOpenDownload,
+                onDownloadAnyway = connectionHold::downloadAnyway,
+                onChooseAnotherSource = onChooseAnotherSource,
+                onRecheckAll = rechecks?.let { checks ->
+                    { checkScope.launch { tripController.runRecheckAll(checks) } }
+                },
+                onFetchMissingCompanions = tripController.runFetchCompanions?.let { action ->
+                    { checkScope.launch { action() } }
+                },
+                onPauseDownload = tripDeps.pauseDownload,
+                onResumeDownload = tripDeps.resumeDownload,
+            )
+        } else if (selectedShowId == null) {
             if (extras != null) {
                 item(key = "storage-summary") {
                     DownloadStorageSummary(
                         state = folderStateNow,
                         autoLimitGb = storageLimitNow,
-                        onManageLocations = openSettingsPage?.let { open -> { open(SettingsPage.Playback) } },
+                        onManageLocations = openDownloadSettings,
+                        onChangeStorageLimit = autoDownloads?.let { controller ->
+                            { profile, limit -> controller.setStorageLimit(profile, limit) }
+                        },
+                        profileId = activeProfileId,
                     )
                 }
             }
-            holdState.holdReason?.let { reason ->
+            if (holdState.travel.enabled) {
+                item(key = "travel-state") {
+                    TravelModeStatusBanner(holdState.travel)
+                }
+            }
+            holdState.holdReason?.takeUnless { it == LimitedConnectionReason.Travel }?.let { reason ->
                 item(key = "connection-hold") {
                     ConnectionHoldLine(reason = reason, onDownloadAnyway = connectionHold::downloadAnyway)
+                }
+            }
+            if (polite.yielding && (holdState.holdReason == null || holdState.holdReason == LimitedConnectionReason.Travel) && anyDownloading) {
+                item(key = "yielding") {
+                    Text(
+                        text = stringResource(Res.string.downloads_yielding_line),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp)
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
             speedLimitBytes?.let { limit ->
                 item(key = "speed-limit") {
                     SpeedLimitLine(
                         megabytesPerSecond = (limit / 1_000_000L).toInt().coerceAtLeast(1),
-                        onChange = openSettingsPage?.let { open -> { open(SettingsPage.Playback) } },
+                        onChange = openDownloadSettings,
                     )
                 }
             }
@@ -365,33 +600,38 @@ internal fun DownloadsScreenContent(
             )
             downloadsRootContent(
                 uiState = uiState,
+                completed = completedRoot,
                 clock = clock,
+                watchStatusOf = watchStatusOf,
                 onChooseAnotherSource = onChooseAnotherSource,
+                onOpenDetails = onOpenDetails,
                 onOpenDownloadsFolder = {
                     if (!openDownloadsFolder()) NuvioToastController.show(openDownloadsDirectoryFailedText)
                 },
                 showSeasonHint = showSeasonHint,
                 onBrowse = onBrowse,
                 onOpenDownload = onOpenDownload,
-                onOpenShow = { showId, title ->
-                    onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId }
-                },
-                onDeleteDownload = { downloadPendingDeletionId = it },
+                onOpenShow = openShow,
+                onDeleteDownload = deleteDownload,
                 episodeLinks = episodeLinks,
                 unreachable = folderStateNow.unreachable,
                 onCheckAgain = checkAgain,
+                posterPatternOverride = posterPatternOverride,
             )
         } else {
+            val goodCopies = completedRoot.goodCopies
             downloadsShowContent(
                 showId = selectedShowId.orEmpty(),
-                episodes = completedEpisodes,
+                seasons = showGroups,
                 clock = clock,
+                watchStatusOf = watchStatusOf,
+                onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDownload = onOpenDownload,
-                onDeleteDownload = { downloadPendingDeletionId = it },
-                scheduledDeletions = removalByDownload,
-                onKeepScheduled = { autoDownloads?.keepDownload(activeProfileId, it) },
+                onOpenDetails = onOpenDetails,
+                onDeleteDownload = deleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = checkAgain,
+                goodCopies = goodCopies,
             )
         }
     }
@@ -400,26 +640,6 @@ internal fun DownloadsScreenContent(
     val deleteNotMovedText = stringResource(Res.string.downloads_delete_not_moved_toast)
     val deleteNotConnectedText = stringResource(Res.string.downloads_delete_not_connected_toast)
     val deleteMovingText = stringResource(Res.string.downloads_delete_moving_toast)
-    val permanentDeletion = permanentDeletionId?.let { id -> uiState.items.firstOrNull { it.id == id } }
-    if (permanentDeletion != null) {
-        NuvioStatusModal(
-            title = stringResource(Res.string.downloads_delete_permanent_title, permanentDeletion.nameForLabels()),
-            message = stringResource(Res.string.downloads_delete_not_moved_toast) + " " + stringResource(Res.string.downloads_delete_permanent_message),
-            isVisible = true,
-            destructive = true,
-            confirmText = stringResource(Res.string.downloads_delete_permanent_confirm),
-            dismissText = stringResource(Res.string.action_cancel),
-            onConfirm = {
-                permanentDeletionId = null
-                deleteScope.launch {
-                    if (DownloadsRepository.deleteDownload(permanentDeletion.id, permanently = true) == DownloadDeleteResult.NotMoved) {
-                        NuvioToastController.show(deleteNotMovedText)
-                    }
-                }
-            },
-            onDismiss = { permanentDeletionId = null },
-        )
-    }
     moveRequest?.let { active ->
         DownloadMoveFlow(
             request = active,
@@ -435,6 +655,7 @@ internal fun DownloadsScreenContent(
     locatePick?.let { (item, path) ->
         val adopted = stringResource(Res.string.downloads_locate_adopted)
         val refused = stringResource(Res.string.downloads_locate_refused)
+        PlatformModalBackHandler(onDismiss = { locatePick = null })
         AlertDialog(
             onDismissRequest = { locatePick = null },
             title = { Text(stringResource(Res.string.downloads_locate_confirm_title)) },
@@ -494,11 +715,8 @@ internal fun DownloadsScreenContent(
                 deleteScope.launch {
                     rememberDeletion(pendingDeletion)
                     when (DownloadsRepository.deleteDownload(pendingDeletion.id)) {
-                        // Say so, and offer to delete it for good, which needs its own confirmation.
-                        DownloadDeleteResult.NotMoved -> {
-                            NuvioToastController.show(deleteNotMovedText)
-                            permanentDeletionId = pendingDeletion.id
-                        }
+                        // When the Trash is unavailable, keep the file and tell the user why.
+                        DownloadDeleteResult.NotMoved -> NuvioToastController.show(deleteNotMovedText)
                         DownloadDeleteResult.NotReachable -> NuvioToastController.show(deleteNotConnectedText)
                         DownloadDeleteResult.Moving -> NuvioToastController.show(deleteMovingText)
                         DownloadDeleteResult.Removed, DownloadDeleteResult.Gone -> Unit
@@ -518,11 +736,18 @@ private val NoScheduledRemovals = kotlinx.coroutines.flow.MutableStateFlow(empty
 
 /** The time and network state that the rows work out their status from. */
 private data class RowClock(
-    val nowEpochMs: Long,
+    val nowEpochMs: State<Long>,
+    val runtimeMinutes: (DownloadItem) -> Int?,
     val offline: Boolean,
     val extras: RowExtras? = null,
     /** Why the connection is limited now, or null. */
     val limitedBy: LimitedConnectionReason? = null,
+    val removals: Map<String, AutoDownloadRemoval> = emptyMap(),
+    val keptDownloadIds: Set<String> = emptySet(),
+    val onKeep: ((String) -> Unit)? = null,
+    val onUndoKeep: ((String) -> Unit)? = null,
+    /** The app's own searches for another source, by title. Null where the app does not search by itself. */
+    val searches: Map<String, SourceSearchProgress>? = null,
 )
 
 /** What the rows need to know about locations, selection and moving. Null where there are no locations. */
@@ -588,10 +813,21 @@ private fun LocationBanner(unreachable: List<DownloadLocationInfo>) {
     }
 }
 
+private class CompletedGroups(items: List<DownloadItem>) {
+    val goodCopies = items.mapTo(mutableSetOf()) { it.logicalContentKey }
+    val movies = items.filterNot(DownloadItem::isEpisode)
+    val shows = items.filter(DownloadItem::isEpisode).groupBy { it.parentMetaId }
+        .mapNotNull { (_, episodes) -> episodes.firstOrNull()?.let { it to episodes } }
+        .sortedBy { (item, _) -> item.title.lowercase() }
+}
+
 private fun LazyListScope.downloadsRootContent(
     uiState: DownloadsUiState,
+    completed: CompletedGroups,
     clock: RowClock,
+    watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
     onOpenDownloadsFolder: () -> Unit,
     showSeasonHint: Boolean,
     onBrowse: (() -> Unit)?,
@@ -601,6 +837,7 @@ private fun LazyListScope.downloadsRootContent(
     episodeLinks: DownloadEpisodeLinks?,
     unreachable: List<DownloadLocationInfo> = emptyList(),
     onCheckAgain: ((DownloadItem) -> Unit)?,
+    posterPatternOverride: String? = null,
 ) {
     uiState.storeProblem?.let { problem ->
         item(key = "store-problem") {
@@ -612,22 +849,32 @@ private fun LazyListScope.downloadsRootContent(
     }
 
     val activeItems = uiState.activeItems
-    // The titles that have a finished download that is the video.
-    val goodCopies = uiState.completedItems.mapTo(mutableSetOf()) { it.logicalContentKey }
-    val completedMovies = uiState.completedItems.filterNot(DownloadItem::isEpisode)
-    val completedShows = uiState.completedItems
-        .filter(DownloadItem::isEpisode)
-        .groupBy { it.parentMetaId }
-        .mapNotNull { (_, episodes) ->
-            episodes.firstOrNull()?.let { first ->
-                first to episodes
-            }
-        }
-        .sortedBy { (item, _) -> item.title.lowercase() }
+    val goodCopies = completed.goodCopies
+    val completedMovies = completed.movies
+    val completedShows = completed.shows
 
     if (activeItems.isNotEmpty()) {
-        item {
-            SectionTitle(stringResource(Res.string.downloads_section_active))
+        item(key = "active-heading") {
+            val hasDownloading = activeItems.any { it.status == DownloadStatus.Downloading }
+            val hasResumablePaused = activeItems.any {
+                it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection
+            }
+            SectionTitle(
+                title = stringResource(Res.string.downloads_section_active),
+                actionText = when {
+                    activeItems.size < 2 -> null
+                    hasDownloading -> stringResource(Res.string.downloads_pause_all)
+                    hasResumablePaused -> stringResource(Res.string.downloads_resume_all)
+                    else -> null
+                },
+                onAction = {
+                    if (hasDownloading) {
+                        DownloadsRepository.pauseActiveDownloads()
+                    } else {
+                        DownloadsRepository.resumePausedDownloads()
+                    }
+                },
+            )
         }
         val failedCount = activeItems.count { it.status == DownloadStatus.Failed }
         if (failedCount > 0) {
@@ -642,46 +889,46 @@ private fun LazyListScope.downloadsRootContent(
             items = activeItems,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
+                watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
+                onOpenDetails = onOpenDetails,
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
-                newCopyReady = item.isPlaceholder && item.logicalContentKey in goodCopies,
+                newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
+                posterPatternOverride = posterPatternOverride,
             )
         }
     }
 
     if (completedMovies.isNotEmpty()) {
-        item {
+        item(key = "movies-heading") {
             SectionTitle(stringResource(Res.string.downloads_section_movies))
         }
         items(
             items = completedMovies,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
+                watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
+                onOpenDetails = onOpenDetails,
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 onCheckAgain = onCheckAgain,
+                posterPatternOverride = posterPatternOverride,
             )
         }
     }
 
     if (completedShows.isNotEmpty()) {
-        item {
+        item(key = "shows-heading") {
             SectionTitle(stringResource(Res.string.downloads_section_shows))
         }
         items(
@@ -714,8 +961,13 @@ private fun LazyListScope.downloadsRootContent(
                         .fillMaxWidth()
                         .padding(horizontal = 14.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
+                    DownloadPoster(
+                        item = item,
+                        patternOverride = posterPatternOverride,
+                        hideWhenMissing = true,
+                    )
                     Column(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -756,8 +1008,32 @@ private fun LazyListScope.downloadsRootContent(
         }
     }
 
+    if (uiState.unrecognisedFiles.isNotEmpty()) {
+        item(key = "unrecognised-header") {
+            SectionTitle(stringResource(Res.string.downloads_section_unrecognised))
+        }
+        item(key = "unrecognised-note") {
+            Text(
+                text = stringResource(Res.string.downloads_unrecognised_note),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        items(
+            items = uiState.unrecognisedFiles,
+            key = { "unrecognised:${it.localFileUri}" },
+        ) { file ->
+            val locationInfo = clock.extras?.folderState?.location(file.locationId)
+            val showLocation = clock.extras?.folderState?.hasSeveralLocations == true ||
+                (locationInfo != null && !locationInfo.isAppFolder) ||
+                (!file.locationId.isNullOrBlank() && file.locationId != "app")
+            UnrecognisedFileRow(file = file, showLocation = showLocation)
+        }
+    }
+
     // A list that could not be read is not an empty one: the banner says so instead.
-    if (uiState.items.isEmpty() && uiState.storeProblem == null) {
+    if (uiState.items.isEmpty() && uiState.unrecognisedFiles.isEmpty() && uiState.storeProblem == null) {
         item {
             EmptyDownloads(showSeasonHint = showSeasonHint, onBrowse = onBrowse)
         }
@@ -766,27 +1042,18 @@ private fun LazyListScope.downloadsRootContent(
 
 private fun LazyListScope.downloadsShowContent(
     showId: String,
-    episodes: List<DownloadItem>,
+    seasons: List<Pair<Int, List<DownloadItem>>>,
     clock: RowClock,
+    watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
     onOpenDownload: (DownloadItem) -> Unit,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
     onDeleteDownload: (String) -> Unit,
-    scheduledDeletions: Map<String, AutoDownloadRemoval>,
-    onKeepScheduled: (downloadId: String) -> Unit,
     episodeLinks: DownloadEpisodeLinks?,
     onCheckAgain: ((DownloadItem) -> Unit)?,
+    goodCopies: Set<String> = emptySet(),
 ) {
-    val showEpisodes = episodes
-        .filter { it.parentMetaId == showId }
-        .sortedForSeriesDownloads()
-
-    val seasons = showEpisodes
-        .groupBy { it.seasonNumber ?: 0 }
-        .toList()
-        .sortedWith(
-            compareBy<Pair<Int, List<DownloadItem>>> { (season, _) ->
-                if (season == 0) 0 else 1
-            }.thenBy { (season, _) -> if (season == 0) 0 else season },
-        )
+    val showEpisodes = seasons.flatMap { it.second }
 
     if (seasons.isEmpty()) {
         item {
@@ -806,8 +1073,15 @@ private fun LazyListScope.downloadsShowContent(
         return
     }
 
+    val watchedCount = showEpisodes.count { watchStatusOf(it).isWatched }
+    if (watchedCount > 0) {
+        item(key = "show-watched-summary") {
+            ShowWatchedSummary(showId = showId, episodeCount = showEpisodes.size, watchedCount = watchedCount)
+        }
+    }
+
     seasons.forEach { (seasonNumber, entries) ->
-        item {
+        item(key = "season-heading-$showId-$seasonNumber") {
             SectionTitle(
                 if (seasonNumber == 0) {
                     stringResource(Res.string.episodes_specials)
@@ -817,58 +1091,113 @@ private fun LazyListScope.downloadsShowContent(
             )
         }
 
-        val sortedEpisodes = entries.sortedForSeriesDownloads()
-
         items(
-            items = sortedEpisodes,
+            items = entries,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
-                onChooseAnotherSource = null,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
-                scheduledDeletionDueAtEpochMs = scheduledDeletions[item.id]?.dueAtEpochMs,
-                onKeepScheduled = { onKeepScheduled(item.id) },
+                watchStatus = watchStatusOf(item),
+                onChooseAnotherSource = onChooseAnotherSource,
+                onOpenDetails = onOpenDetails,
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
+                newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
             )
         }
     }
 }
 
 @Composable
+private fun ShowWatchedSummary(showId: String, episodeCount: Int, watchedCount: Int) {
+    val bytesOfShow: (DownloadsUiState) -> Long = remember(showId) {
+        { state -> state.items.sumOf { if (it.isEpisode && it.parentMetaId == showId) it.sizeOnDiskBytes else 0L } }
+    }
+    val bytes by remember(bytesOfShow) {
+        DownloadsRepository.uiState.map(bytesOfShow).distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = bytesOfShow(DownloadsRepository.uiState.value))
+    Text(
+        text = listOf(
+            pluralStringResource(Res.plurals.downloads_episodes, episodeCount, episodeCount),
+            formatBytes(bytes),
+            stringResource(Res.string.downloads_watched_count, watchedCount),
+        ).joinToString(DownloadTextSeparator),
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun DownloadRowEntry(
+    item: DownloadItem,
+    clock: RowClock,
+    watchStatus: DownloadWatchStatus,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
+    onOpenDownload: (DownloadItem) -> Unit,
+    onDeleteDownload: (String) -> Unit,
+    episodeLinks: DownloadEpisodeLinks? = null,
+    onCheckAgain: ((DownloadItem) -> Unit)? = null,
+    newCopyReady: Boolean = false,
+    posterPatternOverride: String? = null,
+) {
+    val current = if (item.status == DownloadStatus.Downloading) {
+        val progress by remember(item.id) {
+            DownloadsRepository.uiState.map { state -> state.items.firstOrNull { it.id == item.id } }.distinctUntilChanged()
+        }.collectAsStateWithLifecycle(initialValue = DownloadsRepository.uiState.value.items.firstOrNull { it.id == item.id })
+        progress ?: item
+    } else item
+    val speed = if (current.status == DownloadStatus.Downloading) rememberDownloadSpeeds(listOf(current))[current.id] else null
+    DownloadRow(
+        item = current, clock = clock, speedBytesPerSecond = speed, watchStatus = watchStatus,
+        onChooseAnotherSource = onChooseAnotherSource, onOpenDetails = onOpenDetails,
+        onOpen = remember(current, onOpenDownload) { { onOpenDownload(current) } },
+        onPause = remember(item.id) { { DownloadsRepository.pauseDownload(item.id) } },
+        onResume = remember(item.id) { { DownloadsRepository.resumeDownload(item.id) } },
+        onRetry = remember(item.id) { { DownloadsRepository.retryDownload(item.id) } },
+        onDelete = remember(item.id, onDeleteDownload) { { onDeleteDownload(item.id) } },
+        episodeLinks = episodeLinks, onCheckAgain = onCheckAgain, newCopyReady = newCopyReady,
+        posterPatternOverride = posterPatternOverride,
+    )
+}
+
+@Composable
 private fun DownloadRow(
     item: DownloadItem,
     clock: RowClock,
+    speedBytesPerSecond: Long? = null,
+    watchStatus: DownloadWatchStatus = DownloadWatchStatus(),
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)? = null,
     onOpen: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onRetry: () -> Unit,
     onDelete: () -> Unit,
-    /** When finishing the episode scheduled its deletion: the time it is due. Null otherwise. */
-    scheduledDeletionDueAtEpochMs: Long? = null,
-    onKeepScheduled: () -> Unit = {},
     episodeLinks: DownloadEpisodeLinks? = null,
     /** Looks at the file again. Null where that is not offered. */
     onCheckAgain: ((DownloadItem) -> Unit)? = null,
-    /** A marked file has a good new copy beside it: offers to replace it with that copy (the file goes to the trash). */
+    /** A bad source has a good new copy beside it: no automatic search is needed; a marked file can be trashed. */
     newCopyReady: Boolean = false,
+    posterPatternOverride: String? = null,
 ) {
+    val scheduledDeletionDueAtEpochMs = clock.removals[item.id]?.dueAtEpochMs
+    val isKept = item.id in clock.keptDownloadIds
     val extras = clock.extras
     val location = extras?.folderState?.location(extras.locationIdOf(item))
     val availability = location?.availability ?: FolderAvailability.Available
     val reachable = availability == FolderAvailability.Available
     val isMoving = extras != null && item.id in extras.folderState.movingIds
+    val now = if (item.status == DownloadStatus.Downloading || scheduledDeletionDueAtEpochMs != null) clock.nowEpochMs.value else 0L
     val rowStatus = downloadRowStatus(
-        item, clock.nowEpochMs, clock.offline, availability, isMoving,
-        addressRequired = extras != null, runtimeMinutes = ::runtimeMinutesOfDownload, limitedBy = clock.limitedBy,
+        item, now, clock.offline, availability, isMoving,
+        addressRequired = extras != null, runtimeMinutes = clock.runtimeMinutes, limitedBy = clock.limitedBy,
     )
+    val searchState = clock.searches?.let { sourceSearchRowState(item, it) }
     val skipTimesNote by produceState<DownloadCompanionsNote?>(null, item.localFileUri, item.status) {
         val uri = item.localFileUri?.takeIf { item.status == DownloadStatus.Completed }
         // Subtitles and skip times are saved a moment after a download finishes, so a missing note is looked for a few more times.
@@ -940,9 +1269,21 @@ private fun DownloadRow(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.Top,
             ) {
+                if (!item.isEpisode) {
+                    DownloadPoster(
+                        item = item,
+                        patternOverride = posterPatternOverride,
+                        hideWhenMissing = true,
+                    )
+                } else if (item.landscapeArtwork() != null) {
+                    DownloadThumbnail(
+                        imageUrl = item.landscapeArtwork(),
+                        watchProgress = if (item.status == DownloadStatus.Completed) watchStatus.progress else 0f,
+                    )
+                }
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -979,6 +1320,40 @@ private fun DownloadRow(
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
                     )
+                    val activeSpeed = speedBytesPerSecond?.takeIf { it > 0L && rowStatus.phase == DownloadPhase.Downloading }
+                    if (activeSpeed != null) {
+                        val speedLabel = stringResource(Res.string.downloads_speed, formatBytes(activeSpeed))
+                        val total = item.totalBytes?.takeIf { it > 0L }
+                        val speedLine = if (total != null) {
+                            val timeLeft = formatTimeLeft((total - item.downloadedBytes).coerceAtLeast(0L) * 1_000L / activeSpeed)
+                            listOf(speedLabel, timeLeft).joinToString(DownloadTextSeparator)
+                        } else {
+                            speedLabel
+                        }
+                        Text(
+                            text = speedLine,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (item.status == DownloadStatus.Completed) {
+                        val watchNote = when {
+                            watchStatus.isWatched -> stringResource(Res.string.episodes_cd_watched)
+                            watchStatus.remainingMs > 0L -> formatTimeLeft(watchStatus.remainingMs)
+                            watchStatus.progress > 0f -> stringResource(
+                                Res.string.home_continue_watching_watched,
+                                "${(watchStatus.progress * 100f).toInt()}%",
+                            )
+                            else -> null
+                        }
+                        if (watchNote != null) {
+                            Text(
+                                text = watchNote,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                     if (extras != null && extras.folderState.hasSeveralLocations && location != null) {
                         Text(
                             text = stringResource(Res.string.downloads_row_location, location.name),
@@ -1003,14 +1378,15 @@ private fun DownloadRow(
                     if (onCheckAgain != null && (rowStatus.result == DownloadResult.NotChecked || rowStatus.result == DownloadResult.CouldNotCompare)) {
                         CheckAgainButton(item = item, onCheckAgain = onCheckAgain)
                     }
-                    if (scheduledDeletionDueAtEpochMs != null) {
-                        val hours = removalHoursLeft(scheduledDeletionDueAtEpochMs, clock.nowEpochMs)
-                        val keepDescription = stringResource(
-                            Res.string.downloads_auto_keep_description,
-                            item.title,
-                            item.seasonNumber ?: 0,
-                            item.episodeNumber ?: 0,
+                    if (isKept) {
+                        Text(
+                            text = stringResource(Res.string.downloads_kept),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                    if (scheduledDeletionDueAtEpochMs != null) {
+                        val hours = removalHoursLeft(scheduledDeletionDueAtEpochMs, now)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = if (hours < 1) {
@@ -1021,17 +1397,31 @@ private fun DownloadRow(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            TextButton(
-                                modifier = Modifier.semantics { contentDescription = keepDescription },
-                                onClick = onKeepScheduled,
-                            ) {
-                                Text(text = stringResource(Res.string.downloads_auto_keep), style = MaterialTheme.typography.labelLarge)
-                            }
                         }
                     }
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (clock.onKeep != null) {
+                        val keepDescription = if (isKept) {
+                            stringResource(Res.string.downloads_undo_keep_description, name)
+                        } else if (item.isEpisode) {
+                            stringResource(Res.string.downloads_auto_keep_description, item.title, item.seasonNumber ?: 0, item.episodeNumber ?: 0)
+                        } else {
+                            stringResource(Res.string.downloads_keep_description, name)
+                        }
+                        TextButton(
+                            modifier = Modifier.semantics { contentDescription = keepDescription },
+                            onClick = {
+                                if (isKept) clock.onUndoKeep?.invoke(item.id) else clock.onKeep.invoke(item.id)
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(if (isKept) Res.string.downloads_undo_keep else Res.string.downloads_auto_keep),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
                     when (item.status) {
                         DownloadStatus.Downloading -> {
                             IconButton(onClick = onPause) {
@@ -1089,12 +1479,20 @@ private fun DownloadRow(
                             Text(stringResource(Res.string.downloads_locate_file), style = MaterialTheme.typography.labelLarge)
                         }
                     }
-                    if (extras != null && item.status == DownloadStatus.Paused && item.pausedByFolder) {
+                    if (extras != null && item.status == DownloadStatus.Paused && item.pausedByFolder && !item.awaitingCheck && item.localFileUri == null) {
                         TextButton(
                             onClick = { extras.onChooseLocation(item) },
                             modifier = Modifier.semantics { contentDescription = chooseLocationDescription },
                         ) {
                             Text(stringResource(Res.string.downloads_choose_location), style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                    if (onOpenDetails != null && !selectable && (episodeLinks == null || !item.isEpisode)) {
+                        IconButton(onClick = { onOpenDetails(item) }) {
+                            Icon(
+                                imageVector = Icons.Rounded.Info,
+                                contentDescription = stringResource(Res.string.cw_action_go_to_details),
+                            )
                         }
                     }
                     // While a move has the item it cannot be deleted; the status line says why.
@@ -1107,24 +1505,41 @@ private fun DownloadRow(
                 }
             }
 
-            if (episodeLinks != null && item.isEpisode) {
+            if (episodeLinks != null && item.isEpisode && !item.parentMetaId.startsWith("recovered:")) {
                 EpisodeLinkButtons(item = item, links = episodeLinks)
             }
 
             if (item.isPlaceholder) {
-                PlaceholderDetails(
-                    item = item,
-                    onChooseAnotherSource = onChooseAnotherSource,
-                    onCheckAgain = onCheckAgain,
-                    onReplaceWithNewCopy = onDelete.takeIf { newCopyReady },
-                )
+                if (searchState != null && !newCopyReady) {
+                    SourceSearchDetails(item = item, state = searchState, onChooseAnotherSource = onChooseAnotherSource)
+                } else {
+                    PlaceholderDetails(
+                        item = item,
+                        onChooseAnotherSource = onChooseAnotherSource,
+                        onCheckAgain = onCheckAgain,
+                        onReplaceWithNewCopy = onDelete.takeIf { newCopyReady },
+                    )
+                }
             }
 
             if (item.status == DownloadStatus.Failed) {
-                FailureDetails(
-                    item = item,
-                    onRetry = onRetry,
-                    onChooseAnotherSource = onChooseAnotherSource,
+                if (searchState != null && item.hasBadSource && !newCopyReady) {
+                    SourceSearchDetails(item = item, state = searchState, onChooseAnotherSource = onChooseAnotherSource)
+                } else {
+                    FailureDetails(
+                        item = item,
+                        onRetry = onRetry,
+                        onChooseAnotherSource = onChooseAnotherSource,
+                    )
+                }
+            }
+
+            // A download the app started in place of a bad source says which of its tries it is.
+            if (item.status == DownloadStatus.Downloading && searchState is SourceSearchRowState.Trying) {
+                Text(
+                    text = stringResource(Res.string.downloads_source_search_trying, searchState.attempt, searchState.of),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
 
@@ -1175,20 +1590,36 @@ private fun downloadDisplaySubtitle(
 }
 
 @Composable
-private fun SectionTitle(title: String) {
-    Text(
-        text = title,
+private fun SectionTitle(
+    title: String,
+    actionText: String? = null,
+    onAction: () -> Unit = {},
+) {
+    Row(
         modifier = Modifier
-            .padding(horizontal = 14.dp, vertical = 8.dp)
-            .semantics { heading() },
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        fontWeight = FontWeight.SemiBold,
-    )
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            modifier = Modifier.semantics { heading() },
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (actionText != null) {
+            NuvioActionLabel(text = actionText, onClick = onAction)
+        }
+    }
 }
 
 @Composable
-private fun statusText(item: DownloadItem, status: DownloadRowStatus): String {
+internal fun statusText(
+    item: DownloadItem,
+    status: DownloadRowStatus,
+): String {
     val size = if (item.status == DownloadStatus.Completed) {
         formatBytes(item.totalBytes ?: item.downloadedBytes)
     } else if (item.totalBytes != null && item.totalBytes > 0L) {
@@ -1325,6 +1756,42 @@ private fun PlaceholderDetails(
     }
 }
 
+/**
+ * What the app does about a download whose source was bad, when it looks for another source by itself:
+ * which source it is trying, that it will try one soon, or that it found none, with the user's own pick
+ * then. The file of a download that is not the video stays where it is; the row's delete button moves it
+ * to the trash. "Check again" is not offered: the same file held against the same claim gives the same answer.
+ */
+@Composable
+private fun SourceSearchDetails(
+    item: DownloadItem,
+    state: SourceSearchRowState,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+) {
+    val name = item.nameForLabels()
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = when (state) {
+                is SourceSearchRowState.Trying -> stringResource(Res.string.downloads_source_search_trying, state.attempt, state.of)
+                SourceSearchRowState.Waiting -> stringResource(Res.string.downloads_source_search_waiting)
+                SourceSearchRowState.NoneFound -> stringResource(Res.string.downloads_source_search_none_found)
+            },
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state == SourceSearchRowState.NoneFound && onChooseAnotherSource != null) {
+            val pickDescription = stringResource(Res.string.downloads_pick_source_myself_description, name)
+            TextButton(
+                modifier = Modifier.semantics { contentDescription = pickDescription },
+                onClick = { onChooseAnotherSource(item) },
+            ) {
+                Text(text = stringResource(Res.string.downloads_pick_source_myself), style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
 /** The next step of a failed row and the buttons that take it. */
 @Composable
 private fun FailureDetails(
@@ -1397,12 +1864,33 @@ private fun SpeedLimitLine(megabytesPerSecond: Int, onChange: (() -> Unit)?) {
     }
 }
 
+@Composable
+internal fun TravelModeStatusBanner(travel: TravelState) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+            .semantics { liveRegion = LiveRegionMode.Polite },
+    ) {
+        Text(
+            text = stringResource(Res.string.travel_status, (travel.capBytesPerSecond / 1000).toInt()),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        if (travel.remembered) {
+            Text(
+                text = stringResource(Res.string.travel_network_remembered),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
 /**
  * Downloads wait because the connection is limited: says why, and offers to download anyway on this
  * network (until it changes or the app is closed).
  */
 @Composable
-private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway: () -> Unit) {
+internal fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway: () -> Unit) {
     val anywayDescription = stringResource(Res.string.downloads_held_download_anyway_description)
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp),
@@ -1417,13 +1905,13 @@ private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            Text(
+            if (reason.canDownloadAnyway) Text(
                 text = stringResource(Res.string.downloads_held_detail),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        TextButton(
+        if (reason.canDownloadAnyway) TextButton(
             modifier = Modifier.semantics { contentDescription = anywayDescription },
             onClick = onDownloadAnyway,
         ) {
@@ -1434,8 +1922,12 @@ private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway
 
 /** The line at the top of the Downloads screen for each reason downloads can wait. */
 internal fun connectionHoldTitle(reason: LimitedConnectionReason): StringResource = when (reason) {
+    LimitedConnectionReason.Travel -> Res.string.downloads_held_travel
+    LimitedConnectionReason.CheckingNetwork -> Res.string.downloads_checking_network
     LimitedConnectionReason.Hotspot -> Res.string.downloads_held_hotspot
     LimitedConnectionReason.LowDataMode -> Res.string.downloads_held_low_data
+    LimitedConnectionReason.SlowConnection -> Res.string.downloads_held_slow
+    LimitedConnectionReason.NetworkBlocksDownloads -> Res.string.downloads_held_blocked
 }
 
 /** The empty list: what to do to get a download, and where to start. */
@@ -1567,16 +2059,80 @@ private fun resultText(status: DownloadRowStatus, saved: DownloadCompanionsNote?
     return message
 }
 
-internal fun formatBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 ${localizedByteUnit("B")}"
-    val kib = 1024.0
-    val mib = kib * 1024.0
-    val gib = mib * 1024.0
-    val value = bytes.toDouble()
-    return when {
-        value >= gib -> "${((value / gib) * 10.0).toInt() / 10.0} ${localizedByteUnit("GB")}"
-        value >= mib -> "${((value / mib) * 10.0).toInt() / 10.0} ${localizedByteUnit("MB")}"
-        value >= kib -> "${((value / kib) * 10.0).toInt() / 10.0} ${localizedByteUnit("KB")}"
-        else -> "$bytes ${localizedByteUnit("B")}"
+@Composable
+private fun UnrecognisedFileRow(
+    file: UnrecognisedFile,
+    showLocation: Boolean,
+) {
+    val sizeText = formatBytes(file.sizeBytes)
+    val subtitle = if (showLocation && !file.locationName.isNullOrBlank()) {
+        stringResource(Res.string.downloads_unrecognised_size_location, sizeText, file.locationName)
+    } else {
+        sizeText
     }
+    val reasonText = unrecognisedReasonText(file.reason)
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+            .semantics(mergeDescendants = true) {},
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = file.fileName,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = reasonText,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun unrecognisedReasonText(reason: UnrecognisedFileReason): String = stringResource(
+    when (reason) {
+        UnrecognisedFileReason.NoCompanionFolder -> Res.string.downloads_unrecognised_reason_no_companion
+        UnrecognisedFileReason.ForeignCompanionFolder -> Res.string.downloads_unrecognised_reason_foreign_companion
+        UnrecognisedFileReason.EpisodeMismatch -> Res.string.downloads_unrecognised_reason_episode_mismatch
+        UnrecognisedFileReason.AmbiguousName -> Res.string.downloads_unrecognised_reason_ambiguous_name
+        UnrecognisedFileReason.UnreadableCompanion -> Res.string.downloads_unrecognised_reason_unreadable_companion
+        UnrecognisedFileReason.NotAVideoFile -> Res.string.downloads_unrecognised_reason_not_video
+    },
+)
+
+private suspend fun scanSummaryToast(summary: DiskScanSummary): String = when {
+    summary.skippedBusy -> getString(Res.string.downloads_find_on_disk_busy)
+    summary.addedCount > 0 && summary.unrecognisedCount > 0 -> getString(
+        Res.string.downloads_find_on_disk_found_partial,
+        summary.addedCount,
+        summary.unrecognisedCount,
+    )
+    summary.addedCount > 0 -> getPluralString(Res.plurals.downloads_find_on_disk_found, summary.addedCount, summary.addedCount)
+    summary.unrecognisedCount > 0 -> getPluralString(
+        Res.plurals.downloads_find_on_disk_none_with_unrecognised,
+        summary.unrecognisedCount,
+        summary.unrecognisedCount,
+    )
+    else -> getString(Res.string.downloads_find_on_disk_none)
 }

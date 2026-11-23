@@ -1,6 +1,9 @@
 package com.nuvio.app.features.catalog
 
+import com.nuvio.app.core.memory.retainBrowseWindow
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.core.poster.CustomPosterUrlRepository
+import com.nuvio.app.core.ui.userFacingFailure
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.features.collection.CollectionRepository
 import com.nuvio.app.features.collection.TmdbCollectionSourceResolver
@@ -31,7 +34,7 @@ object CatalogRepository {
 
     private var activeJob: Job? = null
     private var activeRequest: CatalogRequest? = null
-    private val scrollPositions = linkedMapOf<CatalogRequest, CatalogScrollPosition>()
+    private val scrollPositions = BoundedCache<CatalogRequest, CatalogScrollPosition>(64)
 
     fun load(
         target: CatalogTarget,
@@ -117,7 +120,10 @@ object CatalogRepository {
             } catch (error: Exception) {
                 if (activeRequest != request) return@launch
                 _uiState.value = CatalogUiState(
-                    errorMessage = error.serverMessage() ?: error.message ?: getString(Res.string.catalog_load_failed),
+                    errorMessage = userFacingFailure(
+                        error.serverMessage() ?: error.message,
+                        getString(Res.string.catalog_load_failed),
+                    ),
                 )
             }
         }
@@ -136,11 +142,12 @@ object CatalogRepository {
             items = if (reset) emptyList() else current.items,
             isLoading = true,
             nextSkip = if (reset) null else current.nextSkip,
+            loadMoreFailed = false,
             errorMessage = null,
         )
 
         activeJob = scope.launch {
-            runCatching {
+            val pageResult = runCatching {
                 when (val target = request.target) {
                     is CatalogTarget.Addon -> fetchCatalogPage(
                         manifestUrl = target.manifestUrl,
@@ -160,9 +167,21 @@ object CatalogRepository {
 
                     is CatalogTarget.Library -> error(getString(Res.string.catalog_load_failed))
                 }.withUnreleasedFilter(request.hideUnreleasedContent)
-            }.fold(
-                onSuccess = { page ->
-                    if (activeRequest != request) return@fold
+            }
+            val failure = pageResult.exceptionOrNull()
+            if (failure is CancellationException) throw failure
+            if (failure != null) {
+                if (activeRequest != request) return@launch
+                val message = userFacingFailure(
+                    failure.serverMessage() ?: failure.message,
+                    getString(Res.string.catalog_load_failed),
+                )
+                _uiState.value = catalogStateAfterPageFailure(current, reset, message)
+                return@launch
+            }
+            val page = pageResult.getOrThrow()
+            run {
+                    if (activeRequest != request) return@run
 
                     val mergedItems = if (reset) {
                         dedupeCatalogItems(page.items)
@@ -186,24 +205,13 @@ object CatalogRepository {
                     }
                     val posterPattern = CustomPosterUrlRepository.patternForScreen(posterScreen)
                     _uiState.value = CatalogUiState(
-                        items = mergedItems.withCustomPosterUrls(posterPattern),
+                        items = retainBrowseWindow(mergedItems).withCustomPosterUrls(posterPattern),
                         isLoading = false,
                         nextSkip = paginationState.nextSkip,
                         consecutiveDuplicatePages = paginationState.consecutiveDuplicatePages,
                         errorMessage = null,
                     )
-                },
-                onFailure = { error ->
-                    if (activeRequest != request) return@fold
-
-                    _uiState.value = current.copy(
-                        items = if (reset) emptyList() else current.items,
-                        isLoading = false,
-                        nextSkip = null,
-                        errorMessage = error.serverMessage() ?: error.message ?: getString(Res.string.catalog_load_failed),
-                    )
-                },
-            )
+            }
         }
     }
 

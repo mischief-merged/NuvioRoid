@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.BasicAlertDialog
+import com.nuvio.app.core.ui.PlatformModalBackHandler
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -36,6 +37,7 @@ import com.nuvio.app.core.ui.NuvioModalBottomSheet
 import com.nuvio.app.core.ui.SurfaceEdge
 import com.nuvio.app.core.ui.dismissNuvioBottomSheet
 import com.nuvio.app.core.ui.nuvio
+import com.nuvio.app.core.ui.platformTouchScroll
 import com.nuvio.app.features.mdblist.MdbListLibraryListOption
 import com.nuvio.app.features.mdblist.localizedMdbListMessage
 import kotlinx.coroutines.launch
@@ -121,7 +123,8 @@ private fun MdbListLibraryListsDialog(
     onDismiss: () -> Unit,
 ) {
     val tokens = MaterialTheme.nuvio
-    BasicAlertDialog(onDismissRequest = onDismiss) {
+    PlatformModalBackHandler(onDismiss = onDismiss)
+    BasicAlertDialog(onDismissRequest = onDismiss, modifier = Modifier.platformTouchScroll()) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()

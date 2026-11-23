@@ -2,7 +2,7 @@ package com.nuvio.app.features.player
 
 import com.nuvio.app.core.i18n.localizedNoSubtitleLinesFound
 import com.nuvio.app.core.i18n.localizedSubtitleLinesLoadError
-import com.nuvio.app.features.addons.httpGetTextWithHeaders
+import com.nuvio.app.features.addons.httpGetSubtitleText
 import com.nuvio.app.features.autosync.AutoSyncPlayerController
 import com.nuvio.app.features.streams.StreamLinkCacheRepository
 import kotlinx.coroutines.launch
@@ -64,7 +64,11 @@ internal fun PlayerScreenRuntime.setSubtitleDelay(delayMs: Int) {
     (playerController as? AutoSyncPlayerController)?.cancelForManualSubtitleDelay() // AutoSync hook
     val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
     subtitleDelayMs = clamped
-    PlayerTrackPreferenceStorage.saveSubtitleDelayMs(playbackSession.videoId, clamped)
+    saveShowSubtitleDelayMs(
+        parentMetaId = parentMetaId,
+        videoId = playbackSession.videoId,
+        delayMs = clamped,
+    )
     playerController?.setSubtitleDelayMs(clamped)
 }
 
@@ -76,7 +80,7 @@ internal fun PlayerScreenRuntime.loadSubtitleAutoSyncCues(force: Boolean = false
     subtitleAutoSyncState = subtitleAutoSyncState.copy(isLoading = true, errorMessage = null)
     scope.launch {
         val result = runCatching {
-            val body = httpGetTextWithHeaders(
+            val body = httpGetSubtitleText(
                 url = subtitle.url,
                 headers = sanitizePlaybackHeaders(activeSourceHeaders),
             )

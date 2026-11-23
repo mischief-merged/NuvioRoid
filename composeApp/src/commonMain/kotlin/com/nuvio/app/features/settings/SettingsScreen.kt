@@ -38,6 +38,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.Modifier
@@ -51,8 +54,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.max
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.ui.ContentEntry
 import com.nuvio.app.core.ui.LocalScreenActive
 import com.nuvio.app.core.ui.ScreenActivityEffect
+import com.nuvio.app.core.ui.nuvioContentEntry
 import com.nuvio.app.core.ui.AppTheme
 import com.nuvio.app.core.ui.LocalNuvioBottomNavigationOverlayPadding
 import com.nuvio.app.core.ui.NuvioDesktopVerticalScrollbar
@@ -284,6 +289,7 @@ fun SettingsScreen(
         val previousPage = page.previousPage()
 
         fun openPage(targetPage: SettingsPage) {
+            if (targetPage != SettingsPage.Playback) SettingsSectionFocus.clear()
             if (!targetPage.isEnabledByPolicy()) return
             val externalNavigator = onNavigatePage
             if (externalNavigator == null) {
@@ -373,6 +379,7 @@ fun SettingsScreen(
             val requestedPage = requestedPageName ?: return@ScreenActivityEffect
             val targetPage = runCatching { SettingsPage.valueOf(requestedPage) }.getOrNull()
             if (targetPage == null || !targetPage.isEnabledByPolicy()) {
+                SettingsSectionFocus.clear()
                 onRequestedPageConsumed()
                 return@ScreenActivityEffect
             }
@@ -914,6 +921,7 @@ private fun TabletSettingsScreen(
     }
 
     val saveableStateHolder = rememberSaveableStateHolder()
+    val categoryEntryRequester = remember { FocusRequester() }
 
     Row(modifier = Modifier.fillMaxSize()) {
         Surface(
@@ -951,6 +959,23 @@ private fun TabletSettingsScreen(
                                 onPageChange(SettingsPage.Root)
                             }
                         },
+                        modifier = Modifier
+                            .focusProperties {
+                                if (category == SettingsCategory.entries.first()) {
+                                    up = FocusRequester.Cancel
+                                }
+                                if (category == SettingsCategory.entries.last()) {
+                                    down = FocusRequester.Cancel
+                                }
+                                right = ContentEntry.requester
+                            }
+                            .then(
+                                if (category == activeCategory) {
+                                    Modifier.focusRequester(categoryEntryRequester)
+                                } else {
+                                    Modifier
+                                },
+                            ),
                     )
                 }
             }
@@ -1005,7 +1030,7 @@ private fun TabletSettingsScreen(
                 }
             }
             val watchPartyRowClick = watchPartyRow(onWatchPartyClick)
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxSize().nuvioContentEntry()) {
                 LazyColumn(
                     state = listState,
                     modifier = Modifier

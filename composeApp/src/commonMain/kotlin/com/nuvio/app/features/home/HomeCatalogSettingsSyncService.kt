@@ -95,6 +95,7 @@ object HomeCatalogSettingsSyncService {
             val pullToken = currentPullToken(profileId) ?: return
             val localPayload = HomeCatalogSettingsRepository.exportToSyncPayload()
             val remoteBlob = fetchRemoteBlob(profileId)
+            if (currentPullToken(profileId) != pullToken) return
             cachedSharedSettings = CachedSharedSettings(
                 token = pullToken,
                 settingsJson = remoteBlob?.settingsJson ?: buildJsonObject { },
@@ -168,6 +169,7 @@ object HomeCatalogSettingsSyncService {
     private fun currentPullToken(profileId: Int = ProfileRepository.activeProfileId): PullToken? {
         val authState = AuthRepository.state.value
         if (authState !is AuthState.Authenticated || authState.isAnonymous) return null
+        if (!AuthRepository.isRemoteAccountAuthenticated(authState.userId)) return null
         return PullToken(
             userId = authState.userId,
             profileId = profileId,

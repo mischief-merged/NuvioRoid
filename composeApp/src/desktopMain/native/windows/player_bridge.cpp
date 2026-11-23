@@ -49,6 +49,7 @@ typedef enum mpv_format {
 typedef enum mpv_event_id {
     MPV_EVENT_NONE = 0,
     MPV_EVENT_SHUTDOWN = 1,
+    MPV_EVENT_VIDEO_RECONFIG = 17,
 } mpv_event_id;
 
 typedef struct mpv_event {
@@ -881,6 +882,7 @@ public:
         JavaVM *vm,
         int decoderPriority,
         bool nvidiaRtxSuperResolutionEnabled,
+        bool nvidiaRtxHdrEnabled,
         jobject sink,
         jmethodID method
     ) {
@@ -896,8 +898,8 @@ public:
         auto initState = std::make_shared<InitializationState>();
         auto self = shared_from_this();
         uiThread = std::thread(
-            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState]() {
-                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState);
+            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, nvidiaRtxHdrEnabled, initState]() {
+                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, nvidiaRtxHdrEnabled, initState);
             }
         );
 
@@ -1121,7 +1123,7 @@ public:
         std::lock_guard<std::mutex> lock(mpvMutex);
         if (!mpv) return;
         std::string seconds = std::to_string((double)positionMs / 1000.0);
-        const char *command[] = {"seek", seconds.c_str(), "absolute+keyframes", nullptr};
+        const char *command[] = {"seek", seconds.c_str(), "absolute+exact", nullptr};
         mpvApi().command(mpv, command);
     }
 
@@ -1129,7 +1131,7 @@ public:
         std::lock_guard<std::mutex> lock(mpvMutex);
         if (!mpv) return;
         std::string seconds = std::to_string((double)offsetMs / 1000.0);
-        const char *command[] = {"seek", seconds.c_str(), "relative+keyframes", nullptr};
+        const char *command[] = {"seek", seconds.c_str(), "relative+exact", nullptr};
         mpvApi().command(mpv, command);
     }
 
@@ -1285,7 +1287,8 @@ public:
         const std::string &font,
         const std::string &fontsDir,
         const std::string &shadowColor,
-        double shadowOffset
+        double shadowOffset,
+        double shadowBlur
     ) {
         if (!fontsDir.empty()) setStringProperty("sub-fonts-dir", fontsDir);
         setStringProperty("sub-font", font);
@@ -1293,6 +1296,7 @@ public:
         std::lock_guard<std::mutex> lock(mpvMutex);
         if (!mpv) return;
         mpvApi().setProperty(mpv, "sub-shadow-offset", MPV_FORMAT_DOUBLE, &shadowOffset);
+        mpvApi().setProperty(mpv, "sub-blur", MPV_FORMAT_DOUBLE, &shadowBlur);
     }
 
     void applySubtitleStyle(
@@ -1408,6 +1412,9 @@ private:
     mpv_handle *mpv = nullptr;
     std::thread eventThread;
     std::atomic_bool stopping = false;
+    bool rtxSuperResolution = false;
+    bool rtxHdr = false;
+    std::string appliedVideoFilter;
     std::atomic_bool shuttingDown = false;
     std::atomic_bool hwdecLogged = false;  // one-shot log for hwdec-current
 
@@ -1443,11 +1450,12 @@ private:
         std::string controlsUrl,
         int decoderPriority,
         bool nvidiaRtxSuperResolutionEnabled,
+        bool nvidiaRtxHdrEnabled,
         std::shared_ptr<InitializationState> initState
     ) {
         std::string failure;
         try {
-            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled);
+            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, nvidiaRtxHdrEnabled);
         } catch (const std::exception &error) {
             failure = error.what();
             cleanupUiResources();
@@ -1478,7 +1486,8 @@ private:
         long long initialPositionMs,
         const std::string &controlsUrl,
         int decoderPriority,
-        bool nvidiaRtxSuperResolutionEnabled
+        bool nvidiaRtxSuperResolutionEnabled,
+        bool nvidiaRtxHdrEnabled
     ) {
         registerWindowClasses();
         uiThreadId = GetCurrentThreadId();
@@ -1530,7 +1539,7 @@ private:
         }
 
         startWebView(controlsUrl);
-        startMpv(sourceUrl, headerLines, playWhenReady, initialPositionMs, decoderPriority, nvidiaRtxSuperResolutionEnabled);
+        startMpv(sourceUrl, headerLines, playWhenReady, initialPositionMs, decoderPriority, nvidiaRtxSuperResolutionEnabled, nvidiaRtxHdrEnabled);
         layoutNativeSubviews();
         if (!SetTimer(messageHwnd, NUVIO_TIMER_ID, 500, nullptr)) {
             throw std::runtime_error("Unable to start native player timer.");
@@ -1725,10 +1734,12 @@ private:
         bool playWhenReady,
         long long initialPositionMs,
         int decoderPriority,
-        bool nvidiaRtxSuperResolutionEnabled
+        bool nvidiaRtxSuperResolutionEnabled,
+        bool nvidiaRtxHdrEnabled
     ) {
         MpvApi &api = mpvApi();
-        bool fastProfile = !nvidiaRtxSuperResolutionEnabled && unifiedMemoryGpu();
+        bool rtxVideoEnabled = nvidiaRtxSuperResolutionEnabled || nvidiaRtxHdrEnabled;
+        bool fastProfile = !rtxVideoEnabled && unifiedMemoryGpu();
         {
             std::lock_guard<std::mutex> lock(mpvMutex);
             // libmpv requires LC_NUMERIC=C: non-"C" locales that use comma
@@ -1750,7 +1761,7 @@ private:
             setMpvOptionStringLocked("keep-open", "yes");
             setMpvOptionStringLocked("volume-max", "200");
             setMpvOptionStringLocked("vo", "gpu-next,gpu,");
-            if (nvidiaRtxSuperResolutionEnabled) {
+            if (rtxVideoEnabled) {
                 setMpvOptionStringLocked("gpu-api", "d3d11");
                 setMpvOptionStringLocked("hwdec", "d3d11va");
                 setMpvOptionStringLocked("d3d11-adapter", "NVIDIA");
@@ -1760,8 +1771,11 @@ private:
             }
             setMpvOptionStringLocked("hwdec-codecs", "all");
 
-            if (nvidiaRtxSuperResolutionEnabled) {
-                setMpvOptionStringLocked("vf", "d3d11vpp=scale=2:scaling-mode=nvidia");
+            rtxSuperResolution = nvidiaRtxSuperResolutionEnabled;
+            rtxHdr = nvidiaRtxHdrEnabled;
+            appliedVideoFilter = rtxVideoFilter(false);
+            if (!appliedVideoFilter.empty()) {
+                setMpvOptionStringLocked("vf", appliedVideoFilter.c_str());
             }
             setMpvOptionStringLocked("target-colorspace-hint", "yes");
             if (decoderPriority == 0) {
@@ -1789,7 +1803,6 @@ private:
                 "stream-lavf-o",
                 "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=%23%408,429,500,502,503,504,reconnect_delay_max=15"
             );
-            setMpvOptionStringLocked("hr-seek", "no");
             std::string shaderCacheDirectory = mpvShaderCacheDirectory();
             if (!shaderCacheDirectory.empty()) {
                 setMpvOptionStringLocked("gpu-shader-cache-dir", shaderCacheDirectory.c_str());
@@ -2028,6 +2041,33 @@ private:
         }
     }
 
+    std::string rtxVideoFilter(bool sourceIsSdr) const {
+        const bool hdr = rtxHdr && sourceIsSdr;
+        if (rtxSuperResolution && hdr) {
+            return "d3d11vpp=scale=2:scaling-mode=nvidia:format=x2bgr10:nvidia-true-hdr,format=x2bgr10:transfer=pq:primaries=bt.2020";
+        }
+        if (rtxSuperResolution) {
+            return "d3d11vpp=scale=2:scaling-mode=nvidia";
+        }
+        if (hdr) {
+            return "d3d11vpp=format=x2bgr10:nvidia-true-hdr,format=x2bgr10:transfer=pq:primaries=bt.2020";
+        }
+        return "";
+    }
+
+    void updateRtxVideoFilter() {
+        if (!rtxHdr) return;
+        std::string gamma = stringProperty("video-params/gamma", "");
+        if (gamma.empty()) return;
+        const bool sourceIsSdr = gamma != "pq" && gamma != "hlg";
+        std::string wanted = rtxVideoFilter(sourceIsSdr);
+        if (wanted == appliedVideoFilter) return;
+        std::lock_guard<std::mutex> lock(mpvMutex);
+        if (!mpv) return;
+        mpvApi().setPropertyString(mpv, "vf", wanted.c_str());
+        appliedVideoFilter = wanted;
+    }
+
     void drainMpvEvents() {
         while (!stopping.load()) {
             mpv_handle *current = nullptr;
@@ -2043,6 +2083,9 @@ private:
             if (!event) continue;
             if (event->event_id == MPV_EVENT_SHUTDOWN) {
                 return;
+            }
+            if (event->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+                updateRtxVideoFilter();
             }
         }
     }
@@ -2274,7 +2317,7 @@ private:
 
     std::string channelLayoutName(const std::string &channels, int channelCount) {
         std::string normalized = trim(channels);
-        if (!normalized.empty() && lowerCopy(normalized) != "unknown") {
+        if (!normalized.empty() && lowerCopy(normalized).rfind("unknown", 0) != 0) {
             std::string lower = lowerCopy(normalized);
             if (lower == "mono") return "Mono";
             if (lower == "stereo") return "Stereo";
@@ -2410,6 +2453,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     jstring controlsPageUrl,
     jint decoderPriority,
     jboolean nvidiaRtxSuperResolutionEnabled,
+    jboolean nvidiaRtxHdrEnabled,
     jobject eventSink
 ) {
     HWND hostHwnd = (HWND)(intptr_t)hostViewPtr;
@@ -2445,6 +2489,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
             javaVm,
             decoderPriority,
             nvidiaRtxSuperResolutionEnabled == JNI_TRUE,
+            nvidiaRtxHdrEnabled == JNI_TRUE,
             eventSinkRef,
             eventMethod
         );
@@ -3039,7 +3084,8 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setSubtitleAppeara
     jstring font,
     jstring fontsDir,
     jstring shadowColor,
-    jfloat shadowOffset
+    jfloat shadowOffset,
+    jfloat shadowBlur
 ) {
     auto player = playerFromHandle(handle);
     if (!player) return;
@@ -3047,6 +3093,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setSubtitleAppeara
         jstringToUtf8(env, font),
         jstringToUtf8(env, fontsDir),
         jstringToUtf8(env, shadowColor),
-        shadowOffset
+        shadowOffset,
+        shadowBlur
     );
 }

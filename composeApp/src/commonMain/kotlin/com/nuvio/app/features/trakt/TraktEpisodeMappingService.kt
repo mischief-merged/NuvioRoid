@@ -1,10 +1,13 @@
 package com.nuvio.app.features.trakt
 
+import com.nuvio.app.core.memory.SharedLookup
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpGetTextWithHeaders
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -23,7 +26,7 @@ private const val BASE_URL = "https://api.trakt.tv"
 private val NON_ALPHANUMERIC = Regex("[^a-z0-9]+")
 private val COLLAPSED_SPACES = Regex("\\s+")
 private val titleMutex = Mutex()
-private val normalizedTitleCache = mutableMapOf<String, String>()
+private val normalizedTitleCache = BoundedCache<String, String>()
 
 /**
  * Handles episode number remapping between addon metadata (which may use multi-season
@@ -39,15 +42,15 @@ object TraktEpisodeMappingService {
     private val json = Json { ignoreUnknownKeys = true }
 
     private val cacheMutex = Mutex()
-    private val mappingCache = mutableMapOf<String, EpisodeMappingEntry>()
-    private val reverseMappingCache = mutableMapOf<String, EpisodeMappingEntry>()
-    private val addonEpisodesCache = mutableMapOf<String, List<EpisodeMappingEntry>>()
-    private val traktEpisodesCache = mutableMapOf<String, List<EpisodeMappingEntry>>()
+    private val mappingCache = BoundedCache<String, EpisodeMappingEntry>()
+    private val reverseMappingCache = BoundedCache<String, EpisodeMappingEntry>()
+    private val addonEpisodesCache = BoundedCache<String, List<EpisodeMappingEntry>>()
+    private val traktEpisodesCache = BoundedCache<String, List<EpisodeMappingEntry>>()
     // In-flight dedup: prevents multiple concurrent coroutines from fetching
     // In-flight dedup: prevents multiple concurrent coroutines from fetching
     // the same show's addon episodes simultaneously.
-    private val addonEpisodesInFlight = mutableMapOf<String, CompletableDeferred<List<EpisodeMappingEntry>>>()
-    private val traktEpisodesInFlight = mutableMapOf<String, CompletableDeferred<List<EpisodeMappingEntry>>>()
+    private val addonEpisodesInFlight = SharedLookup<String, List<EpisodeMappingEntry>>()
+    private val traktEpisodesInFlight = SharedLookup<String, List<EpisodeMappingEntry>>()
 
     var normalizeTitleCount = 0L
     var normalizeTitleTimeNs = 0L
@@ -373,45 +376,29 @@ object TraktEpisodeMappingService {
             addonEpisodesCache[cacheKey]?.let { return it }
         }
 
-        getAddonMisses++
         val startTime = TimeSource.Monotonic.markNow()
-        // Dedup: if another coroutine is already fetching this show, await its result.
-        val existingDeferred = cacheMutex.withLock { addonEpisodesInFlight[cacheKey] }
-        if (existingDeferred != null) {
-            return try { existingDeferred.await() } catch (_: Exception) { emptyList() }
-        }
-
-        // Register ourselves as the in-flight fetcher.
-        val deferred = CompletableDeferred<List<EpisodeMappingEntry>>()
-        val weOwn = cacheMutex.withLock {
-            // Double-check: cache or another flight may have appeared while we waited.
-            addonEpisodesCache[cacheKey]?.let { return it }
-            if (addonEpisodesInFlight.containsKey(cacheKey)) {
-                false
-            } else {
-                addonEpisodesInFlight[cacheKey] = deferred
-                true
-            }
-        }
-        if (!weOwn) {
-            val other = cacheMutex.withLock { addonEpisodesInFlight[cacheKey] }
-            return try { other?.await() ?: emptyList() } catch (_: Exception) { emptyList() }
-        }
-
         return try {
-            val addonEpisodes = fetchAddonEpisodes(contentId, contentType)
-            cacheMutex.withLock { addonEpisodesCache[cacheKey] = addonEpisodes }
-            deferred.complete(addonEpisodes)
-            addonEpisodes
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            deferred.completeExceptionally(e)
+            addonEpisodesInFlight.get(cacheKey) {
+                addonEpisodesCache[cacheKey]?.let { return@get it }
+                getAddonMisses++
+                val episodes = addonEpisodeLoader(contentId, contentType)
+                currentCoroutineContext().ensureActive()
+                addonEpisodesCache[cacheKey] = episodes
+                episodes
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log.w { "Episode lookup failed: ${error.message}" }
             emptyList()
         } finally {
-            cacheMutex.withLock { addonEpisodesInFlight.remove(cacheKey) }
             getAddonTimeMs += startTime.elapsedNow().inWholeMilliseconds
         }
     }
+
+    internal var addonEpisodeLoader: suspend (String, String) -> List<EpisodeMappingEntry> = ::fetchAddonEpisodes
+    internal var episodeHeaders: suspend () -> Map<String, String>? = { TraktAuthRepository.authorizedHeaders() }
+    internal var episodeText: suspend (String, Map<String, String>) -> String = { url, headers -> httpGetTextWithHeaders(url, headers) }
 
     private suspend fun fetchAddonEpisodes(
         contentId: String,
@@ -447,64 +434,29 @@ object TraktEpisodeMappingService {
 
     // ── Trakt episodes fetching ─────────────────────────────────────────
 
-    private suspend fun getTraktEpisodes(showLookupId: String): List<EpisodeMappingEntry> {
+    internal suspend fun getTraktEpisodes(showLookupId: String): List<EpisodeMappingEntry> {
         getTraktCalls++
-        cacheMutex.withLock {
-            traktEpisodesCache[showLookupId]?.let { return it }
-        }
-
-        val existingDeferred = cacheMutex.withLock { traktEpisodesInFlight[showLookupId] }
-        if (existingDeferred != null) {
-            return try { existingDeferred.await() } catch (_: Exception) { emptyList() }
-        }
-
-        val deferred = CompletableDeferred<List<EpisodeMappingEntry>>()
-        val weOwn = cacheMutex.withLock {
-            traktEpisodesCache[showLookupId]?.let { return it }
-            if (traktEpisodesInFlight.containsKey(showLookupId)) {
-                false
-            } else {
-                traktEpisodesInFlight[showLookupId] = deferred
-                true
-            }
-        }
-        if (!weOwn) {
-            val other = cacheMutex.withLock { traktEpisodesInFlight[showLookupId] }
-            return try { other?.await() ?: emptyList() } catch (_: Exception) { emptyList() }
-        }
-
-        getTraktMisses++
+        traktEpisodesCache[showLookupId]?.let { return it }
         val startTime = TimeSource.Monotonic.markNow()
-        val headers = TraktAuthRepository.authorizedHeaders() ?: run {
-            cleanupTraktFlight(showLookupId)
-            return emptyList()
-        }
-
-        // Trakt API: GET /shows/{id}/seasons?extended=episodes
-        val url = "$BASE_URL/shows/$showLookupId/seasons?extended=episodes"
-        val payload = runCatching {
-            httpGetTextWithHeaders(url = url, headers = headers)
-        }.onFailure { e ->
-            if (e is CancellationException) throw e
-            log.w { "getTraktEpisodes: seasons request failed id=$showLookupId: ${e.message}" }
-        }.getOrNull() ?: run {
+        return try {
+            traktEpisodesInFlight.get(showLookupId) {
+                traktEpisodesCache[showLookupId]?.let { return@get it }
+                getTraktMisses++
+                val headers = episodeHeaders() ?: return@get emptyList()
+                val payload = episodeText("$BASE_URL/shows/$showLookupId/seasons?extended=episodes", headers)
+                val episodes = parseTraktSeasonsPayload(payload)
+                currentCoroutineContext().ensureActive()
+                traktEpisodesCache[showLookupId] = episodes
+                episodes
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            log.w { "Episode lookup failed: ${error.message}" }
+            emptyList()
+        } finally {
             getTraktTimeMs += startTime.elapsedNow().inWholeMilliseconds
-            cleanupTraktFlight(showLookupId)
-            return emptyList()
         }
-
-        val traktEpisodes = parseTraktSeasonsPayload(payload)
-        cacheMutex.withLock {
-            traktEpisodesCache[showLookupId] = traktEpisodes
-        }
-        deferred.complete(traktEpisodes)
-        cleanupTraktFlight(showLookupId)
-        getTraktTimeMs += startTime.elapsedNow().inWholeMilliseconds
-        return traktEpisodes
-    }
-
-    private suspend fun cleanupTraktFlight(showLookupId: String) {
-        cacheMutex.withLock { traktEpisodesInFlight.remove(showLookupId) }
     }
 
     private fun parseTraktSeasonsPayload(payload: String): List<EpisodeMappingEntry> {

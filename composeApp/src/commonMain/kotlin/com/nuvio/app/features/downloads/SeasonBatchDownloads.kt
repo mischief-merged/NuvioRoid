@@ -5,12 +5,14 @@ import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.addons.fetchAddonResponseText
+import com.nuvio.app.features.debrid.DebridStreamLanguage
 import com.nuvio.app.features.debrid.DirectDebridPlaybackResolver
 import com.nuvio.app.features.debrid.DirectDebridPlayableResult
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamParser
+import com.nuvio.app.features.streams.WantedContent
 import com.nuvio.app.features.streams.runCatchingUnlessCancelled
 import com.nuvio.app.features.streams.streamAddonInstanceId
 import com.nuvio.app.features.streams.supportsStream
@@ -57,7 +59,9 @@ internal object SeasonBatchDownloads {
         prepareStream = ::prepareStream,
         enqueue = { request, episode, stream -> enqueueEpisode(request, episode, stream) },
         onFinished = { request, summary ->
-            if (request.autoDownloadRuleKey == null) {
+            if (request.replacesBadSource) {
+                SourceReplacements.onSearchFinished(request, summary)
+            } else if (request.autoDownloadRuleKey == null) {
                 summaryToast(request, summary)?.let { NuvioToastController.show(it) }
                 // The toast goes away; the last run stays on the Downloads screen until dismissed.
                 summary.toRunRecord(request, DownloadsClock.nowEpochMs())
@@ -66,11 +70,19 @@ internal object SeasonBatchDownloads {
                 AutoDownloads.onBatchFinished(request, summary)
             }
         },
-        discard = { item -> DownloadsRepository.cancelDownload(item.id) },
+        discard = ::discardSource,
         verifyCompleted = { item -> DownloadsRepository.verifyCompletedDownload(item.id) },
         inspect = DownloadsRepository::inspectCompletedDownload,
         preferAudioLanguage = { item, language -> DownloadsRepository.setPreferredAudioLanguage(item.id, language) },
+        onSourceTried = { request, episode, attempt ->
+            if (request.replacesBadSource) SourceReplacements.onSourceTried(request.titleKey(episode), attempt)
+        },
     )
+
+    internal fun discardSource(item: DownloadItem) = DownloadsRepository.rejectBatchSource(item.id)
+
+    /** The titles a running season download, or a search for another source, is working on. */
+    val titlesInFlight: StateFlow<Set<String>> get() = downloader.titlesInFlight
 
     val running: StateFlow<Map<String, SeasonBatchProgress>> get() = downloader.running
 
@@ -81,6 +93,9 @@ internal object SeasonBatchDownloads {
     }
 
     fun cancel(parentMetaId: String, seasonNumber: Int) = downloader.cancel(parentMetaId, seasonNumber)
+
+    /** Starts the app's own search for another source for one title ([SeasonBatchRequest.replacesBadSource]). */
+    internal fun startReplacement(request: SeasonBatchRequest): SeasonBatchStart = start(request)
 
     /**
      * Queues one item of a batch: an episode of the request's show, or a movie of its own. A source
@@ -116,11 +131,37 @@ internal object SeasonBatchDownloads {
         )
         // A single movie has no summary worth waiting for: the user is told as soon as it is queued.
         val queued = result == DownloadEnqueueResult.Started || result == DownloadEnqueueResult.Replaced
-        if (queued && request.isSingleMovie) NuvioToastController.show(result.toastMessage())
+        if (queued && request.isSingleMovie && !request.replacesBadSource) NuvioToastController.show(result.toastMessage())
         return result
     }
 
-    private suspend fun fetchAddonStreams(episode: SeasonBatchEpisode): List<StreamItem> {
+    internal suspend fun fetchStreamsForEpisode(
+        episode: SeasonBatchEpisode,
+        quality: BatchQuality,
+        maxBitrateMbps: Int?,
+        audioLanguage: DebridStreamLanguage?,
+        wanted: WantedContent?,
+    ): List<StreamItem> {
+        val embedded = rankBatchCandidates(
+            streams = MetaDetailsRepository.findEmbeddedStreams(episode.videoId),
+            quality = quality,
+            maxBitrateMbps = maxBitrateMbps,
+            audioLanguage = audioLanguage,
+            runtimeMinutes = episode.runtimeMinutes,
+            wanted = wanted,
+        )
+        if (embedded.isNotEmpty()) return embedded
+        return rankBatchCandidates(
+            streams = fetchAddonStreams(episode),
+            quality = quality,
+            maxBitrateMbps = maxBitrateMbps,
+            audioLanguage = audioLanguage,
+            runtimeMinutes = episode.runtimeMinutes,
+            wanted = wanted,
+        )
+    }
+
+    internal suspend fun fetchAddonStreams(episode: SeasonBatchEpisode): List<StreamItem> {
         val type = episode.movie?.metaType ?: "series"
         val streamId = if (episode.movie != null) movieStreamId(episode.videoId) else episode.videoId
         return coroutineScope {
@@ -160,7 +201,7 @@ internal object SeasonBatchDownloads {
         return runCatchingUnlessCancelled { TmdbService.tmdbToImdb(tmdbId, "movie") }.getOrNull() ?: videoId
     }
 
-    private suspend fun prepareStream(stream: StreamItem, episode: SeasonBatchEpisode): StreamItem? {
+    internal suspend fun prepareStream(stream: StreamItem, episode: SeasonBatchEpisode): StreamItem? {
         val resolved = DirectDebridPlaybackResolver.resolveToPlayableStream(
             stream = stream,
             season = episode.seasonNumber.takeIf { episode.movie == null },

@@ -7,9 +7,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -40,10 +43,15 @@ internal object SavedDetails {
     private fun readMeta(type: String, id: String): MetaDetails? {
         // The list of downloads may not have been read yet when a title is opened offline.
         DownloadsRepository.ensureLoaded()
-        val items = DownloadsRepository.uiState.value.items.filter { it.parentMetaId == id && it.status == DownloadStatus.Completed && !it.isPlaceholder }
-        if (items.isEmpty()) return null
-        val lists = items.mapNotNull { item ->
-            item.localFileUri?.let { runCatching { EpisodeListSidecar.read(it) }.getOrNull() }
+        val resolved = DownloadsRepository.uiState.value.items.mapNotNull { item ->
+            if (item.parentMetaId.trim() != id.trim()) return@mapNotNull null
+            val uri = DownloadsRepository.resolveLocalUriWithoutMutation(item) ?: return@mapNotNull null
+            item to uri
+        }
+        if (resolved.isEmpty()) return null
+        val items = resolved.map { it.first }
+        val lists = resolved.mapNotNull { (_, uri) ->
+            runCatching { EpisodeListSidecar.read(uri) }.getOrNull()
         }
         return buildSavedMeta(type, id, items, lists)
     }
@@ -104,15 +112,33 @@ internal class SavedLookup(val meta: MetaDetails?, val settled: Boolean)
  * "failed to load" dead end for the moment the look takes.
  */
 @Composable
-internal fun rememberSavedLookup(type: String, id: String, wanted: Boolean): State<SavedLookup> =
-    produceState(SavedLookup(null, settled = !wanted), type, id, wanted, DownloadsRepository.uiState.value.items) {
-        if (!wanted) {
-            value = SavedLookup(null, settled = true)
-        } else {
-            value = SavedLookup(null, settled = false)
-            value = SavedLookup(SavedDetails.metaFor(type, id), settled = true)
+internal fun rememberSavedLookup(type: String, id: String, wanted: Boolean): State<SavedLookup> {
+    val downloadsState by remember {
+        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.uiState
+    }.collectAsStateWithLifecycle()
+    val relevantItems = remember(downloadsState.items, id) {
+        val normalizedId = id.trim()
+        downloadsState.items.filter { item ->
+            item.parentMetaId.trim() == normalizedId &&
+                item.status == DownloadStatus.Completed &&
+                !item.isPlaceholder
         }
     }
+    val state = remember(type, id) {
+        mutableStateOf(SavedLookup(null, settled = !wanted))
+    }
+    LaunchedEffect(type, id, wanted, relevantItems) {
+        if (!wanted) {
+            state.value = SavedLookup(null, settled = true)
+        } else {
+            val previousMeta = state.value.meta
+            state.value = SavedLookup(meta = previousMeta, settled = previousMeta != null)
+            state.value = SavedLookup(SavedDetails.metaFor(type, id), settled = true)
+        }
+    }
+    return state
+}
 
 /** The plain line shown over a page built from saved details. */
 @Composable

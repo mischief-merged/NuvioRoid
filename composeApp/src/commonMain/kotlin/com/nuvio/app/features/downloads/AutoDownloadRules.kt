@@ -104,6 +104,8 @@ internal data class AutoDownloadPlan(
  *   order, without the watched ones, so a show that was watched to the end gets nothing.
  * - An episode the rule finished downloading before that is no longer in [downloads] was removed
  *   and is left out.
+ * - An episode waiting for deletion after watching ([pendingRemovalDownloadIds]) counts as watched,
+ *   so it does not take a slot in the keep-next window.
  * - An episode that is downloaded, downloading or paused, by the rule or by hand, counts as kept and
  *   is not queued again. One whose download failed, or whose finished file is too small to be the
  *   episode or is marked as not the real video, is queued again.
@@ -113,6 +115,7 @@ internal fun planAutoDownload(
     released: List<SeasonBatchEpisode>,
     isWatched: (SeasonBatchEpisode) -> Boolean,
     downloads: List<DownloadItem>,
+    pendingRemovalDownloadIds: Set<String> = emptySet(),
 ): AutoDownloadPlan {
     val ordered = released
         .filter { it.seasonNumber > 0 }
@@ -120,18 +123,22 @@ internal fun planAutoDownload(
         .sortedWith(compareBy({ it.seasonNumber }, { it.episodeNumber }))
     val statusByEpisode = downloads.episodeStatuses(rule.parentMetaId)
     val placeholders = downloads.placeholderEpisodeKeys(rule.parentMetaId, ordered)
+    val pendingRemovalEpisodes = downloads.pendingRemovalEpisodeKeys(rule.parentMetaId, ordered, pendingRemovalDownloadIds)
+    val treatedAsWatched: (SeasonBatchEpisode) -> Boolean = { episode ->
+        episode.autoDownloadKey in pendingRemovalEpisodes || isWatched(episode)
+    }
     val removed = rule.ownedEpisodeKeys - statusByEpisode.keys
 
     val window = when (rule.scope) {
         AutoDownloadScope.NextUnwatched ->
             ordered
-                .drop(ordered.indexOfLast(isWatched) + 1)
+                .drop(ordered.indexOfLast(treatedAsWatched) + 1)
                 .filter { it.autoDownloadKey !in removed }
                 .take(rule.keepCount)
         AutoDownloadScope.LatestReleased ->
             ordered
                 .takeLast(rule.keepCount)
-                .filter { it.autoDownloadKey !in removed && !isWatched(it) }
+                .filter { it.autoDownloadKey !in removed && !treatedAsWatched(it) }
     }
     val toDownload = window.filter { episode ->
         when (statusByEpisode[episode.autoDownloadKey]) {
@@ -148,16 +155,41 @@ internal val SeasonBatchEpisode.autoDownloadKey: String
     get() = autoDownloadEpisodeKey(seasonNumber, episodeNumber)
 
 /**
+ * The episodes of [parentMetaId] that have a completed, real-video download waiting for deletion
+ * after watching. Incomplete downloads and placeholders never count as watched.
+ */
+private fun List<DownloadItem>.pendingRemovalEpisodeKeys(
+    parentMetaId: String,
+    episodes: List<SeasonBatchEpisode>,
+    pendingRemovalDownloadIds: Set<String>,
+): Set<String> {
+    if (pendingRemovalDownloadIds.isEmpty()) return emptySet()
+    val parent = parentMetaId.trim()
+    val runtimes = episodes.associate { it.autoDownloadKey to it.runtimeMinutes }
+    return mapNotNullTo(mutableSetOf()) { item ->
+        if (item.id !in pendingRemovalDownloadIds) return@mapNotNullTo null
+        if (item.parentMetaId.trim() != parent) return@mapNotNullTo null
+        if (item.status != DownloadStatus.Completed) return@mapNotNullTo null
+        val season = item.seasonNumber ?: return@mapNotNullTo null
+        val episode = item.episodeNumber ?: return@mapNotNullTo null
+        val key = autoDownloadEpisodeKey(season, episode)
+        if (item.isNotTheVideo(runtimes[key])) return@mapNotNullTo null
+        key
+    }
+}
+
+private fun DownloadItem.isNotTheVideo(runtimeMinutes: Int?): Boolean =
+    isPlaceholder || finishedSizeBytes < minPlausibleVideoBytes(runtimeMinutes)
+
+/**
  * The episodes of a show whose only finished download is not the video: marked as not the real
  * video, or too small to be one. An episode that also has a download that is not such a file, a good
  * copy or one that is on its way, is not in the set: the marked file is kept beside it, as a problem
  * for the user to deal with, and does not make the rule fetch again.
  */
-private fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, episodes: List<SeasonBatchEpisode>): Set<String> {
+internal fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, episodes: List<SeasonBatchEpisode>): Set<String> {
     val parent = parentMetaId.trim()
     val runtimes = episodes.associate { it.autoDownloadKey to it.runtimeMinutes }
-    fun isNotTheVideo(item: DownloadItem, key: String) =
-        item.isPlaceholder || item.finishedSizeBytes < minPlausibleVideoBytes(runtimes[key])
     val ofShow = mapNotNull { item ->
         val season = item.seasonNumber ?: return@mapNotNull null
         val episode = item.episodeNumber ?: return@mapNotNull null
@@ -168,7 +200,7 @@ private fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, epis
         val finished = items.filter { it.status == DownloadStatus.Completed }
         val others = items.filter { it.status != DownloadStatus.Completed && it.status != DownloadStatus.Failed }
         key.takeIf {
-            finished.isNotEmpty() && finished.all { isNotTheVideo(it, key) } && others.isEmpty()
+            finished.isNotEmpty() && finished.all { it.isNotTheVideo(runtimes[key]) } && others.isEmpty()
         }
     }
 }

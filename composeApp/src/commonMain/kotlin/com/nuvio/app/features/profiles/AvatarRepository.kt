@@ -164,7 +164,7 @@ object AvatarRepository {
         if (standardFetchInFlight) return
         standardFetchInFlight = true
         try {
-            val result = SupabaseProvider.client.postgrest.rpc("get_avatar_catalog")
+            val result = SupabaseProvider.publicClient.postgrest.rpc("get_avatar_catalog")
             val items = result.decodeList<AvatarCatalogItem>()
             standardCatalog = items.filter { it.isActive }.sortedWith(
                 compareBy({ it.category }, { it.sortOrder }),

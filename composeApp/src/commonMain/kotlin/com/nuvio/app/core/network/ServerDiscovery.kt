@@ -109,8 +109,12 @@ internal object ServerDiscoveryPolicy {
         return candidate.host.equals(backend.host, ignoreCase = true) && candidate.port == backend.port
     }
 
+    internal fun canonicalBackendUrlOrNull(value: String): String? =
+        runCatching { normalizeBackendUrl(value) }.getOrNull()
+
     private fun normalizeBackendUrl(value: String): String {
         val normalized = value.trim()
+        if (normalized.isBlank()) throw ServerDiscoveryException(ServerDiscoveryFailure.MissingConfiguration)
         val parsed = parseHttpUrl(normalized, ServerDiscoveryFailure.MissingConfiguration)
         if (
             authorityOf(normalized).contains('@') ||
@@ -119,7 +123,8 @@ internal object ServerDiscoveryPolicy {
         ) {
             throw ServerDiscoveryException(ServerDiscoveryFailure.MissingConfiguration)
         }
-        return (originOf(parsed) + parsed.encodedPath).trimEnd('/')
+        val pathPart = if (parsed.encodedPath == "/") "" else parsed.encodedPath
+        return (originOf(parsed) + pathPart).trimEnd('/')
     }
 
     private fun parseHttpUrl(value: String, failure: ServerDiscoveryFailure): Url {
@@ -134,10 +139,12 @@ internal object ServerDiscoveryPolicy {
     }
 
     private fun originOf(url: Url): String {
-        val defaultPort = if (url.protocol.name == "https") 443 else 80
-        val host = if (':' in url.host) "[${url.host}]" else url.host
-        val port = if (url.port == defaultPort) "" else ":${url.port}"
-        return "${url.protocol.name}://$host$port"
+        val scheme = url.protocol.name.lowercase()
+        val defaultPort = if (scheme == "https") 443 else 80
+        val loweredHost = url.host.lowercase()
+        val host = if (':' in loweredHost && !loweredHost.startsWith('[')) "[$loweredHost]" else loweredHost
+        val port = if (url.port == defaultPort || url.port == 0) "" else ":${url.port}"
+        return "$scheme://$host$port"
     }
 
     private fun authorityOf(value: String): String =
