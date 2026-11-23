@@ -1992,12 +1992,8 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
             NSString *audioTracks = miniMode ? nil : ([self audioTracksJson] ?: @"[]");
             NSString *subtitleTracks = miniMode ? nil : ([self subtitleTracksJson] ?: @"[]");
             NSString *mediaTitle = needMediaTitle ? [self stringProperty:"media-title" fallback:@""] : @"";
-            NSString *gamma = (!miniMode || needHdrInit)
-                ? [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString]
-                : @"";
-            NSString *primaries = (!miniMode || needHdrInit)
-                ? [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString]
-                : @"";
+            NSString *gamma = [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString];
+            NSString *primaries = [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString];
             [self updateCachedDuration:duration
                               position:position
                         positionReadAt:positionReadAt
@@ -2014,9 +2010,7 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
                     return;
                 }
                 [self updatePeriodicTimers];
-                if (!miniMode || needHdrInit) {
-                    [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
-                }
+                [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
                 [self updateNowPlayingWithTitle:mediaTitle
                                        duration:duration
                                        position:position
@@ -2353,11 +2347,15 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     if (!_mpv) return;
     int flag = paused ? 1 : 0;
     mpv_set_property(_mpv, "pause", MPV_FORMAT_FLAG, &flag);
-    [self storeCachedPosition:[self estimatedPositionSeconds] at:CACurrentMediaTime()];
+    double currentPosition = [self estimatedPositionSeconds];
+    [self storeCachedPosition:currentPosition at:CACurrentMediaTime()];
     _cachedPaused.store(paused);
     [self updatePeriodicTimers];
-    _nowPlayingMetadataDirty = YES;
-    [self pushCurrentNowPlayingInfoFromCache];
+    [self updateNowPlayingWithTitle:@""
+                           duration:_cachedDurationSeconds.load()
+                           position:currentPosition
+                             paused:paused
+                              speed:_cachedSpeed.load()];
 }
 
 - (BOOL)isPaused {
@@ -2373,30 +2371,50 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
 
 - (void)seekToMilliseconds:(long long)positionMs {
     if (!_mpv) return;
-    std::string seconds = std::to_string((double)positionMs / 1000.0);
+    double targetSeconds = fmax((double)positionMs / 1000.0, 0.0);
+    std::string seconds = std::to_string(targetSeconds);
     const char *command[] = {"seek", seconds.c_str(), "absolute+exact", NULL};
     mpv_command(_mpv, command);
-    [self storeCachedPosition:(double)positionMs / 1000.0 at:CACurrentMediaTime()];
+    [self storeCachedPosition:targetSeconds at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
-    [self pushCurrentNowPlayingInfoFromCache];
+    [self updateNowPlayingWithTitle:@""
+                           duration:_cachedDurationSeconds.load()
+                           position:targetSeconds
+                             paused:_cachedPaused.load()
+                              speed:_cachedSpeed.load()];
 }
 
 - (void)seekByMilliseconds:(long long)offsetMs {
     if (!_mpv) return;
+    double duration = _cachedDurationSeconds.load();
+    double targetSeconds = fmax([self estimatedPositionSeconds] + ((double)offsetMs / 1000.0), 0.0);
+    if (duration > 0.0 && targetSeconds > duration) {
+        targetSeconds = duration;
+    }
     std::string seconds = std::to_string((double)offsetMs / 1000.0);
     const char *command[] = {"seek", seconds.c_str(), "relative+exact", NULL};
     mpv_command(_mpv, command);
-    [self storeCachedPosition:fmax(0.0, [self estimatedPositionSeconds] + ((double)offsetMs / 1000.0)) at:CACurrentMediaTime()];
+    [self storeCachedPosition:targetSeconds at:CACurrentMediaTime()];
     _nowPlayingMetadataDirty = YES;
-    [self pushCurrentNowPlayingInfoFromCache];
+    [self updateNowPlayingWithTitle:@""
+                           duration:duration
+                           position:targetSeconds
+                             paused:_cachedPaused.load()
+                              speed:_cachedSpeed.load()];
 }
 
 - (void)setSpeed:(double)speed {
     if (!_mpv) return;
     double clamped = fmax(0.25, fmin(4.0, speed));
     mpv_set_property(_mpv, "speed", MPV_FORMAT_DOUBLE, &clamped);
-    [self storeCachedPosition:[self estimatedPositionSeconds] at:CACurrentMediaTime()];
+    double currentPosition = [self estimatedPositionSeconds];
+    [self storeCachedPosition:currentPosition at:CACurrentMediaTime()];
     _cachedSpeed.store(clamped);
+    [self updateNowPlayingWithTitle:@""
+                           duration:_cachedDurationSeconds.load()
+                           position:currentPosition
+                             paused:_cachedPaused.load()
+                              speed:clamped];
 }
 
 - (double)speed {
@@ -2442,6 +2460,8 @@ static constexpr uint64_t kObserveMiniUserdata = 10;
         mpv_observe_property(mpv, kObserveMiniUserdata, "eof-reached", MPV_FORMAT_FLAG);
         mpv_observe_property(mpv, kObserveMiniUserdata, "core-idle", MPV_FORMAT_FLAG);
         mpv_observe_property(mpv, kObserveMiniUserdata, "speed", MPV_FORMAT_DOUBLE);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "video-params/gamma", MPV_FORMAT_STRING);
+        mpv_observe_property(mpv, kObserveMiniUserdata, "video-params/primaries", MPV_FORMAT_STRING);
     } else {
         mpv_unobserve_property(mpv, kObserveMiniUserdata);
     }
@@ -2462,6 +2482,7 @@ static constexpr uint64_t kObserveMiniUserdata = 10;
     if (!mpv) return;
     BOOL notifyMiniState = NO;
     BOOL refreshNowPlaying = NO;
+    BOOL refreshHdr = NO;
     for (;;) {
         mpv_event *event = mpv_wait_event(mpv, 0);
         if (!event || event->event_id == MPV_EVENT_NONE) break;
@@ -2514,6 +2535,7 @@ static constexpr uint64_t kObserveMiniUserdata = 10;
                             _cachedLoading.store(false);
                         }
                         notifyMiniState = YES;
+                        refreshNowPlaying = YES;
                     } else if (strcmp(prop->name, "duration") == 0 && prop->format == MPV_FORMAT_DOUBLE && prop->data) {
                         double dur = *(double *)prop->data;
                         if (std::isfinite(dur) && dur >= 0.0) {
@@ -2548,13 +2570,43 @@ static constexpr uint64_t kObserveMiniUserdata = 10;
                         }
                         notifyMiniState = YES;
                         refreshNowPlaying = YES;
+                    } else if (
+                        strcmp(prop->name, "video-params/gamma") == 0
+                        || strcmp(prop->name, "video-params/primaries") == 0
+                    ) {
+                        refreshHdr = YES;
                     }
+                }
+                break;
+            }
+            case MPV_EVENT_PLAYBACK_RESTART: {
+                if (_miniPropertiesObserved.load()) {
+                    double pos = [self doubleProperty:"time-pos" fallback:[self estimatedPositionSeconds]];
+                    [self storeCachedPosition:fmax(pos, 0.0) at:CACurrentMediaTime()];
+                    _cachedLoading.store(false);
+                    notifyMiniState = YES;
+                    refreshNowPlaying = YES;
+                }
+                break;
+            }
+            case MPV_EVENT_FILE_LOADED:
+            case MPV_EVENT_VIDEO_RECONFIG: {
+                if (_miniPropertiesObserved.load()) {
+                    refreshHdr = YES;
                 }
                 break;
             }
             default:
                 break;
         }
+    }
+    if (refreshHdr && _miniPropertiesObserved.load()) {
+        NSString *gamma = [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString];
+        NSString *primaries = [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!self->_mpv) return;
+            [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"mini-video-params" force:NO];
+        });
     }
     if (notifyMiniState && _miniPropertiesObserved.load()) {
         double posMs = floor([self estimatedPositionSeconds] * 1000.0);

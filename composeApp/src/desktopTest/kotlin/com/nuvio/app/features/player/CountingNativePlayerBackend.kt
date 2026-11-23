@@ -33,6 +33,7 @@ internal class CountingNativePlayerBackend(
         @Volatile var nowPlayingTitle: String = "",
         @Volatile var nowPlayingSubtitle: String = "",
         @Volatile var nowPlayingArtworkUrl: String = "",
+        @Volatile var nowPlayingPositionMs: Long = 0L,
         val eventSink: NativePlayerEventSink,
     )
 
@@ -68,7 +69,11 @@ internal class CountingNativePlayerBackend(
 
     fun emitPlaybackPosition(handle: Long, positionMs: Long) {
         val state = statesByHandle[handle] ?: return
+        val seeked = kotlin.math.abs(positionMs - state.nowPlayingPositionMs) > 3_000L
         state.positionMs = positionMs
+        if (state.remoteCommandsEnabled && seeked) {
+            state.nowPlayingPositionMs = positionMs
+        }
         state.eventSink.onPlayerEvent("nativeStateTick", positionMs.toDouble())
     }
 
@@ -168,16 +173,31 @@ internal class CountingNativePlayerBackend(
     override fun layoutNativeSubviews(handle: Long) = Unit
 
     override fun setPaused(handle: Long, paused: Boolean) {
-        statesByHandle[handle]?.paused = paused
+        statesByHandle[handle]?.apply {
+            this.paused = paused
+            if (remoteCommandsEnabled) {
+                nowPlayingPositionMs = positionMs
+            }
+        }
     }
 
     override fun seekTo(handle: Long, positionMs: Long) {
-        statesByHandle[handle]?.positionMs = positionMs.coerceAtLeast(0L)
+        statesByHandle[handle]?.apply {
+            val clamped = positionMs.coerceAtLeast(0L)
+            this.positionMs = clamped
+            if (remoteCommandsEnabled) {
+                nowPlayingPositionMs = clamped
+            }
+        }
     }
 
     override fun seekBy(handle: Long, offsetMs: Long) {
         val state = statesByHandle[handle] ?: return
-        state.positionMs = (state.positionMs + offsetMs).coerceIn(0L, state.durationMs)
+        val next = (state.positionMs + offsetMs).coerceIn(0L, state.durationMs)
+        state.positionMs = next
+        if (state.remoteCommandsEnabled) {
+            state.nowPlayingPositionMs = next
+        }
     }
 
     override fun setSpeed(handle: Long, speed: Float) {

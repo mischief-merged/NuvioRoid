@@ -1823,10 +1823,12 @@ class MiniPlayerSessionTest {
         assertEquals(audioQueriesWhenPaused, backend.audioTrackQueries.get(), "zero audio-track scans while paused and minimized")
         assertEquals(dimQueriesWhenPaused, backend.videoDimensionQueries.get(), "zero dimension reads while paused and minimized")
 
-        // Seeking forward +10s while paused refreshes the dock position once and goes right back to idle.
+        // Seeking forward +10s while paused refreshes both the dock and Now Playing position once, then returns to idle.
+        assertEquals(105_000L, backend.statesByHandle[1L]?.nowPlayingPositionMs)
         compose.onNodeWithContentDescription(text(Res.string.compose_player_seek_forward_10)).performClick()
         compose.mainClock.advanceTimeBy(100L)
         assertEquals(115_000L, sessionController.playbackState?.positionMs)
+        assertEquals(115_000L, backend.statesByHandle[1L]?.nowPlayingPositionMs)
         val snapQueriesAfterPausedSeek = backend.snapshotQueries.get()
         compose.mainClock.advanceTimeBy(5_000L)
         assertEquals(snapQueriesAfterPausedSeek, backend.snapshotQueries.get(), "returns to zero polling after paused seek")
