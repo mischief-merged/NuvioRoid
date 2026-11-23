@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- Downloads keep going in the background when the window closes, with a menu bar progress item and a check before quitting; the Mac stays awake only while data is arriving ([#64](https://github.com/mischief-merged/NuvioRoid/pull/64)).
 - The downloads list can be rebuilt from the files already on disk, with a Find downloads on disk button ([#98](https://github.com/mischief-merged/NuvioRoid/pull/98)).
 - Sleep timer for the player ([#108](https://github.com/mischief-merged/NuvioRoid/pull/108)).
 - A download source that fails or turns out to be a placeholder is replaced by the next untried source by itself, and tried sources are remembered across retries and restarts ([#62](https://github.com/mischief-merged/NuvioRoid/pull/62)).
