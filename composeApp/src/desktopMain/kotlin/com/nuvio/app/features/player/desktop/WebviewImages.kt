@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.URI
 import java.util.Base64
+import kotlin.math.roundToInt
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
@@ -22,6 +23,8 @@ import okhttp3.Request
 
 internal object WebviewImages {
     private const val SIZE = 112
+    /** Longest side of a remote picture. Local control pictures stay small squares. */
+    private const val ARTWORK_EDGE = 1024
     private val images = BoundedCache<String, String>(64)
     private val rejected = ConcurrentHashMap<String, Long>()
     private val client by lazy { guardedHttpClient().callTimeout(30, TimeUnit.SECONDS).build() }
@@ -48,29 +51,58 @@ internal object WebviewImages {
                 response.body?.readBounded(ArtworkMaxBytes) ?: return null
             }
             val source = ImageIO.createImageInputStream(ByteArrayInputStream(bytes))?.use { input ->
-                readSubsampled(input)
+                readSubsampled(input, ARTWORK_EDGE, longestSide = true)
             } ?: return null
-            return scaledThumbnail(source)
+            return scaledToFit(source, ARTWORK_EDGE)
         }
         val file = File(URI(url))
         if (!file.isFile || file.length() > ArtworkMaxBytes) return null
         val source = ImageIO.createImageInputStream(file)?.use { input ->
-            readSubsampled(input)
+            readSubsampled(input, SIZE, longestSide = false)
         } ?: return null
         return scaledThumbnail(source)
     }
 
-    private fun readSubsampled(input: javax.imageio.stream.ImageInputStream): BufferedImage? {
+    private fun readSubsampled(
+        input: javax.imageio.stream.ImageInputStream,
+        edge: Int,
+        longestSide: Boolean,
+    ): BufferedImage? {
         val reader = ImageIO.getImageReaders(input).asSequence().firstOrNull() ?: return null
         try {
             reader.input = input
             val width = reader.getWidth(0)
             val height = reader.getHeight(0)
             if (width <= 0 || height <= 0 || width.toLong() * height > 40_000_000L) return null
-            val sample = (minOf(width, height) / SIZE).coerceAtLeast(1)
+            val basis = if (longestSide) maxOf(width, height) else minOf(width, height)
+            val sample = (basis / edge).coerceAtLeast(1)
             val options = reader.defaultReadParam.apply { setSourceSubsampling(sample, sample, 0, 0) }
             return reader.read(0, options)
         } finally { reader.dispose() }
+    }
+
+    private fun scaledToFit(source: BufferedImage, maxEdge: Int): String {
+        val longest = maxOf(source.width, source.height)
+        val scale = if (longest <= maxEdge) 1.0 else maxEdge.toDouble() / longest
+        val width = (source.width * scale).roundToInt().coerceAtLeast(1)
+        val height = (source.height * scale).roundToInt().coerceAtLeast(1)
+        val scaled = if (width == source.width && height == source.height) source
+            else BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+        return try {
+            if (scaled !== source) {
+                scaled.createGraphics().apply {
+                    try {
+                        setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+                        drawImage(source, 0, 0, width, height, null)
+                    } finally { dispose() }
+                }
+            }
+            val bytes = ByteArrayOutputStream().also { ImageIO.write(scaled, "png", it) }.toByteArray()
+            "data:image/png;base64," + Base64.getEncoder().encodeToString(bytes)
+        } finally {
+            source.flush()
+            if (scaled !== source) scaled.flush()
+        }
     }
 
     private fun scaledThumbnail(source: BufferedImage): String {
