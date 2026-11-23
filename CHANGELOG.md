@@ -28,6 +28,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- Finished downloaded episodes now count as watched, so automatic downloads move on to the next episodes; only episodes finished on this device count, and unwatching an episode cancels its pending removal ([#118](https://github.com/mischief-merged/NuvioRoid/pull/118)).
 - Centred the current episode in the episode page navigation trail to match the links beside it ([#42](https://github.com/mischief-merged/NuvioRoid/pull/42)).
 - Avoided a dead-end state on show and episode pages while saved offline details are still loading ([#50](https://github.com/mischief-merged/NuvioRoid/pull/50)).
 - Preserved raw binary HTTP responses on desktop so posters and episode thumbnails saved beside downloads are no longer corrupted, and recorded why missing artwork failed so temporary errors retry sooner ([#52](https://github.com/mischief-merged/NuvioRoid/pull/52)).
