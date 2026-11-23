@@ -86,6 +86,7 @@ object DownloadsRepository {
     private var indexJob: Job? = null
     private var indexGeneration: Long = 0L
     private var lastCompletedIndexKey: List<CompletedIndexKey>? = null
+    private var offlineIndexObserved = false
 
     private data class CompletedIndexKey(
         val id: String,
@@ -357,6 +358,9 @@ object DownloadsRepository {
     }
 
     internal fun ensureOfflineIndexStarted() {
+        synchronized(indexLock) {
+            offlineIndexObserved = true
+        }
         if (!hasLoaded) {
             synchronized(indexLock) {
                 if (indexJob?.isActive == true) return
@@ -367,7 +371,7 @@ object DownloadsRepository {
                     val snapshot = _uiState.value.items
                     val key = completedIndexKey(snapshot)
                     val shouldBuild = synchronized(indexLock) {
-                        if (indexGeneration != generation) return@launch
+                        if (!offlineIndexObserved || indexGeneration != generation) return@launch
                         lastCompletedIndexKey = key
                         key.isNotEmpty()
                     }
@@ -377,7 +381,7 @@ object DownloadsRepository {
                         OfflineDownloadIndex.Empty
                     }
                     synchronized(indexLock) {
-                        if (indexGeneration == generation) {
+                        if (offlineIndexObserved && indexGeneration == generation) {
                             _offlineIndex.value = built
                         }
                     }
@@ -389,6 +393,7 @@ object DownloadsRepository {
     }
 
     internal fun refreshOfflineIndex() {
+        if (!synchronized(indexLock) { offlineIndexObserved }) return
         if (!hasLoaded) {
             ensureOfflineIndexStarted()
             return
@@ -398,6 +403,7 @@ object DownloadsRepository {
 
     private fun resetOfflineIndex() {
         synchronized(indexLock) {
+            offlineIndexObserved = false
             indexGeneration++
             indexJob?.cancel()
             indexJob = null
@@ -423,8 +429,10 @@ object DownloadsRepository {
         }
 
     private fun scheduleOfflineIndexRefresh(items: List<DownloadItem>, force: Boolean = false) {
+        if (!synchronized(indexLock) { offlineIndexObserved }) return
         val key = completedIndexKey(items)
         val generation = synchronized(indexLock) {
+            if (!offlineIndexObserved) return
             if (!force && key == lastCompletedIndexKey) return
             lastCompletedIndexKey = key
             indexJob?.cancel()
@@ -513,7 +521,7 @@ object DownloadsRepository {
     }
 
     internal fun resolveLocalUriWithoutMutation(item: DownloadItem): String? {
-        if (!item.isVerifiedCompletedStatus()) return null
+        if (!item.isVerifiedCompletedStatus() || isBusyOrAway(item)) return null
         return (backend.locate(item) as? FileLookup.Found)?.uri
     }
 

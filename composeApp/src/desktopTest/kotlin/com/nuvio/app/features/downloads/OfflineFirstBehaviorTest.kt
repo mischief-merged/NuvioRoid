@@ -700,6 +700,7 @@ class OfflineFirstBehaviorTest {
         val ep3 = downloadItem("ep3", "tt-sib", "tt-sib:1:3", season = 1, episode = 3)
         backend.presentUris += listOf(ep1.localFileUri!!, ep2.localFileUri!!, ep3.localFileUri!!)
         persistItems(ep1, ep2, ep3)
+        DownloadsRepository.ensureOfflineIndexStarted()
         val indexDeadline = System.currentTimeMillis() + 2_000L
         while (!DownloadsRepository.offlineIndex.value.hasFor("tt-sib", 1, 3, "tt-sib:1:3") &&
             System.currentTimeMillis() < indexDeadline
