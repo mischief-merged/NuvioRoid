@@ -37,6 +37,27 @@ object DownloadsRepository {
     private val _hasUnseenCompleted = MutableStateFlow(false)
     val hasUnseenCompleted: StateFlow<Boolean> = _hasUnseenCompleted.asStateFlow()
 
+    private val _catalogReady = MutableStateFlow(false)
+
+    /** True once a stored list has been published. An offline launch waits for this, so it does not decide before the list exists. */
+    internal val catalogReady: StateFlow<Boolean> = _catalogReady.asStateFlow()
+
+    /**
+     * When this returns true, [ensureLoadedForDisplay] leaves the list for the warm-up instead of reading it here.
+     * The desktop sets it for the interface thread, so the first screen is not held up by the decode.
+     * A click still waits for the list: acting on the empty one would overwrite what is stored.
+     */
+    @Volatile
+    internal var deferLoadOnThisThread: () -> Boolean = { false }
+
+    /** Runs before the list is read. The desktop waits here until a cut-short folder move has been settled. */
+    @Volatile
+    internal var beforeCatalogLoad: () -> Unit = {}
+
+    /** Runs on the thread that is about to read the list. */
+    @Volatile
+    internal var onCatalogLoad: () -> Unit = {}
+
     // The UI, downloader callbacks and background workers reach this object from different threads.
     // Every read-modify-write of the item list, and every use of activeTransfers, holds this lock.
     //
@@ -51,6 +72,10 @@ object DownloadsRepository {
     private val activeTransfers = mutableMapOf<String, ActiveTransfer>()
     @kotlin.concurrent.Volatile
     private var hasLoaded = false
+
+    /** The thread currently inside [loadFromDisk]. A call it makes back must not start another read or wait again. */
+    @Volatile
+    private var catalogLoadingThread: Thread? = null
 
     // Where items are persisted and transfers and files are handled. Always the platform in the app.
     internal var backend: DownloadsBackend = PlatformDownloadsBackend
@@ -98,13 +123,35 @@ object DownloadsRepository {
     /** Runs [block] inside the state lock. Tests only: proves what must not need it. */
     internal fun holdStateLockForTest(block: () -> Unit) = synchronized(stateLock) { block() }
 
-    fun ensureLoaded(): Unit = synchronized(stateLock) {
-        if (hasLoaded) return
-        loadFromDisk()
+    fun ensureLoaded() {
+        if (_catalogReady.value) return
+        // The read calls back into here (a resumed transfer, a connection hold). Waiting again would stick.
+        if (Thread.currentThread() === catalogLoadingThread) return
+        loadAfterRecovery()
+    }
+
+    /**
+     * The screen asks for the list while it is being drawn. Reading it there blocks that frame, so this
+     * returns and the warm-up reads it instead. Anything that changes the list or decides playback uses
+     * [ensureLoaded] and waits until the list has been published.
+     */
+    internal fun ensureLoadedForDisplay() {
+        if (_catalogReady.value) return
+        if (deferLoadOnThisThread()) return
+        loadAfterRecovery()
     }
 
     fun onProfileChanged() {
+        beforeCatalogLoad()
         loadFromDisk()
+    }
+
+    private fun loadAfterRecovery() {
+        beforeCatalogLoad()
+        synchronized(stateLock) {
+            if (_catalogReady.value || Thread.currentThread() === catalogLoadingThread) return
+            loadFromDisk()
+        }
     }
 
     fun markCompletedSeen() {
@@ -116,10 +163,12 @@ object DownloadsRepository {
         activeTransfers.clear()
         transfers.forEach(ActiveTransfer::cancel)
         hasLoaded = false
+        catalogLoadingThread = null
         loadedProfileId = null
         baseline = emptyList()
         baseRevision = 0L
         _hasUnseenCompleted.value = false
+        _catalogReady.value = false
         _uiState.value = DownloadsUiState()
         notifyLiveStatusPlatform()
     }
@@ -595,64 +644,119 @@ object DownloadsRepository {
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
 
     private fun loadFromDisk(): Unit = synchronized(stateLock) {
-        _hasUnseenCompleted.value = false
+        if (Thread.currentThread() === catalogLoadingThread) return
+        val uiBefore = _uiState.value
+        val unseenBefore = _hasUnseenCompleted.value
+        val resumedBefore = downloadsResumedAtLoad
+        val transfersBefore = activeTransfers.toMap()
+        catalogLoadingThread = Thread.currentThread()
+        // Not ready until this attempt publishes, including a profile switch, so a pause during the
+        // read waits and then sees the list this read found. The thread doing the read already returns
+        // from ensureLoaded, so clearing this does not start the read again.
+        _catalogReady.value = false
+        try {
+            onCatalogLoad()
+            _hasUnseenCompleted.value = false
+            loadedPayload = null
+            savingIsUnsafe = false
+            val payload = backend.loadPayload().orEmpty().trim()
+            var decoded = if (payload.isEmpty()) null else DownloadsCodec.decode(payload)
+            val payloadUnreadable = payload.isNotEmpty() && decoded == null
+            if (decoded == null && payload.isNotEmpty()) {
+                // A payload that cannot be read is put aside before anything can be saved in its place,
+                // and the one from before the last write is read instead when there is one. That one
+                // is fetched first: putting the payload aside is a write, after which the copy from
+                // before the last write is no longer this one.
+                val previous = runCatching { backend.loadPreviousPayload() }.getOrNull()
+                savingIsUnsafe = runCatching { backend.saveUnreadablePayload(payload, DownloadsClock.nowEpochMs()) }.isFailure
+                decoded = previous
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let(DownloadsCodec::decode)
+            }
+            // A payload with content that could not be read is a problem to show, whatever was read in its place.
+            val storeProblem = when {
+                !payloadUnreadable -> null
+                savingIsUnsafe -> DownloadsStoreProblem.NotSaving
+                decoded != null -> DownloadsStoreProblem.EarlierCopyShown
+                else -> DownloadsStoreProblem.StartedEmpty
+            }
+            if (decoded == null) {
+                _uiState.value = DownloadsUiState(storeProblem = storeProblem)
+                notifyLiveStatusPlatform()
+                markCatalogLoaded()
+                _catalogReady.value = true
+                return
+            }
+            loadedPayload = decoded
+            baseline = decoded.items
+            baseRevision = DownloadsCodec.revisionOf(payload)
+
+            var shouldPersistNormalized = false
+            val normalized = decoded.items
+                .map { item ->
+                    val statusNormalized = backend.restoreItem(item)
+
+                    val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized).withoutLostFile()
+                    if (localUriNormalized != item) {
+                        shouldPersistNormalized = true
+                    }
+                    localUriNormalized
+                }
+
+            _uiState.value = DownloadsUiState(normalized, storeProblem)
+            notifyLiveStatusPlatform()
+            // Set once the list is the one just read, and before a hold or a resumed transfer looks at it.
+            markCatalogLoaded()
+            if (shouldPersistNormalized) {
+                persist()
+            }
+            val resumed = normalized.filter { it.status == DownloadStatus.Downloading && it.id !in activeTransfers }
+            downloadsResumedAtLoad = downloadsResumedAtLoad + resumed.map { it.id }
+            resumed.forEach(::startDownload)
+            // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
+            applyConnectionHold()
+            _catalogReady.value = true
+        } catch (failure: Exception) {
+            undoFailedCatalogRead(uiBefore, unseenBefore, resumedBefore, transfersBefore)
+            throw failure
+        } finally {
+            catalogLoadingThread = null
+        }
+    }
+
+    /** The list now in memory is the one just read. Callers that look without the lock can use it. */
+    private fun markCatalogLoaded() {
         hasLoaded = true
         loadedProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
+    }
+
+    /**
+     * The read did not finish. Drop what this attempt published or started, and leave the ready flag
+     * clear so the next caller reads again instead of treating a failed read as an empty list.
+     */
+    private fun undoFailedCatalogRead(
+        uiBefore: DownloadsUiState,
+        unseenBefore: Boolean,
+        resumedBefore: Set<String>,
+        transfersBefore: Map<String, ActiveTransfer>,
+    ) {
+        activeTransfers.filter { (id, transfer) -> transfersBefore[id] !== transfer }.keys.toList().forEach { id ->
+            activeTransfers.remove(id)?.cancel()
+        }
+        hasLoaded = false
+        loadedProfileId = null
         loadedPayload = null
+        baseline = emptyList()
+        baseRevision = 0L
         savingIsUnsafe = false
-        val payload = backend.loadPayload().orEmpty().trim()
-        var decoded = if (payload.isEmpty()) null else DownloadsCodec.decode(payload)
-        val payloadUnreadable = payload.isNotEmpty() && decoded == null
-        if (decoded == null && payload.isNotEmpty()) {
-            // A payload that cannot be read is put aside before anything can be saved in its place,
-            // and the one from before the last write is read instead when there is one. That one
-            // is fetched first: putting the payload aside is a write, after which the copy from
-            // before the last write is no longer this one.
-            val previous = runCatching { backend.loadPreviousPayload() }.getOrNull()
-            savingIsUnsafe = runCatching { backend.saveUnreadablePayload(payload, DownloadsClock.nowEpochMs()) }.isFailure
-            decoded = previous
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?.let(DownloadsCodec::decode)
-        }
-        // A payload with content that could not be read is a problem to show, whatever was read in its place.
-        val storeProblem = when {
-            !payloadUnreadable -> null
-            savingIsUnsafe -> DownloadsStoreProblem.NotSaving
-            decoded != null -> DownloadsStoreProblem.EarlierCopyShown
-            else -> DownloadsStoreProblem.StartedEmpty
-        }
-        if (decoded == null) {
-            _uiState.value = DownloadsUiState(storeProblem = storeProblem)
+        downloadsResumedAtLoad = resumedBefore
+        _hasUnseenCompleted.value = unseenBefore
+        _catalogReady.value = false
+        if (_uiState.value !== uiBefore) {
+            _uiState.value = uiBefore
             notifyLiveStatusPlatform()
-            return
         }
-        loadedPayload = decoded
-        baseline = decoded.items
-        baseRevision = DownloadsCodec.revisionOf(payload)
-
-        var shouldPersistNormalized = false
-        val normalized = decoded.items
-            .map { item ->
-                val statusNormalized = backend.restoreItem(item)
-
-                val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized).withoutLostFile()
-                if (localUriNormalized != item) {
-                    shouldPersistNormalized = true
-                }
-                localUriNormalized
-            }
-
-        _uiState.value = DownloadsUiState(normalized, storeProblem)
-        notifyLiveStatusPlatform()
-        if (shouldPersistNormalized) {
-            persist()
-        }
-        val resumed = normalized.filter { it.status == DownloadStatus.Downloading && it.id !in activeTransfers }
-        downloadsResumedAtLoad = downloadsResumedAtLoad + resumed.map { it.id }
-        resumed.forEach(::startDownload)
-        // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
-        applyConnectionHold()
     }
 
     /**

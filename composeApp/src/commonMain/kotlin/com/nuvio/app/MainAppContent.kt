@@ -362,10 +362,8 @@ internal fun MainAppContent(
         WatchedRepository.uiState
     }.collectAsStateWithLifecycle()
     val fullyWatchedSeriesKeys by WatchedRepository.fullyWatchedSeriesKeys.collectAsStateWithLifecycle()
-    val completedDownloads by remember {
-        DownloadsRepository.ensureLoaded()
-        DownloadsRepository.uiState
-    }.collectMappedAsState { it.completedItems }
+    val completedDownloads by DownloadsRepository.uiState.collectMappedAsState { it.completedItems }
+    val downloadsCatalogReady by DownloadsRepository.catalogReady.collectAsStateWithLifecycle()
     val networkCondition by NetworkStatusRepository.uiState.collectMappedAsState { it.condition }
     val playbackAvailability = rememberPlaybackAvailability()
     val playbackUnavailableMessage = stringResource(Res.string.playback_unavailable_message)
@@ -672,6 +670,7 @@ internal fun MainAppContent(
         offlineLaunchRouteHandled,
         networkCondition,
         completedDownloads,
+        downloadsCatalogReady,
     ) {
         if (!ownsAppRuntime) return@LaunchedEffect
         if (!initialHomeReady || offlineLaunchRouteHandled) return@LaunchedEffect
@@ -688,8 +687,14 @@ internal fun MainAppContent(
             NetworkCondition.NoInternet,
             NetworkCondition.ServersUnreachable,
             -> {
+                if (!AppFeaturePolicy.downloadsEnabled) {
+                    offlineLaunchRouteHandled = true
+                    return@LaunchedEffect
+                }
+                // The list is read off the interface thread. Wait for it, or an offline launch
+                // would miss downloads that are still being read.
+                if (!downloadsCatalogReady) return@LaunchedEffect
                 offlineLaunchRouteHandled = true
-                if (!AppFeaturePolicy.downloadsEnabled) return@LaunchedEffect
                 val hasPlayableDownload = completedDownloads.any {
                     !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
                 }

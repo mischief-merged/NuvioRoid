@@ -12,8 +12,11 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.awt.EventQueue
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** What the folders need from the list of downloads. The app wires them to [DownloadsRepository]. */
 internal interface DownloadsHooks {
@@ -140,7 +143,19 @@ internal class DesktopDownloadFolders(
     private val cancelRequested = AtomicBoolean(false)
     private val moveRunning = AtomicBoolean(false)
     private val lastAvailability = java.util.concurrent.ConcurrentHashMap<String, FolderAvailability>()
+    private val pollLock = Any()
+    private val watchers = AtomicInteger(0)
+    private val usageWatched = AtomicBoolean(false)
+    private val recoveryDone = CountDownLatch(1)
+    private var seenSignature = false
+    private var lastSignature: List<Pair<String, DownloadStatus>> = emptyList()
     private var monitor: Thread? = null
+    @Volatile private var stopped = false
+
+    /** The thread that settles a cut-short move. Null until [start] has begun it. */
+    @Volatile
+    internal var recoveryRunner: Thread? = null
+        private set
 
     override fun pickFolder(): String? = picker()
 
@@ -238,7 +253,14 @@ internal class DesktopDownloadFolders(
         return current
     }
 
-    override fun refresh() {
+    override fun setUsageWatched(watched: Boolean) {
+        val count = if (watched) watchers.incrementAndGet() else watchers.updateAndGet { (it - 1).coerceAtLeast(0) }
+        usageWatched.set(count > 0)
+    }
+
+    override fun refresh() = synchronized(pollLock) { refreshLocked() }
+
+    private fun refreshLocked() {
         // A drive that came back under another name is found by the id in its marker.
         locations.all().filter { it.id != DownloadLocations.AppId }.forEach { location ->
             if (locations.availability(location) != FolderAvailability.Available) locations.rediscover(location)
@@ -247,7 +269,7 @@ internal class DesktopDownloadFolders(
         val byLocation = items.groupBy { locationIdOf(it) }
         val defaultId = locations.defaultLocation().id
         val states = locations.all().associate { it.id to locations.availability(it) }
-        val measured = usage.current(items, states)
+        val measured = usage.current(items, states, watching = usageWatched.get())
         val infos = locations.all().map { location ->
             val availability = states.getValue(location.id)
             val members = byLocation[location.id].orEmpty()
@@ -280,25 +302,79 @@ internal class DesktopDownloadFolders(
             autoDownloadUsedBytes = measured.autoDownloadBytes, totalFreeBytes = freeTotal, usageMeasured = true,
             leftovers = runCatching { mover.leftovers() }.getOrDefault(emptyList()),
         )
-        var returned = false
-        infos.forEach { info ->
-            val before = lastAvailability.put(info.id, info.availability)
-            if (before != null && before != FolderAvailability.Available && info.availability == FolderAvailability.Available) returned = true
-        }
-        if (returned) {
+        if (noteAvailability(states)) {
             hooks.resumeHeld()
             onReturned()
         }
     }
 
-    /** Checks every few seconds, off the interface thread, which locations can be reached. */
-    fun start() {
+    /**
+     * One pass of the location watcher. While nobody is looking at sizes, this only checks that each
+     * folder can be reached. Sizes are measured when a transfer's status changes, or while a screen
+     * is showing them.
+     */
+    internal fun poll() = synchronized(pollLock) {
+        if (!moveRunning.get() && mover.unresolvedJournals().isNotEmpty()) runCatching { mover.recover() }
+        val items = runCatching { hooks.items() }.getOrDefault(emptyList())
+        val signature = items.map { it.id to it.status }
+        val changed = seenSignature && signature != lastSignature
+        seenSignature = true
+        lastSignature = signature
+        if (changed) usage.invalidate()
+        if (usageWatched.get() || changed) refreshLocked() else noteReachability()
+    }
+
+    /** Whether each folder can be used, without listing what is inside it. */
+    private fun noteReachability() {
+        locations.all().filter { it.id != DownloadLocations.AppId }.forEach { location ->
+            if (locations.availability(location) != FolderAvailability.Available) locations.rediscover(location)
+        }
+        val states = locations.all().associate { it.id to locations.availability(it) }
+        val current = _state.value
+        if (current.locations.isNotEmpty()) {
+            _state.value = current.copy(
+                locations = current.locations.map { info ->
+                    val availability = states[info.id] ?: info.availability
+                    info.copy(
+                        availability = availability,
+                        freeBytes = if (availability == FolderAvailability.Available) info.freeBytes else null,
+                    )
+                },
+            )
+        }
+        if (noteAvailability(states)) {
+            hooks.resumeHeld()
+            onReturned()
+        }
+    }
+
+    /** True when a folder that was away can be used again. */
+    private fun noteAvailability(states: Map<String, FolderAvailability>): Boolean {
+        var returned = false
+        states.forEach { (id, availability) ->
+            val before = lastAvailability.put(id, availability)
+            if (before != null && before != FolderAvailability.Available && availability == FolderAvailability.Available) returned = true
+        }
+        return returned
+    }
+
+    /**
+     * Checks every few seconds, off the interface thread. The first thing it does is settle a cut-short move.
+     * [afterRecovery] runs on that same thread once the move is settled, before the watcher loops.
+     */
+    fun start(afterRecovery: () -> Unit = {}) {
         if (monitor != null) return
+        stopped = false
         monitor = Thread({
-            while (true) {
-                // An interrupted move is settled as soon as its locations are there, and again when they come back.
-                if (!moveRunning.get() && mover.unresolvedJournals().isNotEmpty()) runCatching { mover.recover() }
-                runCatching { refresh() }
+            recoveryRunner = Thread.currentThread()
+            try {
+                runCatching { recoverInterrupted() }
+            } finally {
+                recoveryDone.countDown()
+            }
+            runCatching { afterRecovery() }
+            while (!stopped && !Thread.currentThread().isInterrupted) {
+                runCatching { poll() }.onFailure { if (it is InterruptedException) return@Thread }
                 try {
                     Thread.sleep(CheckIntervalMs)
                 } catch (_: InterruptedException) {
@@ -309,6 +385,20 @@ internal class DesktopDownloadFolders(
             isDaemon = true
             start()
         }
+    }
+
+    /** Blocks until the opening recovery has finished. [start] counts that down even when there was nothing to settle. */
+    internal fun awaitRecovery() {
+        recoveryDone.await()
+    }
+
+    /** Stops the watcher. Tests use this so the thread does not keep running. */
+    internal fun stop() {
+        stopped = true
+        val running = monitor ?: return
+        running.interrupt()
+        running.join(2_000)
+        monitor = null
     }
 
     /** At start: settles an interrupted move. It touches no user file and changes no record. */
@@ -642,11 +732,18 @@ internal object DesktopDownloads {
         override = folders
     }
 
-    /** Called once when the app starts: settles an interrupted move, then watches the locations. */
+    /**
+     * Called once when the app starts. Recovery runs on the location thread, and the downloads list
+     * is read only after that, never on the interface thread.
+     */
     fun install() {
         val folders = real
-        folders.recoverInterrupted()
+        DownloadsRepository.deferLoadOnThisThread = { EventQueue.isDispatchThread() }
+        DownloadsRepository.beforeCatalogLoad = {
+            if (Thread.currentThread() !== folders.recoveryRunner) folders.awaitRecovery()
+        }
         DownloadFolders.controller = folders
-        folders.start()
+        // Read the list on the location thread, after recovery, so the interface thread never decodes it.
+        folders.start(afterRecovery = { DownloadsRepository.ensureLoaded() })
     }
 }

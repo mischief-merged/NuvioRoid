@@ -16,14 +16,16 @@ internal class UsageResult(
 /**
  * Measures what downloads really take on disk: the sizes of the files of finished and unfinished
  * downloads, partial files and companion files included, not the sizes that were announced. Only files
- * that belong to a download in the list are counted. The result is cached; [current] measures again when
- * the set of downloads or a location's state changed, while transfers run at most every [whileRunningMs],
- * and at most [maxAgeMs] apart. It must be called off the interface thread.
+ * that belong to a download in the list are counted. The result is cached. [current] measures again when
+ * the set of downloads or a location's state changed, or when [invalidate] was called because a transfer
+ * finished or a move ended. While someone is watching sizes and a transfer is running, it also measures
+ * again after [whileRunningMs]. Otherwise it measures again only after [maxAgeMs], so an idle caller
+ * does not walk the folder more than once a minute. It must be called off the interface thread.
  */
 internal class DownloadStorageUsage(
     private val locations: DownloadLocations,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val whileRunningMs: Long = 5_000L,
+    private val whileRunningMs: Long = 30_000L,
     private val maxAgeMs: Long = 60_000L,
     private val timeoutMs: Long = 5_000L,
 ) {
@@ -42,8 +44,17 @@ internal class DownloadStorageUsage(
         forced = true
     }
 
+    /**
+     * [watching] is true while the downloads screen (or the folder setting) is open. A running
+     * transfer then refreshes sizes every [whileRunningMs]. With it false, progress alone never
+     * walks the folder.
+     */
     @Synchronized
-    fun current(items: List<DownloadItem>, availability: Map<String, FolderAvailability>): UsageResult {
+    fun current(
+        items: List<DownloadItem>,
+        availability: Map<String, FolderAvailability>,
+        watching: Boolean = false,
+    ): UsageResult {
         val print = listOf(
             items.map { listOf(it.id, it.status, it.locationId, it.localFileUri, it.fileName) },
             availability.toSortedMap().toList(),
@@ -51,7 +62,8 @@ internal class DownloadStorageUsage(
         val now = clock()
         val running = items.any { it.status == DownloadStatus.Downloading }
         val due = cached == null || forced || print != fingerprint ||
-            now - cachedAt >= maxAgeMs || (running && now - cachedAt >= whileRunningMs)
+            now - cachedAt >= maxAgeMs ||
+            (watching && running && now - cachedAt >= whileRunningMs)
         if (due) {
             cached = measure(items, availability)
             cachedAt = now

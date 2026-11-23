@@ -230,6 +230,12 @@ internal interface DownloadFolderController {
 
     fun refresh()
 
+    /**
+     * True while a screen is showing folder sizes, so they stay current. False leaves the watcher
+     * checking only that folders can be reached.
+     */
+    fun setUsageWatched(watched: Boolean) = Unit
+
     /** The folder path the app keeps its own downloads in. */
     fun appFolderPath(): String
 

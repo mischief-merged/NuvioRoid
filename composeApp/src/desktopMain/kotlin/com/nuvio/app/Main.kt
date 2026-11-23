@@ -38,6 +38,7 @@ import com.nuvio.app.features.player.desktop.DesktopAppFullscreenController
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopWindowGeometry
 import com.nuvio.app.features.player.desktop.DesktopWindowModeStorage
+import com.nuvio.app.features.player.desktop.WindowGeometryWrites
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import com.nuvio.app.features.player.desktop.applyNativeDesktopWindowChrome
 import com.nuvio.app.features.player.desktop.configureMacosWindowBeforePeer
@@ -53,6 +54,8 @@ import com.nuvio.app.features.settings.applyDesktopRendererPreference
 import com.nuvio.app.features.settings.transparentPreviewResource
 import java.awt.Desktop
 import javax.imageio.ImageIO
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.awt.Color as AwtColor
 import javax.swing.JComponent
 
@@ -82,7 +85,8 @@ fun main(args: Array<String>) {
     // Load cached profile data synchronously so the profile color is available
     // on the very first Compose frame (matching Android's SharedPreferences behavior).
     ProfileRepository.loadCachedProfiles()
-    // Settles a folder move that was cut short, before the list of downloads is read.
+    // Starts settling a cut-short folder move on a background thread. The downloads list is read
+    // there, after that finishes, so neither one runs on the interface thread.
     runCatching { com.nuvio.app.features.downloads.DesktopDownloads.install() }
     // Watches for hotspots and Low Data Mode networks, on which downloads wait (when the setting is on).
     runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
@@ -140,6 +144,12 @@ fun main(args: Array<String>) {
             placement = initialPlacement,
         )
         val fullscreenController = remember { DesktopAppFullscreenController() }
+        // One save for position and size, after the window has stopped moving.
+        val geometryWrites = remember {
+            WindowGeometryWrites { maximized, geometry ->
+                DesktopWindowModeStorage.saveSnapshot(maximized, geometry)
+            }
+        }
         val closeApplication = {
             P2pStreamingEngine.shutdown()
             DiscordPresenceManager.shutdown()
@@ -204,24 +214,49 @@ fun main(args: Array<String>) {
             LaunchedEffect(windowState) {
                 // Only persist geometry while windowed: fullscreen/native-Windows-fullscreen
                 // coordinates aren't a meaningful "windowed position" to restore later.
+                // The save waits until the window has stayed still, so a drag writes once.
                 snapshotFlow { Triple(windowState.placement, windowState.position, windowState.size) }
                     .collect { (placement, position, size) ->
                         val isFullscreen = fullscreenController.isFullscreen(window, windowState)
-                        if (!isFullscreen && restoresMaximizedWindowPlacement) {
-                            DesktopWindowModeStorage.saveWasMaximized(placement == WindowPlacement.Maximized)
+                        val maximized = if (!isFullscreen && restoresMaximizedWindowPlacement) {
+                            placement == WindowPlacement.Maximized
+                        } else {
+                            null
                         }
                         val isWindowed = placement == WindowPlacement.Floating && !isFullscreen
-                        if (isWindowed && position.isSpecified) {
-                            DesktopWindowModeStorage.saveWindowedGeometry(
-                                DesktopWindowGeometry(
-                                    x = position.x.value,
-                                    y = position.y.value,
-                                    width = size.width.value,
-                                    height = size.height.value,
-                                ),
+                        val geometry = if (isWindowed && position.isSpecified) {
+                            DesktopWindowGeometry(
+                                x = position.x.value,
+                                y = position.y.value,
+                                width = size.width.value,
+                                height = size.height.value,
                             )
+                        } else {
+                            null
+                        }
+                        if (maximized != null || geometry != null) {
+                            geometryWrites.note(maximized, geometry)
                         }
                     }
+            }
+            LaunchedEffect(geometryWrites) {
+                // Wakes only while a position is waiting, then waits until the window has stayed still.
+                // A failed save is tried again after the same quiet interval. Closing still writes once.
+                while (isActive) {
+                    geometryWrites.wakeups().receive()
+                    while (isActive) {
+                        val wait = geometryWrites.millisUntilDue() ?: break
+                        if (wait > 0L) {
+                            delay(wait)
+                            continue
+                        }
+                        if (geometryWrites.flushIfDue()) break
+                        delay(geometryWrites.quietMs)
+                    }
+                }
+            }
+            DisposableEffect(geometryWrites) {
+                onDispose { geometryWrites.flushNow() }
             }
             DisposableEffect(window, windowState) {
                 val unregisterFullscreenToggle = registerDesktopAppFullscreenToggle(

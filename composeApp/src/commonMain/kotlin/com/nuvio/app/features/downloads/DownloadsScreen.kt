@@ -30,6 +30,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -156,7 +157,7 @@ internal fun DownloadsScreenContent(
     posterPatternOverride: String? = null,
 ) {
     val uiState by remember {
-        DownloadsRepository.ensureLoaded()
+        DownloadsRepository.ensureLoadedForDisplay()
         DownloadsRepository.uiState
     }.collectAsStateWithLifecycle()
     val watchProgressState by remember {
@@ -210,6 +211,10 @@ internal fun DownloadsScreenContent(
     var locatePick by remember { mutableStateOf<Pair<DownloadItem, String>?>(null) }
     val locateScope = rememberCoroutineScope()
     // Looking at the volumes can take a while on a drive that is failing, so never on this thread.
+    DisposableEffect(folders) {
+        if (folders.supported) folders.setUsageWatched(true)
+        onDispose { if (folders.supported) folders.setUsageWatched(false) }
+    }
     LaunchedEffect(folders) { if (folders.supported) withContext(Dispatchers.Default) { folders.refresh() } }
     val extras = if (folders.supported) {
         RowExtras(
