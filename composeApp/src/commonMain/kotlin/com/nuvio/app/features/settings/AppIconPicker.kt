@@ -23,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.BasicAlertDialog
+import com.nuvio.app.core.ui.PlatformModalBackHandler
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -51,6 +52,7 @@ import com.nuvio.app.core.ui.NuvioModalBottomSheet
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.dismissNuvioBottomSheet
 import com.nuvio.app.core.ui.nuvio
+import com.nuvio.app.core.ui.platformTouchScroll
 import com.nuvio.app.core.ui.SurfaceEdge
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
@@ -151,7 +153,8 @@ private fun AppIconPickerDialog(
     onDismiss: () -> Unit,
 ) {
     val tokens = MaterialTheme.nuvio
-    BasicAlertDialog(onDismissRequest = onDismiss) {
+    PlatformModalBackHandler(onDismiss = onDismiss)
+    BasicAlertDialog(onDismissRequest = onDismiss, modifier = Modifier.platformTouchScroll()) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()

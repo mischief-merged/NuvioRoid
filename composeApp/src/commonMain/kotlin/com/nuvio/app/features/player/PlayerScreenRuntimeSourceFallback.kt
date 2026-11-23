@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.ui.NuvioToastController
+import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.enabledAddons
 import com.nuvio.app.features.debrid.DebridSettingsRepository
@@ -40,6 +41,8 @@ private val log = Logger.withTag("PlayerSourceFallback")
 
 /** Monotonic clock for the placeholder check; its origin does not matter, only differences do. */
 private val placeholderClock = kotlin.time.TimeSource.Monotonic.markNow()
+
+internal fun defaultPlaceholderNowMs(): Long = placeholderClock.elapsedNow().inWholeMilliseconds
 
 /**
  * Plays [stream] at [url] in place of the current source. Playback resumes at [resumePositionMs]
@@ -128,11 +131,13 @@ internal fun PlayerScreenRuntime.restartSourceFailoverAfterUserChoice(newVideo: 
     if (newVideo) sourceFallbackTriedKeys.clear()
 }
 
-private fun PlayerScreenRuntime.endSourceFailover() {
+internal fun PlayerScreenRuntime.endSourceFailover() {
     sourceFallbackJob?.cancel()
     sourceFallbackJob = null
     sourceFailoverTryingName = null
     sourceFailoverPlayingName = null
+    sourceFailoverForPlaceholder = false
+    sourceFailoverForStall = false
 }
 
 /** The name of a source as the loading screen and the messages give it. */
@@ -144,6 +149,8 @@ internal fun PlayerScreenRuntime.announceSourceFailoverIfPending() {
     val name = sourceFailoverPlayingName ?: return
     sourceFailoverPlayingName = null
     sourceFailoverTryingName = null
+    sourceFailoverForPlaceholder = false
+    sourceFailoverForStall = false
     scope.launch { showSourceNotice(getString(Res.string.player_failover_now_playing, name)) }
 }
 
@@ -179,43 +186,77 @@ internal fun PlayerScreenRuntime.checkForPlaceholderSource(snapshot: PlayerPlayb
     if (!isDesktop || sourceFailoverCancelled) return
     val url = activeSourceUrl
     val videoId = activeVideoId
-    if (url.isBlank() || videoId == null || placeholderCheckedUrl == url) return
-    val nowMs = placeholderClock.elapsedNow().inWholeMilliseconds
-    // A file that has played to its end has its final length: no need to wait for it to settle. A clip
-    // shorter than the check's settling time ends before the check could decide otherwise.
-    if (snapshot.isEnded && snapshot.durationMs > 0L) {
-        placeholderCheckedUrl = url
-        placeholderCheckState = null
-        judgePlaceholderLength(url, videoId, snapshot.durationMs, ended = true)
-        return
-    }
-    // The window starts at the first frame; before it there is nothing to look at.
-    val state = placeholderCheckState?.takeIf { placeholderCheckStateUrl == url }
-        ?: if (snapshot.isLoading) return else PlaceholderCheckState(nowMs, snapshot.positionMs)
-    placeholderCheckStateUrl = url
-    val step = stepPlaceholderCheck(
-        state = state,
-        nowMs = nowMs,
-        positionMs = snapshot.positionMs,
-        durationMs = snapshot.durationMs,
-        isLoading = snapshot.isLoading,
-        network = NetworkStatusRepository.uiState.value.condition,
-    )
-    val durationMs = when (step) {
-        is PlaceholderCheckStep.Continue -> {
-            placeholderCheckState = step.state
-            return
-        }
-        PlaceholderCheckStep.Finished -> {
+    if (url.isBlank() || videoId == null) return
+    val nowMs = placeholderNowMs()
+    if (placeholderCheckedUrl != url) {
+        // A file that has played to its end has its final length: no need to wait for it to settle. A clip
+        // shorter than the check's settling time ends before the check could decide otherwise.
+        if (snapshot.isEnded && snapshot.durationMs > 0L) {
             placeholderCheckedUrl = url
             placeholderCheckState = null
+            judgePlaceholderLength(url, videoId, snapshot.durationMs, ended = true)
+            updateAddonTrackingDurationSettle(url, snapshot, nowMs)
             return
         }
-        is PlaceholderCheckStep.Stable -> step.durationMs
+        // The window starts at the first frame; before it there is nothing to look at.
+        val state = placeholderCheckState?.takeIf { placeholderCheckStateUrl == url }
+            ?: if (snapshot.isLoading) null else PlaceholderCheckState(nowMs, snapshot.positionMs)
+        if (state != null) {
+            placeholderCheckStateUrl = url
+            val step = stepPlaceholderCheck(
+                state = state,
+                nowMs = nowMs,
+                positionMs = snapshot.positionMs,
+                durationMs = snapshot.durationMs,
+                isLoading = snapshot.isLoading,
+                network = placeholderNetworkCondition(),
+            )
+            when (step) {
+                is PlaceholderCheckStep.Continue -> {
+                    placeholderCheckState = step.state
+                }
+                PlaceholderCheckStep.Finished -> {
+                    placeholderCheckedUrl = url
+                    placeholderCheckState = null
+                }
+                is PlaceholderCheckStep.Stable -> {
+                    placeholderCheckedUrl = url
+                    placeholderCheckState = null
+                    judgePlaceholderLength(url, videoId, step.durationMs, ended = false)
+                }
+            }
+        }
     }
-    placeholderCheckedUrl = url
-    placeholderCheckState = null
-    judgePlaceholderLength(url, videoId, durationMs, ended = false)
+    updateAddonTrackingDurationSettle(url, snapshot, nowMs)
+}
+
+/**
+ * Tracks whether a remote desktop stream has reported a genuinely stable positive duration
+ * for tracking add-on START events, independent of placeholder failover give-ups (seeks,
+ * 30-second window expiry, or offline network status).
+ */
+private fun PlayerScreenRuntime.updateAddonTrackingDurationSettle(
+    url: String,
+    snapshot: PlayerPlaybackSnapshot,
+    nowMs: Long,
+) {
+    if (url.startsWith("file:") || addonTrackingDurationSettledUrl == url) return
+    val currentState = addonTrackingDurationState?.takeIf { addonTrackingDurationStateUrl == url }
+        ?: TrackingDurationSettleState()
+    addonTrackingDurationStateUrl = url
+    val (nextState, settled) = stepTrackingDurationSettle(
+        state = currentState,
+        nowMs = nowMs,
+        durationMs = snapshot.durationMs,
+        isLoading = snapshot.isLoading,
+    )
+    if (settled) {
+        addonTrackingDurationSettledUrl = url
+        addonTrackingDurationState = null
+        syncAddonPlayerStartForPlayback()
+    } else {
+        addonTrackingDurationState = nextState
+    }
 }
 
 /** Judges the final length of the source at [url]; a placeholder is moved on from. */
@@ -277,6 +318,8 @@ internal fun PlayerScreenRuntime.checkForPlaceholderBySourceSignals() {
  * the setting is off (or the device is offline) the source is kept and the user is told once.
  */
 private fun PlayerScreenRuntime.handleDetectedPlaceholder(url: String, byLength: Boolean = false) {
+    placeholderDetectedUrl = url
+    emitAddonPlayerEvent(AddonPlayerAction.STOP)
     sourceFailoverPlaceholderByLength = byLength
     if (tryFallbackToNextSourceAfterError(message = null, failureOverride = SourceFailure.PlaceholderClip)) return
     // Not moved on: the setting is off (or the device is offline). Say so once, only when the user chose to stay.
@@ -357,6 +400,7 @@ internal fun PlayerScreenRuntime.tryFallbackToNextSourceAfterError(
         SourceFailure.FailedToStart -> null
     }
     errorMessage = null
+    emitAddonPlayerEvent(AddonPlayerAction.STOP)
 
     sourceFallbackJob = scope.launch {
         var stopReason = SourceFailoverStop.Exhausted
@@ -543,6 +587,9 @@ internal fun nextSourceFallbackCandidate(
     triedKeys: Set<String>,
     failedAddonId: String? = null,
     failedInfoHash: String? = null,
+    preferences: com.nuvio.app.features.downloads.SeasonDownloadDefaults = StreamAutoPlayPolicy.preferencesFor(settings.streamAutoPlayMode),
+    runtimeMinutes: Int? = null,
+    wanted: com.nuvio.app.features.streams.WantedContent? = null,
     installedAddonNames: Set<String> = AddonRepository.uiState.value.addons.enabledAddons().map { it.displayTitle }.toSet(),
     debridEnabled: Boolean = DebridSettingsRepository.snapshot().canResolvePlayableLinks,
     activeResolverProviderId: String? = DebridSettingsRepository.snapshot().activeResolverProviderId,
@@ -552,6 +599,9 @@ internal fun nextSourceFallbackCandidate(
         settings = settings,
         failedAddonId = failedAddonId,
         failedInfoHash = failedInfoHash,
+        preferences = preferences,
+        runtimeMinutes = runtimeMinutes,
+        wanted = wanted,
         installedAddonNames = installedAddonNames,
         debridEnabled = debridEnabled,
         activeResolverProviderId = activeResolverProviderId,

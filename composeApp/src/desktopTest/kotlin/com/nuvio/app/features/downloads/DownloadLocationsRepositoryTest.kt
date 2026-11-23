@@ -97,12 +97,11 @@ class DownloadLocationsRepositoryTest {
         world.unplug("Archive")
 
         val result = DownloadsRepository.deleteDownload(onDrive.id)
-        val permanent = DownloadsRepository.deleteDownload(onDrive.id, permanently = true)
 
         assertEquals(DownloadDeleteResult.NotReachable, result)
-        assertEquals(DownloadDeleteResult.NotReachable, permanent)
         assertEquals(listOf(onDrive.id), items().map { it.id })
         assertTrue(backend.trashed.isEmpty())
+        assertTrue(backend.removedOutright.isEmpty())
     }
 
     @Test

@@ -19,6 +19,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.downloads.SidecarIo
@@ -166,6 +167,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         showSourcesPanel = false
         showEpisodesPanel = false
         showChaptersPanel = false
+        nativeControlsModalOpen = false
         chapters = emptyList()
         chaptersLoadedForSourceUrl = null
         clearChapterSkipState()
@@ -492,6 +494,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     DisposableEffect(Unit) {
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
+            emitAddonPlayerEvent(AddonPlayerAction.STOP)
             args.launchId?.let { launchId ->
                 PlayerLaunchStore.update(launchId) { currentLaunch(it) }
                 // The player is gone: release the launch payload once the restore window has
@@ -600,6 +603,8 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
             pendingSeekScrobbleRestart = false
             flushWatchProgress(TrackingScrobbleAction.PAUSE)
         }
+
+        syncAddonPlayerStartForPlayback()
 
         if (playbackSnapshot.isPlaying && pendingSeekScrobbleRestart) {
             pendingSeekScrobbleRestart = false

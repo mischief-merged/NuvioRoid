@@ -21,12 +21,14 @@ class DesktopDownloadsTrashTest {
     private lateinit var folder: Path
     private lateinit var downloadsDir: Path
     private lateinit var outside: Path
+    private lateinit var systemTrashDir: Path
 
     @BeforeTest
     fun create_a_temporary_downloads_folder() {
         folder = Files.createTempDirectory("nuvio-trash-test").toRealPath()
         downloadsDir = folder.resolve("downloads").createDirectories()
         outside = folder.resolve("outside").createDirectories()
+        systemTrashDir = folder.resolve("system-trash").createDirectories()
     }
 
     @AfterTest
@@ -39,7 +41,9 @@ class DesktopDownloadsTrashTest {
         systemTrash = { file ->
             if (systemTrashWorks) {
                 trashedBySystem += file
-                file.deleteRecursively()
+                val source = file.toPath()
+                Files.move(source, systemTrashDir.resolve("${trashedBySystem.size}-${source.fileName}"))
+                true
             } else {
                 false
             }
@@ -83,22 +87,33 @@ class DesktopDownloadsTrashTest {
     }
 
     @Test
-    fun without_a_system_trash_the_file_is_held_and_deleted_only_after_seven_days() {
+    fun without_a_system_trash_the_file_stays_archived_until_system_trash_is_available() {
         val video = video()
         subtitlesOf(video)
-        val trash = withoutSystemTrash()
-        assertFalse(trash.usesSystemTrash)
+        val trashWithoutSystem = withoutSystemTrash()
+        assertFalse(trashWithoutSystem.usesSystemTrash)
 
-        assertTrue(trash.moveAway(video.uri()))
+        assertTrue(trashWithoutSystem.moveAway(video.uri()))
 
         assertFalse(video.exists())
         assertEquals(listOf("$now-episode.mkv", "$now-episode.mkv.subtitles"), held())
 
-        assertEquals(0, trash.purgeHeldFiles(now + 7 * day - 1))
+        // Without system Trash, archived files are never permanently deleted even after 7 or 30 days.
+        assertEquals(0, trashWithoutSystem.purgeHeldFiles(now + 7 * day))
+        assertEquals(0, trashWithoutSystem.purgeHeldFiles(now + 30 * day))
+        assertEquals(listOf("$now-episode.mkv", "$now-episode.mkv.subtitles"), held())
+
+        // Once system Trash is available, aged archived files move to system Trash after 7 days.
+        val trashWithSystem = withSystemTrash()
+        assertEquals(0, trashWithSystem.purgeHeldFiles(now + 7 * day - 1))
         assertEquals(2, held().size)
-        assertEquals(2, trash.purgeHeldFiles(now + 7 * day))
+        assertEquals(2, trashWithSystem.purgeHeldFiles(now + 7 * day))
         assertEquals(emptyList(), held())
-        assertEquals(0, trash.purgeHeldFiles(now + 8 * day))
+        assertEquals(
+            listOf(holding.resolve("$now-episode.mkv").toFile(), holding.resolve("$now-episode.mkv.subtitles").toFile()),
+            trashedBySystem,
+        )
+        assertEquals(0, trashWithSystem.purgeHeldFiles(now + 8 * day))
     }
 
     @Test
@@ -112,8 +127,9 @@ class DesktopDownloadsTrashTest {
 
         assertFalse(video.exists())
         assertTrue(downloadsDir.resolve("episode.mkv.subtitles").exists())
-        assertEquals(1, trash.purgeHeldFiles(now + 30 * day))
-        assertTrue(holding.resolve("$now-episode.mkv.subtitles").exists(), "something the app did not hold was deleted")
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals(1, withSystemTrash().purgeHeldFiles(now + 30 * day))
+        assertTrue(holding.resolve("$now-episode.mkv.subtitles").exists(), "something the app did not hold was moved")
     }
 
     @Test
@@ -195,20 +211,21 @@ class DesktopDownloadsTrashTest {
     }
 
     @Test
-    fun only_what_was_held_by_the_app_is_deleted_from_the_holding_folder() {
+    fun only_what_was_held_by_the_app_is_moved_to_system_trash_from_the_holding_folder() {
         val trash = withoutSystemTrash()
         trash.moveAway(video().uri())
         val stray = holding.resolve("${now - 100 * day}-not-ours.mkv").also { it.writeText("stray") }
         val strayFolder = holding.resolve("1-folder").createDirectories()
 
-        assertEquals(1, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 30 * day))
+        assertEquals(1, withSystemTrash().purgeHeldFiles(now + 30 * day))
 
         assertTrue(stray.exists())
         assertTrue(strayFolder.exists())
     }
 
     @Test
-    fun deleting_held_subtitles_does_not_follow_a_link_inside_them() {
+    fun trashing_held_subtitles_does_not_touch_target_outside_downloads_folder() {
         val video = video()
         val subtitles = subtitlesOf(video)
         val target = outside.resolve("keep.txt").also { it.writeText("keep") }
@@ -216,21 +233,22 @@ class DesktopDownloadsTrashTest {
         val trash = withoutSystemTrash()
         trash.moveAway(video.uri())
 
-        assertEquals(2, trash.purgeHeldFiles(now + 7 * day))
+        assertEquals(0, trash.purgeHeldFiles(now + 7 * day))
+        assertEquals(2, withSystemTrash().purgeHeldFiles(now + 7 * day))
 
         assertTrue(target.exists())
         assertEquals(emptyList(), held())
     }
 
     @Test
-    fun an_index_line_that_names_something_outside_the_holding_folder_deletes_nothing() {
+    fun an_index_line_that_names_something_outside_the_holding_folder_touches_nothing() {
         val trash = withoutSystemTrash()
         trash.moveAway(video().uri())
         val target = outside.resolve("keep.txt").also { it.writeText("keep") }
         val index = holding.resolve(DesktopDownloadsTrash.IndexFileName)
         Files.write(index, Files.readAllLines(index) + listOf("1\t../../outside/keep.txt", "1\t..", "1\t/etc/hosts"))
 
-        trash.purgeHeldFiles(now + 30 * day)
+        withSystemTrash().purgeHeldFiles(now + 30 * day)
 
         assertTrue(target.exists())
         assertTrue(outside.exists())

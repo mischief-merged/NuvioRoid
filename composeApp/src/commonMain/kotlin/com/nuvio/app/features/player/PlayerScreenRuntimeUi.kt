@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
@@ -41,6 +42,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.LocalFold
 import com.nuvio.app.features.p2p.P2pStreamingState
+import com.nuvio.app.controller.ControllerDirection
+import com.nuvio.app.controller.ControllerEvent
+import com.nuvio.app.controller.XboxButton
+import com.nuvio.app.controller.audio.ControllerSoundPlayer
+import com.nuvio.app.core.ui.PlatformModalBackHandler
+import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.core.ui.dispatchPlatformModalBack
+import com.nuvio.app.core.ui.hasOpenPlatformModal
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.p2p.formatP2pMegabytes
 import com.nuvio.app.features.p2p.formatP2pSpeed
@@ -74,8 +83,18 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
     val runtime = this
     val systemBackRegistration = args.onSystemBackHandlerChanged
     DisposableEffect(runtime, systemBackRegistration) {
-        systemBackRegistration { runtime.requestBack() }
+        systemBackRegistration {
+            if (!runtime.dismissOpenPlayerOverlay()) {
+                runtime.requestBack()
+            }
+        }
         onDispose { systemBackRegistration(null) }
+    }
+    if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
+        PlatformModalBackHandler(
+            dismissOnBackPress = true,
+            onDismiss = { dismissNativeControlsModal() },
+        )
     }
     val isInPip = rememberIsInPictureInPicture()
     val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
@@ -497,6 +516,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         subtitleAutoSyncIsLoading = subtitleAutoSyncState.isLoading,
         subtitleAutoSyncErrorMessage = subtitleAutoSyncState.errorMessage.orEmpty(),
         closeModalsToken = playerControlsCloseModalsToken,
+        modalNavigationAction = playerControlsModalNavigationAction,
+        modalNavigationToken = playerControlsModalNavigationToken,
         submitIntroSuccessToken = playerControlsSubmitIntroSuccessToken,
         notificationMessage = playerNotificationMessage,
         notificationToken = playerNotificationToken,
@@ -510,7 +531,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             sourceFailoverMessage ?: p2pInitialLoadingMessage ?: playerLoadingStatusMessage(
                 showStatus = true,
                 controllerReady = playerController != null,
-                buffering = playbackSnapshot.isLoading,
+                snapshot = playbackSnapshot,
             )
         } else null,
         openingProgress = p2pInitialLoadingProgress,
@@ -679,6 +700,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
                     }
                     errorMessage = message
                     if (message != null) {
+                        emitAddonPlayerEvent(com.nuvio.app.features.addons.AddonPlayerAction.STOP)
                         scrubbingPositionMs = null
                         controlsVisible = !playerControlsLocked
                         removeFailedStreamFromCache()
@@ -1320,16 +1342,263 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
         "parentalGuideComplete" -> {
             showParentalGuide = false
         }
+        "nativeModalState" -> {
+            nativeControlsModalOpen = value >= 0.5
+        }
         else -> return handlePartyControlsEvent(type, value)
     }
     return true
 }
 
+private const val PLAYER_VOLUME_STEP = 0.05f
+
+/**
+ * Executes keyboard/gamepad player commands. Registered through [PlayerControllerBridge] while the
+ * player is on screen so the desktop key dispatcher and the spatial focus engine can drive playback.
+ */
+internal fun PlayerScreenRuntime.handlePlayerControllerCommand(command: PlayerCommand): Boolean =
+    when (command) {
+        PlayerCommand.SeekBack -> seekPlayerBy(-10_000L)
+        PlayerCommand.SeekForward -> seekPlayerBy(10_000L)
+        PlayerCommand.VolumeUp -> adjustPlayerVolume(PLAYER_VOLUME_STEP)
+        PlayerCommand.VolumeDown -> adjustPlayerVolume(-PLAYER_VOLUME_STEP)
+        PlayerCommand.TogglePlayback -> {
+            // Updates shouldPlay, which drives playWhenReady on every platform.
+            toggleFromNativeControls()
+            true
+        }
+        PlayerCommand.ToggleChrome -> {
+            controlsVisible = !controlsVisible
+            true
+        }
+        PlayerCommand.Back -> {
+            if (!dismissOpenPlayerOverlay()) {
+                requestBack()
+            }
+            true
+        }
+        PlayerCommand.Subtitles -> {
+            refreshTracks()
+            showAudioModal = false
+            showSourcesPanel = false
+            showEpisodesPanel = false
+            showChaptersPanel = false
+            showSubtitleModal = true
+            true
+        }
+        PlayerCommand.Audio -> {
+            refreshTracks()
+            showSubtitleModal = false
+            showSourcesPanel = false
+            showEpisodesPanel = false
+            showChaptersPanel = false
+            showAudioModal = true
+            true
+        }
+        PlayerCommand.Episodes -> {
+            if (!isSeries) return false
+            showAudioModal = false
+            showSubtitleModal = false
+            openEpisodesPanel()
+            true
+        }
+        PlayerCommand.Sources -> {
+            if (activeVideoId == null) return false
+            showAudioModal = false
+            showSubtitleModal = false
+            openSourcesPanel()
+            true
+        }
+        PlayerCommand.NativeModalUp -> dispatchNativeModalNavigation("up")
+        PlayerCommand.NativeModalDown -> dispatchNativeModalNavigation("down")
+        PlayerCommand.NativeModalLeft -> dispatchNativeModalNavigation("left")
+        PlayerCommand.NativeModalRight -> dispatchNativeModalNavigation("right")
+        PlayerCommand.NativeModalSelect -> dispatchNativeModalNavigation("select")
+    }
+
+private fun PlayerScreenRuntime.dispatchNativeModalNavigation(action: String): Boolean {
+    if (!nativeControlsModalOpen && playerControlsPendingP2pSwitch == null) return false
+    playerControlsModalNavigationAction = action
+    playerControlsModalNavigationToken += 1
+    return true
+}
+
+internal fun PlayerScreenRuntime.dismissNativeControlsModal() {
+    nativeControlsModalOpen = false
+    playerControlsPendingP2pSwitch = null
+    playerControlsCloseModalsToken += 1
+}
+
+/**
+ * True while any Compose or embedded native player overlay owns focus, so keyboard arrows/Enter
+ * and gamepad D-pad/A operate the overlay instead of seeking or toggling playback underneath it.
+ */
+internal val PlayerScreenRuntime.hasOpenPlayerOverlay: Boolean
+    get() = isPanelOpen ||
+        showChaptersPanel ||
+        showSwitchEngineConfirm ||
+        pendingP2pSwitch != null ||
+        playerControlsPendingP2pSwitch != null ||
+        nativeControlsModalOpen
+
+/**
+ * Translates a controller event while the player is active.
+ * - When an embedded native popup (audio, subtitles, speed, P2P consent, etc.) is open, D-pad
+ *   navigation and A/Select are forwarded into the native controls WebView while B/Back closes it.
+ * - When a Compose player modal, dialog, or side panel is open, directional navigation and
+ *   A/Select yield (`false`) so Compose focus operates the overlay while B/Back dismisses it.
+ */
+internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
+    event: ControllerEvent,
+    modalOpen: Boolean = hasOpenPlatformModal(),
+    dispatch: (PlayerCommand) -> Boolean = PlayerControllerBridge::dispatch,
+    onNavigateHandled: () -> Unit = ControllerSoundPlayer::playNavigate,
+): Boolean {
+    val composePanelOrDialogOpen = isPanelOpen ||
+        showChaptersPanel ||
+        showSwitchEngineConfirm ||
+        pendingP2pSwitch != null
+    val nativeModalOpen = (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) && !composePanelOrDialogOpen
+    val composeOverlayOpen = composePanelOrDialogOpen || (modalOpen && !nativeModalOpen)
+    val anyOverlayOpen = nativeModalOpen || composeOverlayOpen
+    return when (event) {
+        is ControllerEvent.Navigate -> {
+            if (composeOverlayOpen) return false
+            val command = if (nativeModalOpen) {
+                when (event.direction) {
+                    ControllerDirection.Left -> PlayerCommand.NativeModalLeft
+                    ControllerDirection.Right -> PlayerCommand.NativeModalRight
+                    ControllerDirection.Up -> PlayerCommand.NativeModalUp
+                    ControllerDirection.Down -> PlayerCommand.NativeModalDown
+                }
+            } else {
+                when (event.direction) {
+                    ControllerDirection.Left -> PlayerCommand.SeekBack
+                    ControllerDirection.Right -> PlayerCommand.SeekForward
+                    ControllerDirection.Up -> PlayerCommand.VolumeUp
+                    ControllerDirection.Down -> PlayerCommand.VolumeDown
+                }
+            }
+            val handled = dispatch(command)
+            if (handled) onNavigateHandled()
+            handled
+        }
+        is ControllerEvent.ButtonPressed -> when (event.button) {
+            XboxButton.B -> dispatch(PlayerCommand.Back)
+            XboxButton.A -> when {
+                composeOverlayOpen -> false
+                nativeModalOpen -> dispatch(PlayerCommand.NativeModalSelect)
+                else -> dispatch(PlayerCommand.TogglePlayback)
+            }
+            XboxButton.X -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Audio)
+            XboxButton.Y -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Subtitles)
+            XboxButton.LB, XboxButton.LT -> if (anyOverlayOpen) false else dispatch(PlayerCommand.SeekBack)
+            XboxButton.RB, XboxButton.RT -> if (anyOverlayOpen) false else dispatch(PlayerCommand.SeekForward)
+            XboxButton.Menu -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Episodes)
+            XboxButton.View -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Sources)
+            else -> false
+        }
+        else -> false
+    }
+}
+
+/**
+ * Dismisses any open player modal, dialog, or side panel before exiting playback.
+ * Priority: Compose modal dialogs -> embedded native controls popups -> page-level handlers
+ * (such as NextEpisodeCard or side panels) -> runtime overlay flags.
+ * Returns true if an overlay was dismissed (so the Back press is consumed).
+ */
+internal fun PlayerScreenRuntime.dismissOpenPlayerOverlay(): Boolean {
+    if (dispatchPlatformModalBack()) return true
+    if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
+        dismissNativeControlsModal()
+        return true
+    }
+    if (dispatchPlatformLocalBack()) return true
+    if (showSwitchEngineConfirm) {
+        showSwitchEngineConfirm = false
+        return true
+    }
+    if (pendingP2pSwitch != null) {
+        pendingP2pSwitch = null
+        return true
+    }
+    if (showSubmitIntroModal) {
+        showSubmitIntroModal = false
+        return true
+    }
+    if (showAudioModal) {
+        showAudioModal = false
+        return true
+    }
+    if (showSubtitleModal) {
+        showSubtitleModal = false
+        return true
+    }
+    if (showVideoSettingsModal) {
+        showVideoSettingsModal = false
+        return true
+    }
+    if (showStreamInfo) {
+        showStreamInfo = false
+        return true
+    }
+    if (showPartyPanel) {
+        showPartyPanel = false
+        return true
+    }
+    if (showSourcesPanel) {
+        showSourcesPanel = false
+        PlayerStreamsRepository.stopSourcesLoading()
+        controlsVisible = true
+        return true
+    }
+    if (showEpisodesPanel) {
+        showEpisodesPanel = false
+        episodeStreamsPanelState = EpisodeStreamsPanelState()
+        PlayerStreamsRepository.clearEpisodeStreams()
+        controlsVisible = true
+        return true
+    }
+    if (showChaptersPanel) {
+        showChaptersPanel = false
+        controlsVisible = true
+        return true
+    }
+    if (showNextEpisodeCard) {
+        showNextEpisodeCard = false
+        nextEpisodeCardDismissed = true
+        cancelNextEpisodeAutoPlay()
+        return true
+    }
+    return false
+}
+
+/** Seeks through the current engine, showing the same +/-10s feedback as the keyboard shortcut. */
+private fun PlayerScreenRuntime.seekPlayerBy(offsetMs: Long): Boolean {
+    if (isPartySynced) {
+        seekBy(offsetMs)
+        return true
+    }
+    val controller = playerController ?: return false
+    seekFromNativeControls(offsetMs)
+    seekByWithNote(controller, offsetMs)
+    return true
+}
+
+private fun PlayerScreenRuntime.adjustPlayerVolume(delta: Float): Boolean {
+    gestureController?.let { controller ->
+        val current = controller.currentVolume()?.fraction ?: 1f
+        controller.setVolume((current + delta).coerceIn(0f, 1f))
+        return true
+    }
+    return playerController?.adjustVolumeBy(delta) ?: false
+}
+
 private fun PlayerScreenRuntime.requestP2pConsentForPlayerControls(
     stream: StreamItem,
     episode: MetaVideo?,
-): Boolean {
-    val shouldRequestConsent = shouldRequestP2pConsentForPlayerControls(
+): Boolean {    val shouldRequestConsent = shouldRequestP2pConsentForPlayerControls(
         isP2pStream = isP2pStream(stream),
         shouldResolveToPlayableStream = DirectDebridPlaybackResolver.shouldResolveToPlayableStream(stream),
         p2pSettingsVisible = P2pSettingsRepository.isVisible,
@@ -1919,7 +2188,7 @@ private fun BoxScope.RenderPlaybackOverlays(
                 sourceFailoverLoadingMessage() ?: p2pInitialLoadingMessage ?: playerLoadingStatusMessage(
                     showStatus = true,
                     controllerReady = playerController != null,
-                    buffering = playbackSnapshot.isLoading,
+                    snapshot = playbackSnapshot,
                 )
             } else null,
             p2pInitialLoadingProgress = p2pInitialLoadingProgress,

@@ -7,6 +7,8 @@ import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.features.addons.AddonPlayerAction
+import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.addons.AddonsUiState
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsUiState
@@ -224,6 +226,15 @@ internal class PlayerScreenRuntime(
     var pendingSeekScrobbleRestart by mutableStateOf(false)
     var hasSentCompletionScrobbleForCurrentItem by mutableStateOf(false)
     var currentTrackingMedia by mutableStateOf<TrackingMediaReference?>(null)
+    var activeAddonPlayerEventTarget: AddonPlayerEventTarget? = null
+    var lastAddonPlayerAction: AddonPlayerAction? = null
+    /** Where Stremio player tracking events are sent. Tests replace it to record events. */
+    var dispatchAddonPlayerEvent: (
+        target: AddonPlayerEventTarget,
+        action: AddonPlayerAction,
+        currentTimeMs: Long,
+        durationMs: Long,
+    ) -> Unit = com.nuvio.app.features.addons.AddonEventDispatcher::player
 
     var showSourcesPanel by mutableStateOf(false)
     var showEpisodesPanel by mutableStateOf(false)
@@ -243,6 +254,8 @@ internal class PlayerScreenRuntime(
     var submitIntroStatusMessage by mutableStateOf<String?>(null)
     var playerControlsPendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)
     var playerControlsCloseModalsToken by mutableStateOf(0L)
+    var playerControlsModalNavigationAction by mutableStateOf("")
+    var playerControlsModalNavigationToken by mutableStateOf(0L)
     var playerControlsSubmitIntroSuccessToken by mutableStateOf(0L)
     var playerNotificationMessage by mutableStateOf("")
     var playerNotificationToken by mutableStateOf(0L)
@@ -300,11 +313,23 @@ internal class PlayerScreenRuntime(
     var lastSeekTargetMs: Long? = null
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
+    /** The source confirmed as a placeholder clip; never receives tracking events. */
+    var placeholderDetectedUrl: String? = null
     /** The source whose first seconds were checked for being a placeholder, so each is checked once. */
     var placeholderCheckedUrl: String? = null
     var placeholderCheckStateUrl: String? = null
     var placeholderCheckState: PlaceholderCheckState? = null
     var placeholderWarnedUrl: String? = null
+    /** Remote source whose duration settled over stable non-loading snapshots for tracking add-ons. */
+    var addonTrackingDurationSettledUrl: String? = null
+    var addonTrackingDurationStateUrl: String? = null
+    var addonTrackingDurationState: TrackingDurationSettleState? = null
+    /** Monotonic clock in milliseconds for the placeholder check. Tests replace it to step time. */
+    var placeholderNowMs: () -> Long = ::defaultPlaceholderNowMs
+    /** Current network condition for the placeholder check. Tests replace it to simulate offline playback. */
+    var placeholderNetworkCondition: () -> com.nuvio.app.core.network.NetworkCondition = {
+        com.nuvio.app.core.network.NetworkStatusRepository.uiState.value.condition
+    }
     /** Where moving on to another source finds the sources: the player's own search. Tests give their own list. */
     var failoverSourceSearch: FailoverSourceSearch = FailoverSourceSearch.Player
 
@@ -313,6 +338,8 @@ internal class PlayerScreenRuntime(
     var showVideoSettingsModal by mutableStateOf(false)
     var showStreamInfo by mutableStateOf(false)
     var showPartyPanel by mutableStateOf(false)
+    /** True while an embedded desktop native controls popup (audio, subtitles, speed, etc.) is open. */
+    var nativeControlsModalOpen by mutableStateOf(false)
     var partyPanelToken by mutableStateOf(0L)
     var partyMessage by mutableStateOf("")
     var partyMessageToken by mutableStateOf(0L)

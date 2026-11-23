@@ -31,7 +31,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.enabledAddons
-import com.nuvio.app.isIos
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.SOURCE_FALLBACK_MAX_SOURCES_RANGE
 import com.nuvio.app.features.player.engineSwitchOnErrorBlocksSourceFailover

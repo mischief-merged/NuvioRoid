@@ -61,6 +61,9 @@
     <string name="addons_error_enter_url">Enter an addon URL.</string>
     <string name="addons_input_placeholder">Addon URL</string>
     <string name="addons_install_button">Install Addon</string>
+    <string name="addons_tracking_consent_title">Tracking addon</string>
+    <string name="addons_tracking_consent_body">%1$s is a tracking addon. Nuvio will send it your activity: what you play, pause and stop with the playback position, what you add to or remove from your library, and what you mark as watched or unwatched. This data leaves Nuvio and is handled by the addon's developer and the service it connects to.</string>
+    <string name="addons_tracking_consent_checkbox">I agree to share my watch activity and library with this addon</string>
     <string name="addons_loading_manifest_details">Loading manifest details...</string>
     <string name="addons_modal_checking_message">Validating the manifest URL and loading addon details before install.</string>
     <string name="addons_modal_checking_title">Checking Addon</string>
@@ -657,20 +660,37 @@
     <string name="detail_tab_trailer">Trailer</string>
     <string name="detail_trailer_category_count">%1$s (%2$d)</string>
     <string name="detail_trailers_title">Trailers</string>
+    <string name="downloads_delete_message">This frees %1$s on this device.</string>
+    <string name="downloads_delete_title">Delete %1$s?</string>
+    <string name="downloads_downloading_count">%1$d downloading</string>
     <string name="downloads_empty_episodes">No completed episodes</string>
+    <string name="downloads_empty_message">Long-press a stream and choose Download file to watch it offline.</string>
     <string name="downloads_empty_title">No downloads yet</string>
     <string name="downloads_episode_count">%1$d downloaded episode(s)</string>
     <string name="downloads_open_directory">Open downloads folder</string>
     <string name="downloads_open_directory_failed">Couldn&apos;t open downloads folder</string>
+    <string name="downloads_pause_all">Pause all</string>
+    <string name="downloads_resume_all">Resume all</string>
     <string name="downloads_section_active">Active</string>
+    <string name="downloads_section_downloaded">Downloaded</string>
     <string name="downloads_section_movies">Movies</string>
     <string name="downloads_section_shows">Shows</string>
     <string name="downloads_show_downloads">Show Downloads</string>
+    <string name="downloads_speed">%1$s/s</string>
     <string name="downloads_status_completed">Completed • %1$s</string>
     <string name="downloads_status_completed_suspect">Completed • %1$s • The title of the file names another episode</string>
     <string name="downloads_status_downloading">Downloading • %1$s</string>
     <string name="downloads_status_failed">Failed</string>
     <string name="downloads_status_paused">Paused • %1$s</string>
+    <string name="downloads_watched_count">%1$d watched</string>
+    <plurals name="downloads_episodes">
+        <item quantity="one">%1$d episode</item>
+        <item quantity="other">%1$d episodes</item>
+    </plurals>
+    <plurals name="downloads_titles">
+        <item quantity="one">%1$d title</item>
+        <item quantity="other">%1$d titles</item>
+    </plurals>
     <string name="downloads_status_auto">Auto</string>
     <string name="downloads_status_checking">Checking the file</string>
     <string name="downloads_status_reconnecting">Connection lost, trying again • %1$s</string>
@@ -728,9 +748,8 @@
     <string name="downloads_empty_hint">Open a movie or an episode, choose a source, then tap its download button.</string>
     <string name="downloads_empty_hint_seasons">On a series page you can also download a whole season, or keep new episodes downloaded automatically.</string>
     <string name="downloads_empty_browse">Browse titles</string>
-    <string name="downloads_delete_title">Delete %1$s?</string>
     <string name="downloads_delete_message_trash">It moves to the Trash. You can put it back from there.</string>
-    <string name="downloads_delete_message_held">It stays in the downloads folder for 7 days, then it is deleted for good.</string>
+    <string name="downloads_delete_message_held">It is moved to the archive folder inside the downloads folder until you remove it or the Trash is available.</string>
     <string name="downloads_delete_auto_note">Auto-download will not fetch this episode again.</string>
     <string name="downloads_delete_message_partial">This stops the download and removes what was downloaded so far.</string>
     <string name="downloads_delete_confirm_trash">Move to Trash</string>
@@ -2267,7 +2286,7 @@
     <string name="downloads_auto_delete_heading">After watching</string>
     <string name="downloads_auto_delete_after">Delete episodes 24 hours after I watch them</string>
     <string name="downloads_auto_delete_note">Only auto-downloaded episodes. Your own downloads are never deleted. You can keep or delete one early in Downloads.</string>
-    <string name="downloads_auto_delete_no_trash_note">This computer has no trash Nuvio can use. Deleted episodes are kept in the downloads folder for 7 days, then deleted permanently.</string>
+    <string name="downloads_auto_delete_no_trash_note">This computer has no trash Nuvio can use. Removed episodes are kept in the archive folder inside the downloads folder.</string>
     <string name="downloads_auto_pending_heading">Deleting after you watch</string>
     <string name="downloads_auto_pending_row">%1$s S%2$d E%3$d • %4$s</string>
     <plurals name="downloads_auto_pending_in_hours">
@@ -2298,7 +2317,7 @@
     <string name="downloads_auto_delete_now_description">Delete %1$s S%2$d E%3$d now</string>
     <string name="downloads_auto_delete_now_title">Delete this episode now?</string>
     <string name="downloads_auto_delete_now_message_trash">%1$s S%2$d E%3$d is moved to the trash.</string>
-    <string name="downloads_auto_delete_now_message_held">%1$s S%2$d E%3$d is kept in the downloads folder for 7 days, then deleted permanently.</string>
+    <string name="downloads_auto_delete_now_message_held">%1$s S%2$d E%3$d is moved to the archive folder inside the downloads folder.</string>
     <string name="downloads_auto_deleted_toast">Episode deleted</string>
     <string name="downloads_auto_delete_playing_toast">Couldn't delete yet: the episode is playing</string>
     <string name="downloads_auto_delete_failed_toast">Couldn't delete: the file could not be moved</string>
@@ -2376,9 +2395,16 @@
     <string name="library_empty_message">Saved titles will appear here after you tap Save on a details screen.</string>
     <string name="library_empty_title">Your library is empty</string>
     <string name="library_filter_all_types">All types</string>
+    <string name="library_filter_genre">Genre</string>
     <string name="library_filter_list">Select list</string>
     <string name="library_filter_sort">Sort library</string>
     <string name="library_filter_type">Select type</string>
+    <string name="library_filter_watched">Watched</string>
+    <string name="library_filter_year">Year</string>
+    <string name="library_type_all">All</string>
+    <string name="library_watched_filter_all">All</string>
+    <string name="library_watched_filter_watched">Watched</string>
+    <string name="library_watched_filter_unwatched">Unwatched</string>
     <string name="library_layout_show_horizontal">Show horizontal shelves</string>
     <string name="library_layout_show_vertical">Show vertical grid</string>
     <string name="library_load_failed">Couldn't load library</string>
@@ -2500,7 +2526,9 @@
     <!-- Playback settings Windows NVIDIA RTX Video -->
     <string name="settings_playback_nvidia_rtx_video_section">NVIDIA RTX Video</string>
     <string name="settings_playback_nvidia_rtx_super_resolution">RTX Video Super Resolution</string>
-    <string name="settings_playback_nvidia_rtx_super_resolution_desc">Upscale low-resolution video using NVIDIA RTX AI Super Resolution.</string>
+    <string name="settings_playback_nvidia_rtx_super_resolution_desc">Upscale low-resolution video using NVIDIA RTX Video Super Resolution.</string>
+    <string name="settings_playback_nvidia_rtx_hdr">RTX Video HDR</string>
+    <string name="settings_playback_nvidia_rtx_hdr_desc">Converts SDR video to HDR output using NVIDIA RTX Video HDR for better contrast, colors and brightness. Requires Windows HDR enabled and an HDR-capable display.</string>
     <!-- Playback settings iOS video output -->
     <string name="settings_playback_ios_video_output">iOS VIDEO OUTPUT</string>
     <string name="settings_playback_ios_hardware_decoder">Hardware decoder</string>
@@ -2996,6 +3024,7 @@
     <string name="subtitle_shadow_description">Separate the text from bright scenes.</string>
     <string name="subtitle_shadow_opacity">Shadow opacity</string>
     <string name="subtitle_shadow_size">Shadow size</string>
+    <string name="subtitle_outline_width">Outline width</string>
     <string name="subtitle_reset_appearance">Reset appearance</string>
     <string name="window_menu_file">File</string>
     <string name="window_menu_window">Window</string>
@@ -3155,9 +3184,6 @@
     <string name="downloads_location_banner_title">A download location is not connected</string>
     <string name="downloads_location_banner_message">%1$s is not available. Its downloads stay in the list and open again when it is back. Auto-downloads and removal after watching wait for it.</string>
     <string name="downloads_delete_not_connected_toast">Its drive is not connected, so it can&apos;t be deleted now.</string>
-    <string name="downloads_delete_permanent_title">Delete %1$s for good?</string>
-    <string name="downloads_delete_permanent_message">It could not be moved to the Trash. Deleting it now cannot be undone.</string>
-    <string name="downloads_delete_permanent_confirm">Delete permanently</string>
     <string name="downloads_auto_status_folder_not_connected">Waiting: the drive that holds this show is not connected</string>
     <string name="downloads_auto_delete_not_connected_toast">Its drive is not connected, so it was left alone.</string>
     <string name="download_folder_saved_toast">New downloads will go to %1$s.</string>

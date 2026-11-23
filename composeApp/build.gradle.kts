@@ -699,10 +699,17 @@ val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer
 val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
 val linuxPlayerBridgeSourceFile = linuxPlayerBridgeSource.asFile
 val linuxPlayerBridgeOutputFile = linuxPlayerBridgeOutput.get().asFile
+// Keep the distributed bridge compatible with x86-64 CPUs without AVX.
+val linuxPlayerBridgeCpuFlags = if (isLinuxHost && normalizedLinuxArch(System.getProperty("os.arch")) == "x86_64") {
+    "-march=x86-64 -mtune=generic"
+} else {
+    ""
+}
 val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
     notCompatibleWithConfigurationCache("Builds a host-local player bridge against system libmpv.")
     enabled = isLinuxHost
     inputs.file(linuxPlayerBridgeSourceFile)
+    inputs.property("cpuFlags", linuxPlayerBridgeCpuFlags)
     outputs.file(linuxPlayerBridgeOutputFile)
     val src = linuxPlayerBridgeSourceFile.absolutePath
     val out = linuxPlayerBridgeOutputFile.absolutePath
@@ -714,6 +721,7 @@ val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
         "c++ -std=c++17 -shared -fPIC -O2 " +
             "-I'$jni' -I'$jni/linux' " +
             "$(pkg-config --cflags mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) " +
+            "$linuxPlayerBridgeCpuFlags " +
             "'$src' -o '$out' " +
             "$(pkg-config --libs mpv webkit2gtk-4.1 gtk+-3.0 x11 xcomposite xext) -lpthread",
     )
@@ -1029,6 +1037,10 @@ tasks.withType<KotlinCompilationTask<*>>().configureEach {
     dependsOn(generateRuntimeConfigs)
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().matching { it.name == "desktopTest" }.configureEach {
+    jvmArgs("--add-opens=java.desktop/java.awt.event=ALL-UNNAMED")
+}
+
 kotlin {
     android {
         namespace = "com.nuvio.app"
@@ -1279,10 +1291,23 @@ compose.desktop {
             // bridge owns the process's GTK via initGtkEarly (skoruppa's fix).
             "-Djdk.gtk.version=0",
             "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
+            "--add-opens=java.desktop/java.awt.event=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+            // Without these the JVM sizes the heap from the machine's RAM (about
+            // 1 GB initial and a quarter of RAM as maximum) and G1 keeps hundreds
+            // of MB committed for a live set of roughly 100 MB.
+            "-Xms128m",
+            "-Xmx2g",
+            "-XX:MinHeapFreeRatio=10",
+            "-XX:MaxHeapFreeRatio=30",
+            // Lets an idle app hand unused heap back to the system.
+            "-XX:G1PeriodicGCInterval=15000",
+            // Skiko's FrameWatcher calls System.gc() every 30 s while frames are
+            // being rendered; as a full collection that is a 40-50 ms pause.
+            "-XX:+ExplicitGCInvokesConcurrent",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
         )
 
@@ -1708,4 +1733,12 @@ configurations.all {
     exclude(group = "androidx.media3", module = "media3-datasource")
     exclude(group = "androidx.media3", module = "media3-datasource-okhttp")
     exclude(group = "androidx.media3", module = "media3-extractor")
+}
+
+composeCompiler {
+    stabilityConfigurationFiles.add(project.layout.projectDirectory.file("compose_stability_config.conf"))
+    if (providers.gradleProperty("composeCompilerReports").orNull == "true") {
+        metricsDestination = layout.buildDirectory.dir("compose_metrics")
+        reportsDestination = layout.buildDirectory.dir("compose_reports")
+    }
 }

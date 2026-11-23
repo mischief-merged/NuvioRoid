@@ -396,6 +396,14 @@ object DownloadsRepository {
             .forEach(::pauseDownload)
     }
 
+    fun resumePausedDownloads(): Unit = synchronized(stateLock) {
+        ensureLoaded()
+        _uiState.value.items
+            .filter { it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection }
+            .map { it.id }
+            .forEach(::resumeDownload)
+    }
+
     /**
      * Pauses a running download and waits until its transfer has stopped writing, so that its file can
      * be looked at or moved. False when it did not stop in time. Never holds the state lock while waiting.
@@ -521,16 +529,16 @@ object DownloadsRepository {
      * far is removed. A file that another download also uses stays where it is. When the file cannot
      * be moved nothing is removed: the entry stays, so that the file is not lost from view.
      */
-    internal fun deleteDownload(downloadId: String, permanently: Boolean = false): DownloadDeleteResult {
+    internal fun deleteDownload(downloadId: String): DownloadDeleteResult {
         ensureLoaded()
         // LOCK ORDER (see stateLock): per-video lock, then the state lock, then the list lock.
         // If the file moved between the look and the locks, look again.
         repeat(LockAttempts) {
             val locked = finishedFileUriOf(downloadId)
             val result = if (locked != null) {
-                SidecarLocks.withLock(locked) { deleteWithLocksHeld(downloadId, locked, permanently) }
+                SidecarLocks.withLock(locked) { deleteWithLocksHeld(downloadId, locked) }
             } else {
-                deleteWithLocksHeld(downloadId, null, permanently)
+                deleteWithLocksHeld(downloadId, null)
             }
             if (result != null) return result
         }
@@ -538,7 +546,7 @@ object DownloadsRepository {
     }
 
     /** Null when the file is no longer where [lockedUri] said: the caller starts again with the right lock. */
-    private fun deleteWithLocksHeld(downloadId: String, lockedUri: String?, permanently: Boolean): DownloadDeleteResult? = synchronized(stateLock) {
+    private fun deleteWithLocksHeld(downloadId: String, lockedUri: String?): DownloadDeleteResult? = synchronized(stateLock) {
         ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return DownloadDeleteResult.Gone
@@ -550,13 +558,13 @@ object DownloadsRepository {
         if (!ItemLocks.tryAcquire(downloadId)) return DownloadDeleteResult.Moving
         try {
             // The ownership check, the file and the record change under the lock every save of a list takes.
-            return backend.withListLock { deleteLocked(item, items, permanently) }
+            return backend.withListLock { deleteLocked(item, items) }
         } finally {
             ItemLocks.release(downloadId)
         }
     }
 
-    private fun deleteLocked(item: DownloadItem, items: List<DownloadItem>, permanently: Boolean): DownloadDeleteResult {
+    private fun deleteLocked(item: DownloadItem, items: List<DownloadItem>): DownloadDeleteResult {
         val downloadId = item.id
         val lookup = if (item.status == DownloadStatus.Completed) backend.locate(item) else FileLookup.Missing
         // A file whose location is away is not gone. Nothing is touched, and the entry stays.
@@ -568,7 +576,7 @@ object DownloadsRepository {
             // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
             if (!removeRecordDurably(item)) return DownloadDeleteResult.NotMoved
             if (!usedByAnother) {
-                val gone = if (permanently) backend.removeFile(fileUri) else backend.trashFile(fileUri)
+                val gone = backend.trashFile(fileUri)
                 if (!gone) {
                     restoreRecord(item)
                     return DownloadDeleteResult.NotMoved

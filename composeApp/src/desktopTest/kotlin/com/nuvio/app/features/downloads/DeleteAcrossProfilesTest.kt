@@ -93,14 +93,12 @@ class DeleteAcrossProfilesTest {
     }
 
     @Test
-    fun a_file_another_profile_uses_is_kept_on_delete_and_on_permanent_delete() {
+    fun a_file_another_profile_uses_is_kept_on_delete() {
         val item = film("a")
         load(item)
         backend.owners = FileOwnership.Owned
 
         assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item.id))
-        load(item)
-        assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item.id, permanently = true))
 
         assertTrue(backend.inner.trashed.isEmpty())
         assertTrue(backend.inner.removedOutright.isEmpty())

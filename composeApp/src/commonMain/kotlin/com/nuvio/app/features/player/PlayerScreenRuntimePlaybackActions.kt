@@ -1,11 +1,15 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.features.addons.AddonPlayerAction
+import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.downloads.AutoDownloads
 import com.nuvio.app.features.servers.ServerItemRef
 import com.nuvio.app.features.servers.ServerStreams
+import com.nuvio.app.features.streams.saysNotCached
 import com.nuvio.app.features.tmdb.TmdbService
 import com.nuvio.app.features.tracking.TrackingMediaReference
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
+import com.nuvio.app.isDesktop
 import com.nuvio.app.features.tracking.TrackingScrobbleCoordinator
 import com.nuvio.app.features.tracking.TrackingScrobbleEvent
 import com.nuvio.app.features.tracking.buildTrackingMediaReference
@@ -387,6 +391,92 @@ internal suspend fun PlayerScreenRuntime.resolveParentalGuideImdbId(): String? {
     )
 }
 
+internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
+    durationMs: Long = playbackSnapshot.durationMs,
+): Boolean {
+    val url = activeSourceUrl
+    if (url.isBlank()) return false
+    if (errorMessage != null) return false
+    if (sourceFailoverCancelled) return false
+    if (sourceFallbackJob?.isActive == true) return false
+    if (sourceFailoverForPlaceholder) return false
+    if (placeholderDetectedUrl == url) return false
+    if (isDesktop && activeVideoId != null && !url.startsWith("file:") && addonTrackingDurationSettledUrl != url) return false
+    if (playbackSnapshot.isEnded) return false
+    if (durationMs <= 0L) return false
+    if (isShortPlaceholderDuration(durationMs)) return false
+    val assessment = if (activeTorrentInfoHash == null) {
+        assessSourceLink(url, listOf(activeSourceFilename, activeStreamFilename))
+    } else {
+        null
+    }
+    if (assessment?.decisive == true) return false
+    val suspect = placeholderSuspectUrl == url ||
+        assessment != null ||
+        activeStream?.saysNotCached == true
+    val expectedMinutes = activeVideoId?.let { expectedRuntimeMinutes(it, activeSeasonNumber, activeEpisodeNumber) }
+    return !isPlaceholderConfirmed(
+        suspect = suspect,
+        durationMs = durationMs,
+        expectedRuntimeMinutes = expectedMinutes,
+        resumeMs = activeInitialPositionMs,
+    )
+}
+
+internal fun PlayerScreenRuntime.syncAddonPlayerStartForPlayback() {
+    if (!playbackSnapshot.isPlaying || playbackSnapshot.isLoading) return
+    if (activeAddonPlayerEventTarget != null && !isSourceAcceptedForAddonPlayerEvents()) {
+        emitAddonPlayerEvent(AddonPlayerAction.STOP)
+        return
+    }
+    if (!previousIsPlaying || activeAddonPlayerEventTarget == null) {
+        emitAddonPlayerEvent(AddonPlayerAction.START)
+    }
+}
+
+internal fun PlayerScreenRuntime.emitAddonPlayerEvent(
+    action: AddonPlayerAction,
+    forceResend: Boolean = false,
+) {
+    val durationMs = playbackSnapshot.durationMs
+    val positionMs = playbackSnapshot.positionMs
+    val active = activeAddonPlayerEventTarget
+    if (action == AddonPlayerAction.STOP) {
+        if (active == null) return
+        activeAddonPlayerEventTarget = null
+        lastAddonPlayerAction = null
+        dispatchAddonPlayerEvent(active, AddonPlayerAction.STOP, positionMs, durationMs)
+        return
+    }
+    val session = playbackSession
+    val target = AddonPlayerEventTarget(type = session.contentType, videoId = session.videoId)
+    if (active != null && active != target) {
+        activeAddonPlayerEventTarget = null
+        lastAddonPlayerAction = null
+        dispatchAddonPlayerEvent(active, AddonPlayerAction.STOP, positionMs, durationMs)
+    }
+    if (!isSourceAcceptedForAddonPlayerEvents(durationMs)) {
+        val current = activeAddonPlayerEventTarget
+        if (current != null) {
+            activeAddonPlayerEventTarget = null
+            lastAddonPlayerAction = null
+            dispatchAddonPlayerEvent(current, AddonPlayerAction.STOP, positionMs, durationMs)
+        }
+        return
+    }
+    if (action == AddonPlayerAction.PAUSE && activeAddonPlayerEventTarget == null) return
+    if (!forceResend && activeAddonPlayerEventTarget == target && lastAddonPlayerAction == action) return
+    activeAddonPlayerEventTarget = target
+    lastAddonPlayerAction = action
+    dispatchAddonPlayerEvent(target, action, positionMs, durationMs)
+}
+
+internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
+    val action = lastAddonPlayerAction ?: return
+    if (activeAddonPlayerEventTarget == null) return
+    emitAddonPlayerEvent(action, forceResend = true)
+}
+
 internal fun PlayerScreenRuntime.flushWatchProgress(
     scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
 ) {
@@ -396,6 +486,11 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
             reportLocalPlaybackCompleted()
             emitStopScrobbleForCurrentProgress()
         }
+        TrackingScrobbleAction.START -> Unit
+    }
+    when (scrobbleAction) {
+        TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
+        TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
         TrackingScrobbleAction.START -> Unit
     }
     WatchProgressRepository.flushPlaybackProgress(
@@ -425,6 +520,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
             session = playbackSession,
             snapshot = playbackSnapshot,
         )
+        resendAddonPlayerStateAfterSeek()
 
         val progressPercent = currentPlaybackProgressPercent()
         if (

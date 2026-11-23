@@ -140,10 +140,10 @@ class DownloadFolderBehaviourTest {
     }
 
     @Test
-    fun without_a_system_trash_a_file_is_held_inside_its_own_location_and_purged_there() {
+    fun without_a_system_trash_a_file_is_held_inside_its_own_location_until_system_trash_is_available() {
         val drive = world.driveLocation("Archive")
         var now = 1_000L
-        val trash = DesktopDownloadsTrash(
+        val trashWithoutSystem = DesktopDownloadsTrash(
             downloadsDir = { world.appFolder.also { Files.createDirectories(it) } },
             systemTrash = null,
             nowEpochMs = { now },
@@ -151,10 +151,30 @@ class DownloadFolderBehaviourTest {
         )
         val onDrive = drive.path.resolve("a.mp4").writeVideo(1)
 
-        assertTrue(trash.moveAway(onDrive.toUri().toString()))
-        assertTrue(drive.path.resolve(".removed").exists(), "the file left the drive's volume")
+        assertTrue(trashWithoutSystem.moveAway(onDrive.toUri().toString()))
+        val archived = drive.path.resolve(".removed/$now-a.mp4")
+        assertTrue(archived.exists(), "the file left the drive's volume")
         assertFalse(onDrive.exists())
 
-        assertEquals(1, trash.purgeHeldFiles(now + HeldFileDays * 24L * 60 * 60 * 1000 + 1))
+        // Without system Trash, the archived file is never permanently deleted.
+        assertEquals(0, trashWithoutSystem.purgeHeldFiles(now + HeldFileDays * 24L * 60 * 60 * 1000 + 1))
+        assertTrue(archived.exists())
+
+        // Once system Trash is available, the aged archived file moves to system Trash.
+        val trashed = mutableListOf<File>()
+        val trashDir = world.root.resolve("system-trash").also { Files.createDirectories(it) }
+        val trashWithSystem = DesktopDownloadsTrash(
+            downloadsDir = { world.appFolder.also { Files.createDirectories(it) } },
+            systemTrash = { file ->
+                trashed += file
+                Files.move(file.toPath(), trashDir.resolve(file.name))
+                true
+            },
+            nowEpochMs = { now },
+            otherDirs = { listOf(drive.path) },
+        )
+        assertEquals(1, trashWithSystem.purgeHeldFiles(now + HeldFileDays * 24L * 60 * 60 * 1000 + 1))
+        assertEquals(listOf(archived.toFile()), trashed)
+        assertFalse(archived.exists())
     }
 }

@@ -17,6 +17,8 @@ interface PlayerEngineController {
     fun retry()
     fun setPlaybackSpeed(speed: Float)
     fun setMuted(muted: Boolean) {}
+    /** Adjusts output volume by [deltaFraction] on a 0..1 scale; true when the platform applied it. */
+    fun adjustVolumeBy(deltaFraction: Float): Boolean = false
     fun getAudioTracks(): List<AudioTrack>
     fun getSubtitleTracks(): List<SubtitleTrack>
     fun applyAudioLanguagePreferences(languages: List<String>)
@@ -309,6 +311,8 @@ data class PlayerControlsState(
     val subtitleAutoSyncIsLoading: Boolean = false,
     val subtitleAutoSyncErrorMessage: String = "",
     val closeModalsToken: Long = 0L,
+    val modalNavigationAction: String = "",
+    val modalNavigationToken: Long = 0L,
     val submitIntroContentKey: String = "",
     val submitIntroSuccessToken: Long = 0L,
     val notificationMessage: String = "",

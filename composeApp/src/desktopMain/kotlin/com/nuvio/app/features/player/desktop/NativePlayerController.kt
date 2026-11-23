@@ -41,6 +41,7 @@ import java.awt.event.WindowEvent
 import java.util.concurrent.CountDownLatch
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
+import kotlin.math.roundToInt
 
 internal typealias NativePlayerCreate = (
     Long,
@@ -51,14 +52,15 @@ internal typealias NativePlayerCreate = (
     String,
     Int,
     Boolean,
+    Boolean,
     NativePlayerEventSink,
 ) -> Long
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
-    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink ->
+    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, rtxHdr, sink ->
         NativePlayerBridge.ensureLoaded()
-        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
+        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, rtxHdr, sink)
     },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
@@ -136,6 +138,7 @@ internal class NativePlayerController(
         initialPositionMs: Long,
         decoderPriority: Int,
         nvidiaRtxSuperResolutionEnabled: Boolean,
+        nvidiaRtxHdrEnabled: Boolean = false,
         onError: (String?) -> Unit,
     ) {
         val pending = PendingSource(
@@ -145,6 +148,7 @@ internal class NativePlayerController(
             initialPositionMs = initialPositionMs.coerceAtLeast(0L),
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
+            nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled,
             onError = onError,
         )
         var terminalFailure: String? = null
@@ -319,6 +323,7 @@ internal class NativePlayerController(
                         NativePlayerBridge.controlsPageUrl,
                         pending.decoderPriority,
                         pending.nvidiaRtxSuperResolutionEnabled,
+                        pending.nvidiaRtxHdrEnabled,
                         eventSink,
                     ).also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
@@ -637,6 +642,11 @@ internal class NativePlayerController(
 
     fun togglePictureInPictureFromShortcut() {
         DesktopPlayerPictureInPicture.toggle()
+    }
+
+    override fun adjustVolumeBy(deltaFraction: Float): Boolean {
+        adjustFallbackVolume(deltaFraction * 100f)
+        return true
     }
 
     @Synchronized
@@ -997,6 +1007,7 @@ internal class NativePlayerController(
             initialPositionMs = pending.initialPositionMs,
             decoderPriority = pending.decoderPriority,
             nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+            nvidiaRtxHdrEnabled = pending.nvidiaRtxHdrEnabled,
             onError = pending.onError,
         )
     }
@@ -1146,25 +1157,26 @@ internal class NativePlayerController(
     }
 
     private fun applySubtitleStyle(handle: Long, style: SubtitleStyleState, useLibass: Boolean) {
+        val shadow = style.toMpvSubtitleShadow()
         NativePlayerBridge.applySubtitleStyle(
             handle = handle,
             textColor = style.textColor.toMpvColorString(),
             backgroundColor = style.backgroundColor.toMpvColorString(),
-            outlineColor = style.outlineColor.toMpvColorString(),
-            outlineSize = if (style.outlineEnabled) style.outlineWidth.toFloat() else 0f,
+            outlineColor = shadow.outlineColor,
+            outlineSize = shadow.outlineSize,
             bold = style.bold,
             fontSize = style.toMpvSubtitleFontSize(),
             subPos = style.toMpvSubtitlePosition(),
             useLibass = useLibass,
             stripSdh = style.stripSdh,
         )
-        val shadowAlpha = if (style.appearance.shadowEnabled) (style.appearance.shadowOpacity * 255 / 100) else 0
         NativePlayerBridge.setSubtitleAppearance(
             handle = handle,
             font = SubtitleFontResolver.mpvFontName(style.appearance.fontId),
             fontsDir = SubtitleFontResolver.fontsDir(),
-            shadowColor = "#" + shadowAlpha.toHexByte() + "000000",
-            shadowOffset = if (style.appearance.shadowEnabled) style.appearance.shadowSize.toFloat() else 0f,
+            shadowColor = shadow.color,
+            shadowOffset = shadow.offset,
+            shadowBlur = shadow.blur,
         )
     }
 
@@ -1231,6 +1243,41 @@ private fun Color.toMpvColorString(): String {
 private fun SubtitleStyleState.toMpvSubtitlePosition(): Int =
     (100 - (bottomOffset / 2)).coerceIn(0, 150)
 
+private const val OUTLINED_SHADOW_OPACITY_SCALE = 0.47f
+
+private data class MpvSubtitleShadow(
+    val color: String,
+    val offset: Float,
+    val blur: Float,
+    val outlineColor: String,
+    val outlineSize: Float,
+)
+
+private fun SubtitleStyleState.toMpvSubtitleShadow(): MpvSubtitleShadow {
+    val outlineSize = if (outlineEnabled) outlineWidth.toFloat() else 0f
+    val outlineColor = outlineColor.toMpvColorString()
+    if (!appearance.shadowEnabled) {
+        return MpvSubtitleShadow(
+            color = "#00000000",
+            offset = 0f,
+            blur = 0f,
+            outlineColor = outlineColor,
+            outlineSize = outlineSize,
+        )
+    }
+    val softened = backgroundColor.alpha == 0f
+    val needsGlyphGuard = softened && outlineSize == 0f
+    val opacityScale = if (softened && !needsGlyphGuard) OUTLINED_SHADOW_OPACITY_SCALE else 1f
+    val shadowAlpha = (appearance.shadowOpacity * 255 / 100 * opacityScale).roundToInt().coerceIn(0, 255)
+    return MpvSubtitleShadow(
+        color = "#" + shadowAlpha.toHexByte() + "000000",
+        offset = appearance.shadowSize.toFloat(),
+        blur = if (softened) (appearance.shadowSize * 0.5f + 1f).coerceIn(1.5f, 4f) else 0f,
+        outlineColor = if (needsGlyphGuard) "#00000000" else outlineColor,
+        outlineSize = if (needsGlyphGuard) 1f else outlineSize,
+    )
+}
+
 private fun SubtitleStyleState.toMpvSubtitleFontSize(): Float =
     (fontSizeSp * 3f).coerceIn(18f, 96f)
 
@@ -1250,6 +1297,7 @@ private data class PendingSource(
     val initialPositionMs: Long,
     val decoderPriority: Int,
     val nvidiaRtxSuperResolutionEnabled: Boolean,
+    val nvidiaRtxHdrEnabled: Boolean,
     val onError: (String?) -> Unit,
 )
 
@@ -1699,6 +1747,10 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         appendJsonArrayField("subtitleOutlineColorSwatches", SubtitleOutlineColorSwatches.map { it.toStorageHexString() }) { append(it.toJsonString()) }
         append(',')
         appendJsonField("closeModalsToken", closeModalsToken)
+        append(',')
+        appendJsonField("modalNavigationAction", modalNavigationAction)
+        append(',')
+        appendJsonField("modalNavigationToken", modalNavigationToken)
         append(',')
         appendJsonField("submitIntroSuccessToken", submitIntroSuccessToken)
         append(',')

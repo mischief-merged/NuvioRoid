@@ -22,6 +22,7 @@ internal fun DownloadsDestination(
     DownloadsScreen(
         onBack = onBack,
         onOpenDownload = onOpenDownload,
+        onOpenDetails = navController::openDownloadDetails,
         onChooseAnotherSource = onChooseAnotherSource,
         onOpenShowDetails = { type, id, title -> navController.navigate(DetailRoute(type = type, id = id, title = title)) },
         episodeLinks = if (isDesktop) downloadEpisodeLinks(navController) else null,
@@ -44,7 +45,9 @@ internal fun DownloadShowDestination(
     DownloadsScreen(
         onBack = onBack,
         onOpenDownload = onOpenDownload,
+        onOpenDetails = navController::openDownloadDetails,
         onChooseAnotherSource = onChooseAnotherSource,
+        episodeLinks = if (isDesktop) downloadEpisodeLinks(navController) else null,
         initialShowId = route.showId,
         onBackFromShow = onBack,
     )
@@ -79,3 +82,13 @@ private fun downloadEpisodeLinks(navController: NuvioNavigator) = DownloadEpisod
         )
     },
 )
+
+private fun NuvioNavigator.openDownloadDetails(item: DownloadItem) {
+    navigate(
+        DetailRoute(
+            type = item.parentMetaType,
+            id = item.parentMetaId,
+            title = item.title,
+        ),
+    )
+}
