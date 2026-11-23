@@ -378,6 +378,13 @@ internal class PlayerScreenRuntime(
     var nativeControlsModalOpen by mutableStateOf(false)
     /** Written from composition so a late native popup event can be ignored once the full player is gone. */
     var pictureInPictureActive: Boolean = false
+
+    /**
+     * Nested [com.nuvio.app.features.player.dismissOpenPlayerOverlay] calls on this player.
+     * Dismiss invokes the local back handler, and the session handler is that handler, so a
+     * nested call must not invoke it again.
+     */
+    internal var overlayDismissDepth: Int = 0
     var partyPanelToken by mutableStateOf(0L)
     var partyMessage by mutableStateOf("")
     var partyMessageToken by mutableStateOf(0L)

@@ -1776,14 +1776,28 @@ internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
  * Priority: Compose modal dialogs -> embedded native controls popups -> page-level handlers
  * (such as NextEpisodeCard or side panels) -> runtime overlay flags.
  * Returns true if an overlay was dismissed (so the Back press is consumed).
+ *
+ * The session back handler is registered as a local back handler and calls this function.
+ * Only the outermost call may dispatch that handler. A nested call still closes the flags,
+ * and it does not invoke the handler again.
  */
 internal fun PlayerScreenRuntime.dismissOpenPlayerOverlay(): Boolean {
+    val includeLocalHandlers = overlayDismissDepth == 0
+    overlayDismissDepth += 1
+    try {
+        return dismissOpenPlayerOverlayNow(includeLocalHandlers)
+    } finally {
+        overlayDismissDepth -= 1
+    }
+}
+
+private fun PlayerScreenRuntime.dismissOpenPlayerOverlayNow(includeLocalHandlers: Boolean): Boolean {
     if (dispatchPlatformModalBack()) return true
     if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
         dismissNativeControlsModal()
         return true
     }
-    if (dispatchPlatformLocalBack()) return true
+    if (includeLocalHandlers && dispatchPlatformLocalBack()) return true
     if (showSwitchEngineConfirm) {
         showSwitchEngineConfirm = false
         return true

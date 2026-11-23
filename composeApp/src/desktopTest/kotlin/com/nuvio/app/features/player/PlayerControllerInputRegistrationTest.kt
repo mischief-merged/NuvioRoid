@@ -8,6 +8,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import com.nuvio.app.controller.ControllerEvent
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.XboxButton
+import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.features.streams.StreamItem
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -36,44 +37,7 @@ class PlayerControllerInputRegistrationTest {
 
     @Test
     fun controller_input_is_registered_only_while_the_full_player_owns_the_screen() {
-        val runtime = PlayerScreenRuntime(
-            PlayerScreenArgs(
-                profileId = 1,
-                title = "Example",
-                sourceUrl = "https://cdn.example/video.mkv",
-                sourceAudioUrl = null,
-                sourceHeaders = emptyMap(),
-                sourceResponseHeaders = emptyMap(),
-                streamType = null,
-                providerName = "Addon",
-                streamTitle = "1080p",
-                streamSubtitle = null,
-                initialBingeGroup = null,
-                pauseDescription = null,
-                onBack = { _ -> },
-                onOpenInExternalPlayer = null,
-                onOpenExternalUrl = null,
-                modifier = Modifier,
-                logo = null,
-                poster = null,
-                background = null,
-                seasonNumber = null,
-                episodeNumber = null,
-                episodeTitle = null,
-                episodeThumbnail = null,
-                contentType = "movie",
-                videoId = "tt1",
-                parentMetaId = "tt1",
-                parentMetaType = "movie",
-                providerAddonId = "addon",
-                torrentInfoHash = null,
-                torrentFileIdx = null,
-                torrentFilename = null,
-                torrentTrackers = emptyList(),
-                initialPositionMs = 0L,
-                initialProgressFraction = null,
-            ),
-        )
+        val runtime = sampleRuntime()
         var ownsInput by mutableStateOf(true)
         compose.setContent {
             PlayerControllerInputRegistration(
@@ -100,44 +64,7 @@ class PlayerControllerInputRegistrationTest {
 
     @Test
     fun leaving_the_full_player_drops_popups_and_ignores_a_late_native_modal_event() {
-        val runtime = PlayerScreenRuntime(
-            PlayerScreenArgs(
-                profileId = 1,
-                title = "Example",
-                sourceUrl = "https://cdn.example/video.mkv",
-                sourceAudioUrl = null,
-                sourceHeaders = emptyMap(),
-                sourceResponseHeaders = emptyMap(),
-                streamType = null,
-                providerName = "Addon",
-                streamTitle = "1080p",
-                streamSubtitle = null,
-                initialBingeGroup = null,
-                pauseDescription = null,
-                onBack = { _ -> },
-                onOpenInExternalPlayer = null,
-                onOpenExternalUrl = null,
-                modifier = Modifier,
-                logo = null,
-                poster = null,
-                background = null,
-                seasonNumber = null,
-                episodeNumber = null,
-                episodeTitle = null,
-                episodeThumbnail = null,
-                contentType = "movie",
-                videoId = "tt1",
-                parentMetaId = "tt1",
-                parentMetaType = "movie",
-                providerAddonId = "addon",
-                torrentInfoHash = null,
-                torrentFileIdx = null,
-                torrentFilename = null,
-                torrentTrackers = emptyList(),
-                initialPositionMs = 0L,
-                initialProgressFraction = null,
-            ),
-        )
+        val runtime = sampleRuntime()
         val pending = PendingPlayerP2pSwitch(
             stream = StreamItem(name = "P2P", infoHash = "abcdef1234567890", addonName = "Addon", addonId = "addon"),
             episode = null,
@@ -171,4 +98,73 @@ class PlayerControllerInputRegistrationTest {
         assertFalse(playerOwnsControllerInput(isMinimized = true, isInPictureInPicture = false))
         assertFalse(playerOwnsControllerInput(isMinimized = false, isInPictureInPicture = true))
     }
+
+    @Test
+    fun dismissing_an_overlay_does_not_reenter_the_session_back_handler() {
+        val runtime = sampleRuntime()
+        var backs = 0
+        val handler: () -> Unit = {
+            if (!runtime.dismissOpenPlayerOverlay()) backs += 1
+        }
+        DesktopEscapeShortcut.registerLocal(handler)
+        try {
+            runtime.showAudioModal = true
+            handler()
+            assertFalse(runtime.showAudioModal)
+            assertEquals(0, backs)
+
+            handler()
+            assertEquals(1, backs)
+
+            runtime.showSubtitleModal = true
+            assertTrue(runtime.dismissOpenPlayerOverlay())
+            assertFalse(runtime.showSubtitleModal)
+            assertEquals(1, backs)
+
+            assertTrue(runtime.dismissOpenPlayerOverlay())
+            assertEquals(2, backs)
+            assertEquals(0, runtime.overlayDismissDepth)
+        } finally {
+            DesktopEscapeShortcut.unregisterLocal(handler)
+        }
+    }
+
+    private fun sampleRuntime() = PlayerScreenRuntime(
+        PlayerScreenArgs(
+            profileId = 1,
+            title = "Example",
+            sourceUrl = "https://cdn.example/video.mkv",
+            sourceAudioUrl = null,
+            sourceHeaders = emptyMap(),
+            sourceResponseHeaders = emptyMap(),
+            streamType = null,
+            providerName = "Addon",
+            streamTitle = "1080p",
+            streamSubtitle = null,
+            initialBingeGroup = null,
+            pauseDescription = null,
+            onBack = { _ -> },
+            onOpenInExternalPlayer = null,
+            onOpenExternalUrl = null,
+            modifier = Modifier,
+            logo = null,
+            poster = null,
+            background = null,
+            seasonNumber = null,
+            episodeNumber = null,
+            episodeTitle = null,
+            episodeThumbnail = null,
+            contentType = "movie",
+            videoId = "tt1",
+            parentMetaId = "tt1",
+            parentMetaType = "movie",
+            providerAddonId = "addon",
+            torrentInfoHash = null,
+            torrentFileIdx = null,
+            torrentFilename = null,
+            torrentTrackers = emptyList(),
+            initialPositionMs = 0L,
+            initialProgressFraction = null,
+        ),
+    )
 }
