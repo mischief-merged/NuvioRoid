@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- Downloads let other apps go first and wait on very slow or blocking networks, judging each host on its own so a good connection is never held back ([#60](https://github.com/mischief-merged/NuvioRoid/pull/60)).
 - Automatic source failover during playback: when a source fails to start, stops working mid-play, or turns out to be a short placeholder clip, the player moves to the next ranked source and resumes where playback left off, with a setting to turn it off (on by default on desktop) ([#42](https://github.com/mischief-merged/NuvioRoid/pull/42)).
 - Stall and placeholder detection during playback: sources that make no progress at startup or stop responding mid-play are abandoned for the next ranked source, and provider placeholder clips are flagged using link and file-name signs paired with a second check such as a very short length; pausing, seeking, sleep, end-of-file, and going offline do not count as stalls ([#44](https://github.com/mischief-merged/NuvioRoid/pull/44)).
 - Complete offline downloads: downloaded titles now keep their subtitles (including on desktop), intro and credits skip times, the season's episode list for the next-episode card, and poster and thumbnail artwork in a folder beside the video, with existing downloads filled in quietly in the background ([#48](https://github.com/mischief-merged/NuvioRoid/pull/48)).
