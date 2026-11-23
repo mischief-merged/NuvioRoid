@@ -36,9 +36,11 @@ import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
 import com.nuvio.app.features.autosync.AutoSyncMpvCoordinator
 import com.nuvio.app.features.autosync.DesktopAutoSyncMpvPlatform
 import com.nuvio.app.features.autosync.withAutoSyncMessage
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 internal data class DesktopNativePlayerHooks(
     val createController: (NativePlayerHost, Boolean) -> NativePlayerController = { host, enableRemoteCommands ->
@@ -362,6 +364,20 @@ private fun NativePlayerSurface(
                 !snapshot.isPlaying
             ) {
                 controller.manualRefreshTick.first { it != tickBeforeSnapshot }
+                continue
+            }
+            if (isInMiniPlayer) {
+                // Seek, pause, and speed signals wake a snapshot. With no signal the
+                // wait still lasts the mini poll interval, so the cadence stays put.
+                coroutineScope {
+                    val interval = launch { delay(pollIntervalMs) }
+                    val signal = launch {
+                        controller.manualRefreshTick.first { it != tickBeforeSnapshot }
+                        interval.cancel()
+                    }
+                    interval.join()
+                    signal.cancel()
+                }
                 continue
             }
             delay(pollIntervalMs)

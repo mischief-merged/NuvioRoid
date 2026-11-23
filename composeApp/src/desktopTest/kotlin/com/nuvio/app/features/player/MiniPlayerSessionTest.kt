@@ -2107,6 +2107,82 @@ class MiniPlayerSessionTest {
     }
 
     @Test
+    fun playing_mini_seek_updates_saved_progress_before_the_next_periodic_snapshot() {
+        WatchProgressRepository.ensureLoaded()
+        WatchProgressRepository.clearProgress(episodes[0].id)
+        WatchProgressRepository.clearLocalState()
+
+        val backend = CountingNativePlayerBackend()
+        val hooks = backend.toDesktopHooks()
+        val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        sessionController.open(
+            launch = sampleSeriesLaunch(),
+            launchId = 908L,
+        )
+
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.setContent {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            PlayerSessionHost(
+                                controller = sessionController,
+                                navController = navigator,
+                                externalPlayerId = null,
+                                externalPlayerNotConfiguredText = "",
+                                externalPlayerFailedText = "",
+                                onExternalPlayerLaunch = {},
+                                launchExternalPlayer = { false },
+                                openExternalStreamUrl = { false },
+                                onOpenPartyMedia = {},
+                            )
+                        }
+                    }
+                }
+            }
+            compose.mainClock.advanceTimeBy(50L)
+            compose.waitUntil(5_000L) { backend.createCount == 1 }
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 105_000L
+                durationMs = 1_800_000L
+            }
+            sessionController.minimize()
+            compose.mainClock.advanceTimeBy(150L)
+            assertEquals(105_000L, sessionController.playbackState?.positionMs)
+            val queriesAfterSnapshot = backend.snapshotQueries.get()
+
+            compose.onNodeWithContentDescription(text(Res.string.compose_player_seek_forward_10)).performClick()
+            compose.mainClock.advanceTimeBy(150L)
+            assertEquals(115_000L, sessionController.playbackState?.positionMs)
+            assertTrue(
+                backend.snapshotQueries.get() > queriesAfterSnapshot,
+                "a playing seek must snapshot before the 2s poll",
+            )
+
+            compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
+            compose.mainClock.advanceTimeBy(200L)
+            assertEquals(
+                115_000L,
+                WatchProgressRepository.progressForVideo(episodes[0].id)?.lastPositionMs,
+                "closing inside the poll interval must save the post-skip position",
+            )
+            val queriesAfterClose = backend.snapshotQueries.get()
+            compose.mainClock.advanceTimeBy(4_000L)
+            assertEquals(
+                queriesAfterClose,
+                backend.snapshotQueries.get(),
+                "closing stops the playing snapshot loop",
+            )
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
     fun floating_pip_surface_host_is_preserved_across_episode_autoplay_and_source_failover() {
         PlayerSettingsRepository.ensureLoaded()
         val previousSettings = PlayerSettingsRepository.uiState.value
