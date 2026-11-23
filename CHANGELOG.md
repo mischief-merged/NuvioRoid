@@ -44,6 +44,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- The download folder setting tests no longer read saved downloads on the test machine, so they pass the same way in any order ([#138](https://github.com/mischief-merged/NuvioRoid/pull/138)).
 - Add-on searches can run together without crashing the app, and a source that times out stops safely ([#136](https://github.com/mischief-merged/NuvioRoid/pull/136)).
 - Desktop account data is never wiped by sign-out, a lost session or an account change: a different account is offered Start fresh, which archives the old data instead of deleting it, and quitting waits for downloads and the player to finish saving ([#133](https://github.com/mischief-merged/NuvioRoid/pull/133)).
 - An expired download link is refreshed and the same file resumes instead of starting over ([#94](https://github.com/mischief-merged/NuvioRoid/pull/94)).
