@@ -42,6 +42,11 @@ class SidecarLockOrderTest {
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri?.takeIf { it in files }
         override fun inspectFile(localFileUri: String): DownloadedFileFacts =
             if (localFileUri in files) DownloadedFileFacts(exists = true, sizeBytes = 1_000, isVideoContainer = true) else DownloadedFileFacts(exists = false)
+        override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult {
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            return if (trashFile(localFileUri)) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.NotMoved
+        }
+
         override fun trashFile(localFileUri: String): Boolean { trashed += localFileUri; files.remove(localFileUri); return true }
     }
 

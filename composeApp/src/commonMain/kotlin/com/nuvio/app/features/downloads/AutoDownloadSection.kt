@@ -170,15 +170,18 @@ internal fun AutoDownloadSection(
                 } else {
                     pluralStringResource(Res.plurals.downloads_auto_pending_in_hours, hoursLeft, hoursLeft)
                 }
-                val keepDescription = stringResource(Res.string.downloads_auto_keep_description, item.title, season, episode)
-                val deleteDescription = stringResource(Res.string.downloads_auto_delete_now_description, item.title, season, episode)
+                val keepDescription = if (item.isEpisode) stringResource(Res.string.downloads_auto_keep_description, item.title, season, episode)
+                else stringResource(Res.string.downloads_keep_description, item.title)
+                val deleteDescription = if (item.isEpisode) stringResource(Res.string.downloads_auto_delete_now_description, item.title, season, episode)
+                else stringResource(Res.string.downloads_movie_delete_now_description, item.title)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = stringResource(Res.string.downloads_auto_pending_row, item.title, season, episode, due),
+                        text = if (item.isEpisode) stringResource(Res.string.downloads_auto_pending_row, item.title, season, episode, due)
+                        else stringResource(Res.string.downloads_movie_removal_row, item.title, due),
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.bodyMedium,
                         color = tokens.colors.textPrimary,
@@ -214,7 +217,9 @@ internal fun AutoDownloadSection(
                     pluralStringResource(Res.plurals.downloads_auto_recent_days_ago, days, days)
                 }
                 Text(
-                    text = stringResource(
+                    text = if (entry.seasonNumber == null || entry.episodeNumber == null) {
+                        stringResource(Res.string.downloads_movie_removal_row, entry.title, ago)
+                    } else stringResource(
                         Res.string.downloads_auto_recent_row,
                         entry.title,
                         entry.seasonNumber ?: 0,
@@ -254,8 +259,12 @@ internal fun AutoDownloadSection(
 
     deletionToConfirm?.let { (confirmProfileId, item) ->
         NuvioStatusModal(
-            title = stringResource(Res.string.downloads_auto_delete_now_title),
-            message = stringResource(
+            title = stringResource(if (item.isEpisode) Res.string.downloads_auto_delete_now_title else Res.string.downloads_movie_delete_now_title),
+            message = if (!item.isEpisode) stringResource(
+                if (controller.usesSystemTrash) Res.string.downloads_movie_delete_now_message_trash
+                else Res.string.downloads_movie_delete_now_message_held,
+                item.title,
+            ) else stringResource(
                 if (controller.usesSystemTrash) {
                     Res.string.downloads_auto_delete_now_message_trash
                 } else {

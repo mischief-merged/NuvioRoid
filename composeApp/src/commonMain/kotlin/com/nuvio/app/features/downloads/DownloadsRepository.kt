@@ -691,7 +691,7 @@ object DownloadsRepository {
         return DownloadDeleteResult.Removed
     }
 
-    /** Whether the files of deleted downloads go to the trash of the system, or are held for days in the downloads folder. */
+    /** Whether deleted downloads go to the system Trash. When they do not, the files stay in the holding folder. */
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
 
     private fun loadFromDisk(): Unit = synchronized(stateLock) {
@@ -1393,7 +1393,7 @@ object DownloadsRepository {
     }
 
     /**
-     * Removes a finished automatic download: its file is moved to the trash and its entry dropped.
+     * Removes a finished watched download: its file is moved to the trash and its entry dropped.
      * Everything is looked at again here, under the state lock, so nothing that changed since the
      * caller decided is acted on: the download must still be finished and still belong to [ruleKey],
      * and [stillWanted] must say so.
@@ -1402,7 +1402,7 @@ object DownloadsRepository {
      */
     internal fun removeWatchedAutoDownload(
         downloadId: String,
-        ruleKey: String,
+        ruleKey: String?,
         stillWanted: () -> Boolean = { true },
     ): AutoDownloadRemovalResult {
         ensureLoaded()
@@ -1421,7 +1421,7 @@ object DownloadsRepository {
 
     private fun removeAutoWithLocksHeld(
         downloadId: String,
-        ruleKey: String,
+        ruleKey: String?,
         stillWanted: () -> Boolean,
         lockedUri: String?,
     ): AutoDownloadRemovalResult? = synchronized(stateLock) {
@@ -1432,6 +1432,8 @@ object DownloadsRepository {
         if (item.autoDownloadRuleKey != ruleKey || item.status != DownloadStatus.Completed || item.isPlaceholder) {
             return AutoDownloadRemovalResult.Changed
         }
+        // Scheduled removals need the system Trash. Without it the file is left where it is.
+        if (!backend.usesSystemTrash) return AutoDownloadRemovalResult.NotMoved
         if (!stillWanted()) return AutoDownloadRemovalResult.Changed
         val fileUri = backend.resolveLocalFileUri(item.localFileUri, item.fileName)
         if (fileUri != lockedUri) return null
@@ -1439,31 +1441,36 @@ object DownloadsRepository {
         // A move has the item: it stays scheduled and is looked at again later.
         if (!ItemLocks.tryAcquire(downloadId)) return AutoDownloadRemovalResult.Busy
         try {
-            return backend.withListLock { removeWatchedLocked(item, items) }
+            return synchronized(WatchedRemovalGuard.lock) {
+                val checked = WatchedRemovalGuard.check(stillWanted)
+                backend.withListLock { removeWatchedLocked(item, items, checked) }
+            }
         } finally {
             ItemLocks.release(downloadId)
         }
     }
 
-    private fun removeWatchedLocked(item: DownloadItem, items: List<DownloadItem>): AutoDownloadRemovalResult {
-        val downloadId = item.id
-        run {
-            val lookup = backend.locate(item)
-            // A file whose location is away is not gone: it is left, and the entry stays.
-            if (lookup is FileLookup.Unreachable) return AutoDownloadRemovalResult.NotReachable
-            val fileUri = (lookup as? FileLookup.Found)?.uri
-            if (fileUri != null) {
-                val usedByAnother = usedByAnother(item, items, fileUri) ?: return AutoDownloadRemovalResult.NotMoved
-                if (!removeRecordDurably(item)) return AutoDownloadRemovalResult.NotMoved
-                if (!usedByAnother && !backend.trashFile(fileUri)) {
-                    restoreRecord(item)
-                    return AutoDownloadRemovalResult.NotMoved
-                }
-                return AutoDownloadRemovalResult.Removed
-            }
-            if (!removeRecordDurably(item)) return AutoDownloadRemovalResult.NotMoved
-            return AutoDownloadRemovalResult.Removed
-        }
+    private fun removeWatchedLocked(
+        item: DownloadItem,
+        items: List<DownloadItem>,
+        stillWanted: () -> Boolean,
+    ): AutoDownloadRemovalResult {
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        val lookup = backend.locate(item)
+        // A file whose location is away is not gone: it is left, and the entry stays.
+        if (lookup is FileLookup.Unreachable) return AutoDownloadRemovalResult.NotReachable
+        val fileUri = (lookup as? FileLookup.Found)?.uri
+        val shared = fileUri?.let { usedByAnother(item, items, it) ?: return AutoDownloadRemovalResult.NotMoved } ?: false
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        if (!removeRecordDurably(item)) return AutoDownloadRemovalResult.NotMoved
+        // Saving the list may block. Keep, settings, playback and progress must be checked again.
+        val result = runCatching {
+            if (!stillWanted()) AutoDownloadRemovalResult.Changed
+            else if (fileUri != null && !shared) backend.trashWatchedFile(fileUri, stillWanted)
+            else AutoDownloadRemovalResult.Removed
+        }.getOrDefault(AutoDownloadRemovalResult.NotMoved)
+        if (result != AutoDownloadRemovalResult.Removed) restoreRecord(item)
+        return result
     }
 
     /** Removes [item]'s record and saves the list durably. False (and the record back in place) when that save failed. */
@@ -1798,6 +1805,10 @@ internal interface DownloadsBackend {
     /** Moves a file out of the downloads folder without deleting it at once. True when it is out, or was gone. */
     fun trashFile(localFileUri: String): Boolean = false
 
+    /** A reversible system-Trash move. Cancellation restores the original path before returning. */
+    fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
+        AutoDownloadRemovalResult.NotMoved
+
     /** True when [trashFile] puts files in the trash of the system, false when it only holds them for days. */
     val usesSystemTrash: Boolean get() = true
 
@@ -1933,6 +1944,9 @@ private object PlatformDownloadsBackend : DownloadsBackend {
         sampleConfirmingDownloadedFrames(localFileUri, durationMs)
 
     override fun trashFile(localFileUri: String): Boolean = DownloadsTrash.moveAway(localFileUri)
+
+    override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
+        DownloadsTrash.moveWatchedAway(localFileUri, stillWanted)
 
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
 

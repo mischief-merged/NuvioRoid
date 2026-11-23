@@ -33,6 +33,9 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_cancel
 import nuvio.composeapp.generated.resources.downloads_auto_check_now
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_description
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_message_trash
+import nuvio.composeapp.generated.resources.downloads_movie_delete_now_message_held
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_description
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_message_held
 import nuvio.composeapp.generated.resources.downloads_auto_delete_now_message_trash
@@ -77,6 +80,7 @@ import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 import org.junit.Rule
 import kotlin.test.Test
+import kotlin.test.assertTrue
 import kotlin.test.assertEquals
 
 @OptIn(ExperimentalTestApi::class)
@@ -387,7 +391,7 @@ class AutoDownloadSectionTest {
     }
 
     @Test
-    fun the_question_says_the_file_will_be_deleted_for_good_when_there_is_no_trash() {
+    fun the_question_says_the_file_stays_when_there_is_no_trash() {
         controller.usesSystemTrash = false
         scheduleRemoval(inMs = 5 * hour)
         show()
@@ -395,6 +399,32 @@ class AutoDownloadSectionTest {
         compose.onNodeWithContentDescription(text(Res.string.downloads_auto_delete_now_description, "Show", 1, 4)).performClick()
 
         compose.onNodeWithText(text(Res.string.downloads_auto_delete_now_message_held, "Show", 1, 4)).assertIsDisplayed()
+    }
+
+    @Test
+    fun a_movie_confirmation_says_the_file_stays_without_trash() {
+        showMovieConfirmation(usesTrash = false)
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_held, "Show")).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_trash, "Show")).assertDoesNotExist()
+    }
+
+    @Test
+    fun a_movie_confirmation_says_the_file_moves_when_trash_is_available() {
+        showMovieConfirmation(usesTrash = true)
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_trash, "Show")).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_movie_delete_now_message_held, "Show")).assertDoesNotExist()
+    }
+
+    private fun showMovieConfirmation(usesTrash: Boolean) {
+        controller.usesSystemTrash = usesTrash
+        scheduleRemoval(inMs = 5 * hour)
+        downloads.value = DownloadsUiState(listOf(downloads.value.items.single().copy(
+            contentType = "movie", parentMetaType = "movie", seasonNumber = null, episodeNumber = null, autoDownloadRuleKey = null,
+        )))
+        controller.removals.value = controller.removals.value.map { it.copy(ruleKey = null) }
+        show()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_movie_delete_now_description, "Show")).performClick()
+        assertTrue(controller.deletedNow.isEmpty())
     }
 
     @Test
@@ -500,6 +530,15 @@ class AutoDownloadSectionTest {
     }
 
     private fun recent(episode: Int, agoMs: Long) = AutoDownloadDeleted("Show", 1, episode, atEpochMs = shownNow - agoMs)
+
+    @Test
+    fun a_manual_movie_removed_today_is_shown_without_episode_numbers_or_rules() {
+        controller.recentlyDeleted.value = listOf(AutoDownloadDeleted("Movie", atEpochMs = shownNow))
+        show()
+        compose.onNodeWithText(text(Res.string.downloads_auto_recent_heading)).assertIsDisplayed()
+        compose.onNodeWithText("Movie • " + text(Res.string.downloads_auto_recent_today)).assertIsDisplayed()
+        compose.onNodeWithText("S0 E0", substring = true).assertDoesNotExist()
+    }
 
     @Test
     fun an_episode_deleted_after_watching_is_listed_under_recently_deleted_for_a_week() {

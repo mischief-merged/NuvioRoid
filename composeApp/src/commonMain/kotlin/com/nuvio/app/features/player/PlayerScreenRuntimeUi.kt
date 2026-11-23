@@ -203,7 +203,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             (bufferedSeconds / 10f).coerceIn(0f, 1f)
         }
     }
-    val playerSurfaceSourceUrl = if (isP2pPlaybackActive) p2pResolvedSourceUrl else activeSourceUrl
+    val playerSurfaceSourceUrl = rememberReadyPlayerSource(
+        if (isP2pPlaybackActive) p2pResolvedSourceUrl else activeSourceUrl,
+    )
     val initialPositionRequestKey = currentInitialPositionRequestKey()
     val currentPlayerSurfaceSource = playerSurfaceSourceUrl?.let { sourceUrl ->
         PlayerSurfaceSource(

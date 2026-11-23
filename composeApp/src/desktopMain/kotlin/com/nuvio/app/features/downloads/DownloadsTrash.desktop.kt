@@ -5,10 +5,13 @@ import java.awt.Desktop
 import java.io.File
 import java.io.IOException
 import java.net.URI
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import kotlin.io.path.createDirectories
 
 internal actual object DownloadsTrash {
@@ -27,6 +30,9 @@ internal actual object DownloadsTrash {
     actual val usesSystemTrash: Boolean get() = trash.usesSystemTrash
 
     actual fun moveAway(localFileUri: String): Boolean = trash.moveAway(localFileUri)
+
+    actual fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
+        trash.moveWatchedAway(localFileUri, stillWanted)
 
     actual fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
         trash.isSameFile(firstFileUri, secondFileUri)
@@ -83,6 +89,82 @@ internal class DesktopDownloadsTrash(
     }
 
     /**
+     * Keep hard links beside the download until the move is accepted. They use no extra video
+     * storage and let cancellation restore both the video and subtitles even after the system has
+     * moved them. If links cannot be made on this volume, leave the download alone.
+     */
+    fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult = synchronized(this) {
+        val trash = systemTrash ?: return AutoDownloadRemovalResult.NotMoved
+        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        val file = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return AutoDownloadRemovalResult.NotMoved
+        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
+            return if (stillWanted()) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.Changed
+        }
+        val root = roots().firstOrNull { file.isRegularFileInside(it) } ?: return AutoDownloadRemovalResult.NotMoved
+        val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
+        val sources = listOfNotNull(file, subtitles)
+        val recovery = runCatching { Files.createTempDirectory(root, ".watched-removal-") }.getOrNull()
+            ?: return AutoDownloadRemovalResult.NotMoved
+        try {
+            sources.forEach { linkForRecovery(it, recovery.resolve(it.fileName)) }
+        } catch (_: Exception) {
+            runCatching { deleteWithoutFollowingLinks(recovery) }
+            return AutoDownloadRemovalResult.NotMoved
+        }
+
+        fun restore() {
+            sources.forEach { source ->
+                val saved = recovery.resolve(source.fileName)
+                restoreRecovery(saved, source)
+            }
+        }
+
+        var accepted = false
+        try {
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            val moved = runCatching { trash(file.toFile()) }.getOrDefault(false)
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            if (!moved || Files.exists(file, LinkOption.NOFOLLOW_LINKS)) return AutoDownloadRemovalResult.NotMoved
+            subtitles?.let { runCatching { trash(it.toFile()) } }
+            if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+            accepted = true
+            AutoDownloadRemovalResult.Removed
+        } finally {
+            // If restoring fails, keep the recovery links. Never discard the only remaining copy.
+            if (accepted || runCatching { restore() }.isSuccess) {
+                runCatching { deleteWithoutFollowingLinks(recovery) }
+            }
+        }
+    }
+
+    private fun restoreRecovery(saved: Path, source: Path) {
+        if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+            Files.move(saved, source)
+        } else if (Files.isDirectory(saved, LinkOption.NOFOLLOW_LINKS) &&
+            !Files.isSymbolicLink(source) && Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)
+        ) {
+            Files.newDirectoryStream(saved).use { children ->
+                children.forEach { restoreRecovery(it, source.resolve(it.fileName)) }
+            }
+        } else if (Files.isSymbolicLink(source) || !Files.isSameFile(saved, source)) {
+            throw IOException("The original path has changed; its recovery copy has been kept")
+        }
+    }
+
+    private fun linkForRecovery(source: Path, destination: Path) {
+        if (Files.isSymbolicLink(source)) throw IOException("A link cannot be saved for removal")
+        if (Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) {
+            Files.createDirectory(destination)
+            Files.newDirectoryStream(source).use { children ->
+                children.forEach { linkForRecovery(it, destination.resolve(it.fileName)) }
+            }
+        } else {
+            if (!Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) throw IOException("Not a regular file")
+            Files.createLink(destination, source)
+        }
+    }
+
+    /**
      * Sends one file or folder that is inside a downloads folder (at any depth, never the folder itself
      * or its holding folder) to the Trash of the system, or, without one, to the holding folder of that
      * downloads folder. A link is refused and never followed. Nothing is deleted. True when it is out.
@@ -106,6 +188,8 @@ internal class DesktopDownloadsTrash(
     }
 
     fun purgeHeldFiles(nowEpochMs: Long): Int = synchronized(this) {
+        // Held videos and partials are never permanently deleted; aged entries move to Trash when available.
+        if (systemTrash == null) return 0
         roots().sumOf { purgeHeldFilesIn(it, nowEpochMs) }
     }
 
@@ -190,6 +274,24 @@ internal class DesktopDownloadsTrash(
             Files.isDirectory(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 
+    /** Removes a temporary recovery folder this class just made. Never a held video or partial. */
+    private fun deleteWithoutFollowingLinks(entry: Path) {
+        Files.walkFileTree(
+            entry,
+            object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    Files.delete(file)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
+                    if (exc != null) throw exc
+                    Files.delete(dir)
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
+    }
     companion object {
         const val HoldingFolderName = ".removed"
         const val IndexFileName = "index"
