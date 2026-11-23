@@ -84,9 +84,11 @@ object DownloadsRepository {
     private val indexScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     internal var indexDispatcher: CoroutineDispatcher = Dispatchers.IO
     private var indexJob: Job? = null
+    private var watchedReleaseJob: Job? = null
     private var indexGeneration: Long = 0L
     private var lastCompletedIndexKey: List<CompletedIndexKey>? = null
     private var offlineIndexObserved = false
+    private val watchedReleaseCoalesceMs = 25L
 
     private data class CompletedIndexKey(
         val id: String,
@@ -210,6 +212,7 @@ object DownloadsRepository {
 
     init {
         connectionHold.listen(::applyConnectionHold)
+        ItemLocks.setReleaseListener(::onWatchedItemLockReleased)
     }
 
     private var nextDownloadOrdinal = 0L
@@ -406,10 +409,33 @@ object DownloadsRepository {
         synchronized(indexLock) {
             offlineIndexObserved = false
             indexGeneration++
+            watchedReleaseJob?.cancel()
+            watchedReleaseJob = null
             indexJob?.cancel()
             indexJob = null
             lastCompletedIndexKey = null
             _offlineIndex.value = OfflineDownloadIndex.Empty
+            ItemLocks.clearWatched()
+        }
+    }
+
+    private fun onWatchedItemLockReleased() {
+        val dispatcher = indexDispatcher
+        if (dispatcher === Dispatchers.Unconfined) {
+            refreshOfflineIndex()
+            return
+        }
+        synchronized(indexLock) {
+            if (!offlineIndexObserved) return
+            if (watchedReleaseJob?.isActive == true) return
+            watchedReleaseJob = indexScope.launch(dispatcher) {
+                delay(watchedReleaseCoalesceMs)
+                synchronized(indexLock) {
+                    watchedReleaseJob = null
+                }
+                if (!isActive) return@launch
+                refreshOfflineIndex()
+            }
         }
     }
 
@@ -562,9 +588,18 @@ object DownloadsRepository {
         var heldWhileConnected = false
         val index = OfflineDownloadIndex(candidates) { item ->
             if (!item.isVerifiedCompletedStatus()) return@OfflineDownloadIndex null
-            if (isBusyOrAway(item)) {
-                if (backend.isConnected(item)) heldWhileConnected = true
+            if (ItemLocks.watchIfHeld(item.id)) {
+                heldWhileConnected = true
                 return@OfflineDownloadIndex null
+            }
+            if (isBusyOrAway(item)) {
+                // Re-check ItemLocks so a lock acquired between the two checks is still watched on release,
+                // and only skip if the item is still busy/away after watching or is away from disk.
+                val lockHeld = ItemLocks.watchIfHeld(item.id)
+                if (lockHeld || isBusyOrAway(item)) {
+                    if (lockHeld || backend.isConnected(item)) heldWhileConnected = true
+                    return@OfflineDownloadIndex null
+                }
             }
             (backend.locate(item) as? FileLookup.Found)?.uri
         }
@@ -1103,7 +1138,7 @@ object DownloadsRepository {
                     backend.removePartialOf(item)
                 }
             } finally {
-                releaseItemLockAndRefreshIfCompleted(downloadId)
+                ItemLocks.release(downloadId)
             }
         }
     }
@@ -1144,7 +1179,7 @@ object DownloadsRepository {
             // The ownership check, the file and the record change under the lock every save of a list takes.
             return backend.withListLock { deleteLocked(item, items) }
         } finally {
-            releaseItemLockAndRefreshIfCompleted(downloadId)
+            ItemLocks.release(downloadId)
         }
     }
 
@@ -2175,10 +2210,6 @@ object DownloadsRepository {
         } finally {
             ItemLocks.release(downloadId)
         }
-        if (verified) {
-            val snapshot = synchronized(stateLock) { _uiState.value.items }
-            scheduleOfflineIndexRefresh(snapshot, force = true)
-        }
         return verified
     }
 
@@ -2359,15 +2390,7 @@ object DownloadsRepository {
                 backend.withListLock { removeWatchedLocked(item, items, checked) }
             }
         } finally {
-            releaseItemLockAndRefreshIfCompleted(downloadId)
-        }
-    }
-
-    private fun releaseItemLockAndRefreshIfCompleted(downloadId: String) {
-        ItemLocks.release(downloadId)
-        val items = _uiState.value.items
-        if (items.any { it.id == downloadId && it.isVerifiedCompletedStatus() }) {
-            scheduleOfflineIndexRefresh(items, force = true)
+            ItemLocks.release(downloadId)
         }
     }
 

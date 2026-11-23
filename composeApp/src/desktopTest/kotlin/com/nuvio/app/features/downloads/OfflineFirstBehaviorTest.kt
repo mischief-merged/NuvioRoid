@@ -30,6 +30,9 @@ import com.nuvio.app.features.streams.PlaybackAvailability
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -901,7 +904,7 @@ class OfflineFirstBehaviorTest {
             )
 
             // If an index build runs while a connected item is temporarily held by ItemLocks,
-            // lastCompletedIndexKey must not stay poisoned once the lock is released.
+            // releasing the lock alone restores the item into offlineIndex without a caller refresh.
             assertTrue(ItemLocks.tryAcquire(movie.id))
             try {
                 DownloadsRepository.refreshOfflineIndex()
@@ -909,10 +912,9 @@ class OfflineFirstBehaviorTest {
             } finally {
                 ItemLocks.release(movie.id)
             }
-            DownloadsRepository.ensureOfflineIndexStarted()
             assertTrue(
                 DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId),
-                "Ordinary index refresh after ItemLocks release must restore the temporarily held item",
+                "ItemLocks release after a scan skipped the item must restore it to offlineIndex",
             )
         } finally {
             DownloadsRepository.indexDispatcher = previousDispatcher
@@ -1018,5 +1020,167 @@ class OfflineFirstBehaviorTest {
         } finally {
             DownloadsRepository.indexDispatcher = previousDispatcher
         }
+    }
+
+    private fun awaitCondition(timeoutMs: Long = 3_000L, condition: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (condition()) return true
+            Thread.sleep(10)
+        }
+        return condition()
+    }
+
+    @Test
+    fun releasing_ItemLocks_after_scan_skipped_item_restores_offline_index_without_caller_refresh() {
+        val sentinel = downloadItem("mv-sentinel", "tt-sentinel", "tt-sentinel", totalBytes = 1_000L, updatedAtEpochMs = 1L)
+        val movie = downloadItem("mv-watch", "tt-watch", "tt-watch", totalBytes = 1_000L, updatedAtEpochMs = 200L)
+        backend.presentUris += sentinel.localFileUri!!
+        backend.fileFacts[sentinel.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        backend.presentUris += movie.localFileUri!!
+        backend.fileFacts[movie.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val lockAwareBackend = object : DownloadsBackend by backend {
+            override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
+        }
+        persistItems(movie, sentinel)
+        DownloadsRepository.backend = lockAwareBackend
+
+        assertTrue(ItemLocks.tryAcquire(movie.id))
+        try {
+            DownloadsRepository.ensureOfflineIndexStarted()
+            assertTrue(
+                awaitCondition {
+                    DownloadsRepository.offlineIndex.value.hasFor(sentinel.parentMetaId, videoId = sentinel.videoId)
+                },
+                "Initial scan should complete with sentinel item while locked item is held",
+            )
+            assertFalse(DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId))
+        } finally {
+            // Holder releases only ItemLocks and never calls ensureOfflineIndexStarted or refreshOfflineIndex.
+            ItemLocks.release(movie.id)
+        }
+
+        assertTrue(
+            awaitCondition {
+                DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId)
+            },
+            "Releasing watched ItemLocks must schedule an offlineIndex refresh automatically",
+        )
+    }
+
+    @Test
+    fun retiring_superseded_partials_with_no_retired_keys_restores_offline_index_after_unlock() {
+        val enteredRetireLatch = CountDownLatch(1)
+        val allowRetireReturnLatch = CountDownLatch(1)
+        val sentinel = downloadItem("mv-retire-sentinel", "tt-retire-sentinel", "tt-retire-sentinel", totalBytes = 1_000L, updatedAtEpochMs = 1L)
+        backend.presentUris += sentinel.localFileUri!!
+        backend.fileFacts[sentinel.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val movie = downloadItem(
+            id = "mv-retire",
+            parentMetaId = "tt-retire",
+            videoId = "tt-retire",
+            status = DownloadStatus.Completed,
+            framesCheck = DownloadFramesCheck.Passed,
+            verifiedBy = DownloadVerification.Size,
+            totalBytes = 1_000L,
+            updatedAtEpochMs = 200L,
+            localUri = "file:///tmp/mv-retire.mkv",
+        ).copy(
+            supersededPartials = listOf(
+                KeptPartialFile(
+                    fileName = "old.mkv.part",
+                    partialFileKey = "k-1",
+                    locationId = DownloadLocations.AppId,
+                ),
+            ),
+        )
+        backend.presentUris += movie.localFileUri!!
+        backend.fileFacts[movie.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+
+        val customBackend = object : DownloadsBackend by backend {
+            override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
+
+            override fun retireSupersededPartials(item: DownloadItem): Set<String> {
+                enteredRetireLatch.countDown()
+                assertTrue(allowRetireReturnLatch.await(3, TimeUnit.SECONDS))
+                return emptySet()
+            }
+        }
+
+        val json = kotlinx.serialization.json.Json { encodeDefaults = true }
+        val listJson = listOf(movie, sentinel).joinToString(",") { json.encodeToString(DownloadItem.serializer(), it) }
+        DownloadsRepository.clearLocalState()
+        backend.payload = """{"items":[$listJson]}"""
+        DownloadsRepository.backend = customBackend
+        DownloadsRepository.ensureLoaded()
+
+        assertTrue(enteredRetireLatch.await(3, TimeUnit.SECONDS))
+        DownloadsRepository.ensureOfflineIndexStarted()
+        assertTrue(
+            awaitCondition {
+                DownloadsRepository.offlineIndex.value.hasFor(sentinel.parentMetaId, videoId = sentinel.videoId)
+            },
+            "Scan should finish sentinel while retireCompletedSupersededPartials holds ItemLocks",
+        )
+        assertFalse(DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId))
+
+        // Return emptySet() so applyRetiredSupersededPartials performs no state publish or refresh.
+        allowRetireReturnLatch.countDown()
+        assertTrue(
+            awaitCondition {
+                DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId)
+            },
+            "Completed item whose superseded partial retirement returned emptySet must enter offlineIndex after ItemLocks unlock",
+        )
+    }
+
+    @Test
+    fun coalesced_refresh_runs_once_for_burst_of_ItemLocks_releases() {
+        val sentinel = downloadItem("mv-burst-sentinel", "tt-burst-sentinel", "tt-burst-sentinel", totalBytes = 1_000L, updatedAtEpochMs = 1L)
+        backend.presentUris += sentinel.localFileUri!!
+        backend.fileFacts[sentinel.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val ids = (1..5).map { "mv-burst-$it" }
+        val items = ids.map { id ->
+            downloadItem(id, "tt-burst-$id", "tt-burst-$id", totalBytes = 1_000L, updatedAtEpochMs = 200L).also { item ->
+                backend.presentUris += item.localFileUri!!
+                backend.fileFacts[item.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+            }
+        }
+        val locateCount = AtomicInteger(0)
+        val countingBackend = object : DownloadsBackend by backend {
+            override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
+
+            override fun locate(item: DownloadItem): FileLookup {
+                locateCount.incrementAndGet()
+                return backend.locate(item)
+            }
+        }
+        persistItems(*(items + sentinel).toTypedArray())
+        DownloadsRepository.backend = countingBackend
+
+        ids.forEach { assertTrue(ItemLocks.tryAcquire(it)) }
+        try {
+            DownloadsRepository.ensureOfflineIndexStarted()
+            assertTrue(
+                awaitCondition {
+                    DownloadsRepository.offlineIndex.value.hasFor(sentinel.parentMetaId, videoId = sentinel.videoId)
+                },
+                "Initial scan should complete with sentinel while all burst items are locked",
+            )
+            assertEquals(1, locateCount.get())
+            assertTrue(ids.none { id -> DownloadsRepository.offlineIndex.value.hasFor("tt-burst-$id", videoId = "tt-burst-$id") })
+        } finally {
+            locateCount.set(0)
+            ids.forEach { ItemLocks.release(it) }
+        }
+
+        assertTrue(
+            awaitCondition {
+                ids.all { id -> DownloadsRepository.offlineIndex.value.hasFor("tt-burst-$id", videoId = "tt-burst-$id") }
+            },
+            "All released watched items must appear in offlineIndex",
+        )
+        Thread.sleep(100)
+        assertEquals(ids.size + 1, locateCount.get(), "Burst of ItemLocks releases must coalesce into a single index scan")
     }
 }
