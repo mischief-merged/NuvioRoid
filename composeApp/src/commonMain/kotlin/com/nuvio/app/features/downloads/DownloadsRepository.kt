@@ -78,13 +78,16 @@ object DownloadsRepository {
     // The UI, downloader callbacks and background workers reach this object from different threads.
     // Every read-modify-write of the item list, and every use of activeTransfers, holds this lock.
     //
-    // LOCK ORDER, everywhere: the per-video lock (SidecarLocks) FIRST, then loadLock, then this state
-    // lock. loadLock covers one catalog read and the disk scan after it, and a profile change. The
-    // state lock is not held while that scan walks the disk, and a manual scan does not take loadLock,
-    // so a pause or a profile change can run during the walk. Code that holds the state lock never
-    // waits for a per-video lock, and code that holds a per-video lock never takes this one: the guard
-    // behind every sidecar write (videoFileIsThere) reads the disk through the backend only. Both
-    // delete paths therefore take the per-video lock before entering here.
+    // LOCK ORDER, everywhere: loadLock, then the per-video lock (SidecarLocks), then this state lock.
+    // loadLock covers one catalog read and the disk scan after it, and a profile change. Nothing takes
+    // loadLock while it already holds the state lock or a per-video lock. The state lock is not held
+    // while that scan walks the disk, and a manual scan does not take loadLock, so a pause or a profile
+    // change can run during the walk. An action that may have to load the list calls ensureLoaded before
+    // it takes the state lock. A caller that already holds the state lock resumes through
+    // resumeDownloadLocked and does not load. Code that holds the state lock never waits for a per-video
+    // lock. The guard behind every sidecar write (videoFileIsThere) reads the disk through the backend
+    // only, so it does not take the state lock. Both delete paths load the list first, then take the
+    // per-video lock, then the state lock.
     private val loadLock = SynchronizedObject()
     private val stateLock = SynchronizedObject()
 
@@ -410,129 +413,130 @@ object DownloadsRepository {
         autoDownloadRuleKey: String? = null,
         /** The user picked this source for a title that has a finished download: it replaces that download's file. */
         userChoseReplacement: Boolean = false,
-    ): DownloadEnqueueResult = synchronized(stateLock) {
+    ): DownloadEnqueueResult {
         ensureLoaded()
+        return synchronized(stateLock) {
+            val sourceUrl = stream.playableDirectUrl
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: return DownloadEnqueueResult.MissingUrl
 
-        val sourceUrl = stream.playableDirectUrl
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: return DownloadEnqueueResult.MissingUrl
-
-        if (!sourceUrl.isSupportedDownloadUrl()) {
-            return DownloadEnqueueResult.UnsupportedFormat
-        }
-        // Nobody looks at the address of a download that starts by itself, so it may only go to a
-        // public host.
-        if (autoDownloadRuleKey != null && !sourceUrl.hasPublicDownloadHost()) {
-            return DownloadEnqueueResult.UnsupportedFormat
-        }
-
-        val now = DownloadsClock.nowEpochMs()
-        val logicalKey = buildLogicalKey(
-            parentMetaId = parentMetaId,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-        )
-
-        var replacedExisting = false
-        val currentItems = _uiState.value.items.toMutableList()
-        // The sources this title had, and how many the app started by itself, go on with the new download.
-        val history = sourceHistoryFor(currentItems.filter { it.logicalContentKey == logicalKey }, stream, userChoseReplacement)
-        // What is replaced: a download that has no finished file. A finished file, marked as not the
-        // real video or not, is a stored file of the user: it is replaced only when the user chose
-        // to ([userChoseReplacement]), and then a marked one goes to the trash. Anything automatic
-        // leaves it and its record where they are and fetches the new copy beside it, under a name
-        // and a record of its own.
-        val replaced = currentItems.filter { item ->
-            item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed) &&
-                !(item.awaitingCheck && item.localFileUri != null)
-        }
-        replaced.forEach { existing ->
-            replacedExisting = true
-            removeTransfer(existing.id)?.cancel()
-            currentItems.removeAll { it.id == existing.id }
-        }
-
-        val downloadId = nextDownloadId(now)
-        val fileName = buildFileName(
-            title = title,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-            episodeTitle = episodeTitle,
-            fallbackTitle = stream.streamLabel,
-            sourceUrl = sourceUrl,
-            downloadId = downloadId,
-        )
-
-        val item = DownloadItem(
-            id = downloadId,
-            contentType = contentType,
-            parentMetaId = parentMetaId,
-            parentMetaType = parentMetaType,
-            videoId = videoId,
-            title = title,
-            logo = logo,
-            poster = poster,
-            background = background,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-            episodeTitle = episodeTitle,
-            episodeThumbnail = episodeThumbnail,
-            streamTitle = stream.streamLabel,
-            streamSubtitle = stream.streamSubtitle,
-            providerName = stream.addonName,
-            providerAddonId = stream.addonId,
-            sourceUrl = sourceUrl,
-            sourceHeaders = sanitizeRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
-            sourceResponseHeaders = sanitizeResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
-            subtitleRequests = addonSubtitleRequests(
-                type = contentType,
-                videoId = videoId,
-                extras = SubtitleRequestExtras.from(stream.behaviorHints, sourceUrl),
-            ),
-            sourceSubtitles = stream.externalSubtitles,
-            localFileUri = null,
-            fileName = fileName,
-            // A show stays where its downloaded episodes are; a movie goes to the default location.
-            locationId = backend.placementFor(currentItems, parentMetaId, seasonNumber != null && episodeNumber != null),
-            status = DownloadStatus.Downloading,
-            downloadedBytes = 0L,
-            totalBytes = null,
-            errorMessage = null,
-            createdAtEpochMs = now,
-            updatedAtEpochMs = now,
-            expectedVideoHash = stream.behaviorHints.videoHash.asVideoHash(),
-            autoDownloadRuleKey = autoDownloadRuleKey,
-            triedSources = history.triedSources,
-            autoSourceAttempts = history.autoSourceAttempts,
-        )
-
-        // The size the source claims for the selected file, where that is established (see SourceSizeClaim).
-        val claimed = usableSizeClaim(stream, item.isEpisode, runtimeMinutesOf(item))
-        val queued = item.copy(expectedSizeBytes = claimed)
-
-        currentItems.add(0, queued)
-        publish(currentItems)
-        // The list without the old record is on disk first; only then does its file go, so a crash or a
-        // failed save can leave a file without a record, never a record whose file is in the Trash.
-        val savedDurably = persist(durably = replaced.isNotEmpty())
-        replaced.forEach { existing ->
-            val oldUri = playableLocalFileUri(existing) ?: existing.localFileUri
-            // The old file goes to the Trash (a flagged placeholder too, so it can be looked at), and only when
-            // no other record of any profile uses it; where that cannot be told it stays where it is.
-            val keep = !savedDurably || oldUri != null &&
-                backend.ownershipOf(existing, oldUri).let { it == FileOwnership.Owned || it == FileOwnership.Unknown }
-            if (!keep) {
-                if (existing.isPlaceholder) oldUri?.let(backend::trashFile) else backend.discardFile(oldUri)
-                // Each source has its own destination. Leave the previous partial file for the user.
+            if (!sourceUrl.isSupportedDownloadUrl()) {
+                return DownloadEnqueueResult.UnsupportedFormat
             }
-        }
-        startDownload(queued)
+            // Nobody looks at the address of a download that starts by itself, so it may only go to a
+            // public host.
+            if (autoDownloadRuleKey != null && !sourceUrl.hasPublicDownloadHost()) {
+                return DownloadEnqueueResult.UnsupportedFormat
+            }
 
-        return if (replacedExisting) {
-            DownloadEnqueueResult.Replaced
-        } else {
-            DownloadEnqueueResult.Started
+            val now = DownloadsClock.nowEpochMs()
+            val logicalKey = buildLogicalKey(
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+            )
+
+            var replacedExisting = false
+            val currentItems = _uiState.value.items.toMutableList()
+            // The sources this title had, and how many the app started by itself, go on with the new download.
+            val history = sourceHistoryFor(currentItems.filter { it.logicalContentKey == logicalKey }, stream, userChoseReplacement)
+            // What is replaced: a download that has no finished file. A finished file, marked as not the
+            // real video or not, is a stored file of the user: it is replaced only when the user chose
+            // to ([userChoseReplacement]), and then a marked one goes to the trash. Anything automatic
+            // leaves it and its record where they are and fetches the new copy beside it, under a name
+            // and a record of its own.
+            val replaced = currentItems.filter { item ->
+                item.logicalContentKey == logicalKey && (userChoseReplacement || item.status != DownloadStatus.Completed) &&
+                    !(item.awaitingCheck && item.localFileUri != null)
+            }
+            replaced.forEach { existing ->
+                replacedExisting = true
+                removeTransfer(existing.id)?.cancel()
+                currentItems.removeAll { it.id == existing.id }
+            }
+
+            val downloadId = nextDownloadId(now)
+            val fileName = buildFileName(
+                title = title,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                episodeTitle = episodeTitle,
+                fallbackTitle = stream.streamLabel,
+                sourceUrl = sourceUrl,
+                downloadId = downloadId,
+            )
+
+            val item = DownloadItem(
+                id = downloadId,
+                contentType = contentType,
+                parentMetaId = parentMetaId,
+                parentMetaType = parentMetaType,
+                videoId = videoId,
+                title = title,
+                logo = logo,
+                poster = poster,
+                background = background,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                episodeTitle = episodeTitle,
+                episodeThumbnail = episodeThumbnail,
+                streamTitle = stream.streamLabel,
+                streamSubtitle = stream.streamSubtitle,
+                providerName = stream.addonName,
+                providerAddonId = stream.addonId,
+                sourceUrl = sourceUrl,
+                sourceHeaders = sanitizeRequestHeaders(stream.behaviorHints.proxyHeaders?.request),
+                sourceResponseHeaders = sanitizeResponseHeaders(stream.behaviorHints.proxyHeaders?.response),
+                subtitleRequests = addonSubtitleRequests(
+                    type = contentType,
+                    videoId = videoId,
+                    extras = SubtitleRequestExtras.from(stream.behaviorHints, sourceUrl),
+                ),
+                sourceSubtitles = stream.externalSubtitles,
+                localFileUri = null,
+                fileName = fileName,
+                // A show stays where its downloaded episodes are; a movie goes to the default location.
+                locationId = backend.placementFor(currentItems, parentMetaId, seasonNumber != null && episodeNumber != null),
+                status = DownloadStatus.Downloading,
+                downloadedBytes = 0L,
+                totalBytes = null,
+                errorMessage = null,
+                createdAtEpochMs = now,
+                updatedAtEpochMs = now,
+                expectedVideoHash = stream.behaviorHints.videoHash.asVideoHash(),
+                autoDownloadRuleKey = autoDownloadRuleKey,
+                triedSources = history.triedSources,
+                autoSourceAttempts = history.autoSourceAttempts,
+            )
+
+            // The size the source claims for the selected file, where that is established (see SourceSizeClaim).
+            val claimed = usableSizeClaim(stream, item.isEpisode, runtimeMinutesOf(item))
+            val queued = item.copy(expectedSizeBytes = claimed)
+
+            currentItems.add(0, queued)
+            publish(currentItems)
+            // The list without the old record is on disk first; only then does its file go, so a crash or a
+            // failed save can leave a file without a record, never a record whose file is in the Trash.
+            val savedDurably = persist(durably = replaced.isNotEmpty())
+            replaced.forEach { existing ->
+                val oldUri = playableLocalFileUri(existing) ?: existing.localFileUri
+                // The old file goes to the Trash (a flagged placeholder too, so it can be looked at), and only when
+                // no other record of any profile uses it; where that cannot be told it stays where it is.
+                val keep = !savedDurably || oldUri != null &&
+                    backend.ownershipOf(existing, oldUri).let { it == FileOwnership.Owned || it == FileOwnership.Unknown }
+                if (!keep) {
+                    if (existing.isPlaceholder) oldUri?.let(backend::trashFile) else backend.discardFile(oldUri)
+                    // Each source has its own destination. Leave the previous partial file for the user.
+                }
+            }
+            startDownload(queued)
+
+            if (replacedExisting) {
+                DownloadEnqueueResult.Replaced
+            } else {
+                DownloadEnqueueResult.Started
+            }
         }
     }
 
@@ -541,37 +545,41 @@ object DownloadsRepository {
      * downloads with a bad source are marked, so that the app does not look again and the user is
      * offered to pick one. Nothing else about them changes; a file stays where it is.
      */
-    internal fun markNoWorkingSourceFound(titleKey: String): Unit = synchronized(stateLock) {
+    internal fun markNoWorkingSourceFound(titleKey: String) {
         ensureLoaded()
-        val items = _uiState.value.items
-        if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
-        publish(
-            items.map { item ->
-                if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
-            },
-        )
-        persist()
+        synchronized(stateLock) {
+            val items = _uiState.value.items
+            if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
+            publish(
+                items.map { item ->
+                    if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
+                },
+            )
+            persist()
+        }
     }
 
-    fun pauseDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun pauseDownload(downloadId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        // One that waits for a better connection becomes paused by the user: it stays paused when that ends.
-        if (item.status == DownloadStatus.Paused && item.pausedByConnection) {
-            mutateItem(downloadId) { it.copy(pausedByConnection = false, updatedAtEpochMs = DownloadsClock.nowEpochMs()) }
-            return
-        }
-        if (item.status != DownloadStatus.Downloading) return
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            // One that waits for a better connection becomes paused by the user: it stays paused when that ends.
+            if (item.status == DownloadStatus.Paused && item.pausedByConnection) {
+                mutateItem(downloadId) { it.copy(pausedByConnection = false, updatedAtEpochMs = DownloadsClock.nowEpochMs()) }
+                return
+            }
+            if (item.status != DownloadStatus.Downloading) return
 
-        removeTransfer(downloadId)?.cancel()
-        mutateItem(downloadId) { current ->
-            current.copy(
-                status = DownloadStatus.Paused,
-                pausedByFolder = false,
-                pausedByConnection = false,
-                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                errorMessage = null,
-            )
+            removeTransfer(downloadId)?.cancel()
+            mutateItem(downloadId) { current ->
+                current.copy(
+                    status = DownloadStatus.Paused,
+                    pausedByFolder = false,
+                    pausedByConnection = false,
+                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                    errorMessage = null,
+                )
+            }
         }
     }
 
@@ -583,12 +591,14 @@ object DownloadsRepository {
             .forEach(::pauseDownload)
     }
 
-    fun resumePausedDownloads(): Unit = synchronized(stateLock) {
+    fun resumePausedDownloads() {
         ensureLoaded()
-        _uiState.value.items
-            .filter { it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection }
-            .map { it.id }
-            .forEach(::resumeDownload)
+        synchronized(stateLock) {
+            _uiState.value.items
+                .filter { it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection }
+                .map { it.id }
+                .forEach(::resumeDownloadLocked)
+        }
     }
 
     /**
@@ -596,8 +606,8 @@ object DownloadsRepository {
      * be looked at or moved. False when it did not stop in time. Never holds the state lock while waiting.
      */
     internal fun pauseAndWait(downloadId: String, timeoutMs: Long = 30_000L): Boolean {
+        ensureLoaded()
         val transfer = synchronized(stateLock) {
-            ensureLoaded()
             val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return true
             if (item.status != DownloadStatus.Downloading) return true
             removeTransfer(downloadId).also {
@@ -615,8 +625,13 @@ object DownloadsRepository {
         return transfer?.cancelAndWait(timeoutMs) ?: true
     }
 
-    fun resumeDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun resumeDownload(downloadId: String) {
         ensureLoaded()
+        synchronized(stateLock) { resumeDownloadLocked(downloadId) }
+    }
+
+    /** The caller already holds the state lock. This does not load the list and does not take that lock. */
+    private fun resumeDownloadLocked(downloadId: String) {
         val item = _uiState.value.items.firstOrNull { it.id == downloadId }?.let(::normalizeCompletedLocalFileUri) ?: return
         if (item.status != DownloadStatus.Paused && item.status != DownloadStatus.Failed) return
 
@@ -645,34 +660,38 @@ object DownloadsRepository {
      * those again would give the same bad file, so they wait for another source. Returns how many
      * were started.
      */
-    fun retryAllFailed(): Int = synchronized(stateLock) {
+    fun retryAllFailed(): Int {
         ensureLoaded()
-        val retryable = _uiState.value.items
-            .filter { it.status == DownloadStatus.Failed && !it.needsAnotherSource }
-            .map { it.id }
-        retryable.forEach(::resumeDownload)
-        retryable.size
+        return synchronized(stateLock) {
+            val retryable = _uiState.value.items
+                .filter { it.status == DownloadStatus.Failed && !it.needsAnotherSource }
+                .map { it.id }
+            retryable.forEach(::resumeDownloadLocked)
+            retryable.size
+        }
     }
 
     /** Removes every failed download from the list. A failed download has no file; only a partial one is cleaned up. Returns how many. */
-    fun clearFailed(): Int = synchronized(stateLock) {
+    fun clearFailed(): Int {
         ensureLoaded()
-        // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
-        val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && it.localFileUri == null && backend.isConnected(it) }
-            .filter { ItemLocks.tryAcquire(it.id) }
-        if (failed.isEmpty()) return 0
-        try {
-            failed.forEach { item ->
-                removeTransfer(item.id)?.cancel()
-                backend.removePartialOf(item)
+        return synchronized(stateLock) {
+            // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
+            val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && it.localFileUri == null && backend.isConnected(it) }
+                .filter { ItemLocks.tryAcquire(it.id) }
+            if (failed.isEmpty()) return 0
+            try {
+                failed.forEach { item ->
+                    removeTransfer(item.id)?.cancel()
+                    backend.removePartialOf(item)
+                }
+                val ids = failed.mapTo(mutableSetOf()) { it.id }
+                publish(_uiState.value.items.filterNot { it.id in ids })
+                persist()
+            } finally {
+                failed.forEach { ItemLocks.release(it.id) }
             }
-            val ids = failed.mapTo(mutableSetOf()) { it.id }
-            publish(_uiState.value.items.filterNot { it.id in ids })
-            persist()
-        } finally {
-            failed.forEach { ItemLocks.release(it.id) }
+            failed.size
         }
-        failed.size
     }
 
     internal fun reattachBackgroundDownload(downloadId: String): Unit = synchronized(stateLock) {
@@ -691,43 +710,47 @@ object DownloadsRepository {
      * replacement; unfinished transfers stop, leaving their partial files intact. A folder hold
      * protects those files, but must not prevent recording the rejection or stopping the transfer.
      */
-    internal fun rejectBatchSource(downloadId: String): Unit = synchronized(stateLock) {
+    internal fun rejectBatchSource(downloadId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        if (item.status != DownloadStatus.Completed && item.status != DownloadStatus.Downloading) return
-        removeTransfer(downloadId)?.cancel()
-        mutateItem(downloadId) { current ->
-            current.copy(
-                status = if (current.status == DownloadStatus.Completed) DownloadStatus.Completed else DownloadStatus.Failed,
-                failureKind = DownloadFailureKind.BadFile,
-                errorMessage = current.errorMessage ?: runBlocking { getString(Res.string.downloads_source_rejected) },
-                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-            )
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            if (item.status != DownloadStatus.Completed && item.status != DownloadStatus.Downloading) return
+            removeTransfer(downloadId)?.cancel()
+            mutateItem(downloadId) { current ->
+                current.copy(
+                    status = if (current.status == DownloadStatus.Completed) DownloadStatus.Completed else DownloadStatus.Failed,
+                    failureKind = DownloadFailureKind.BadFile,
+                    errorMessage = current.errorMessage ?: runBlocking { getString(Res.string.downloads_source_rejected) },
+                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                )
+            }
         }
     }
 
-    fun cancelDownload(downloadId: String): Unit = synchronized(stateLock) {
+    fun cancelDownload(downloadId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        // On a location that is away, or while a move has the item, nothing is cancelled or removed.
-        if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
-        try {
-            backend.withListLock {
-                val fileUri = playableLocalFileUri(item) ?: item.localFileUri
-                // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
-                val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
-                if (used == null) return@withListLock
-                removeTransfer(downloadId)?.cancel()
-                // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
-                if (!removeRecordDurably(item)) return@withListLock
-                if (fileUri != null && !used && !backend.discardFile(fileUri)) {
-                    restoreRecord(item)
-                    return@withListLock
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            // On a location that is away, or while a move has the item, nothing is cancelled or removed.
+            if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
+            try {
+                backend.withListLock {
+                    val fileUri = playableLocalFileUri(item) ?: item.localFileUri
+                    // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
+                    val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
+                    if (used == null) return@withListLock
+                    removeTransfer(downloadId)?.cancel()
+                    // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
+                    if (!removeRecordDurably(item)) return@withListLock
+                    if (fileUri != null && !used && !backend.discardFile(fileUri)) {
+                        restoreRecord(item)
+                        return@withListLock
+                    }
+                    backend.removePartialOf(item)
                 }
-                backend.removePartialOf(item)
+            } finally {
+                ItemLocks.release(downloadId)
             }
-        } finally {
-            ItemLocks.release(downloadId)
         }
     }
 
@@ -755,7 +778,6 @@ object DownloadsRepository {
 
     /** Null when the file is no longer where [lockedUri] said: the caller starts again with the right lock. */
     private fun deleteWithLocksHeld(downloadId: String, lockedUri: String?): DownloadDeleteResult? = synchronized(stateLock) {
-        ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return DownloadDeleteResult.Gone
         val current = if (item.status == DownloadStatus.Completed || item.localFileUri != null) backend.resolveLocalFileUri(item.localFileUri, item.fileName) else null
@@ -1046,7 +1068,7 @@ object DownloadsRepository {
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByConnection && it.connectionHoldReason() == null }
-            .forEach { resumeDownload(it.id) }
+            .forEach { resumeDownloadLocked(it.id) }
     }
 
     /** Why this download waits for the connection now: some reasons hold automatic downloads only. */
@@ -1492,19 +1514,21 @@ object DownloadsRepository {
      * download was, becomes a failed download, which can be tried again, and is not counted as
      * downloaded. True for a platform that cannot look at the file.
      */
-    internal fun verifyCompletedDownload(downloadId: String): Boolean = synchronized(stateLock) {
+    internal fun verifyCompletedDownload(downloadId: String): Boolean {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
-        if (item.status != DownloadStatus.Completed) return false
-        // A move has the item: its file is in the middle of changing places, which is not a file that is lost.
-        if (!ItemLocks.tryAcquire(downloadId)) return true
-        try {
-            val checked = item.withoutLostFile()
-            if (checked.status == DownloadStatus.Completed) return true
-            mutateItem(downloadId) { checked }
-            return false
-        } finally {
-            ItemLocks.release(downloadId)
+        return synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
+            if (item.status != DownloadStatus.Completed) return false
+            // A move has the item: its file is in the middle of changing places, which is not a file that is lost.
+            if (!ItemLocks.tryAcquire(downloadId)) return true
+            try {
+                val checked = item.withoutLostFile()
+                if (checked.status == DownloadStatus.Completed) return true
+                mutateItem(downloadId) { checked }
+                false
+            } finally {
+                ItemLocks.release(downloadId)
+            }
         }
     }
 
@@ -1658,7 +1682,6 @@ object DownloadsRepository {
         stillWanted: () -> Boolean,
         lockedUri: String?,
     ): AutoDownloadRemovalResult? = synchronized(stateLock) {
-        ensureLoaded()
         val items = _uiState.value.items
         val item = items.firstOrNull { it.id == downloadId } ?: return AutoDownloadRemovalResult.Changed
         // A file flagged as a placeholder is never removed automatically.
@@ -1905,13 +1928,15 @@ object DownloadsRepository {
      * A download that waits for a location that is not there is put in another one, at the user's
      * request, and starts.
      */
-    internal fun chooseLocationForWaiting(downloadId: String, locationId: String): Unit = synchronized(stateLock) {
+    internal fun chooseLocationForWaiting(downloadId: String, locationId: String) {
         ensureLoaded()
-        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-        if (item.status != DownloadStatus.Paused || !item.pausedByFolder || item.awaitingCheck || item.localFileUri != null) return
-        backend.removePartialOf(item)
-        mutateItem(downloadId) { it.copy(locationId = locationId) }
-        resumeDownload(downloadId)
+        synchronized(stateLock) {
+            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+            if (item.status != DownloadStatus.Paused || !item.pausedByFolder || item.awaitingCheck || item.localFileUri != null) return
+            backend.removePartialOf(item)
+            mutateItem(downloadId) { it.copy(locationId = locationId) }
+            resumeDownloadLocked(downloadId)
+        }
     }
 
     /** Whether the location that holds the show's downloads (or would take a new one) cannot be used now. */
@@ -1926,7 +1951,7 @@ object DownloadsRepository {
         if (!hasLoaded) return
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByFolder && !backend.heldByFolder(it) }
-            .forEach { resumeDownload(it.id) }
+            .forEach { resumeDownloadLocked(it.id) }
     }
 
     internal fun nextDownloadId(nowEpochMs: Long): String {

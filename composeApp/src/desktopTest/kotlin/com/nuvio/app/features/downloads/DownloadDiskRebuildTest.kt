@@ -962,6 +962,47 @@ class DownloadDiskRebuildTest {
     }
 
     @Test
+    fun action_that_loads_the_list_does_not_hold_the_state_lock_during_the_scan() {
+        val storeFile = world.appData.resolve("nuvio_downloads.properties")
+        val inner = TempStoreBackend(world, storeFile)
+        val runningItem = movieItem("first-load-pause", status = DownloadStatus.Downloading)
+        inner.savePayload(DownloadsCodec.encode(listOf(runningItem), null, revision = 1L))
+        val scanStarted = CountDownLatch(1)
+        val allowFinish = CountDownLatch(1)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.backend = object : DownloadsBackend by inner {
+            override val supportsDiskScan: Boolean = true
+            override fun scanDownloadsOnDisk(
+                activeProfileId: Int,
+                inMemoryItems: List<DownloadItem>,
+                nextDownloadId: (Long) -> String,
+                nowEpochMs: Long,
+            ): DiskScanResult {
+                scanStarted.countDown()
+                allowFinish.await(5, TimeUnit.SECONDS)
+                return DiskScanResult()
+            }
+        }
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            // This pause is what loads the list. The walk must not keep the state lock.
+            val pauseFuture = executor.submit { DownloadsRepository.pauseDownload(runningItem.id) }
+            assertTrue(scanStarted.await(2, TimeUnit.SECONDS))
+
+            val lockFuture = executor.submit { DownloadsRepository.holdStateLockForTest { } }
+            lockFuture.get(1, TimeUnit.SECONDS)
+
+            allowFinish.countDown()
+            pauseFuture.get(5, TimeUnit.SECONDS)
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.single().status)
+        } finally {
+            allowFinish.countDown()
+            executor.shutdown()
+            assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test
     fun ownership_path_resolution_cannot_hold_discovery_forever() {
         val drive = world.driveLocation("Sleeping", "Movies")
         val owned = drive.path.resolve("Owned.mp4").writeVideo(1)
