@@ -97,6 +97,10 @@ internal class NativePlayerController(
     nativeUpdateControls: ((Long, String) -> Unit)? = null,
     private val isHostDisplayable: () -> Boolean = { host.isDisplayable },
     private val resolveHostView: () -> Long = { AwtNativeViewResolver.resolveNativeViewPointer(host) },
+    private val isComponentDisplayable: (Component) -> Boolean = { component -> component.isDisplayable },
+    private val resolveComponentView: (Component) -> Long = { component ->
+        AwtNativeViewResolver.resolveNativeViewPointer(component)
+    },
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
     private val onCreateWaitCompleted: () -> Unit = {},
@@ -155,6 +159,10 @@ internal class NativePlayerController(
     @Volatile
     private var handle: Long = 0L
 
+    /** Reparented surface target (for example the floating PiP holder), preserved across handle replacements. */
+    @Volatile
+    private var surfaceHostOverride: Component? = null
+
     /** Native teardown of the previous player, if one is still running. */
     @Volatile
     private var disposeInFlight: Thread? = null
@@ -193,6 +201,13 @@ internal class NativePlayerController(
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
     private fun eventSink(pending: PendingSource, token: Any) = NativePlayerEventSink { type, value ->
+        if (type == "stateSynchronized") {
+            val current = synchronized(lifecycleLock) {
+                !releaseRequested && pendingSource === pending && activeEventToken === token
+            }
+            if (current) _manualRefreshTick.update { it + 1L }
+            return@NativePlayerEventSink
+        }
         SwingUtilities.invokeLater {
             val current = synchronized(lifecycleLock) {
                 !releaseRequested && pendingSource === pending && activeEventToken === token
@@ -375,6 +390,17 @@ internal class NativePlayerController(
         true
     }
 
+    private fun resolveEffectiveHostViewPtr(): Long {
+        val overrideHost = surfaceHostOverride
+        if (overrideHost != null) {
+            if (isComponentDisplayable(overrideHost)) {
+                return resolveComponentView(overrideHost)
+            }
+            surfaceHostOverride = null
+        }
+        return resolveHostView()
+    }
+
     private fun createPlayer(pending: PendingSource) {
         val terminalFailure = synchronized(lifecycleLock) { terminalReleaseFailure }
         if (terminalFailure != null) {
@@ -382,7 +408,7 @@ internal class NativePlayerController(
             return
         }
         // Resolving the AWT peer must happen on the EDT; everything after it must not.
-        val hostViewPtr = runCatching { resolveHostView() }
+        val hostViewPtr = runCatching { resolveEffectiveHostViewPtr() }
             .getOrElse { error ->
                 log.w(error) { "attach failed to resolve host source=${pending.sourceUrl.toPlaybackLogKey()}" }
                 if (!releaseRequested && pendingSource === pending) pending.onError(playbackFailureText(error.message))
@@ -472,6 +498,10 @@ internal class NativePlayerController(
                         log.d {
                             "attach created handle=$created source=${resolvedSource.toPlaybackLogKey()} " +
                                 "initialPositionMs=${pending.initialPositionMs}"
+                        }
+                        val currentHostViewPtr = runCatching { resolveEffectiveHostViewPtr() }.getOrNull()
+                        if (currentHostViewPtr != null && currentHostViewPtr != hostViewPtr) {
+                            backend.reparentSurface(created, currentHostViewPtr)
                         }
                         backend.setRemoteCommandsEnabled(created, remoteCommandsEnabled)
                         if (miniPlayerMode) {
@@ -639,12 +669,25 @@ internal class NativePlayerController(
     }
 
     fun reparentSurface(host: Component): Boolean {
-        val current = handle.takeIf { it != 0L } ?: return false
-        if (!host.isDisplayable) return false
-        val pointer = runCatching { AwtNativeViewResolver.resolveNativeViewPointer(host) }
+        if (!isComponentDisplayable(host)) return false
+        val pointer = runCatching { resolveComponentView(host) }
             .onFailure { error -> log.w(error) { "failed to resolve PiP native host ${host.javaClass.name}" } }
             .getOrNull() ?: return false
-        return backend.reparentSurface(current, pointer)
+        val nextOverride = host.takeIf { it !== this.host }
+        val (current, hasPendingOrCreating) = synchronized(lifecycleLock) {
+            createsInFlight.removeAll { !it.isAlive }
+            handle to (!releaseRequested && (pendingSource != null || createsInFlight.isNotEmpty()))
+        }
+        if (current != 0L) {
+            if (!backend.reparentSurface(current, pointer)) return false
+            surfaceHostOverride = nextOverride
+            return true
+        }
+        if (hasPendingOrCreating) {
+            surfaceHostOverride = nextOverride
+            return true
+        }
+        return false
     }
 
     fun layoutNativeSubviews() {
@@ -727,6 +770,9 @@ internal class NativePlayerController(
     @Synchronized
     fun setPictureInPictureActive(active: Boolean) {
         pictureInPictureActive = active
+        if (!active) {
+            surfaceHostOverride = null
+        }
         applyResizeMode()
     }
 
@@ -805,6 +851,7 @@ internal class NativePlayerController(
                     ensureFallbackHideTimer().onControlsHidden()
                 }
             }
+            "stateSynchronized" -> _manualRefreshTick.update { it + 1L }
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
                 log.d { "scrubChange positionMs=${value.toLong()} handled=$handled handle=$handle" }
@@ -1239,6 +1286,7 @@ internal class NativePlayerController(
         fallbackHideTimer?.dispose()
         fallbackHideTimer = null
         cancelPendingAttachment()
+        surfaceHostOverride = null
         host.onCursorActivity = null
         onAction = { false }
         onEvent = { _, _ -> false }
@@ -1402,6 +1450,7 @@ internal class NativePlayerController(
     override fun setPlaybackSpeed(speed: Float) {
         log.d { "setPlaybackSpeed speed=$speed handle=$handle" }
         handle.takeIf { it != 0L }?.let { backend.setSpeed(it, speed) }
+        _manualRefreshTick.update { it + 1L }
     }
 
     override fun getAudioTracks(): List<AudioTrack> =

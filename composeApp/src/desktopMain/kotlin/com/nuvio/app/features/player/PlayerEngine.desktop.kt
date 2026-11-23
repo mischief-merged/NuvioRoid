@@ -347,8 +347,8 @@ private fun NativePlayerSurface(
     LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
         val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
         val includeVideoSize = !isInMiniPlayer
-        var observedRefreshTick = controller.manualRefreshTick.value
         while (true) {
+            val tickBeforeSnapshot = controller.manualRefreshTick.value
             val snapshot = if (!controller.isReleasing) {
                 controller.snapshot(includeVideoSize = includeVideoSize).also(onSnapshot)
             } else {
@@ -361,7 +361,7 @@ private fun NativePlayerSurface(
                 !snapshot.isLoading &&
                 !snapshot.isPlaying
             ) {
-                observedRefreshTick = controller.manualRefreshTick.first { it != observedRefreshTick }
+                controller.manualRefreshTick.first { it != tickBeforeSnapshot }
                 continue
             }
             delay(pollIntervalMs)

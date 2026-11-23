@@ -39,6 +39,7 @@ internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
     playbackKey: PlaybackKey = activePlaybackKey,
 ): Boolean {
     if (playbackKey != activePlaybackKey) return false
+    val previousPositionMs = playbackSnapshot.positionMs
     val reported = if (partyRateNudge != null) snapshot.copy(playbackSpeed = partyBaseRate()) else snapshot
     playbackSnapshot = if (reported.durationMs <= 0L && playbackSnapshotKey == playbackKey) {
         reported.copy(durationMs = playbackSnapshot.durationMs)
@@ -47,6 +48,15 @@ internal fun PlayerScreenRuntime.updatePlaybackSnapshot(
     }
     playbackSnapshotKey = playbackKey
     playbackSnapshotMark = TimeSource.Monotonic.markNow()
+    if (
+        awaitingPausedSeekSnapshot &&
+        !shouldPlay &&
+        !playbackSnapshot.isPlaying &&
+        abs(playbackSnapshot.positionMs - previousPositionMs) >= 500L
+    ) {
+        awaitingPausedSeekSnapshot = false
+        scheduleProgressSyncAfterSeek()
+    }
     val targetPositionMs = scrubbingPositionMs ?: return true
     if (!isScrubbingTimeline && (
             !snapshot.isLoading || snapshot.isEnded ||
@@ -163,6 +173,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
         pendingSeekScrobbleRestart = false
+        awaitingPausedSeekSnapshot = false
         resetTrackSelectionState()
     }
 
@@ -558,10 +569,20 @@ private fun PlayerScreenRuntime.reportLocalPlaybackCompleted() {
 
 internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     val shouldRestartScrobbleAfterSeek = shouldPlay || playbackSnapshot.isPlaying
+    if (!shouldRestartScrobbleAfterSeek) {
+        awaitingPausedSeekSnapshot = true
+    }
     seekProgressSyncJob?.cancel()
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
+        val expectedTargetMs = lastSeekTargetMs ?: pendingSeekTarget?.first
+        val reachedTarget = expectedTargetMs?.let { targetMs ->
+            abs(playbackSnapshot.positionMs - targetMs) <= 1_000L
+        } ?: true
+        if (reachedTarget) {
+            awaitingPausedSeekSnapshot = false
+        }
         // A seek during a sleep stop must not mark the episode watched or scrobble past it.
         val holdIncomplete = playbackHoldIncomplete()
         WatchProgressRepository.upsertPlaybackProgress(

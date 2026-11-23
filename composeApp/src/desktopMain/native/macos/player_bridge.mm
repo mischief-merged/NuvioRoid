@@ -242,6 +242,15 @@ static NSString *NuvioPlaybackNetwork(void) {
                            paused:(BOOL)paused
                           loading:(BOOL)loading
                             speed:(double)speed;
+- (BOOL)updateCachedDuration:(double)duration
+                    position:(double)position
+              positionReadAt:(double)positionReadAt
+          positionGeneration:(uint64_t)positionGeneration
+                  cacheAhead:(double)cacheAhead
+                      paused:(BOOL)paused
+                     loading:(BOOL)loading
+                       ended:(BOOL)ended
+                       speed:(double)speed;
 - (double)activeSyncTimerIntervalSecondsForTest;
 - (BOOL)attemptedInitialFocusForTest;
 - (double)lastNowPlayingRateForTest;
@@ -1990,7 +1999,10 @@ static char kPlayerUiQueueKey;
     if (!_mpv || (!_webView && !_headlessForTest)) {
         return 0.0;
     }
-    return _isInMiniPlayer ? 2.0 : 0.5;
+    if (_isInMiniPlayer) {
+        return (_cachedPaused.load() && !_cachedLoading.load()) ? 0.0 : 2.0;
+    }
+    return 0.5;
 }
 
 - (void)cancelSyncTimer {
@@ -2069,15 +2081,17 @@ static char kPlayerUiQueueKey;
             NSString *mediaTitle = needMediaTitle ? [self stringProperty:"media-title" fallback:@""] : @"";
             NSString *gamma = [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString];
             NSString *primaries = [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString];
-            [self updateCachedDuration:duration
-                              position:position
-                        positionReadAt:positionReadAt
-                    positionGeneration:positionGeneration
-                            cacheAhead:cacheAhead
-                                paused:paused
-                                 loading:loading
-                                   ended:ended
-                                   speed:speed];
+            BOOL wasLoading = self->_cachedLoading.load();
+            BOOL wasEnded = self->_cachedEnded.load();
+            BOOL generationMatched = [self updateCachedDuration:duration
+                                                       position:position
+                                                 positionReadAt:positionReadAt
+                                             positionGeneration:positionGeneration
+                                                     cacheAhead:cacheAhead
+                                                         paused:paused
+                                                        loading:loading
+                                                          ended:ended
+                                                          speed:speed];
 
             [self runOnUiAsync:^{
                 self->_controlsSyncInFlight = NO;
@@ -2088,12 +2102,17 @@ static char kPlayerUiQueueKey;
                 if (!self->_headlessForTest) {
                     [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
                 }
-                [self updateNowPlayingWithTitle:mediaTitle
-                                       duration:duration
-                                       position:position
-                                         paused:paused
-                                        loading:loading
-                                          speed:speed];
+                if (generationMatched) {
+                    [self updateNowPlayingWithTitle:mediaTitle
+                                           duration:duration
+                                           position:position
+                                             paused:paused
+                                            loading:loading
+                                              speed:speed];
+                    if (self->_isInMiniPlayer && ((paused && !loading && wasLoading) || ended != wasEnded)) {
+                        [self sendPlayerEvent:@"stateSynchronized" value:0.0];
+                    }
+                }
                 if (miniMode || self->_isInMiniPlayer || self->_headlessForTest) {
                     return;
                 }
@@ -2431,6 +2450,9 @@ static char kPlayerUiQueueKey;
     double currentPosition = [self estimatedPositionSeconds];
     [self storeCachedPosition:currentPosition at:CACurrentMediaTime()];
     _cachedPaused.store(paused);
+    if (paused && _cachedDurationSeconds.load() > 0.0) {
+        _cachedLoading.store(false);
+    }
     [self updatePeriodicTimers];
     [self updateNowPlayingWithTitle:@""
                            duration:_cachedDurationSeconds.load()
@@ -2438,6 +2460,7 @@ static char kPlayerUiQueueKey;
                              paused:paused
                             loading:_cachedLoading.load()
                               speed:_cachedSpeed.load()];
+    [self sendPlayerEvent:@"stateSynchronized" value:0.0];
 }
 
 - (BOOL)isPaused {
@@ -2465,6 +2488,7 @@ static char kPlayerUiQueueKey;
                              paused:_cachedPaused.load()
                             loading:_cachedLoading.load()
                               speed:_cachedSpeed.load()];
+    [self sendPlayerEvent:@"stateSynchronized" value:0.0];
 }
 
 - (void)seekByMilliseconds:(long long)offsetMs {
@@ -2485,6 +2509,7 @@ static char kPlayerUiQueueKey;
                              paused:_cachedPaused.load()
                             loading:_cachedLoading.load()
                               speed:_cachedSpeed.load()];
+    [self sendPlayerEvent:@"stateSynchronized" value:0.0];
 }
 
 - (void)setSpeed:(double)speed {
@@ -2500,6 +2525,7 @@ static char kPlayerUiQueueKey;
                              paused:_cachedPaused.load()
                             loading:_cachedLoading.load()
                               speed:clamped];
+    [self sendPlayerEvent:@"stateSynchronized" value:0.0];
 }
 
 - (double)speed {
@@ -2824,11 +2850,14 @@ static constexpr uint64_t kObserveAoUserdata = 2;
 }
 
 - (BOOL)rawLoadingWithPaused:(BOOL)paused ended:(BOOL)eofReached duration:(double)duration {
+    if ([self flagProperty:"idle-active" fallback:NO]) {
+        return NO;
+    }
     BOOL idle = [self flagProperty:"core-idle" fallback:YES];
     BOOL bufferingCache = [self flagProperty:"paused-for-cache" fallback:NO];
     BOOL fileReady = duration > 0.0
         || [self int64Property:"track-list/count" fallback:0] > 0;
-    return !fileReady || (idle && !paused && !eofReached) || bufferingCache;
+    return !fileReady || (!paused && !eofReached && (idle || bufferingCache));
 }
 
 - (BOOL)isEnded {
@@ -2839,7 +2868,7 @@ static constexpr uint64_t kObserveAoUserdata = 2;
     return [self flagProperty:"eof-reached" fallback:_cachedEnded.load()];
 }
 
-- (void)updateCachedDuration:(double)duration
+- (BOOL)updateCachedDuration:(double)duration
                     position:(double)position
               positionReadAt:(double)positionReadAt
           positionGeneration:(uint64_t)positionGeneration
@@ -2850,14 +2879,15 @@ static constexpr uint64_t kObserveAoUserdata = 2;
                        speed:(double)speed {
     _cachedDurationSeconds.store(std::isfinite(duration) ? fmax(duration, 0.0) : 0.0);
     _cachedCacheAheadSeconds.store(std::isfinite(cacheAhead) ? fmax(cacheAhead, 0.0) : 0.0);
+    std::lock_guard<std::mutex> guard(_cachedPositionLock);
+    if (_cachedPositionGeneration != positionGeneration) return NO;
     _cachedLoading.store(loading);
     _cachedEnded.store(ended);
-    std::lock_guard<std::mutex> guard(_cachedPositionLock);
-    if (_cachedPositionGeneration != positionGeneration) return;
     _cachedPositionSeconds.store(std::isfinite(position) ? fmax(position, 0.0) : 0.0);
     _cachedPositionStamp = positionReadAt;
     _cachedSpeed.store(std::isfinite(speed) ? fmax(0.25, fmin(4.0, speed)) : 1.0);
     _cachedPaused.store(paused);
+    return YES;
 }
 
 - (NSString *)audioTracksJson {

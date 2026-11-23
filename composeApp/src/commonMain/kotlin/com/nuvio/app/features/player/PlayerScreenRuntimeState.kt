@@ -345,6 +345,8 @@ internal class PlayerScreenRuntime(
     /** How many seeks the runtime asked the player for, and the target of the latest (null when relative). The stall watch reads them. */
     var seekRequestCount = 0L
     var lastSeekTargetMs: Long? = null
+    /** True when a paused seek was requested and watch progress must sync again once the delayed native snapshot lands. */
+    var awaitingPausedSeekSnapshot = false
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
     /** The source confirmed as a placeholder clip; never receives tracking events. */
