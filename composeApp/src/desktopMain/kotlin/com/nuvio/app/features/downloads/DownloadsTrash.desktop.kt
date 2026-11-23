@@ -5,13 +5,10 @@ import java.awt.Desktop
 import java.io.File
 import java.io.IOException
 import java.net.URI
-import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.nio.file.SimpleFileVisitor
-import java.nio.file.attribute.BasicFileAttributes
 import kotlin.io.path.createDirectories
 
 internal actual object DownloadsTrash {
@@ -53,8 +50,9 @@ private fun moveToSystemTrash(file: File): Boolean =
  * Only a regular file directly inside the downloads folder is moved. A symbolic link is refused and
  * never followed, so nothing outside the folder is touched. With [systemTrash] the file goes to the
  * trash of the system, and a trash that fails leaves the file where it is. Without one the file is
- * moved to a holding folder inside the downloads folder and listed in an index there;
- * [purgeHeldFiles] deletes only what that index lists, once it was held for [HeldFileDays] days.
+ * moved to an archive folder inside the downloads folder and listed in an index there;
+ * [purgeHeldFiles] never permanently deletes archived files—once [systemTrash] is available it moves
+ * aged archived entries to the system Trash, and otherwise leaves them archived.
  */
 internal class DesktopDownloadsTrash(
     private val downloadsDir: () -> Path,
@@ -118,27 +116,31 @@ internal class DesktopDownloadsTrash(
             .distinct()
 
     private fun purgeHeldFilesIn(root: Path, nowEpochMs: Long): Int {
+        // Never permanently delete archived user files: without a working system Trash they stay
+        // in the archive folder until Trash is available or the user removes them themselves.
+        val trash = systemTrash ?: return 0
         val holding = root.resolve(HoldingFolderName)
         if (!holding.isDirectoryInside(root)) return 0
         val maxAgeMs = HeldFileDays * 24L * 60 * 60 * 1000
-        var purged = 0
+        var movedToTrash = 0
         val remaining = readIndex(holding).filter { (heldAtEpochMs, name) ->
             if (nowEpochMs - heldAtEpochMs < maxAgeMs) return@filter true
             val entry = holding.resolve(name)
-            // Only a name this class wrote, directly inside the holding folder, and never through a link.
+            // Only a name this class wrote, directly inside the archive folder, and never through a link.
             val isOwn = entry.parent == holding && entry.fileName.toString() == name
             when {
                 !isOwn -> false
                 !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) -> false
-                runCatching { deleteWithoutFollowingLinks(entry) }.isSuccess -> {
-                    purged++
+                Files.isSymbolicLink(entry) -> false
+                runCatching { trash(entry.toFile()) && !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) }.getOrDefault(false) -> {
+                    movedToTrash++
                     false
                 }
                 else -> true
             }
         }
         runCatching { writeIndex(holding, remaining) }
-        return purged
+        return movedToTrash
     }
 
     private fun hold(root: Path, source: Path) {
@@ -187,24 +189,6 @@ internal class DesktopDownloadsTrash(
         !Files.isSymbolicLink(this) &&
             Files.isDirectory(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
-
-    private fun deleteWithoutFollowingLinks(entry: Path) {
-        Files.walkFileTree(
-            entry,
-            object : SimpleFileVisitor<Path>() {
-                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    Files.delete(file)
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
-                    if (exc != null) throw exc
-                    Files.delete(dir)
-                    return FileVisitResult.CONTINUE
-                }
-            },
-        )
-    }
 
     companion object {
         const val HoldingFolderName = ".removed"

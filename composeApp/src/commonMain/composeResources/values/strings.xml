@@ -749,7 +749,7 @@
     <string name="downloads_empty_hint_seasons">On a series page you can also download a whole season, or keep new episodes downloaded automatically.</string>
     <string name="downloads_empty_browse">Browse titles</string>
     <string name="downloads_delete_message_trash">It moves to the Trash. You can put it back from there.</string>
-    <string name="downloads_delete_message_held">It stays in the downloads folder for 7 days, then it is deleted for good.</string>
+    <string name="downloads_delete_message_held">It is moved to the archive folder inside the downloads folder until you remove it or the Trash is available.</string>
     <string name="downloads_delete_auto_note">Auto-download will not fetch this episode again.</string>
     <string name="downloads_delete_message_partial">This stops the download and removes what was downloaded so far.</string>
     <string name="downloads_delete_confirm_trash">Move to Trash</string>
@@ -2286,7 +2286,7 @@
     <string name="downloads_auto_delete_heading">After watching</string>
     <string name="downloads_auto_delete_after">Delete episodes 24 hours after I watch them</string>
     <string name="downloads_auto_delete_note">Only auto-downloaded episodes. Your own downloads are never deleted. You can keep or delete one early in Downloads.</string>
-    <string name="downloads_auto_delete_no_trash_note">This computer has no trash Nuvio can use. Deleted episodes are kept in the downloads folder for 7 days, then deleted permanently.</string>
+    <string name="downloads_auto_delete_no_trash_note">This computer has no trash Nuvio can use. Removed episodes are kept in the archive folder inside the downloads folder.</string>
     <string name="downloads_auto_pending_heading">Deleting after you watch</string>
     <string name="downloads_auto_pending_row">%1$s S%2$d E%3$d • %4$s</string>
     <plurals name="downloads_auto_pending_in_hours">
@@ -2317,7 +2317,7 @@
     <string name="downloads_auto_delete_now_description">Delete %1$s S%2$d E%3$d now</string>
     <string name="downloads_auto_delete_now_title">Delete this episode now?</string>
     <string name="downloads_auto_delete_now_message_trash">%1$s S%2$d E%3$d is moved to the trash.</string>
-    <string name="downloads_auto_delete_now_message_held">%1$s S%2$d E%3$d is kept in the downloads folder for 7 days, then deleted permanently.</string>
+    <string name="downloads_auto_delete_now_message_held">%1$s S%2$d E%3$d is moved to the archive folder inside the downloads folder.</string>
     <string name="downloads_auto_deleted_toast">Episode deleted</string>
     <string name="downloads_auto_delete_playing_toast">Couldn't delete yet: the episode is playing</string>
     <string name="downloads_auto_delete_failed_toast">Couldn't delete: the file could not be moved</string>
