@@ -7,7 +7,6 @@ import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import com.nuvio.app.core.network.NetworkCondition
 import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.addons.AddonsUiState
@@ -344,9 +343,8 @@ internal class PlayerScreenRuntime(
     /** The placeholder being moved on from was recognised by its length alone, not by a status clip link. */
     var sourceFailoverPlaceholderByLength = false
     /** How many seeks the runtime asked the player for, and the target of the latest (null when relative). The stall watch reads them. */
-    var seekRequestCount by mutableStateOf(0L)
+    var seekRequestCount = 0L
     var lastSeekTargetMs: Long? = null
-    var networkCondition by mutableStateOf(NetworkCondition.Unknown)
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
     /** The source confirmed as a placeholder clip; never receives tracking events. */

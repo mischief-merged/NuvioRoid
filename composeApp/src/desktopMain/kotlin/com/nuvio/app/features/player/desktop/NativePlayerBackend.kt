@@ -156,6 +156,8 @@ internal interface NativePlayerBackend {
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
+        inMiniPlayer: Boolean = false,
+        remoteCommandsEnabled: Boolean = true,
     ): Long
 
     fun dispose(handle: Long)
@@ -227,6 +229,8 @@ internal object NoOpNativePlayerBackend : NativePlayerBackend {
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
     ): Long = 0L
 
     override fun dispose(handle: Long) = Unit
@@ -299,6 +303,8 @@ internal object RealNativePlayerBackend : NativePlayerBackend {
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
     ): Long {
         NativePlayerBridge.ensureLoaded()
         if (DesktopHostOs.current == DesktopHostOs.MACOS) {
@@ -320,6 +326,8 @@ internal object RealNativePlayerBackend : NativePlayerBackend {
                     controlsPageUrl,
                     decoderPriority,
                     nvidiaRtxSuperResolutionEnabled,
+                    inMiniPlayer,
+                    remoteCommandsEnabled,
                     eventSink,
                     bundle.toString(),
                     network,

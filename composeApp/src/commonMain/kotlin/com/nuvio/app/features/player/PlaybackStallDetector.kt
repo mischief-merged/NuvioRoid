@@ -93,51 +93,15 @@ internal object PlaybackStallDetector {
         referenceBufferedMs = bufferedPositionMs,
     )
 
-    fun isSampleExempt(sample: Sample): Boolean {
+    fun step(state: State, sample: Sample): Step {
+        val gapMs = sample.nowMs - state.lastNowMs
+        val discontinuity = gapMs < 0L || gapMs > MAX_SAMPLE_GAP_MS
         val atEnd = sample.isEnded ||
             (sample.durationMs > 0L && sample.positionMs >= sample.durationMs - END_MARGIN_MS)
         // The player is not trying to play on its own account (paused by something other than the user, or
         // between states): that says nothing about the source either.
         val notTrying = !sample.isLoading && !sample.isPlaying
-        return !sample.wantsToPlay || atEnd || sample.isUserSeeking || sample.isOffline || notTrying
-    }
-
-    /**
-     * Anchors unset stillness timestamps to [state]'s [State.lastNowMs] before sleeping on an
-     * event-driven deadline, where no intermediate 1-second samples run while media stands still.
-     */
-    fun armForDeadline(state: State, sample: Sample): State {
-        if (isSampleExempt(sample) || state.pendingSeekSinceMs != null) return state
-        return state.copy(
-            positionStillSinceMs = state.positionStillSinceMs ?: state.lastNowMs,
-            bufferStillSinceMs = state.bufferStillSinceMs ?: state.lastNowMs,
-        )
-    }
-
-    /**
-     * Milliseconds from [sample.nowMs] until [state] reaches a stall if no further progress arrives,
-     * or `null` while [sample] is exempt from stall tracking.
-     */
-    fun nextDeadlineDelayMs(state: State, sample: Sample): Long? {
-        if (isSampleExempt(sample)) return null
-        val pendingSince = state.pendingSeekSinceMs
-        if (pendingSince != null) {
-            val ageMs = (sample.nowMs - pendingSince).coerceAtLeast(0L)
-            return (SEEK_NEVER_SETTLES_MS - ageMs).coerceAtLeast(1L)
-        }
-        val posSince = state.positionStillSinceMs ?: state.lastNowMs
-        val bufSince = state.bufferStillSinceMs ?: state.lastNowMs
-        val posAgeMs = (sample.nowMs - posSince).coerceAtLeast(0L)
-        val bufAgeMs = (sample.nowMs - bufSince).coerceAtLeast(0L)
-        val trickleRemainingMs = TRICKLE_DEADLINE_MS - posAgeMs
-        val bothStillRemainingMs = maxOf(STALL_DEADLINE_MS - posAgeMs, STALL_DEADLINE_MS - bufAgeMs)
-        return minOf(trickleRemainingMs, bothStillRemainingMs).coerceAtLeast(1L)
-    }
-
-    fun step(state: State, sample: Sample, discontinuityOverride: Boolean? = null): Step {
-        val gapMs = sample.nowMs - state.lastNowMs
-        val discontinuity = discontinuityOverride ?: (gapMs < 0L || gapMs > MAX_SAMPLE_GAP_MS)
-        val exempt = isSampleExempt(sample)
+        val exempt = !sample.wantsToPlay || atEnd || sample.isUserSeeking || sample.isOffline || notTrying
 
         var pendingSince = state.pendingSeekSinceMs
         var pendingTarget = state.pendingSeekTargetMs

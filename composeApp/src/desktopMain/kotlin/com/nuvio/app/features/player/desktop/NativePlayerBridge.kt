@@ -58,7 +58,8 @@ internal object NativePlayerBridge {
     external fun createMac(
         hostViewPtr: Long, sourceUrl: String, headerLines: Array<String>, playWhenReady: Boolean,
         initialPositionMs: Long, controlsPageUrl: String, decoderPriority: Int,
-        nvidiaRtxSuperResolutionEnabled: Boolean, eventSink: NativePlayerEventSink,
+        nvidiaRtxSuperResolutionEnabled: Boolean, inMiniPlayer: Boolean, remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
         caFile: String, network: String, allowUnverified: Boolean, warning: String,
     ): Long
 
@@ -74,6 +75,32 @@ internal object NativePlayerBridge {
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
+
+    /** macOS only: applies [inMiniPlayer] and [remoteCommandsEnabled] inside init before initial focus or activation. */
+    external fun createMacos(
+        hostViewPtr: Long,
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        controlsPageUrl: String,
+        decoderPriority: Int,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+
+    external fun createHeadlessMacosForTest(
+        sourceUrl: String,
+        headerLines: Array<String>,
+        playWhenReady: Boolean,
+        initialPositionMs: Long,
+        inMiniPlayer: Boolean,
+        eventSink: NativePlayerEventSink,
+    ): Long
+    external fun activeSyncTimerIntervalSecondsForTest(handle: Long): Double
+    external fun attemptedInitialFocusForTest(handle: Long): Boolean
+    external fun lastNowPlayingRateForTest(handle: Long): Double
 
     /**
      * macOS only. Takes 32 by 32 grey pictures of the local video [path] at [fractions] of its duration

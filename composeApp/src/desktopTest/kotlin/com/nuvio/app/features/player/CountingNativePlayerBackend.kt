@@ -108,6 +108,8 @@ internal class CountingNativePlayerBackend(
         nvidiaRtxSuperResolutionEnabled: Boolean,
         nvidiaRtxHdrEnabled: Boolean,
         eventSink: NativePlayerEventSink,
+        inMiniPlayer: Boolean,
+        remoteCommandsEnabled: Boolean,
     ): Long {
         val handle = handleCounter.incrementAndGet()
         val state = HandleState(
@@ -117,6 +119,8 @@ internal class CountingNativePlayerBackend(
             loading = false,
             ended = false,
             positionMs = initialPositionMs.coerceAtLeast(0L),
+            remoteCommandsEnabled = remoteCommandsEnabled,
+            miniPlayerMode = inMiniPlayer,
             eventSink = eventSink,
         )
         statesByHandle[handle] = state

@@ -54,7 +54,7 @@ internal data class DesktopNativePlayerHooks(
 )
 
 internal const val FULL_PLAYER_SNAPSHOT_POLL_MS = 250L
-internal const val MINI_PLAYER_SNAPSHOT_POLL_MS = 1_000L
+internal const val MINI_PLAYER_SNAPSHOT_POLL_MS = 2_000L
 
 internal fun desktopSnapshotPollIntervalMs(isInMiniPlayer: Boolean): Long =
     if (isInMiniPlayer) MINI_PLAYER_SNAPSHOT_POLL_MS else FULL_PLAYER_SNAPSHOT_POLL_MS
@@ -344,7 +344,6 @@ private fun NativePlayerSurface(
     }
 
     val isInMiniPlayer = controlsState.isInMiniPlayer
-    val eventDrivenMiniSnapshots = isInMiniPlayer && DesktopHostOs.current == DesktopHostOs.MACOS
     LaunchedEffect(controller, isInMiniPlayer, playWhenReady) {
         val pollIntervalMs = desktopSnapshotPollIntervalMs(isInMiniPlayer)
         val includeVideoSize = !isInMiniPlayer
@@ -356,14 +355,11 @@ private fun NativePlayerSurface(
                 null
             }
             if (
-                eventDrivenMiniSnapshots ||
-                (
-                    isInMiniPlayer &&
-                        !playWhenReady &&
-                        snapshot != null &&
-                        !snapshot.isLoading &&
-                        !snapshot.isPlaying
-                    )
+                isInMiniPlayer &&
+                !playWhenReady &&
+                snapshot != null &&
+                !snapshot.isLoading &&
+                !snapshot.isPlaying
             ) {
                 observedRefreshTick = controller.manualRefreshTick.first { it != observedRefreshTick }
                 continue

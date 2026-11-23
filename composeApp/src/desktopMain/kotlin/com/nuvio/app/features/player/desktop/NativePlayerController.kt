@@ -122,7 +122,7 @@ internal class NativePlayerController(
     private val backend: NativePlayerBackend =
         (if (usesInjectedCreateStub) NoOpNativePlayerBackend else backend)
             .withTestCommandOverrides(nativeSeekBy, nativeUpdateControls)
-    private val nativeCreate: NativePlayerCreate = nativeCreate ?: this.backend::create
+    private val nativeCreateOverride: NativePlayerCreate? = nativeCreate
     private val nativeDispose: (Long) -> Unit = nativeDispose ?: this.backend::dispose
     private val nativeSeekTo: (Long, Long) -> Unit = nativeSeekTo ?: this.backend::seekTo
     private val controlsPageUrlProvider: () -> String = this.backend::controlsPageUrl
@@ -397,6 +397,9 @@ internal class NativePlayerController(
             pending.sourceUrl
         }
 
+        val initialMiniPlayer = miniPlayerMode || controlsState.isInMiniPlayer
+        val initialRemoteCommands = remoteCommandsEnabled
+
         // Native create blocks until the player's own UI thread finishes initialising, and that
         // thread creates child windows of the AWT host, which needs the EDT to keep pumping
         // messages. Creating on the EDT is therefore the same circular wait that the teardown had:
@@ -406,18 +409,37 @@ internal class NativePlayerController(
         val createWorker = Thread({
             try {
                 runCatching {
-                    nativeCreate(
-                        hostViewPtr,
-                        resolvedSource,
-                        pending.headerLines.toTypedArray(),
-                        pending.playWhenReady,
-                        pending.initialPositionMs,
-                        controlsPageUrlProvider(),
-                        pending.decoderPriority,
-                        pending.nvidiaRtxSuperResolutionEnabled,
-                        pending.nvidiaRtxHdrEnabled,
-                        eventSink(pending, eventToken),
-                    ).also { if (it == 0L) error("Native player did not return a handle.") }
+                    val createOverride = nativeCreateOverride
+                    val createdHandle = if (createOverride != null) {
+                        createOverride(
+                            hostViewPtr,
+                            resolvedSource,
+                            pending.headerLines.toTypedArray(),
+                            pending.playWhenReady,
+                            pending.initialPositionMs,
+                            controlsPageUrlProvider(),
+                            pending.decoderPriority,
+                            pending.nvidiaRtxSuperResolutionEnabled,
+                            pending.nvidiaRtxHdrEnabled,
+                            eventSink(pending, eventToken),
+                        )
+                    } else {
+                        backend.create(
+                            hostViewPtr = hostViewPtr,
+                            sourceUrl = resolvedSource,
+                            headerLines = pending.headerLines.toTypedArray(),
+                            playWhenReady = pending.playWhenReady,
+                            initialPositionMs = pending.initialPositionMs,
+                            controlsPageUrl = controlsPageUrlProvider(),
+                            decoderPriority = pending.decoderPriority,
+                            nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+                            nvidiaRtxHdrEnabled = pending.nvidiaRtxHdrEnabled,
+                            eventSink = eventSink(pending, eventToken),
+                            inMiniPlayer = initialMiniPlayer,
+                            remoteCommandsEnabled = initialRemoteCommands,
+                        )
+                    }
+                    createdHandle.also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
                     val accepted = synchronized(lifecycleLock) {
                         if (!releaseRequested && terminalReleaseFailure == null && pendingSource === pending && activeEventToken === eventToken) {
@@ -783,7 +805,6 @@ internal class NativePlayerController(
                     ensureFallbackHideTimer().onControlsHidden()
                 }
             }
-            "nativeStateTick" -> _manualRefreshTick.update { it + 1L }
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
                 log.d { "scrubChange positionMs=${value.toLong()} handled=$handled handle=$handle" }
