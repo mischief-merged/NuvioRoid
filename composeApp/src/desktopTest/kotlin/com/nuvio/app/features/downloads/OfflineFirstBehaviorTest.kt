@@ -22,6 +22,7 @@ import com.nuvio.app.features.shuffle.shufflePrimaryAction
 import com.nuvio.app.features.watched.WatchedItem
 import com.nuvio.app.features.home.HOME_DOWNLOADED_SECTION_KEY
 import com.nuvio.app.features.home.buildDownloadedHomeSection
+import com.nuvio.app.features.player.launchPlayerNextEpisodeAutoPlay
 import com.nuvio.app.features.player.resolveSkipSegmentsJson
 import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.plugins.PluginsUiState
@@ -976,7 +977,7 @@ class OfflineFirstBehaviorTest {
             assertTrue(diskChecksOnCaller.isEmpty(), "findCachedPlayableDownload must not touch disk: $diskChecksOnCaller")
 
             val selected = java.util.concurrent.CopyOnWriteArrayList<String>()
-            val job = com.nuvio.app.features.player.launchPlayerNextEpisodeAutoPlay(
+            val job = launchPlayerNextEpisodeAutoPlay(
                 previousJob = null,
                 nextEpisodeInfo = com.nuvio.app.features.player.skip.NextEpisodeInfo(
                     videoId = "tt-fast:1:6",
