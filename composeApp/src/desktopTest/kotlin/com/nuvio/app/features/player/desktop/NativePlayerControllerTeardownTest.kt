@@ -856,7 +856,7 @@ class NativePlayerControllerTeardownTest {
             },
             lifecycleCoordinator = coordinator,
         )
-        first.setNativeHandleForTest(101L)
+        first.assignNativeHandleForTest(101L)
 
         val second = NativePlayerController(
             host = NativePlayerHost(),
@@ -988,7 +988,7 @@ class NativePlayerControllerTeardownTest {
                 nativeDispose = { disposedLatch.countDown() },
                 lifecycleCoordinator = coordinator,
             )
-            controller.setNativeHandleForTest(301L)
+            controller.assignNativeHandleForTest(301L)
             val released = CountDownLatch(1)
             controller.releaseBeforeNavigation { released.countDown() }
             assertTrue(released.await(2, TimeUnit.SECONDS))
@@ -1003,7 +1003,7 @@ class NativePlayerControllerTeardownTest {
                 nativeDispose = { done.countDown() },
                 lifecycleCoordinator = coordinator,
             )
-            controller.setNativeHandleForTest(302L)
+            controller.assignNativeHandleForTest(302L)
             controller.dispose()
             assertTrue(done.await(2, TimeUnit.SECONDS))
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
