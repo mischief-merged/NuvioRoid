@@ -475,6 +475,42 @@ object DownloadsRepository {
         }
     }
 
+    internal fun findCachedPlayableDownload(
+        parentMetaId: String,
+        seasonNumber: Int? = null,
+        episodeNumber: Int? = null,
+        videoId: String? = null,
+    ): DownloadItem? {
+        val (readyIndex, indexPending) = synchronized(indexLock) {
+            (offlineIndexObserved && indexJob?.isActive != true) to (offlineIndexObserved && indexJob?.isActive == true)
+        }
+        if (readyIndex) {
+            return _offlineIndex.value.findFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+            )
+        }
+        if (indexPending) {
+            _offlineIndex.value.findFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+            )?.let { return it }
+        }
+        val candidates = _uiState.value.items.filter { it.isVerifiedCompletedStatus() }
+        if (candidates.isEmpty()) return null
+        return OfflineDownloadIndex(candidates) { it.localFileUri?.takeIf(String::isNotBlank) }
+            .findFor(
+                parentMetaId = parentMetaId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                videoId = videoId,
+            )
+    }
+
     fun findPlayableDownload(
         parentMetaId: String,
         seasonNumber: Int? = null,
@@ -1067,7 +1103,7 @@ object DownloadsRepository {
                     backend.removePartialOf(item)
                 }
             } finally {
-                ItemLocks.release(downloadId)
+                releaseItemLockAndRefreshIfCompleted(downloadId)
             }
         }
     }
@@ -1108,7 +1144,7 @@ object DownloadsRepository {
             // The ownership check, the file and the record change under the lock every save of a list takes.
             return backend.withListLock { deleteLocked(item, items) }
         } finally {
-            ItemLocks.release(downloadId)
+            releaseItemLockAndRefreshIfCompleted(downloadId)
         }
     }
 
@@ -2323,7 +2359,15 @@ object DownloadsRepository {
                 backend.withListLock { removeWatchedLocked(item, items, checked) }
             }
         } finally {
-            ItemLocks.release(downloadId)
+            releaseItemLockAndRefreshIfCompleted(downloadId)
+        }
+    }
+
+    private fun releaseItemLockAndRefreshIfCompleted(downloadId: String) {
+        ItemLocks.release(downloadId)
+        val items = _uiState.value.items
+        if (items.any { it.id == downloadId && it.isVerifiedCompletedStatus() }) {
+            scheduleOfflineIndexRefresh(items, force = true)
         }
     }
 

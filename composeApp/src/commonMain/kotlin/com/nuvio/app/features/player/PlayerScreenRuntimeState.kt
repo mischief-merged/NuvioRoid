@@ -89,7 +89,7 @@ internal class PlayerScreenRuntime(
     args: PlayerScreenArgs,
     val episodePlaybackOffline: () -> Boolean = ::isNetworkOffline,
     val findEpisodeDownload: (String, MetaVideo) -> DownloadItem? = { parentId, video ->
-        DownloadsRepository.findPlayableDownload(parentId, video.season, video.episode, video.id)
+        DownloadsRepository.findCachedPlayableDownload(parentId, video.season, video.episode, video.id)
     },
 ) {
     var args by mutableStateOf(args)

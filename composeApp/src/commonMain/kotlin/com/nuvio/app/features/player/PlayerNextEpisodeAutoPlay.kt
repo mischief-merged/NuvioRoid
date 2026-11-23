@@ -100,7 +100,7 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     onNextEpisodeCardVisibleChanged: (Boolean) -> Unit,
     isOffline: () -> Boolean = ::isNetworkOffline,
     findDownloadedEpisode: (MetaVideo) -> DownloadItem? = { video ->
-        DownloadsRepository.findPlayableDownload(parentMetaId, video.season, video.episode, video.id)
+        DownloadsRepository.findCachedPlayableDownload(parentMetaId, video.season, video.episode, video.id)
     },
     verifyDownloadedEpisode: suspend (DownloadItem) -> Boolean = { item ->
         DownloadsRepository.verifyCompletedDownload(item.id)
@@ -167,11 +167,9 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
 
     val job = launch(start = CoroutineStart.LAZY) {
         if (hasDownload) {
-            val candidate = findDownloadedEpisode(nextVideo)
-            val verified = if (candidate != null && withContext(Dispatchers.IO) { verifyDownloadedEpisode(candidate) }) {
-                candidate
-            } else {
-                null
+            val verified = withContext(Dispatchers.IO) {
+                val candidate = findDownloadedEpisode(nextVideo)
+                if (candidate != null && verifyDownloadedEpisode(candidate)) candidate else null
             }
             if (verified != null) {
                 onDownloadedEpisodeSelected(verified, nextVideo)

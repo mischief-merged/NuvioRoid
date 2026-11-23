@@ -917,4 +917,105 @@ class OfflineFirstBehaviorTest {
             DownloadsRepository.indexDispatcher = previousDispatcher
         }
     }
+
+    @Test
+    fun failed_delete_restores_completed_item_to_offline_index_after_releasing_ItemLocks() {
+        val lockAwareTrashFailingBackend = object : DownloadsBackend by backend {
+            override fun heldByFolder(item: DownloadItem): Boolean = ItemLocks.isHeld(item.id)
+            override fun trashFile(localFileUri: String): Boolean = false
+        }
+        val movie = downloadItem("mv-del-fail", "tt-del-fail", "tt-del-fail", totalBytes = 1_000L)
+        backend.presentUris += movie.localFileUri!!
+        backend.fileFacts[movie.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val previousDispatcher = DownloadsRepository.indexDispatcher
+        DownloadsRepository.indexDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        try {
+            persistItems(movie)
+            DownloadsRepository.backend = lockAwareTrashFailingBackend
+            DownloadsRepository.ensureOfflineIndexStarted()
+            assertTrue(DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId))
+
+            assertEquals(DownloadDeleteResult.NotMoved, DownloadsRepository.deleteDownload(movie.id))
+            assertTrue(
+                DownloadsRepository.offlineIndex.value.hasFor(movie.parentMetaId, videoId = movie.videoId),
+                "Failed delete rollback must leave the retained download in offlineIndex once ItemLocks is released",
+            )
+        } finally {
+            DownloadsRepository.indexDispatcher = previousDispatcher
+        }
+    }
+
+    @Test
+    fun findCachedPlayableDownload_and_autoplay_lookup_do_not_perform_disk_io_on_caller_thread() = runBlocking {
+        val diskChecksOnCaller = java.util.concurrent.CopyOnWriteArrayList<Thread>()
+        val callerThread = Thread.currentThread()
+        val trackingBackend = object : DownloadsBackend by backend {
+            override fun locate(item: DownloadItem): FileLookup {
+                diskChecksOnCaller += Thread.currentThread()
+                return backend.locate(item)
+            }
+
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? {
+                diskChecksOnCaller += Thread.currentThread()
+                return backend.resolveLocalFileUri(localFileUri, destinationFileName)
+            }
+        }
+        val ep6 = downloadItem("ep6-fast", "tt-fast", "tt-fast:1:6", season = 1, episode = 6, totalBytes = 1_000L)
+        backend.presentUris += ep6.localFileUri!!
+        backend.fileFacts[ep6.localFileUri] = DownloadedFileFacts(exists = true, sizeBytes = 1_000L)
+        val previousDispatcher = DownloadsRepository.indexDispatcher
+        DownloadsRepository.indexDispatcher = kotlinx.coroutines.Dispatchers.Unconfined
+        try {
+            persistItems(ep6)
+            DownloadsRepository.backend = trackingBackend
+            DownloadsRepository.ensureOfflineIndexStarted()
+            diskChecksOnCaller.clear()
+
+            val cached = DownloadsRepository.findCachedPlayableDownload("tt-fast", 1, 6, "tt-fast:1:6")
+            assertEquals(ep6.id, cached?.id)
+            assertTrue(diskChecksOnCaller.isEmpty(), "findCachedPlayableDownload must not touch disk: $diskChecksOnCaller")
+
+            val selected = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val job = com.nuvio.app.features.player.launchPlayerNextEpisodeAutoPlay(
+                previousJob = null,
+                nextEpisodeInfo = com.nuvio.app.features.player.skip.NextEpisodeInfo(
+                    videoId = "tt-fast:1:6",
+                    season = 1,
+                    episode = 6,
+                    title = "Episode 6",
+                    thumbnail = null,
+                    overview = null,
+                    released = null,
+                    hasAired = true,
+                    isWatched = false,
+                    unairedMessage = null,
+                ),
+                allEpisodes = listOf(
+                    MetaVideo(id = "tt-fast:1:6", title = "Episode 6", season = 1, episode = 6, thumbnail = null),
+                ),
+                parentMetaId = "tt-fast",
+                parentMetaType = "series",
+                contentType = "series",
+                settings = com.nuvio.app.features.player.PlayerSettingsUiState(),
+                currentStreamBingeGroup = null,
+                onDownloadedEpisodeSelected = { item, _ -> selected += item.id },
+                onEpisodeStreamSelected = { _, _, _ -> },
+                onManualSelectionRequired = {},
+                onSearchingChanged = {},
+                onSourceNameChanged = {},
+                onCountdownChanged = {},
+                onNextEpisodeCardVisibleChanged = {},
+                isOffline = { true },
+            )
+            assertNotNull(job)
+            job.join()
+            assertEquals(listOf(ep6.id), selected.toList())
+            assertFalse(
+                diskChecksOnCaller.any { it === callerThread },
+                "Caller thread must not touch disk during next-episode lookup/verification: $diskChecksOnCaller",
+            )
+        } finally {
+            DownloadsRepository.indexDispatcher = previousDispatcher
+        }
+    }
 }
