@@ -119,6 +119,7 @@ fun DownloadsScreen(
         onOpenShowDetails = onOpenShowDetails,
         episodeLinks = episodeLinks,
         rechecks = DownloadRechecks.app,
+        sourceSearches = SourceReplacements.progress,
     )
 }
 
@@ -157,6 +158,11 @@ internal fun DownloadsScreenContent(
     posterPatternOverride: String? = null,
     /** Whether downloads are slowed down to leave the connection to other apps. */
     politeState: kotlinx.coroutines.flow.StateFlow<PoliteState> = PoliteDownloadsHost.state,
+    /**
+     * The app's own searches for another source, by title. Null where the app does not look for another
+     * source by itself: a bad source then offers only the user's own choices.
+     */
+    sourceSearches: kotlinx.coroutines.flow.StateFlow<Map<String, SourceSearchProgress>>? = null,
 ) {
     val uiState by remember {
         DownloadsRepository.ensureLoadedForDisplay()
@@ -242,8 +248,9 @@ internal fun DownloadsScreenContent(
     }
     val holdState by connectionHold.state.collectAsStateWithLifecycle()
     val polite by politeState.collectAsStateWithLifecycle()
+    val searches = sourceSearches?.collectAsStateWithLifecycle()?.value
     val clock = RowClock(
-        nowEpochMs = now, offline = network.isOfflineLike, extras = extras, limitedBy = holdState.reason,
+        nowEpochMs = now, offline = network.isOfflineLike, extras = extras, limitedBy = holdState.reason, searches = searches,
         removals = removalByDownload, keptDownloadIds = keptDownloadIds,
         onKeep = autoDownloads?.let { controller -> { id -> controller.keepDownload(activeProfileId, id) } },
         onUndoKeep = autoDownloads?.let { controller -> { id -> controller.undoKeepDownload(activeProfileId, id) } },
@@ -563,6 +570,8 @@ private data class RowClock(
     val keptDownloadIds: Set<String> = emptySet(),
     val onKeep: ((String) -> Unit)? = null,
     val onUndoKeep: ((String) -> Unit)? = null,
+    /** The app's own searches for another source, by title. Null where the app does not search by itself. */
+    val searches: Map<String, SourceSearchProgress>? = null,
 )
 
 /** What the rows need to know about locations, selection and moving. Null where there are no locations. */
@@ -719,7 +728,7 @@ private fun LazyListScope.downloadsRootContent(
                 onDelete = { onDeleteDownload(item.id) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
-                newCopyReady = item.isPlaceholder && item.logicalContentKey in goodCopies,
+                newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
                 posterPatternOverride = posterPatternOverride,
             )
         }
@@ -931,7 +940,7 @@ private fun LazyListScope.downloadsShowContent(
                 onDelete = { onDeleteDownload(item.id) },
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
-                newCopyReady = item.isPlaceholder && item.logicalContentKey in goodCopies,
+                newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
             )
         }
     }
@@ -953,7 +962,7 @@ private fun DownloadRow(
     episodeLinks: DownloadEpisodeLinks? = null,
     /** Looks at the file again. Null where that is not offered. */
     onCheckAgain: ((DownloadItem) -> Unit)? = null,
-    /** A marked file has a good new copy beside it: offers to replace it with that copy (the file goes to the trash). */
+    /** A bad source has a good new copy beside it: no automatic search is needed; a marked file can be trashed. */
     newCopyReady: Boolean = false,
     posterPatternOverride: String? = null,
 ) {
@@ -968,6 +977,7 @@ private fun DownloadRow(
         item, clock.nowEpochMs, clock.offline, availability, isMoving,
         addressRequired = extras != null, runtimeMinutes = ::runtimeMinutesOfDownload, limitedBy = clock.limitedBy,
     )
+    val searchState = clock.searches?.let { sourceSearchRowState(item, it) }
     val skipTimesNote by produceState<DownloadCompanionsNote?>(null, item.localFileUri, item.status) {
         val uri = item.localFileUri?.takeIf { item.status == DownloadStatus.Completed }
         // Subtitles and skip times are saved a moment after a download finishes, so a missing note is looked for a few more times.
@@ -1280,19 +1290,36 @@ private fun DownloadRow(
             }
 
             if (item.isPlaceholder) {
-                PlaceholderDetails(
-                    item = item,
-                    onChooseAnotherSource = onChooseAnotherSource,
-                    onCheckAgain = onCheckAgain,
-                    onReplaceWithNewCopy = onDelete.takeIf { newCopyReady },
-                )
+                if (searchState != null && !newCopyReady) {
+                    SourceSearchDetails(item = item, state = searchState, onChooseAnotherSource = onChooseAnotherSource)
+                } else {
+                    PlaceholderDetails(
+                        item = item,
+                        onChooseAnotherSource = onChooseAnotherSource,
+                        onCheckAgain = onCheckAgain,
+                        onReplaceWithNewCopy = onDelete.takeIf { newCopyReady },
+                    )
+                }
             }
 
             if (item.status == DownloadStatus.Failed) {
-                FailureDetails(
-                    item = item,
-                    onRetry = onRetry,
-                    onChooseAnotherSource = onChooseAnotherSource,
+                if (searchState != null && item.hasBadSource && !newCopyReady) {
+                    SourceSearchDetails(item = item, state = searchState, onChooseAnotherSource = onChooseAnotherSource)
+                } else {
+                    FailureDetails(
+                        item = item,
+                        onRetry = onRetry,
+                        onChooseAnotherSource = onChooseAnotherSource,
+                    )
+                }
+            }
+
+            // A download the app started in place of a bad source says which of its tries it is.
+            if (item.status == DownloadStatus.Downloading && searchState is SourceSearchRowState.Trying) {
+                Text(
+                    text = stringResource(Res.string.downloads_source_search_trying, searchState.attempt, searchState.of),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
 
@@ -1505,6 +1532,42 @@ private fun PlaceholderDetails(
                 }
             }
             if (onCheckAgain != null) CheckAgainButton(item = item, onCheckAgain = onCheckAgain)
+        }
+    }
+}
+
+/**
+ * What the app does about a download whose source was bad, when it looks for another source by itself:
+ * which source it is trying, that it will try one soon, or that it found none, with the user's own pick
+ * then. The file of a download that is not the video stays where it is; the row's delete button moves it
+ * to the trash. "Check again" is not offered: the same file held against the same claim gives the same answer.
+ */
+@Composable
+private fun SourceSearchDetails(
+    item: DownloadItem,
+    state: SourceSearchRowState,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+) {
+    val name = item.nameForLabels()
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = when (state) {
+                is SourceSearchRowState.Trying -> stringResource(Res.string.downloads_source_search_trying, state.attempt, state.of)
+                SourceSearchRowState.Waiting -> stringResource(Res.string.downloads_source_search_waiting)
+                SourceSearchRowState.NoneFound -> stringResource(Res.string.downloads_source_search_none_found)
+            },
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state == SourceSearchRowState.NoneFound && onChooseAnotherSource != null) {
+            val pickDescription = stringResource(Res.string.downloads_pick_source_myself_description, name)
+            TextButton(
+                modifier = Modifier.semantics { contentDescription = pickDescription },
+                onClick = { onChooseAnotherSource(item) },
+            ) {
+                Text(text = stringResource(Res.string.downloads_pick_source_myself), style = MaterialTheme.typography.labelLarge)
+            }
         }
     }
 }

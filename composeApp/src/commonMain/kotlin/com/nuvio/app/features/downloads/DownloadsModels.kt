@@ -87,7 +87,7 @@ data class DownloadItem(
     val autoDownloadRuleKey: String? = null,
     /** The limit that paused this automatic download. Cleared when it is resumed. */
     val autoDownloadStop: AutoDownloadStop? = null,
-    /** Why this download failed. Null for a download that is not failed, or failed before this was recorded. */
+    /** Why this source failed. Also set on a finished file rejected by a batch; null when no failure was recorded. */
     val failureKind: DownloadFailureKind? = null,
     /**
      * The download location this item lives in or is going to. Null for an item written before
@@ -113,6 +113,15 @@ data class DownloadItem(
     val publishedDigestVerified: Boolean = false,
     /** The identity of the published file, saved before its partial name is removed. */
     val publishedFileKey: String? = null,
+    /**
+     * Every source already downloaded for this title, as [sourceIdentityKeys] write them, this one's and
+     * those of the downloads it replaced or sits beside. A source the app picks by itself is never one of them.
+     */
+    val triedSources: List<String> = emptyList(),
+    /** How many sources the app has started by itself for this title, each after a source that was bad. */
+    val autoSourceAttempts: Int = 0,
+    /** The app looked for a working source by itself and found none. Only the user picks one now. */
+    val noWorkingSourceFound: Boolean = false,
 ) {
     val isEpisode: Boolean
         get() = seasonNumber != null && episodeNumber != null
@@ -123,12 +132,17 @@ data class DownloadItem(
             (failureKind == DownloadFailureKind.BadFile || failureKind == DownloadFailureKind.SourceRefused)
 
     /**
-     * A finished download whose file is not the video: a placeholder the source served in its place.
-     * It keeps its file, so that the user can delete it to the trash, but it is not downloaded: it
+     * A finished download whose file is not suitable: a placeholder, or a source rejected by the batch
+     * checks (including the chosen audio language). It keeps its file for the user to trash, but it
      * does not play, does not count as available offline and is replaced by a fetch from another source.
      */
     val isPlaceholder: Boolean
-        get() = status == DownloadStatus.Completed && framesCheck == DownloadFramesCheck.NotTheRealVideo
+        get() = status == DownloadStatus.Completed &&
+            (framesCheck == DownloadFramesCheck.NotTheRealVideo || failureKind == DownloadFailureKind.BadFile)
+
+    /** Its source is the problem: a file that is not the video, or a source that failed in a way trying it again cannot fix. */
+    val hasBadSource: Boolean
+        get() = needsAnotherSource || isPlaceholder
 
     val isPlayable: Boolean
         get() = status == DownloadStatus.Completed && !localFileUri.isNullOrBlank() && !isPlaceholder

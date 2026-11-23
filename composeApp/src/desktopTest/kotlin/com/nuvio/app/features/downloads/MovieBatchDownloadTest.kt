@@ -23,6 +23,8 @@ class MovieBatchDownloadTest {
 
     private fun stream(label: String, url: String, sizeBytes: Long? = null) = StreamItem(
         name = label,
+        // Alternative releases have different listings even when their quality is the same.
+        description = url.substringAfterLast('/'),
         url = url,
         addonName = "A",
         addonId = "addon:A",
@@ -146,6 +148,25 @@ class MovieBatchDownloadTest {
 
         assertEquals(listOf("https://x/1.mp4", "https://x/2.mp4", "https://x/3.mp4"), fake.queuedUrls)
         assertEquals(SeasonBatchEpisodeResult.Failed, fake.result())
+    }
+
+    @Test
+    fun the_same_listing_with_a_changed_address_is_not_transferred_twice() = runTest {
+        val fake = Fake()
+        val first = stream("1080p", "https://x/first.mp4")
+        val sameListing = first.copy(url = "https://x/rotated.mp4")
+        val next = stream("1080p", "https://x/next.mp4")
+        val downloader = downloader(fake) { listOf(first, sameListing, next) }
+
+        downloader.start(movie.movieBatchRequest(SeasonDownloadDefaults()))
+        advanceUntilIdle()
+        fake.settle("tt100", DownloadStatus.Failed)
+        advanceUntilIdle()
+
+        assertEquals(listOf("https://x/first.mp4", "https://x/next.mp4"), fake.queuedUrls)
+        fake.settle("tt100", DownloadStatus.Completed)
+        advanceUntilIdle()
+        assertEquals(SeasonBatchEpisodeResult.Completed, fake.result())
     }
 
     @Test

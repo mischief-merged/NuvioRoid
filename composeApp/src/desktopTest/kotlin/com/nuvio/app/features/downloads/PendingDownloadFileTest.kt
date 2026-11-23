@@ -32,12 +32,14 @@ class PendingDownloadFileTest {
     private val starts = AtomicInteger()
     private val partials = AtomicInteger()
     private val outright = AtomicInteger()
+    private val removedUris = java.util.concurrent.CopyOnWriteArrayList<String?>()
     private val removals = AtomicInteger()
     private val ownershipChecks = AtomicInteger()
     private val syncs = AtomicInteger()
     private var ownership: FileOwnership? = null
     private var syncSucceeds = true
     private var onTrash: () -> Unit = {}
+    private var onSave: () -> Unit = {}
     private val listLock = java.util.concurrent.locks.ReentrantLock()
     private var blockCheck = false
     private var payload: String? = null
@@ -48,7 +50,7 @@ class PendingDownloadFileTest {
     private val backend = object : DownloadsBackend {
         override fun <T> withListLock(block: () -> T): T = listLock.withLock { block() }
         override fun loadPayload() = payload
-        override fun savePayload(payload: String) { this@PendingDownloadFileTest.payload = payload }
+        override fun savePayload(payload: String) { this@PendingDownloadFileTest.payload = payload; onSave() }
         override fun restoreItem(item: DownloadItem) = item
         override fun syncPayload(): Boolean { syncs.incrementAndGet(); return syncSucceeds }
         override fun ownershipOf(item: DownloadItem, fileUri: String): FileOwnership? {
@@ -59,7 +61,7 @@ class PendingDownloadFileTest {
             starts.incrementAndGet()
             return object : DownloadsTaskHandle { override fun cancel() = Unit }
         }
-        override fun removeFile(localFileUri: String?): Boolean { outright.incrementAndGet(); return false }
+        override fun removeFile(localFileUri: String?): Boolean { removedUris += localFileUri; outright.incrementAndGet(); return false }
         override fun removePartialFile(destinationFileName: String): Boolean { partials.incrementAndGet(); return true }
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String) =
             (world.locations.locate(null, localFileUri, destinationFileName) as? FileLookup.Found)?.uri
@@ -295,6 +297,101 @@ class PendingDownloadFileTest {
         assertEquals(0, outright.get())
     }
 
+
+    private fun queueReplacement(userChose: Boolean = false) = DownloadsRepository.enqueueFromStream(
+        contentType = "series", videoId = "show:1:1", parentMetaId = "show", parentMetaType = "series", title = "Show",
+        logo = null, poster = null, background = null, seasonNumber = 1, episodeNumber = 1,
+        episodeTitle = null, episodeThumbnail = null,
+        stream = com.nuvio.app.features.streams.StreamItem(
+            name = "1080p replacement", url = "https://example.com/replacement.mkv", addonName = "test", addonId = "test",
+        ),
+        userChoseReplacement = userChose,
+    )
+
+    private fun replacementDuringTrash(userChose: Boolean, refused: Boolean) {
+        RandomAccessFile(file.toFile(), "rw").use { it.write("not a video".toByteArray()) }
+        load(pending().copy(autoSourceAttempts = 1, triedSources = listOf("label:earlier")))
+        val original = item()
+        world.trash.fails = refused
+        val queued = CountDownLatch(1)
+        onTrash = {
+            val worker = thread(isDaemon = true) { queueReplacement(userChose); queued.countDown() }
+            assertTrue(queued.await(10, TimeUnit.SECONDS), "replacement waited for the Trash move")
+            worker.join(10_000)
+        }
+        DownloadsRepository.resumeDownload(original.id)
+        await {
+            removals.get() == 1 && !ItemLocks.isHeld(original.id) &&
+                (refused || DownloadsRepository.uiState.value.items.none { it.id == original.id && it.awaitingCheck })
+        }
+        val records = DownloadsRepository.uiState.value.items
+        val replacement = records.single { it.id != original.id }
+        assertEquals(if (userChose) 0 else 2, replacement.autoSourceAttempts)
+        assertTrue(replacement.triedSources.containsAll(original.sourceIdentityKeys + "label:earlier"))
+        assertEquals(DownloadStatus.Downloading, replacement.status)
+        assertEquals(records, DownloadsCodec.decode(payload!!)!!.items)
+        if (refused) {
+            assertEquals(2, records.size)
+            assertEquals(uri, records.single { it.id == original.id }.localFileUri)
+            assertTrue(records.single { it.id == original.id }.awaitingCheck)
+            assertTrue(Files.exists(file))
+            assertTrue(world.trash.sent.isEmpty())
+        } else {
+            assertEquals(listOf(replacement), records)
+            assertFalse(Files.exists(file))
+            assertEquals(savedFileKey, DownloadMover.identityOf(world.trash.sent.single().second))
+        }
+        assertEquals(1, starts.get())
+        assertEquals(0, partials.get())
+        assertEquals(0, outright.get())
+    }
+
+    @Test fun a_replacement_queued_during_trash_keeps_the_history_without_an_empty_failed_row() =
+        replacementDuringTrash(userChose = false, refused = false)
+
+    @Test fun a_manual_replacement_during_trash_keeps_its_reset_attempt_count() =
+        replacementDuringTrash(userChose = true, refused = false)
+
+    @Test fun a_replacement_during_a_refused_trash_move_keeps_the_file_and_its_owner() =
+        replacementDuringTrash(userChose = false, refused = true)
+
+    @Test fun a_replacement_after_trash_keeps_the_same_history_without_an_empty_failed_row() {
+        RandomAccessFile(file.toFile(), "rw").use { it.write("not a video".toByteArray()) }
+        load(pending(DownloadStatus.Downloading).copy(autoSourceAttempts = 1, triedSources = listOf("label:earlier")))
+        val id = pending().id
+        await { removals.get() == 1 && !ItemLocks.isHeld(id) && !item().awaitingCheck }
+        val rejected = item()
+        assertEquals(null, rejected.localFileUri)
+        queueReplacement()
+        val replacement = item()
+        assertEquals(2, replacement.autoSourceAttempts)
+        assertTrue(replacement.triedSources.containsAll(rejected.sourceIdentityKeys + "label:earlier"))
+        assertEquals(replacement, DownloadsCodec.decode(payload!!)!!.items.single())
+        assertFalse(Files.exists(file))
+        assertEquals(1, world.trash.sent.size)
+        assertEquals(0, partials.get())
+        // Replacing a fileless row may pass null to the removal helper, never a file address.
+        assertTrue(removedUris.all { it == null })
+    }
+
+    @Test fun a_completed_rejection_is_ready_for_the_replacement_watcher_when_it_is_published() {
+        RandomAccessFile(file.toFile(), "rw").use { it.write("not a video".toByteArray()) }
+        load()
+        val ready = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        onSave = {
+            val record = DownloadsCodec.decode(payload!!)!!.items.single()
+            if (record.hasBadSource && record.localFileUri == null && !record.awaitingCheck) {
+                ready.set(!DownloadsRepository.isBusyOrAway(record))
+            }
+        }
+        val id = item().id
+        DownloadsRepository.resumeDownload(id)
+        await { removals.get() == 1 && !ItemLocks.isHeld(id) && ready.get() != null }
+        assertEquals(true, ready.get(), "the replacement watcher saw a completed rejection as still held")
+        assertEquals(1, sourceReplacementSteps(listOf(item()), emptySet(), DownloadsRepository::isBusyOrAway).size)
+        assertFalse(Files.exists(file))
+        assertEquals(1, world.trash.sent.size)
+    }
 
     @Test fun another_download_can_save_its_pause_while_a_rejected_file_goes_to_trash() {
         RandomAccessFile(file.toFile(), "rw").use { it.write("not a video".toByteArray()) }

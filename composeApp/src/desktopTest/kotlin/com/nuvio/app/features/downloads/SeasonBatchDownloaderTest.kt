@@ -960,6 +960,53 @@ class SeasonBatchDownloaderTest {
         assertFalse(asked)
     }
 
+    @Test
+    fun a_failed_embedded_source_is_not_downloaded_again_from_the_fallback_lookup() = runTest {
+        val fake = Fake()
+        val repeated = stream("1080p b", "http://x/b.mp4")
+        val next = stream("1080p c", "http://x/c.mp4")
+        val d = downloader(
+            fake,
+            fetch = { listOf(repeated) },
+            fallback = { listOf(repeated, next) },
+        )
+        d.start(request(episodes.take(1)))
+        advanceUntilIdle()
+        fake.finishedBytes = 73_615
+        fake.setStatus(1, DownloadStatus.Completed)
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to "http://x/b.mp4", 1 to "http://x/c.mp4"), fake.enqueued)
+        fake.finishedBytes = 700_000_000
+        fake.setStatus(1, DownloadStatus.Completed)
+        advanceUntilIdle()
+        assertTrue(d.running.value.isEmpty())
+    }
+
+    @Test
+    fun different_listings_that_resolve_to_the_same_address_are_only_downloaded_once() = runTest {
+        val fake = Fake()
+        val first = stream("1080p a", "http://x/a.mp4")
+        val alias = stream("1080p b", "http://x/b.mp4")
+        val next = stream("1080p c", "http://x/c.mp4")
+        val d = downloader(
+            fake,
+            fetch = { listOf(first, alias, next) },
+            prepare = { candidate, _ ->
+                if (candidate == next) candidate else candidate.copy(url = "http://x/resolved.mp4")
+            },
+        )
+        d.start(request(episodes.take(1)))
+        advanceUntilIdle()
+        fake.setStatus(1, DownloadStatus.Failed)
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to "http://x/resolved.mp4", 1 to "http://x/c.mp4"), fake.enqueued)
+        fake.setStatus(1, DownloadStatus.Completed)
+        advanceUntilIdle()
+        assertTrue(d.running.value.isEmpty())
+    }
+
     // ---- placeholder clips ----
 
     private fun threeSources() = listOf(stream("1080p a", "http://x/a.mp4"), stream("1080p b", "http://x/b.mp4"), stream("1080p c", "http://x/c.mp4"))

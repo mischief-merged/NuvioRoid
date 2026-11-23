@@ -149,6 +149,30 @@ class DownloadProbeBudgetTest {
         assertEquals(0, backend.partialRemovals.get())
     }
 
+    @Test fun rejecting_a_source_during_its_check_clears_the_marker_and_keeps_the_published_file() {
+        enqueue(1); backend.facts[uri(1)] = video.copy(durationMs = null)
+        val entered = CountDownLatch(1)
+        backend.duringSample = { entered.countDown(); await(release) }
+        val first = worker { finish(1) }
+        await(entered)
+        val id = item(1).id
+        assertTrue(id in DownloadsRepository.uiState.value.checkingIds)
+
+        DownloadsRepository.rejectBatchSource(id)
+
+        assertTrue(DownloadsRepository.uiState.value.checkingIds.isEmpty())
+        assertEquals(DownloadStatus.Failed, item(1).status)
+        assertEquals(DownloadFailureKind.BadFile, item(1).failureKind)
+        assertEquals(uri(1), item(1).localFileUri)
+        val rejected = item(1)
+        release.countDown(); first.join(10_000)
+        assertFalse(first.isAlive)
+        assertEquals(rejected, item(1), "a late check changed the rejected source")
+        assertEquals(rejected, DownloadsCodec.decode(backend.payload!!)!!.items.single())
+        assertEquals(emptyList(), backend.removed)
+        assertEquals(0, backend.partialRemovals.get())
+    }
+
     @Test fun a_published_file_waiting_for_a_probe_survives_reload_without_a_transfer() {
         enqueue(1)
         backend.requests.single().onDigestVerified()
@@ -442,6 +466,13 @@ class DownloadProbeBudgetTest {
             assertEquals(DownloadStatus.Downloading, item(firstEpisode).status)
             assertFalse(item(firstEpisode).isPlayable)
             assertFalse(summary.isCompleted)
+            // Releasing transfer capacity must not let another search take over the checked title.
+            val titleKey = item(firstEpisode).logicalContentKey
+            assertTrue(titleKey in downloader.titlesInFlight.value)
+            assertTrue(sourceReplacementSteps(
+                listOf(item(firstEpisode).copy(status = DownloadStatus.Failed, failureKind = DownloadFailureKind.BadFile)),
+                busyTitles = downloader.titlesInFlight.value,
+            ).isEmpty())
             release.countDown()
             val queued = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
             while (notPresent(secondEpisode) && System.nanoTime() < queued) Thread.yield()
@@ -451,6 +482,9 @@ class DownloadProbeBudgetTest {
             assertEquals(2, backend.requests.size)
             assertEquals(1, backend.sampled.size)
             assertEquals(emptyList(), backend.removed)
+            val settled = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (downloader.titlesInFlight.value.isNotEmpty() && System.nanoTime() < settled) Thread.yield()
+            assertTrue(downloader.titlesInFlight.value.isEmpty())
         } finally { release.countDown(); scope.cancel() }
     }
 }
