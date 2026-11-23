@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.core.storage.DesktopStorage
 import com.sun.net.httpserver.HttpServer
 import java.net.InetSocketAddress
@@ -48,7 +49,7 @@ internal class ProgressBackend : DownloadsBackend {
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class DownloadProgressCheckpointTest {
+class DownloadProgressCheckpointTest : TrustedLocalServerTest() {
     private val original = DownloadsRepository.backend
     private val originalScope = DownloadsRepository.progressScope
     private val originalCompanions = DownloadsRepository.companions
