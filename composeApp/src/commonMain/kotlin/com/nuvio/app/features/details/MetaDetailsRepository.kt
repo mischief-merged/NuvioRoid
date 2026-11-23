@@ -57,6 +57,29 @@ object MetaDetailsRepository {
     private var activeRequestKey: String? = null
     private val cachedMetaByRequestKey = BoundedCache<String, CachedMetaEntry>()
 
+    internal fun putCachedMetaForTest(meta: MetaDetails) {
+        val requestKey = "${meta.type}:${meta.id}"
+        val fingerprint = buildMetaScreenSettingsFingerprint(MdbListSettingsRepository.snapshot())
+        cachedMetaByRequestKey[requestKey] = CachedMetaEntry(
+            baseMeta = meta,
+            metaScreenMeta = meta,
+            metaScreenSettingsFingerprint = fingerprint,
+        )
+        if (activeRequestKey == null || activeRequestKey == requestKey) {
+            activeRequestKey = requestKey
+            _uiState.value = MetaDetailsUiState(meta = meta.withUnreleasedFilter())
+        }
+    }
+
+    internal fun removeCachedMetaForTest(type: String, id: String) {
+        val requestKey = "$type:$id"
+        cachedMetaByRequestKey.remove(requestKey)
+        if (activeRequestKey == requestKey) {
+            activeRequestKey = null
+            _uiState.value = MetaDetailsUiState()
+        }
+    }
+
     fun load(type: String, id: String) {
         log.d { "load() called — type=$type id=$id" }
         val requestKey = "$type:$id"

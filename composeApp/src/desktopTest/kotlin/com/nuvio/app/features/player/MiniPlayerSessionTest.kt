@@ -13,20 +13,36 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasClickAction
+import androidx.compose.ui.test.hasScrollToNodeAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performMouseInput
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.printToString
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
+import com.nuvio.app.MainAppContent
 import com.nuvio.app.PlayerSessionHost
+import com.nuvio.app.core.i18n.localizedPlayLabel
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.details.MetaDetails
+import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.components.DetailActions
@@ -41,8 +57,12 @@ import com.nuvio.app.features.downloads.DownloadEnqueueResult
 import com.nuvio.app.features.downloads.DownloadItem
 import com.nuvio.app.features.downloads.DownloadStatus
 import com.nuvio.app.features.downloads.DownloadsUiState
+import com.nuvio.app.features.downloads.SeasonBatchDownloads
 import com.nuvio.app.features.downloads.SeasonBatchDownloader
+import com.nuvio.app.features.downloads.SeasonBatchRequest
+import com.nuvio.app.features.downloads.SeasonBatchStart
 import com.nuvio.app.features.downloads.SeasonDownloadDefaultsStorage
+import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
 import com.nuvio.app.features.tracking.TrackingProviderId
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
@@ -55,8 +75,10 @@ import com.nuvio.app.features.library.LibraryRepository
 import com.nuvio.app.features.plugins.runtime.PluginRuntime
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.AddonStreamGroup
+import com.nuvio.app.features.streams.StreamAutoPlayMode
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
+import com.nuvio.app.features.streams.StreamsRepository
 import com.nuvio.app.features.streams.StreamsUiState
 import com.nuvio.app.features.trailer.TrailerPlaybackSource
 import com.nuvio.app.features.trailer.TrailerPlaybackState
@@ -81,9 +103,15 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.withTimeout
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_back
 import nuvio.composeapp.generated.resources.compose_action_pause
+import nuvio.composeapp.generated.resources.compose_nav_home
+import nuvio.composeapp.generated.resources.compose_nav_library
 import nuvio.composeapp.generated.resources.compose_player_close
 import nuvio.composeapp.generated.resources.compose_player_seek_forward_10
+import nuvio.composeapp.generated.resources.compose_settings_page_root
+import nuvio.composeapp.generated.resources.compose_settings_root_downloads_title
+import nuvio.composeapp.generated.resources.compose_settings_root_switch_profile_title
 import nuvio.composeapp.generated.resources.detail_btn_play
 import nuvio.composeapp.generated.resources.details_actions_menu_label
 import nuvio.composeapp.generated.resources.downloads_season_button
@@ -115,6 +143,8 @@ class MiniPlayerSessionTest {
     private val scope = CoroutineScope(testDispatcher + SupervisorJob())
     private val testSeriesId = "tt9991109"
     private val browsedSeriesId = "tt9992202"
+    private val appSeriesId = "tt9993303"
+    private val appBrowsedSeriesId = "tt9994404"
     private val testDialogProfileId = 9_900_099
     private val episodes = (1..4).map { number ->
         MetaVideo(
@@ -129,10 +159,27 @@ class MiniPlayerSessionTest {
 
     @After
     fun tearDown() {
+        WatchProgressRepository.ensureLoaded()
         episodes.forEach { WatchProgressRepository.clearProgress(it.id) }
         WatchProgressRepository.clearProgress(testSeriesId)
+        WatchProgressRepository.clearProgress(browsedSeriesId)
+        WatchProgressRepository.removeProgress(contentId = appSeriesId)
+        WatchProgressRepository.removeProgress(contentId = appBrowsedSeriesId)
+        WatchProgressRepository.clearProgress("$appSeriesId:1:1")
+        WatchProgressRepository.clearProgress("$appSeriesId:1:2")
+        WatchProgressRepository.clearProgress(appSeriesId)
+        WatchProgressRepository.clearProgress(appBrowsedSeriesId)
         WatchProgressRepository.clearLocalState()
+        LibraryRepository.remove(testSeriesId)
         LibraryRepository.remove(browsedSeriesId)
+        LibraryRepository.remove(appSeriesId)
+        LibraryRepository.remove(appBrowsedSeriesId)
+        MetaDetailsRepository.removeCachedMetaForTest("series", testSeriesId)
+        MetaDetailsRepository.removeCachedMetaForTest("series", browsedSeriesId)
+        MetaDetailsRepository.removeCachedMetaForTest("series", appSeriesId)
+        MetaDetailsRepository.removeCachedMetaForTest("series", appBrowsedSeriesId)
+        SeasonBatchDownloads.startOverrideForTest = null
+        StreamsRepository.clear()
         SeasonDownloadDefaultsStorage.savePayload(testDialogProfileId, "")
         TrackingScrobbleCoordinator.scrobblersOverrideForTest = null
         sourceHealthTickObserverForTest = null
@@ -1101,6 +1148,287 @@ class MiniPlayerSessionTest {
         assertEquals(0, backend.activeHandleCount)
         assertEquals(listOf(1L), backend.disposedHandles.toList())
         assertFalse(ActivePlayerSessionRegistry.isActive.value)
+    }
+
+    @OptIn(ExperimentalTestApi::class)
+    @Test
+    fun main_app_content_end_to_end_play_minimize_browse_library_season_download_reopen_and_profile_switch() {
+        PlayerSettingsRepository.ensureLoaded()
+        val previousSettings = PlayerSettingsRepository.uiState.value
+        val activeProfileId = ProfileRepository.activeProfileId
+        val previousSeasonDefaults = SeasonDownloadDefaultsStorage.loadPayload(activeProfileId).orEmpty()
+
+        try {
+            WatchProgressRepository.ensureLoaded()
+            WatchProgressRepository.removeProgress(contentId = appSeriesId)
+            WatchProgressRepository.removeProgress(contentId = appBrowsedSeriesId)
+            PlayerSettingsRepository.setExternalPlayerEnabled(false)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(false)
+            PlayerSettingsRepository.setStreamAutoPlayMode(StreamAutoPlayMode.MANUAL)
+            LibraryRepository.remove(appBrowsedSeriesId)
+            LibraryRepository.save(
+                LibraryItem(
+                    id = appSeriesId,
+                    type = "series",
+                    name = "Active Series",
+                    savedAtEpochMs = Long.MAX_VALUE - 1_000L,
+                ),
+            )
+
+            val playingMeta = MetaDetails(
+                id = appSeriesId,
+                type = "series",
+                name = "Active Series",
+                videos = listOf(
+                    MetaVideo(
+                        id = "$appSeriesId:1:1",
+                        title = "Pilot Episode",
+                        season = 1,
+                        episode = 1,
+                        streams = listOf(
+                            StreamItem(
+                                name = "Embedded 1080p",
+                                description = "Embedded Direct Stream",
+                                url = "https://example.com/main-app-ep1.mp4",
+                                addonName = "Embedded",
+                                addonId = "embedded",
+                            ),
+                        ),
+                    ),
+                    MetaVideo(
+                        id = "$appSeriesId:1:2",
+                        title = "Second Episode",
+                        season = 1,
+                        episode = 2,
+                        streams = listOf(
+                            StreamItem(
+                                name = "Embedded 1080p",
+                                description = "Embedded Direct Stream Ep2",
+                                url = "https://example.com/main-app-ep2.mp4",
+                                addonName = "Embedded",
+                                addonId = "embedded",
+                            ),
+                        ),
+                    ),
+                ),
+                moreLikeThis = listOf(
+                    MetaPreview(
+                        id = appBrowsedSeriesId,
+                        type = "series",
+                        name = "Browsed Show",
+                    ),
+                ),
+            )
+            val browsedMeta = MetaDetails(
+                id = appBrowsedSeriesId,
+                type = "series",
+                name = "Browsed Show",
+                videos = listOf(
+                    MetaVideo(
+                        id = "$appBrowsedSeriesId:1:1",
+                        title = "Browsed Ep 1",
+                        season = 1,
+                        episode = 1,
+                        streams = listOf(
+                            StreamItem(
+                                name = "1080p",
+                                description = "Season Source 1080p",
+                                url = "https://example.com/browsed-ep1.mp4",
+                                addonName = "Embedded",
+                                addonId = "embedded",
+                            ),
+                        ),
+                    ),
+                    MetaVideo(
+                        id = "$appBrowsedSeriesId:1:2",
+                        title = "Browsed Ep 2",
+                        season = 1,
+                        episode = 2,
+                        streams = listOf(
+                            StreamItem(
+                                name = "1080p",
+                                description = "Season Source 1080p",
+                                url = "https://example.com/browsed-ep2.mp4",
+                                addonName = "Embedded",
+                                addonId = "embedded",
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            MetaDetailsRepository.putCachedMetaForTest(playingMeta)
+            MetaDetailsRepository.putCachedMetaForTest(browsedMeta)
+
+            val capturedSeasonBatches = mutableListOf<SeasonBatchRequest>()
+            SeasonBatchDownloads.startOverrideForTest = { request ->
+                capturedSeasonBatches += request
+                SeasonBatchStart.Started
+            }
+
+            val backend = CountingNativePlayerBackend()
+            val hooks = backend.toDesktopHooks()
+            val sessionController = PlayerSessionController()
+            val switchProfileCount = AtomicInteger(0)
+
+            compose.setContent {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        MainAppContent(
+                            initialRoute = TabsRoute,
+                            ownsAppRuntime = false,
+                            showLaunchOverlay = false,
+                            sessionController = sessionController,
+                            onSwitchProfile = { switchProfileCount.incrementAndGet() },
+                        )
+                    }
+                }
+            }
+            compose.waitForIdle()
+
+            fun waitForStep(step: String, condition: () -> Boolean) {
+                try {
+                    compose.waitUntil(5_000L, condition)
+                } catch (error: Throwable) {
+                    throw AssertionError(
+                        "$step timed out; meta=${MetaDetailsRepository.uiState.value.meta?.id}; tree=\n" +
+                            compose.onRoot().printToString(),
+                        error,
+                    )
+                }
+            }
+
+            fun leaveSidebarHover() {
+                compose.onRoot().performMouseInput { moveTo(Offset(600f, 100f)) }
+                compose.waitForIdle()
+            }
+
+            // 1. Navigate from Home tab to Library tab via MainAppContent's sidebar, then open "Active Series".
+            val playEpisodeLabel = localizedPlayLabel(1, 1)
+            compose.onNodeWithContentDescription(text(Res.string.compose_nav_library)).performClick()
+            leaveSidebarHover()
+            waitForStep("library-item") {
+                compose.onAllNodes(hasText("Active Series") and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onAllNodes(hasText("Active Series") and hasClickAction()).onFirst().performClick()
+            waitForStep("detail-play-button") {
+                compose.onAllNodes(hasText(playEpisodeLabel) and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
+            }
+
+            // 2. Click Play on MetaDetailsScreen -> StreamDestination -> select embedded stream -> opens PlayerSessionHost.
+            compose.onAllNodes(hasText(playEpisodeLabel) and hasClickAction()).onFirst().performClick()
+            waitForStep("stream-item") {
+                compose.onAllNodes(hasText("Embedded 1080p") and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onAllNodes(hasText("Embedded 1080p") and hasClickAction()).onFirst().performClick()
+            waitForStep("player-full") { backend.createCount == 1 && sessionController.isFullScreen }
+
+            compose.runOnIdle {
+                backend.statesByHandle[1L]?.apply {
+                    loading = false
+                    paused = false
+                    positionMs = 300_000L
+                    durationMs = 1_800_000L
+                }
+            }
+            compose.mainClock.advanceTimeBy(300L)
+            compose.waitForIdle()
+
+            // 3. Minimize while playing via system Back: keeps 1 native handle alive and uncovers MetaDetailsScreen.
+            compose.runOnIdle {
+                sessionController.dispatchSystemBack()
+            }
+            compose.waitForIdle()
+            assertTrue(sessionController.isMinimized)
+            assertEquals(1, backend.createCount)
+            assertEquals(0, backend.disposeCount)
+            compose.onNodeWithTag("mini_player_dock").assertIsDisplayed()
+
+            // 4. Browse from "Active Series" to "Browsed Show" through MainAppContent's More Like This navigation.
+            val verticalListMatcher = hasScrollToNodeAction() and
+                SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange)
+            compose.onNode(verticalListMatcher).performScrollToNode(hasText("Browsed Show"))
+            compose.onAllNodes(hasText("Browsed Show") and hasClickAction()).onFirst().performClick()
+            waitForStep("browsed-detail") {
+                MetaDetailsRepository.uiState.value.meta?.id == appBrowsedSeriesId
+            }
+            compose.waitForIdle()
+
+            // 5. Save "Browsed Show" to Library and queue Season 1 download through MainAppContent's real DetailsDestination.
+            compose.onNodeWithContentDescription(text(Res.string.details_actions_menu_label)).performClick()
+            compose.waitForIdle()
+            compose.onNodeWithContentDescription(text(Res.string.hero_add_to_library)).performClick()
+            waitForStep("library-saved") { LibraryRepository.isSaved(appBrowsedSeriesId, "series") }
+
+            val seasonLabel = text(Res.string.episodes_season, 1)
+            compose.onNode(verticalListMatcher).performScrollToNode(hasText(text(Res.string.downloads_season_start)))
+            compose.onAllNodes(hasText(text(Res.string.downloads_season_start)) and hasClickAction()).onFirst().performClick()
+            compose.waitForIdle()
+            compose.onNodeWithContentDescription(text(Res.string.downloads_season_dialog_title, seasonLabel)).performClick()
+            compose.waitForIdle()
+            compose.onNode(hasText(text(Res.string.downloads_season_button)) and hasAnyAncestor(isDialog())).performClick()
+            compose.waitForIdle()
+            assertEquals(1, capturedSeasonBatches.size)
+            assertEquals(appBrowsedSeriesId, capturedSeasonBatches.single().parentMetaId)
+            assertEquals(1, capturedSeasonBatches.single().seasonNumber)
+            assertEquals(2, capturedSeasonBatches.single().episodes.size)
+
+            // 6. Navigate Back through MainAppContent to TabsRoute (Library), open DownloadsRoute, and switch to Home tab.
+            compose.onNodeWithContentDescription(text(Res.string.action_back)).performClick()
+            waitForStep("back-to-active-series") { MetaDetailsRepository.uiState.value.meta?.id == appSeriesId }
+            compose.onNodeWithContentDescription(text(Res.string.action_back)).performClick()
+            waitForStep("back-to-library") {
+                compose.onAllNodesWithText("Browsed Show").fetchSemanticsNodes().isNotEmpty()
+            }
+
+            compose.onNodeWithContentDescription(text(Res.string.compose_settings_root_downloads_title)).performClick()
+            compose.waitForIdle()
+            compose.onNodeWithContentDescription(text(Res.string.action_back)).performClick()
+            compose.waitForIdle()
+            compose.onNodeWithContentDescription(text(Res.string.compose_nav_home)).performClick()
+            leaveSidebarHover()
+
+            assertTrue(sessionController.isMinimized)
+            assertEquals(1, backend.createCount)
+            assertEquals(0, backend.disposeCount)
+
+            // 7. Reopen Full Player from MiniPlayerDock: zero new native creates and zero disposes.
+            compose.onAllNodes(hasText("Active Series") and hasAnyAncestor(hasTestTag("mini_player_dock")))
+                .onFirst()
+                .performClick()
+            compose.waitForIdle()
+            assertTrue(sessionController.isFullScreen)
+            assertEquals(1, backend.createCount)
+            assertEquals(0, backend.disposeCount)
+
+            // 8. Minimize again, switch to Settings tab, and click Switch profile: MainAppContent closes active session
+            //    (disposing the native player once) and invokes onSwitchProfile on successful close.
+            compose.runOnIdle { sessionController.minimize() }
+            compose.waitForIdle()
+            compose.onNodeWithContentDescription(text(Res.string.compose_settings_page_root)).performClick()
+            leaveSidebarHover()
+            val switchProfileTitle = text(Res.string.compose_settings_root_switch_profile_title)
+            waitForStep("settings-switch-profile") {
+                compose.onAllNodes(hasText(switchProfileTitle) and hasClickAction())
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onAllNodes(hasText(switchProfileTitle) and hasClickAction()).onFirst().performClick()
+            waitForStep("session-closed-and-profile-switched") {
+                backend.disposeCount == 1 &&
+                    !sessionController.hasActiveSession &&
+                    switchProfileCount.get() == 1
+            }
+
+            assertEquals(1, backend.createCount)
+            assertEquals(1, backend.disposeCount)
+            assertEquals(0, backend.activeHandleCount)
+            assertEquals(1, switchProfileCount.get())
+            assertFalse(ActivePlayerSessionRegistry.isActive.value)
+        } finally {
+            PlayerSettingsRepository.setExternalPlayerEnabled(previousSettings.externalPlayerEnabled)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(previousSettings.streamReuseLastLinkEnabled)
+            PlayerSettingsRepository.setStreamAutoPlayMode(previousSettings.streamAutoPlayMode)
+            SeasonDownloadDefaultsStorage.savePayload(activeProfileId, previousSeasonDefaults)
+        }
     }
 
     @Test

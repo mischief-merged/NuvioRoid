@@ -242,6 +242,7 @@ internal fun MainAppContent(
     onTabTitles: ((home: String, search: String, library: String, profile: String, switchProfile: String, addProfile: String) -> Unit)? = null,
     appGateController: AppGateController? = null,
     onRootContentReady: ((Boolean) -> Unit)? = null,
+    sessionController: PlayerSessionController? = null,
     onSwitchProfile: () -> Unit = {},
 ) {
         val navBackStack = rememberNavBackStack(navigationSavedStateConfiguration, initialRoute)
@@ -285,7 +286,7 @@ internal fun MainAppContent(
             warmProfileBoundRepositories()
         }
         val currentRoute = navBackStack.lastOrNull() as? AppRoute
-        val playerSessionController = remember { PlayerSessionController() }
+        val playerSessionController = sessionController ?: remember { PlayerSessionController() }
         DisposableEffect(playerSessionController) {
             onDispose { ActivePlayerSessionRegistry.setActive(false) }
         }
