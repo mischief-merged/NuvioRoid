@@ -171,6 +171,10 @@ internal actual object DownloadsPlatformDownloader {
         return removePathIfExists("$destinationPath.part")
     }
 
+    actual fun retirePartial(item: DownloadItem): Boolean = removePartialFile(item.fileName)
+
+    actual fun retireSupersededPartials(item: DownloadItem): Set<String> = emptySet()
+
     actual fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? {
         localFileUri?.toLocalPath()
             ?.takeIf { NSFileManager.defaultManager.fileExistsAtPath(it) }

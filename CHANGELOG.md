@@ -37,6 +37,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- An expired download link is refreshed and the same file resumes instead of starting over ([#94](https://github.com/mischief-merged/NuvioRoid/pull/94)).
 - Memory stays bounded during long sessions: caches, lists and player resources that could grow without a limit now have one, the image cache is sized from the available memory, and the app clears its caches if memory stays high ([#132](https://github.com/mischief-merged/NuvioRoid/pull/132)).
 - Finished downloaded episodes now count as watched, so automatic downloads move on to the next episodes; only episodes finished on this device count, and unwatching an episode cancels its pending removal ([#118](https://github.com/mischief-merged/NuvioRoid/pull/118)).
 - Centred the current episode in the episode page navigation trail to match the links beside it ([#42](https://github.com/mischief-merged/NuvioRoid/pull/42)).

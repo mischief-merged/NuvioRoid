@@ -1,5 +1,23 @@
 package com.nuvio.app.features.downloads
 
+internal data class RefreshedSourceLink(
+    val url: String,
+    val requestHeaders: Map<String, String> = emptyMap(),
+    val responseHeaders: Map<String, String> = emptyMap(),
+    val filename: String? = null,
+    val videoSize: Long? = null,
+)
+
+internal sealed interface SourceLinkRefreshResult {
+    data class Refreshed(val link: RefreshedSourceLink) : SourceLinkRefreshResult
+
+    /** No fresh link can be obtained for this source; fail without retrying link refresh. */
+    data object Unavailable : SourceLinkRefreshResult
+
+    /** Temporary error while resolving a fresh link; may be retried within bounds. */
+    data class Failed(val message: String? = null) : SourceLinkRefreshResult
+}
+
 internal data class DownloadPlatformRequest(
     val item: DownloadItem,
     /** Called before success is reported when the body matched a digest the server sent with it. */
@@ -20,6 +38,24 @@ internal data class DownloadPlatformRequest(
     val onPublished: (localFileUri: String, size: Long, fileKey: String?) -> Boolean = { _, _, _ -> true },
     /** Releases the publishing wait even if platform work ends before it can report a result. */
     val onFinished: () -> Unit = {},
+    /** Told the server's file validators and total size once a transfer response is accepted. */
+    val onSourceIdentityObserved: (totalBytes: Long?, eTag: String?, lastModified: String?) -> Unit = { _, _, _ -> },
+    /** Re-resolves the same source for a fresh URL when the current link returns 403/404/410. */
+    val refreshSourceLink: (suspend (DownloadItem) -> SourceLinkRefreshResult)? = null,
+    /** Told when link refresh obtained a fresh URL/headers for the same source and whether join verification is pending. */
+    val onSourceRefreshed: (link: RefreshedSourceLink, pendingVerification: Boolean) -> Unit = { _, _ -> },
+    /**
+     * Told when a refreshed link is not provably the same file as the existing partial:
+     * keeps [kept] untouched and switches the active partial to [newPartialFileName].
+     */
+    val onSwitchedToNewPartial: (newPartialFileName: String, kept: KeptPartialFile?) -> Unit = { _, _ -> },
+    /**
+     * Asked after the success callback returns. A repository that checks the published file returns
+     * true only after accepting it; rejected or interrupted completions keep their original partials.
+     */
+    val isCompletionAccepted: () -> Boolean = { true },
+    /** Told once superseded partials have been retired after the new file was accepted. */
+    val onSupersededPartialsRetired: (retiredKeys: Set<String>) -> Unit = {},
 ) {
     val sourceUrl: String get() = item.sourceUrl
     val sourceHeaders: Map<String, String> get() = item.sourceHeaders
@@ -53,6 +89,12 @@ internal expect object DownloadsPlatformDownloader {
     fun removeFile(localFileUri: String?): Boolean
 
     fun removePartialFile(destinationFileName: String): Boolean
+
+    /** Moves this download's partial files to the Trash when they are still the ones it recorded. */
+    fun retirePartial(item: DownloadItem): Boolean
+
+    /** Moves superseded partials of an accepted download to the Trash and returns their keys. */
+    fun retireSupersededPartials(item: DownloadItem): Set<String>
 
     fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String?
 

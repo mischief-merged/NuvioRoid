@@ -156,6 +156,8 @@ internal class DesktopDownloadFolders(
 
     @Volatile private var movingNow: Set<String> = emptySet()
     private val cancelRequested = AtomicBoolean(false)
+
+    internal fun moveToTrash(path: Path): Boolean = trashPath(path)
     private val moveRunning = AtomicBoolean(false)
     private val lastAvailability = java.util.concurrent.ConcurrentHashMap<String, FolderAvailability>()
     private val pollLock = Any()
@@ -204,14 +206,37 @@ internal class DesktopDownloadFolders(
      * The partial file of this download, in its own location only, goes to the Trash, never deleted outright;
      * only when no record of any profile other than this one uses it. A link is never followed.
      */
+    override fun removeActivePartialOf(item: DownloadItem): Boolean {
+        val owner = locations.ownerOf(item.locationId, item.localFileUri) ?: return false
+        if (locations.availability(owner) != FolderAvailability.Available) return false
+        return trashOwnedPartial(owner, item, item.activePartialFileName, item.partialFileKey)
+    }
+
     override fun removePartialOf(item: DownloadItem): Boolean {
         val owner = locations.ownerOf(item.locationId, item.localFileUri) ?: return false
         if (locations.availability(owner) != FolderAvailability.Available) return false
-        val partial = owner.path.resolve(item.fileName + ".part")
+        var allRemoved = trashOwnedPartial(owner, item, item.activePartialFileName, item.partialFileKey)
+        item.supersededPartials.forEach { kept ->
+            val keptOwner = locations.ownerOf(kept.locationId ?: item.locationId, null)
+            val removed = keptOwner != null &&
+                locations.availability(keptOwner) == FolderAvailability.Available &&
+                trashOwnedPartial(keptOwner, item, kept.fileName, kept.partialFileKey)
+            if (!removed) allRemoved = false
+        }
+        return allRemoved
+    }
+
+    private fun trashOwnedPartial(
+        owner: DesktopDownloadLocation,
+        item: DownloadItem,
+        fileName: String,
+        expectedKey: String?,
+    ): Boolean {
+        val partial = owner.path.resolve(fileName)
         if (!Files.exists(partial, LinkOption.NOFOLLOW_LINKS)) return true
         if (Files.isSymbolicLink(partial)) return false
         // Only the partial file this download created, proven by the identity it recorded then.
-        if (item.partialFileKey == null || DownloadMover.identityOf(partial) != item.partialFileKey) return false
+        if (expectedKey == null || DownloadMover.identityOf(partial) != expectedKey) return false
         if (ownershipOfPath(item, partial) != FileOwnership.Free) return false
         return runCatching { trashPath(partial) }.getOrDefault(false) && !Files.exists(partial, LinkOption.NOFOLLOW_LINKS)
     }
@@ -487,7 +512,7 @@ internal class DesktopDownloadFolders(
                     owner == null || locations.availability(owner) != FolderAvailability.Available -> unreachable++
                     owner.id == destination.id -> Unit
                     else -> {
-                        val partialName = item.fileName + ".part"
+                        val partialName = item.activePartialFileName
                         val partial = owner.path.resolve(partialName)
                         val targets = listOf(destination.path.resolve(partialName), destination.path.resolve(item.fileName))
                         val other = ownedBy(listOf(partial) + targets)
@@ -542,6 +567,7 @@ internal class DesktopDownloadFolders(
     internal val records: MoveRecords = object : MoveRecords {
         override fun relocate(item: MoveItem, destinationId: String): RelocateResult =
             hooks.compareAndRelocate(item.profileId, item.itemId, { it.isAsPlanned(item) }) { record ->
+                val keptLocationFallback = record.locationId ?: DownloadLocations.AppId
                 record.copy(
                     locationId = destinationId,
                     localFileUri = if (record.status == DownloadStatus.Completed) item.newUri else record.localFileUri,
@@ -551,6 +577,13 @@ internal class DesktopDownloadFolders(
                         record.partialFileKey
                     } else {
                         item.main?.takeIf { it.kind == MoveKind.Partial }?.let { it.finalKey ?: it.tempKey } ?: record.partialFileKey
+                    },
+                    supersededPartials = if (record.status == DownloadStatus.Completed || record.supersededPartials.isEmpty()) {
+                        record.supersededPartials
+                    } else {
+                        record.supersededPartials.map { kept ->
+                            if (kept.locationId == null) kept.copy(locationId = keptLocationFallback) else kept
+                        }
                     },
                 )
             }
@@ -634,7 +667,14 @@ internal class DesktopDownloadFolders(
             )
             // A location that no record of any profile and no journal names is forgotten, after a move that ended normally.
             val journalled = mover.referencedLocations()
-            val used = hooks.allRecords()?.map { locations.locationOfRecord(it.locationId, it.localFileUri).id }?.toSet()
+            val used = hooks.allRecords()?.flatMapTo(mutableSetOf()) { record ->
+                buildList {
+                    add(locations.locationOfRecord(record.locationId, record.localFileUri).id)
+                    record.supersededPartials.forEach { kept ->
+                        kept.locationId?.let { add(locations.locationOfRecord(it, null).id) }
+                    }
+                }
+            }
             if (report.problem == null && journalled != null && used != null) locations.forgetExcept(used + journalled)
             return report.copy(
                 unreachable = planned.unreachable,
