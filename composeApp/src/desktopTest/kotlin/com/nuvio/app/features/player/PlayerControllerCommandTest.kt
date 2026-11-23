@@ -3,6 +3,7 @@ package com.nuvio.app.features.player
 import androidx.compose.ui.Modifier
 import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.features.details.MetaVideo
+import com.nuvio.app.features.plugins.PluginRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,6 +22,7 @@ class PlayerControllerCommandTest {
         scope.cancel()
         PlayerStreamsRepository.stopSourcesLoading()
         PlayerStreamsRepository.clearEpisodeStreams()
+        PluginRepository.setLocalPluginSearchPaused(false)
     }
 
     private fun createRuntime(
