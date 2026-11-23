@@ -30,6 +30,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.State
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -163,11 +166,12 @@ internal fun DownloadsScreenContent(
      * source by itself: a bad source then offers only the user's own choices.
      */
     sourceSearches: kotlinx.coroutines.flow.StateFlow<Map<String, SourceSearchProgress>>? = null,
+    runtimeMinutes: (DownloadItem) -> Int? = ::runtimeMinutesOfDownload,
 ) {
     val uiState by remember {
         DownloadsRepository.ensureLoadedForDisplay()
-        DownloadsRepository.uiState
-    }.collectAsStateWithLifecycle()
+        DownloadsRepository.uiState.map { it.withoutProgress() }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = DownloadsRepository.uiState.value.withoutProgress())
     val watchProgressState by remember {
         WatchProgressRepository.ensureLoaded()
         WatchProgressRepository.uiState
@@ -176,7 +180,6 @@ internal fun DownloadsScreenContent(
         WatchedRepository.ensureLoaded()
         WatchedRepository.uiState
     }.collectAsStateWithLifecycle()
-    val speeds = rememberDownloadSpeeds(uiState.items)
     val watchStatusOf = remember(watchProgressState, watchedState) {
         { item: DownloadItem -> item.watchStatus(watchProgressState) }
     }
@@ -188,8 +191,8 @@ internal fun DownloadsScreenContent(
     LaunchedEffect(rechecks) {
         rechecks?.checkOnScreen(DownloadsRepository.uiState.value.items)
     }
-    val checkAgain: ((DownloadItem) -> Unit)? = rechecks?.let { checks ->
-        { item: DownloadItem -> checkScope.launch { checks.checkAgain(item) } }
+    val checkAgain: ((DownloadItem) -> Unit)? = remember(rechecks, checkScope) {
+        rechecks?.let { checks -> { item: DownloadItem -> checkScope.launch { checks.checkAgain(item) }; Unit } }
     }
     LaunchedEffect(uiState.completedItems.size) {
         DownloadsRepository.markCompletedSeen()
@@ -203,7 +206,7 @@ internal fun DownloadsScreenContent(
     val needsClock = anyDownloading || removalByDownload.isNotEmpty()
     // Read again every few seconds while something downloads, so a transfer that went silent shows it,
     // and while a deletion is waiting, so the hours left stay right.
-    val now by produceState(initialValue = DownloadsClock.nowEpochMs(), needsClock) {
+    val now = produceState(initialValue = DownloadsClock.nowEpochMs(), needsClock) {
         value = DownloadsClock.nowEpochMs()
         while (needsClock) {
             delay(StatusRefreshMs)
@@ -225,36 +228,63 @@ internal fun DownloadsScreenContent(
         onDispose { if (folders.supported) folders.setUsageWatched(false) }
     }
     LaunchedEffect(folders) { if (folders.supported) withContext(Dispatchers.Default) { folders.refresh() } }
-    val extras = if (folders.supported) {
-        RowExtras(
-            folderState = folderState,
-            locationIdOf = folders::locationIdOf,
-            selecting = selecting,
-            selected = selectedIds,
-            onToggleSelected = { ids ->
-                selectedIds = if (ids.all { it in selectedIds }) selectedIds - ids else selectedIds + ids
-            },
-            onMove = { ids -> moveRequest = MoveRequest.MoveItems(ids) },
-            onChooseLocation = { chooseLocationFor = it },
-            onLocateFile = { item ->
-                locateScope.launch {
-                    val picked = withContext(Dispatchers.Default) { folders.pickFile() }
-                    if (picked != null) locatePick = item to picked
-                }
-            },
-        )
-    } else {
-        null
+    val extras = remember(folders, folderState, selecting, selectedIds) {
+        if (folders.supported) {
+            RowExtras(
+                folderState = folderState,
+                locationIdOf = folders::locationIdOf,
+                selecting = selecting,
+                selected = selectedIds,
+                onToggleSelected = { ids ->
+                    selectedIds = if (ids.all { it in selectedIds }) selectedIds - ids else selectedIds + ids
+                },
+                onMove = { ids -> moveRequest = MoveRequest.MoveItems(ids) },
+                onChooseLocation = { chooseLocationFor = it },
+                onLocateFile = { item ->
+                    locateScope.launch {
+                        val picked = withContext(Dispatchers.Default) { folders.pickFile() }
+                        if (picked != null) locatePick = item to picked
+                    }
+                },
+            )
+        } else {
+            null
+        }
     }
     val holdState by connectionHold.state.collectAsStateWithLifecycle()
     val polite by politeState.collectAsStateWithLifecycle()
     val searches = sourceSearches?.collectAsStateWithLifecycle()?.value
-    val clock = RowClock(
-        nowEpochMs = now, offline = network.isOfflineLike, extras = extras, limitedBy = holdState.reason, searches = searches,
-        removals = removalByDownload, keptDownloadIds = keptDownloadIds,
-        onKeep = autoDownloads?.let { controller -> { id -> controller.keepDownload(activeProfileId, id) } },
-        onUndoKeep = autoDownloads?.let { controller -> { id -> controller.undoKeepDownload(activeProfileId, id) } },
-    )
+    val onKeep = remember(autoDownloads, activeProfileId) {
+        autoDownloads?.let { controller -> { id: String -> controller.keepDownload(activeProfileId, id) } }
+    }
+    val onUndoKeep = remember(autoDownloads, activeProfileId) {
+        autoDownloads?.let { controller -> { id: String -> controller.undoKeepDownload(activeProfileId, id) } }
+    }
+    val clock = remember(
+        now,
+        runtimeMinutes,
+        network.isOfflineLike,
+        extras,
+        holdState.reason,
+        removalByDownload,
+        keptDownloadIds,
+        onKeep,
+        onUndoKeep,
+        searches,
+    ) {
+        RowClock(
+            nowEpochMs = now,
+            runtimeMinutes = runtimeMinutes,
+            offline = network.isOfflineLike,
+            extras = extras,
+            limitedBy = holdState.reason,
+            removals = removalByDownload,
+            keptDownloadIds = keptDownloadIds,
+            onKeep = onKeep,
+            onUndoKeep = onUndoKeep,
+            searches = searches,
+        )
+    }
     // What the list builder needs is read here, in composition, once. A list builder that reads state
     // itself is run again whenever that state changes, also in the middle of a layout pass, which the
     // lazy list does not survive (an item count that changes between two lookups of one pass).
@@ -294,6 +324,17 @@ internal fun DownloadsScreenContent(
 
     PlatformBackHandler(enabled = selectedShowId != null && onBackFromShow == null) {
         selectedShowId = null
+    }
+
+    val deleteDownload: (String) -> Unit = remember { { downloadPendingDeletionId = it } }
+    val openShow: (String, String) -> Unit = remember(onNavigateToShow) {
+        { showId, title -> onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId } }
+    }
+    val completedRoot = remember(uiState.completedItems) { CompletedGroups(uiState.completedItems) }
+    val showGroups = remember(allEpisodes, selectedShowId) {
+        allEpisodes.filter { it.parentMetaId == selectedShowId }
+            .groupBy { it.seasonNumber ?: 0 }.toList()
+            .sortedWith(compareBy<Pair<Int, List<DownloadItem>>> { if (it.first == 0) 0 else 1 }.thenBy { it.first })
     }
 
     NuvioScreen {
@@ -422,8 +463,8 @@ internal fun DownloadsScreenContent(
             )
             downloadsRootContent(
                 uiState = uiState,
+                completed = completedRoot,
                 clock = clock,
-                speeds = speeds,
                 watchStatusOf = watchStatusOf,
                 onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDetails = onOpenDetails,
@@ -433,27 +474,24 @@ internal fun DownloadsScreenContent(
                 showSeasonHint = showSeasonHint,
                 onBrowse = onBrowse,
                 onOpenDownload = onOpenDownload,
-                onOpenShow = { showId, title ->
-                    onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId }
-                },
-                onDeleteDownload = { downloadPendingDeletionId = it },
+                onOpenShow = openShow,
+                onDeleteDownload = deleteDownload,
                 episodeLinks = episodeLinks,
                 unreachable = folderStateNow.unreachable,
                 onCheckAgain = checkAgain,
                 posterPatternOverride = posterPatternOverride,
             )
         } else {
-            val goodCopies = uiState.completedItems.mapTo(mutableSetOf()) { it.logicalContentKey }
+            val goodCopies = completedRoot.goodCopies
             downloadsShowContent(
                 showId = selectedShowId.orEmpty(),
-                episodes = allEpisodes,
+                seasons = showGroups,
                 clock = clock,
-                speeds = speeds,
                 watchStatusOf = watchStatusOf,
                 onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDownload = onOpenDownload,
                 onOpenDetails = onOpenDetails,
-                onDeleteDownload = { downloadPendingDeletionId = it },
+                onDeleteDownload = deleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = checkAgain,
                 goodCopies = goodCopies,
@@ -561,7 +599,8 @@ private val NoScheduledRemovals = kotlinx.coroutines.flow.MutableStateFlow(empty
 
 /** The time and network state that the rows work out their status from. */
 private data class RowClock(
-    val nowEpochMs: Long,
+    val nowEpochMs: State<Long>,
+    val runtimeMinutes: (DownloadItem) -> Int?,
     val offline: Boolean,
     val extras: RowExtras? = null,
     /** Why the connection is limited now, or null. */
@@ -637,10 +676,18 @@ private fun LocationBanner(unreachable: List<DownloadLocationInfo>) {
     }
 }
 
+private class CompletedGroups(items: List<DownloadItem>) {
+    val goodCopies = items.mapTo(mutableSetOf()) { it.logicalContentKey }
+    val movies = items.filterNot(DownloadItem::isEpisode)
+    val shows = items.filter(DownloadItem::isEpisode).groupBy { it.parentMetaId }
+        .mapNotNull { (_, episodes) -> episodes.firstOrNull()?.let { it to episodes } }
+        .sortedBy { (item, _) -> item.title.lowercase() }
+}
+
 private fun LazyListScope.downloadsRootContent(
     uiState: DownloadsUiState,
+    completed: CompletedGroups,
     clock: RowClock,
-    speeds: Map<String, Long>,
     watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
     onOpenDetails: ((DownloadItem) -> Unit)?,
@@ -665,21 +712,12 @@ private fun LazyListScope.downloadsRootContent(
     }
 
     val activeItems = uiState.activeItems
-    // The titles that have a finished download that is the video.
-    val goodCopies = uiState.completedItems.mapTo(mutableSetOf()) { it.logicalContentKey }
-    val completedMovies = uiState.completedItems.filterNot(DownloadItem::isEpisode)
-    val completedShows = uiState.completedItems
-        .filter(DownloadItem::isEpisode)
-        .groupBy { it.parentMetaId }
-        .mapNotNull { (_, episodes) ->
-            episodes.firstOrNull()?.let { first ->
-                first to episodes
-            }
-        }
-        .sortedBy { (item, _) -> item.title.lowercase() }
+    val goodCopies = completed.goodCopies
+    val completedMovies = completed.movies
+    val completedShows = completed.shows
 
     if (activeItems.isNotEmpty()) {
-        item {
+        item(key = "active-heading") {
             val hasDownloading = activeItems.any { it.status == DownloadStatus.Downloading }
             val hasResumablePaused = activeItems.any {
                 it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection
@@ -714,18 +752,14 @@ private fun LazyListScope.downloadsRootContent(
             items = activeItems,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
-                speedBytesPerSecond = speeds[item.id],
                 watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDetails = onOpenDetails,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
                 newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
@@ -735,24 +769,21 @@ private fun LazyListScope.downloadsRootContent(
     }
 
     if (completedMovies.isNotEmpty()) {
-        item {
+        item(key = "movies-heading") {
             SectionTitle(stringResource(Res.string.downloads_section_movies))
         }
         items(
             items = completedMovies,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
                 watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDetails = onOpenDetails,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 onCheckAgain = onCheckAgain,
                 posterPatternOverride = posterPatternOverride,
             )
@@ -760,7 +791,7 @@ private fun LazyListScope.downloadsRootContent(
     }
 
     if (completedShows.isNotEmpty()) {
-        item {
+        item(key = "shows-heading") {
             SectionTitle(stringResource(Res.string.downloads_section_shows))
         }
         items(
@@ -850,9 +881,8 @@ private fun LazyListScope.downloadsRootContent(
 
 private fun LazyListScope.downloadsShowContent(
     showId: String,
-    episodes: List<DownloadItem>,
+    seasons: List<Pair<Int, List<DownloadItem>>>,
     clock: RowClock,
-    speeds: Map<String, Long>,
     watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     onChooseAnotherSource: ((DownloadItem) -> Unit)?,
     onOpenDownload: (DownloadItem) -> Unit,
@@ -862,18 +892,7 @@ private fun LazyListScope.downloadsShowContent(
     onCheckAgain: ((DownloadItem) -> Unit)?,
     goodCopies: Set<String> = emptySet(),
 ) {
-    val showEpisodes = episodes
-        .filter { it.parentMetaId == showId }
-        .sortedForSeriesDownloads()
-
-    val seasons = showEpisodes
-        .groupBy { it.seasonNumber ?: 0 }
-        .toList()
-        .sortedWith(
-            compareBy<Pair<Int, List<DownloadItem>>> { (season, _) ->
-                if (season == 0) 0 else 1
-            }.thenBy { (season, _) -> if (season == 0) 0 else season },
-        )
+    val showEpisodes = seasons.flatMap { it.second }
 
     if (seasons.isEmpty()) {
         item {
@@ -896,21 +915,12 @@ private fun LazyListScope.downloadsShowContent(
     val watchedCount = showEpisodes.count { watchStatusOf(it).isWatched }
     if (watchedCount > 0) {
         item(key = "show-watched-summary") {
-            Text(
-                text = listOf(
-                    pluralStringResource(Res.plurals.downloads_episodes, showEpisodes.size, showEpisodes.size),
-                    formatBytes(showEpisodes.sumOf { it.sizeOnDiskBytes }),
-                    stringResource(Res.string.downloads_watched_count, watchedCount),
-                ).joinToString(DownloadTextSeparator),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            ShowWatchedSummary(showId = showId, episodeCount = showEpisodes.size, watchedCount = watchedCount)
         }
     }
 
     seasons.forEach { (seasonNumber, entries) ->
-        item {
+        item(key = "season-heading-$showId-$seasonNumber") {
             SectionTitle(
                 if (seasonNumber == 0) {
                     stringResource(Res.string.episodes_specials)
@@ -920,30 +930,78 @@ private fun LazyListScope.downloadsShowContent(
             )
         }
 
-        val sortedEpisodes = entries.sortedForSeriesDownloads()
-
         items(
-            items = sortedEpisodes,
+            items = entries,
             key = { it.id },
         ) { item ->
-            DownloadRow(
+            DownloadRowEntry(
                 item = item,
                 clock = clock,
-                speedBytesPerSecond = speeds[item.id],
                 watchStatus = watchStatusOf(item),
                 onChooseAnotherSource = onChooseAnotherSource,
                 onOpenDetails = onOpenDetails,
-                onOpen = { onOpenDownload(item) },
-                onPause = { DownloadsRepository.pauseDownload(item.id) },
-                onResume = { DownloadsRepository.resumeDownload(item.id) },
-                onRetry = { DownloadsRepository.retryDownload(item.id) },
-                onDelete = { onDeleteDownload(item.id) },
+                onOpenDownload = onOpenDownload,
+                onDeleteDownload = onDeleteDownload,
                 episodeLinks = episodeLinks,
                 onCheckAgain = onCheckAgain,
                 newCopyReady = item.hasBadSource && item.logicalContentKey in goodCopies,
             )
         }
     }
+}
+
+@Composable
+private fun ShowWatchedSummary(showId: String, episodeCount: Int, watchedCount: Int) {
+    val bytesOfShow: (DownloadsUiState) -> Long = remember(showId) {
+        { state -> state.items.sumOf { if (it.isEpisode && it.parentMetaId == showId) it.sizeOnDiskBytes else 0L } }
+    }
+    val bytes by remember(bytesOfShow) {
+        DownloadsRepository.uiState.map(bytesOfShow).distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = bytesOfShow(DownloadsRepository.uiState.value))
+    Text(
+        text = listOf(
+            pluralStringResource(Res.plurals.downloads_episodes, episodeCount, episodeCount),
+            formatBytes(bytes),
+            stringResource(Res.string.downloads_watched_count, watchedCount),
+        ).joinToString(DownloadTextSeparator),
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun DownloadRowEntry(
+    item: DownloadItem,
+    clock: RowClock,
+    watchStatus: DownloadWatchStatus,
+    onChooseAnotherSource: ((DownloadItem) -> Unit)?,
+    onOpenDetails: ((DownloadItem) -> Unit)?,
+    onOpenDownload: (DownloadItem) -> Unit,
+    onDeleteDownload: (String) -> Unit,
+    episodeLinks: DownloadEpisodeLinks? = null,
+    onCheckAgain: ((DownloadItem) -> Unit)? = null,
+    newCopyReady: Boolean = false,
+    posterPatternOverride: String? = null,
+) {
+    val current = if (item.status == DownloadStatus.Downloading) {
+        val progress by remember(item.id) {
+            DownloadsRepository.uiState.map { state -> state.items.firstOrNull { it.id == item.id } }.distinctUntilChanged()
+        }.collectAsStateWithLifecycle(initialValue = DownloadsRepository.uiState.value.items.firstOrNull { it.id == item.id })
+        progress ?: item
+    } else item
+    val speed = if (current.status == DownloadStatus.Downloading) rememberDownloadSpeeds(listOf(current))[current.id] else null
+    DownloadRow(
+        item = current, clock = clock, speedBytesPerSecond = speed, watchStatus = watchStatus,
+        onChooseAnotherSource = onChooseAnotherSource, onOpenDetails = onOpenDetails,
+        onOpen = remember(current, onOpenDownload) { { onOpenDownload(current) } },
+        onPause = remember(item.id) { { DownloadsRepository.pauseDownload(item.id) } },
+        onResume = remember(item.id) { { DownloadsRepository.resumeDownload(item.id) } },
+        onRetry = remember(item.id) { { DownloadsRepository.retryDownload(item.id) } },
+        onDelete = remember(item.id, onDeleteDownload) { { onDeleteDownload(item.id) } },
+        episodeLinks = episodeLinks, onCheckAgain = onCheckAgain, newCopyReady = newCopyReady,
+        posterPatternOverride = posterPatternOverride,
+    )
 }
 
 @Composable
@@ -973,9 +1031,10 @@ private fun DownloadRow(
     val availability = location?.availability ?: FolderAvailability.Available
     val reachable = availability == FolderAvailability.Available
     val isMoving = extras != null && item.id in extras.folderState.movingIds
+    val now = if (item.status == DownloadStatus.Downloading || scheduledDeletionDueAtEpochMs != null) clock.nowEpochMs.value else 0L
     val rowStatus = downloadRowStatus(
-        item, clock.nowEpochMs, clock.offline, availability, isMoving,
-        addressRequired = extras != null, runtimeMinutes = ::runtimeMinutesOfDownload, limitedBy = clock.limitedBy,
+        item, now, clock.offline, availability, isMoving,
+        addressRequired = extras != null, runtimeMinutes = clock.runtimeMinutes, limitedBy = clock.limitedBy,
     )
     val searchState = clock.searches?.let { sourceSearchRowState(item, it) }
     val skipTimesNote by produceState<DownloadCompanionsNote?>(null, item.localFileUri, item.status) {
@@ -1166,7 +1225,7 @@ private fun DownloadRow(
                         )
                     }
                     if (scheduledDeletionDueAtEpochMs != null) {
-                        val hours = removalHoursLeft(scheduledDeletionDueAtEpochMs, clock.nowEpochMs)
+                        val hours = removalHoursLeft(scheduledDeletionDueAtEpochMs, now)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 text = if (hours < 1) {

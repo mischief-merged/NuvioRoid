@@ -157,6 +157,16 @@ internal object DesktopStorage {
             changed
         }
 
+        /** Changes one value during the write's existing reload, without a second disk read. */
+        fun updateString(key: String, transform: (String?) -> String?) = change {
+            val previous = properties.getProperty(key)
+            val next = transform(previous)
+            if (next == previous) false else {
+                if (next == null) properties.remove(key) else properties.setProperty(key, next)
+                true
+            }
+        }
+
         /** Every key the store holds. */
         fun keys(): Set<String> = local {
             ensureLoaded()

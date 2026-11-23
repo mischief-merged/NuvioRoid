@@ -13,6 +13,11 @@ internal actual object DownloadsStorage {
         store.putString(ProfileScopedKey.of("downloads"), payload)
     }
 
+    actual val batchesProgress: Boolean = true
+
+    actual fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean =
+        saveDownloadProgress(store, profileId, items)
+
     actual fun loadPreviousPayload(): String? =
         store.getPreviousString(ProfileScopedKey.of("downloads"))
 
@@ -28,4 +33,13 @@ internal actual object DownloadsStorage {
     actual fun <T> withListLock(block: () -> T): T = store.exclusive(block)
 
     actual fun syncPayload(): Boolean = store.sync()
+}
+
+/** Shares the write's reload instead of re-reading the whole list before saving it. */
+internal fun saveDownloadProgress(store: DesktopStorage.Store, profileId: Int, items: List<DownloadItem>): Boolean {
+    var readable = true
+    store.updateString(ProfileScopedKey.of("downloads", profileId)) { payload ->
+        payload?.let { DownloadsCodec.withProgress(it, items).also { next -> readable = next != null } ?: payload }
+    }
+    return readable
 }

@@ -16,6 +16,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.nuvio.app.features.downloads.flushDownloadProgressOnExit
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import org.jetbrains.compose.resources.painterResource
@@ -95,6 +100,7 @@ fun main(args: Array<String>) {
     AppIconRepository.ensureLoaded()
     AutoSyncPreferencesDesktop.initialize()
     DiscordPresenceManager.start()
+    Runtime.getRuntime().addShutdownHook(Thread({ flushDownloadProgressOnExit() }, "download-exit-checkpoint"))
 
     application {
         val appIconState by AppIconRepository.state.collectAsState()
@@ -152,11 +158,19 @@ fun main(args: Array<String>) {
                 DesktopWindowModeStorage.saveSnapshot(maximized, geometry)
             }
         }
-        val closeApplication = {
-            P2pStreamingEngine.shutdown()
-            DiscordPresenceManager.shutdown()
-            SentryInitializer.close()
-            exitApplication()
+        val closeScope = rememberCoroutineScope()
+        var closing by remember { mutableStateOf(false) }
+        val closeApplication: () -> Unit = {
+            if (!closing) {
+                closing = true
+                closeScope.launch {
+                    withContext(Dispatchers.IO) { flushDownloadProgressOnExit() }
+                    P2pStreamingEngine.shutdown()
+                    DiscordPresenceManager.shutdown()
+                    SentryInitializer.close()
+                    exitApplication()
+                }
+            }
         }
         // The number of running downloads the user is being asked about, or null when no question is open.
         var askedAboutDownloads by remember { mutableStateOf<Int?>(null) }
