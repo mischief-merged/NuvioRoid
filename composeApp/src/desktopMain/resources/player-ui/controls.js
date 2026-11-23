@@ -401,6 +401,8 @@ let isScrubbing = false;
 let scrubPositionMs = 0;
 let tapTimer = 0;
 let activeModal = "";
+let activeModalFocusKey = "";
+let activeModalFocusIndex = -1;
 let pressedButton = null;
 let focusedActionCommand = "";
 let sourceFilterId = "";
@@ -1102,6 +1104,8 @@ const setModalVisibility = (modal, visible, animated = true) => {
 const closePlayerModal = (notifyDismiss = false, animated = true) => {
   const closingModal = activeModal;
   activeModal = "";
+  activeModalFocusKey = "";
+  activeModalFocusIndex = -1;
   if (closingModal) {
     send("nativeModalState", 0);
   }
@@ -1124,9 +1128,14 @@ const openPlayerModal = modal => {
     return;
   }
   const wasOpen = Boolean(activeModal);
+  const modalChanged = activeModal !== modal;
   if (activeModal === "party" && modal !== "party") onPartyModalClosed();
   if (modal === "party" && activeModal !== "party") onPartyModalOpened();
   activeModal = modal;
+  if (modalChanged) {
+    activeModalFocusKey = "";
+    activeModalFocusIndex = -1;
+  }
   if (!wasOpen) {
     send("nativeModalState", 1);
   }
@@ -1314,6 +1323,7 @@ const appendSubtitleLanguageRow = item => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `track-row subtitle-language-row${item.key === activeSubtitleLanguageKey ? " selected" : ""}`;
+  row.dataset.navKey = `sub-lang:${item.key}`;
   row.addEventListener("click", event => {
     event.stopPropagation();
     activeSubtitleLanguageKey = item.key;
@@ -1325,7 +1335,10 @@ const appendSubtitleLanguageRow = item => {
     if (event.detail === 0 && item.key !== "__off__") {
       window.requestAnimationFrame(() => {
         const firstOption = addonSubtitleList.querySelector('.track-row:not([disabled]):not([hidden])');
-        if (firstOption) firstOption.focus();
+        if (firstOption) {
+          activeModalFocusKey = firstOption.dataset.navKey || "";
+          firstOption.focus();
+        }
       });
     }
   });
@@ -1347,6 +1360,7 @@ const appendSubtitleOptionRow = option => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `track-row subtitle-option-row${selected ? " selected" : ""}`;
+  row.dataset.navKey = `sub-opt:${option.id}`;
   row.addEventListener("click", event => {
     event.stopPropagation();
     pendingSubtitleOptionId = option.id;
@@ -1396,6 +1410,7 @@ const appendSubtitleOptionsEmptyState = (label, fetch = false) => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = "track-row subtitle-fetch-row";
+  row.dataset.navKey = "sub-fetch";
   row.addEventListener("click", event => {
     event.stopPropagation();
     send("fetchAddonSubtitles", 0);
@@ -1923,11 +1938,15 @@ const renderSourceVirtualRows = () => {
       send("selectSource", Number(selected.index) || 0);
       window.setTimeout(closePlayerModal, 120);
     });
+    row.dataset.navKey = `src:${Number(item.index) || index}`;
     wrapper.appendChild(row);
     fragment.appendChild(wrapper);
     rendered.push({ index, wrapper });
   }
   sourceVirtualSpacer.appendChild(fragment);
+  if (activeModal === "sources") {
+    restoreActiveModalFocus();
+  }
 
   window.requestAnimationFrame(() => {
     let changed = false;
@@ -2010,6 +2029,7 @@ const appendEpisodeRow = (container, item) => {
   const row = document.createElement("button");
   row.type = "button";
   row.className = `track-row episode-row${item.isCurrent ? " selected" : ""}`;
+  row.dataset.navKey = `ep:${Number(item.index) || 0}`;
   if (item.isCurrent) row.setAttribute("aria-current", "true");
   row.addEventListener("click", event => {
     event.stopPropagation();
@@ -2339,6 +2359,7 @@ const renderChaptersModal = (modalOpened = false) => {
       const row = document.createElement("button");
       row.type = "button";
       row.className = "chapter-row";
+      row.dataset.navKey = `ch:${index}`;
       row.addEventListener("click", event => {
         event.stopPropagation();
         send("selectChapter", index);
@@ -2422,7 +2443,55 @@ const renderChapterMarks = () => {
   setText(chapterTitle, index >= 0 && state.chapterTitleEnabled !== false ? chapters[index].title : "");
 };
 
+const getActiveModalElement = () => {
+  if (!activeModal) return null;
+  return isPartyConfirmOpen() ? partyConfirm : modalByName[activeModal];
+};
+
+const getModalFocusableElements = modalEl => {
+  if (!modalEl) return [];
+  return Array.from(modalEl.querySelectorAll('button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])'))
+    .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+};
+
+const captureActiveModalFocus = () => {
+  const modalEl = getActiveModalElement();
+  if (!modalEl) return;
+  const active = document.activeElement;
+  if (!active || !modalEl.contains(active)) return;
+  const focusable = getModalFocusableElements(modalEl);
+  const index = focusable.indexOf(active);
+  if (index >= 0) {
+    activeModalFocusKey = active.dataset.navKey || "";
+    activeModalFocusIndex = index;
+  }
+};
+
+const resolveStoredModalFocusElement = (modalEl, focusable = getModalFocusableElements(modalEl)) => {
+  if (!modalEl || !focusable.length) return null;
+  if (activeModalFocusKey) {
+    const byKey = focusable.find(el => el.dataset.navKey === activeModalFocusKey);
+    if (byKey) return byKey;
+  }
+  if (activeModalFocusIndex >= 0) {
+    return focusable[Math.min(activeModalFocusIndex, focusable.length - 1)] || null;
+  }
+  return null;
+};
+
+const restoreActiveModalFocus = () => {
+  const modalEl = getActiveModalElement();
+  if (!modalEl || (!activeModalFocusKey && activeModalFocusIndex < 0)) return;
+  const active = document.activeElement;
+  if (active && modalEl.contains(active)) return;
+  const target = resolveStoredModalFocusElement(modalEl);
+  if (target) {
+    target.focus({ preventScroll: true });
+  }
+};
+
 const renderActiveModal = (modalOpened = false) => {
+  captureActiveModalFocus();
   if (activeModal === "audio") renderAudioTrackList();
   if (activeModal === "subtitles") renderSubtitleModal();
   if (activeModal === "speed") renderSpeedOptionList();
@@ -2433,6 +2502,7 @@ const renderActiveModal = (modalOpened = false) => {
   if (activeModal === "submitIntro") renderSubmitIntroModal();
   if (activeModal === "p2pConsent") renderP2pConsentModal();
   if (activeModal === "party") renderPartyModal();
+  restoreActiveModalFocus();
 };
 
 window.nuvioNativeViewportChanged = () => {
@@ -3667,13 +3737,23 @@ window.playerUpdate = update => {
 const handleNativeModalNavigation = action => {
   if (!activeModal) return;
   noteChromeActivity(true);
-  const modalEl = isPartyConfirmOpen() ? partyConfirm : modalByName[activeModal];
+  if (activeModal === "sources" && sourceVirtualRenderRaf) {
+    window.cancelAnimationFrame(sourceVirtualRenderRaf);
+    renderSourceVirtualRows();
+  }
+  const modalEl = getActiveModalElement();
   if (!modalEl) return;
 
   if (action === "select") {
     const active = document.activeElement;
     if (active && modalEl.contains(active) && !active.disabled && !active.hidden && (active.offsetWidth > 0 || active.offsetHeight > 0)) {
       active.click();
+      return;
+    }
+    const stored = resolveStoredModalFocusElement(modalEl);
+    if (stored) {
+      stored.focus({ preventScroll: true });
+      stored.click();
       return;
     }
     const preferred =
@@ -3731,18 +3811,22 @@ const handleNativeModalNavigation = action => {
     return;
   }
 
-  const focusable = Array.from(modalEl.querySelectorAll('button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])'))
-    .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+  const focusable = getModalFocusableElements(modalEl);
   if (!focusable.length) return;
   const activeIndex = focusable.indexOf(document.activeElement);
-  const baseIndex = activeIndex >= 0
-    ? activeIndex
+  const storedEl = activeIndex >= 0 ? null : resolveStoredModalFocusElement(modalEl, focusable);
+  const storedIndex = storedEl ? focusable.indexOf(storedEl) : -1;
+  const currentIndex = activeIndex >= 0 ? activeIndex : storedIndex;
+  const baseIndex = currentIndex >= 0
+    ? currentIndex
     : focusable.findIndex(el => el.classList.contains('selected'));
   const startIndex = baseIndex >= 0 ? baseIndex : 0;
   const nextIndex = (action === "down" || action === "right")
-    ? (activeIndex >= 0 || baseIndex >= 0 ? (startIndex + 1) % focusable.length : 0)
-    : (activeIndex >= 0 || baseIndex >= 0 ? (startIndex > 0 ? startIndex - 1 : focusable.length - 1) : focusable.length - 1);
+    ? (currentIndex >= 0 || baseIndex >= 0 ? (startIndex + 1) % focusable.length : 0)
+    : (currentIndex >= 0 || baseIndex >= 0 ? (startIndex > 0 ? startIndex - 1 : focusable.length - 1) : focusable.length - 1);
   const nextEl = focusable[nextIndex];
+  activeModalFocusKey = nextEl.dataset.navKey || "";
+  activeModalFocusIndex = nextIndex;
   nextEl.focus();
   if (typeof nextEl.scrollIntoView === "function") {
     nextEl.scrollIntoView({ block: "nearest" });
@@ -3781,9 +3865,9 @@ window.playerControls = nextState => {
   if (closeToken !== previousCloseToken) {
     closePlayerModal();
   }
-  if (modalNavToken !== previousModalNavToken && activeModal && state.modalNavigationAction) {
-    handleNativeModalNavigation(state.modalNavigationAction);
-  }
+  const pendingModalNavAction = (modalNavToken !== previousModalNavToken && activeModal && state.modalNavigationAction)
+    ? state.modalNavigationAction
+    : "";
   if (submitIntroSuccessToken !== previousSubmitIntroSuccessToken) {
     submitIntroDraft.segmentType = "intro";
     submitIntroDraft.startTime = "00:00";
@@ -3811,6 +3895,9 @@ window.playerControls = nextState => {
   }
   const preventModalAutoScrolling = activeModal === "sources" || activeModal === "episodes";
   render(preventModalAutoScrolling);
+  if (pendingModalNavAction && activeModal) {
+    handleNativeModalNavigation(pendingModalNavAction);
+  }
   if (pendingSettingToastCommand === "resize" && (state.resizeModeLabel || "") !== previousResizeLabel) {
     pendingSettingToastCommand = "";
     showPlayerToast(settingToastLabel("resize"), { icon: "icon-aspect" });
