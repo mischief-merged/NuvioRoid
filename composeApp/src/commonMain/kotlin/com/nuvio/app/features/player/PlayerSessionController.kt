@@ -6,6 +6,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import kotlin.concurrent.Volatile
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -81,6 +83,9 @@ internal object ActivePlayerSessionRegistry {
 
     fun closeActiveSessionBeforeQuit(onCompleted: () -> Unit) {
         val controller = boundController
+        // A launch still preparing subtitles has no in-app session, but it must not
+        // open the external player while the app is quitting.
+        controller?.cancelPendingExternalPlayback()
         if (controller == null || !controller.hasActiveSession) {
             onCompleted()
             return
@@ -161,6 +166,16 @@ internal class PlayerSessionController(
     var pendingReplacement by mutableStateOf<PendingPlaybackReplacement?>(null)
         private set
 
+    /**
+     * An external launch whose subtitles or skip segments are still being prepared.
+     * The in-app session is already gone during that wait, but playback is not.
+     */
+    var pendingExternalPlayback by mutableStateOf<PlayerLaunch?>(null)
+        private set
+
+    private val externalPlaybackLock = SynchronizedObject()
+    private var externalPlaybackToken = 0L
+
     private var boundLaunchId: Long? = null
     private var boundControls by mutableStateOf<PlayerSessionControls?>(null)
     private var closingLaunchId: Long? = null
@@ -170,6 +185,10 @@ internal class PlayerSessionController(
 
     val hasActiveSession: Boolean
         get() = activeSession != null
+
+    /** In-app session, or an external launch still preparing. Replacement prompts use this. */
+    val hasActivePlayback: Boolean
+        get() = activeSession != null || pendingExternalPlayback != null
 
     val isFullScreen: Boolean
         get() = activeSession?.mode == PlayerPresentationMode.Full
@@ -183,11 +202,49 @@ internal class PlayerSessionController(
     val canPlayNextEpisode: Boolean
         get() = playbackState?.nextEpisodePlayable == true && boundControls?.playNextEpisode != null
 
+    /**
+     * Marks [launch] as the playback in progress. A newer claim retires the previous one,
+     * so a subtitle or skip-segment lookup that is still running must not open afterwards.
+     */
+    fun beginExternalPlayback(launch: PlayerLaunch): Long = synchronized(externalPlaybackLock) {
+        val token = ++externalPlaybackToken
+        pendingExternalPlayback = launch
+        ActivePlayerSessionRegistry.setActive(true)
+        token
+    }
+
+    fun isCurrentExternalPlayback(token: Long): Boolean = synchronized(externalPlaybackLock) {
+        token == externalPlaybackToken && pendingExternalPlayback != null
+    }
+
+    fun cancelPendingExternalPlayback() {
+        synchronized(externalPlaybackLock) {
+            val hadPending = pendingExternalPlayback != null
+            externalPlaybackToken += 1
+            pendingExternalPlayback = null
+            if (hadPending && activeSession == null) {
+                ActivePlayerSessionRegistry.setActive(false)
+            }
+        }
+    }
+
+    fun finishExternalPlayback(token: Long) {
+        synchronized(externalPlaybackLock) {
+            if (token != externalPlaybackToken) return
+            val hadPending = pendingExternalPlayback != null
+            pendingExternalPlayback = null
+            if (hadPending && activeSession == null) {
+                ActivePlayerSessionRegistry.setActive(false)
+            }
+        }
+    }
+
     fun open(
         launch: PlayerLaunch,
         launchId: Long = PlayerLaunchStore.put(launch),
         initialFullscreen: Boolean = false,
     ): ActivePlayerSession {
+        cancelPendingExternalPlayback()
         val session = ActivePlayerSession(
             launchId = launchId,
             launch = launch,
@@ -304,10 +361,11 @@ internal class PlayerSessionController(
         onProceed: () -> Unit,
     ) {
         val current = activeSession
+        val pendingExternal = pendingExternalPlayback
         when (
             val decision = decidePlaybackLaunch(
-                activeState = playbackState,
-                activeLaunch = current?.launch,
+                activeState = if (current != null) playbackState else null,
+                activeLaunch = current?.launch ?: pendingExternal,
                 incomingTitle = incomingTitle,
                 videoId = videoId,
                 parentMetaId = parentMetaId,
@@ -317,15 +375,21 @@ internal class PlayerSessionController(
                 allowSameTargetReopen = allowSameTargetReopen,
             )
         ) {
-            ReplacePlaybackDecision.ProceedNow -> onProceed()
+            ReplacePlaybackDecision.ProceedNow -> {
+                cancelPendingExternalPlayback()
+                onProceed()
+            }
             ReplacePlaybackDecision.ReopenActive -> {
-                reopenIfMatching(
-                    videoId = videoId,
-                    parentMetaId = parentMetaId,
-                    seasonNumber = seasonNumber,
-                    episodeNumber = episodeNumber,
-                    sourceUrl = sourceUrl,
-                )
+                if (current != null) {
+                    cancelPendingExternalPlayback()
+                    reopenIfMatching(
+                        videoId = videoId,
+                        parentMetaId = parentMetaId,
+                        seasonNumber = seasonNumber,
+                        episodeNumber = episodeNumber,
+                        sourceUrl = sourceUrl,
+                    )
+                }
             }
             is ReplacePlaybackDecision.AskFirst -> {
                 pendingReplacement = PendingPlaybackReplacement(
@@ -383,6 +447,7 @@ internal class PlayerSessionController(
         val pending = pendingReplacement ?: return
         pendingReplacement = null
         val current = activeSession ?: run {
+            cancelPendingExternalPlayback()
             pending.onConfirm()
             return
         }

@@ -26,9 +26,14 @@ import com.nuvio.app.navigation.NuvioNavigator
 import com.nuvio.app.navigation.TabsRoute
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.test.StandardTestDispatcher
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.player_replace_playback_confirm
@@ -41,6 +46,7 @@ import org.junit.Rule
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -791,6 +797,228 @@ class ReplacePlaybackPromptTest {
         assertEquals(0, backend.activeHandleCount)
         assertEquals(listOf(launch.sourceUrl), externalHandoffs)
         assertEquals(395_000L, WatchProgressRepository.progressForVideo(firstVideoId)?.lastPositionMs)
+    }
+
+    @Test
+    fun waiting_external_preparation_counts_as_playing_and_a_newer_launch_cancels_it() {
+        val controller = PlayerSessionController(onExitPictureInPicture = {})
+        val opened = mutableListOf<String>()
+        val first = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/severance-external.mp4",
+        )
+        val second = sampleLaunch(
+            title = "The Bear",
+            videoId = secondVideoId,
+            parentMetaId = "tt2222222",
+            sourceUrl = "https://example.com/the-bear-external.mp4",
+        )
+        val third = sampleLaunch(
+            title = "Andor",
+            videoId = "tt3333333:1:1",
+            parentMetaId = "tt3333333",
+            sourceUrl = "https://example.com/andor.mp4",
+        )
+        val uninterrupted = sampleLaunch(
+            title = "Ripley",
+            videoId = "tt4444444:1:1",
+            parentMetaId = "tt4444444",
+            sourceUrl = "https://example.com/ripley-external.mp4",
+        )
+        var resumeFirst: (() -> Unit)? = null
+        var resumeSecond: (() -> Unit)? = null
+        var resumeUninterrupted: (() -> Unit)? = null
+        val launchScope = CoroutineScope(Dispatchers.Unconfined)
+        var secondJob: Job? = null
+        var uninterruptedJob: Job? = null
+
+        compose.setContent {
+            NuvioTheme {
+                ReplacePlaybackDialog(
+                    pending = controller.pendingReplacement,
+                    onConfirm = controller::confirmPendingReplacement,
+                    onDismiss = controller::cancelPendingReplacement,
+                )
+            }
+        }
+
+        val firstJob = launchScope.launch {
+            launchPreparedExternalPlayback(
+                sessions = controller,
+                launch = first,
+                prepare = {
+                    suspendCancellableCoroutine { cont ->
+                        resumeFirst = { if (cont.isActive) cont.resume(Unit) }
+                    }
+                },
+                open = {
+                    opened += first.sourceUrl
+                    true
+                },
+            )
+        }
+
+        try {
+            // Preparation is suspended inside the real launch helper, and nothing has opened yet.
+            assertNotNull(resumeFirst)
+            assertTrue(opened.isEmpty())
+            assertEquals(first.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+            assertTrue(controller.hasActivePlayback)
+            assertFalse(controller.hasActiveSession)
+
+            // The same target keeps the launch that is already preparing.
+            compose.runOnIdle {
+                var startedAgain = false
+                controller.launchExternalOrAskToReplace(
+                    launch = first,
+                    allowSameTargetReopen = true,
+                ) {
+                    startedAgain = true
+                }
+                assertFalse(startedAgain)
+                assertNull(controller.pendingReplacement)
+                assertEquals(first.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+            }
+
+            compose.runOnIdle {
+                controller.launchOrAskToReplace(
+                    incomingTitle = second.title,
+                    videoId = second.videoId,
+                    parentMetaId = second.parentMetaId,
+                    seasonNumber = second.seasonNumber,
+                    episodeNumber = second.episodeNumber,
+                    sourceUrl = second.sourceUrl,
+                    allowSameTargetReopen = false,
+                ) {
+                    secondJob = launchScope.launch {
+                        launchPreparedExternalPlayback(
+                            sessions = controller,
+                            launch = second,
+                            prepare = {
+                                suspendCancellableCoroutine { cont ->
+                                    resumeSecond = { if (cont.isActive) cont.resume(Unit) }
+                                }
+                            },
+                            open = {
+                                opened += second.sourceUrl
+                                true
+                            },
+                        )
+                    }
+                }
+            }
+            compose.waitForIdle()
+            compose.onNodeWithText(text(Res.string.player_replace_playback_title)).assertIsDisplayed()
+            compose.onNodeWithText("Severance (S1 E1) is currently playing. Start The Bear (S1 E1) instead?")
+                .assertIsDisplayed()
+
+            // Keep playing leaves the suspended external launch alone.
+            compose.onNodeWithText(text(Res.string.player_replace_playback_keep)).performClick()
+            compose.waitForIdle()
+            assertNull(controller.pendingReplacement)
+            assertEquals(first.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+            assertNull(secondJob)
+            assertTrue(opened.isEmpty())
+
+            // Confirming a newer external launch must retire the one still preparing.
+            compose.runOnIdle {
+                controller.launchExternalOrAskToReplace(
+                    launch = second,
+                    allowSameTargetReopen = false,
+                ) {
+                    secondJob = launchScope.launch {
+                        launchPreparedExternalPlayback(
+                            sessions = controller,
+                            launch = second,
+                            prepare = {
+                                suspendCancellableCoroutine { cont ->
+                                    resumeSecond = { if (cont.isActive) cont.resume(Unit) }
+                                }
+                            },
+                            open = {
+                                opened += second.sourceUrl
+                                true
+                            },
+                        )
+                    }
+                }
+            }
+            compose.waitForIdle()
+            compose.onNodeWithText(text(Res.string.player_replace_playback_confirm)).performClick()
+            compose.waitForIdle()
+            assertNotNull(resumeSecond)
+            assertEquals(second.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+
+            resumeFirst.invoke()
+            runBlocking { firstJob.join() }
+            assertFalse(opened.contains(first.sourceUrl))
+            assertEquals(second.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+
+            // The replacement external launch is still waiting, so an in-app title asks again.
+            compose.runOnIdle {
+                controller.launchOrAskToReplace(
+                    incomingTitle = third.title,
+                    videoId = third.videoId,
+                    parentMetaId = third.parentMetaId,
+                    seasonNumber = third.seasonNumber,
+                    episodeNumber = third.episodeNumber,
+                    sourceUrl = third.sourceUrl,
+                    allowSameTargetReopen = false,
+                ) {
+                    controller.open(launch = third, launchId = 903L)
+                }
+            }
+            compose.waitForIdle()
+            compose.onNodeWithText("The Bear (S1 E1) is currently playing. Start Andor (S1 E1) instead?")
+                .assertIsDisplayed()
+            compose.onNodeWithText(text(Res.string.player_replace_playback_confirm)).performClick()
+            compose.waitForIdle()
+            assertEquals(903L, controller.activeSession?.launchId)
+            assertNull(controller.pendingExternalPlayback)
+
+            resumeSecond.invoke()
+            runBlocking { secondJob?.join() }
+            assertTrue(opened.isEmpty())
+
+            // A prepare that nobody supersedes still opens, after the same wait.
+            controller.clearSession(903L)
+            val happyJob = launchScope.launch {
+                launchPreparedExternalPlayback(
+                    sessions = controller,
+                    launch = uninterrupted,
+                    prepare = {
+                        suspendCancellableCoroutine { cont ->
+                            resumeUninterrupted = { if (cont.isActive) cont.resume(Unit) }
+                        }
+                    },
+                    open = {
+                        opened += uninterrupted.sourceUrl
+                        true
+                    },
+                )
+            }
+            uninterruptedJob = happyJob
+            assertNotNull(resumeUninterrupted)
+            assertTrue(opened.isEmpty())
+            assertEquals(uninterrupted.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+            resumeUninterrupted.invoke()
+            runBlocking { happyJob.join() }
+            assertEquals(listOf(uninterrupted.sourceUrl), opened)
+            assertNull(controller.pendingExternalPlayback)
+            assertFalse(controller.hasActivePlayback)
+        } finally {
+            resumeFirst?.invoke()
+            resumeSecond?.invoke()
+            resumeUninterrupted?.invoke()
+            runBlocking {
+                firstJob.join()
+                secondJob?.join()
+                uninterruptedJob?.join()
+            }
+            launchScope.cancel()
+        }
     }
 
     @Test

@@ -153,6 +153,8 @@ import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerSessionController
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.SubtitleLanguageOption
+import com.nuvio.app.features.player.completeExternalPlayback
+import com.nuvio.app.features.player.launchPreparedExternalPlayback
 import com.nuvio.app.features.player.prepareExternalPlayerLaunch
 import com.nuvio.app.features.player.LockPlayerToLandscape
 import com.nuvio.app.features.player.HidePlayerSystemBars
@@ -782,19 +784,19 @@ internal fun MainAppContent(
         profileSwitchLoading,
         activeProfileIndex,
         showResumePromptOnLaunch,
-        playerSessionController.hasActiveSession,
+        playerSessionController.hasActivePlayback,
     ) {
         if (!ownsAppRuntime) return@LaunchedEffect
         if (!initialHomeReady || profileSwitchLoading) return@LaunchedEffect
         if (resumePromptItem != null) return@LaunchedEffect
-        if (playerSessionController.hasActiveSession || currentRoute is StreamRoute || currentRoute is PlayerRoute || currentRoute is PartyRoute) return@LaunchedEffect
+        if (playerSessionController.hasActivePlayback || currentRoute is StreamRoute || currentRoute is PlayerRoute || currentRoute is PartyRoute) return@LaunchedEffect
         if (showResumePromptOnLaunch) {
             resumePromptItem = ResumePromptRepository.consumeResumePrompt()
         }
     }
 
-    LaunchedEffect(currentRoute, playerSessionController.hasActiveSession) {
-        val inPlaybackFlow = playerSessionController.hasActiveSession || currentRoute is StreamRoute || currentRoute is PlayerRoute || currentRoute is PartyRoute
+    LaunchedEffect(currentRoute, playerSessionController.hasActivePlayback) {
+        val inPlaybackFlow = playerSessionController.hasActivePlayback || currentRoute is StreamRoute || currentRoute is PlayerRoute || currentRoute is PartyRoute
         if (inPlaybackFlow) {
             resumePromptItem = null
         }
@@ -869,65 +871,98 @@ internal fun MainAppContent(
             }
         }
 
+        fun externalPlaybackActions(launch: PlayerLaunch): Pair<suspend () -> Unit, suspend () -> Boolean> {
+            var request = launch.toExternalPlayerPlaybackRequest()
+            val prepare: suspend () -> Unit = {
+                val shouldForwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles &&
+                    !playerSettingsUiState.preferredSubtitleLanguage.equals(SubtitleLanguageOption.NONE, ignoreCase = true)
+                val shouldSendSkipSegments = playerSettingsUiState.externalPlayerSendSkipSegments
+                if (shouldForwardSubtitles) {
+                    StreamsRepository.setOverlayVisible(true, getString(Res.string.streams_loading_subtitles))
+                } else if (shouldSendSkipSegments) {
+                    StreamsRepository.setOverlayVisible(true, getString(Res.string.streams_loading_skip_segments))
+                }
+                try {
+                    request = prepareExternalPlayerLaunch(
+                        request = request,
+                        type = launch.contentType ?: launch.parentMetaType,
+                        videoId = launch.videoId ?: launch.parentMetaId,
+                        contentId = launch.parentMetaId,
+                        forwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles,
+                        sendSkipSegments = shouldSendSkipSegments,
+                        preferredLanguage = playerSettingsUiState.preferredSubtitleLanguage,
+                        secondaryLanguage = playerSettingsUiState.secondaryPreferredSubtitleLanguage,
+                        subtitleExtras = launch.subtitleExtras,
+                        onOverlayMessage = { message -> StreamsRepository.setOverlayVisible(true, message) },
+                    )
+                } finally {
+                    StreamsRepository.setOverlayVisible(false)
+                }
+            }
+            val open: suspend () -> Boolean = {
+                val bingeGroup = launch.bingeGroup
+                if (bingeGroup != null && launch.parentMetaId.isNotBlank()) {
+                    BingeGroupCacheRepository.save(launch.parentMetaId, bingeGroup)
+                }
+                lastExternalPlayerLaunch = launch
+                when (
+                    val intentResult = ExternalPlayerPlatform.buildIntent(
+                        request = request,
+                        playerId = playerSettingsUiState.externalPlayerId,
+                    )
+                ) {
+                    is ExternalPlayerIntentResult.Success -> {
+                        val launched = launchExternalPlayer(intentResult)
+                        if (!launched) {
+                            NuvioToastController.show(externalPlayerFailedText)
+                        }
+                        launched
+                    }
+                    ExternalPlayerIntentResult.NotConfigured -> {
+                        NuvioToastController.show(externalPlayerNotConfiguredText)
+                        false
+                    }
+                    ExternalPlayerIntentResult.Failed -> {
+                        NuvioToastController.show(externalPlayerFailedText)
+                        false
+                    }
+                }
+            }
+            return prepare to open
+        }
+
         suspend fun launchExternalPlaybackNow(launch: PlayerLaunch): Boolean {
             if (!externalPlayerSupported) return false
-
-            lastExternalPlayerLaunch = launch
-
-            val bingeGroup = launch.bingeGroup
-            if (bingeGroup != null && launch.parentMetaId.isNotBlank()) {
-                BingeGroupCacheRepository.save(launch.parentMetaId, bingeGroup)
-            }
-
-            val baseRequest = launch.toExternalPlayerPlaybackRequest()
-            val shouldForwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles &&
-                !playerSettingsUiState.preferredSubtitleLanguage.equals(SubtitleLanguageOption.NONE, ignoreCase = true)
-            val shouldSendSkipSegments = playerSettingsUiState.externalPlayerSendSkipSegments
-            if (shouldForwardSubtitles) {
-                StreamsRepository.setOverlayVisible(true, getString(Res.string.streams_loading_subtitles))
-            } else if (shouldSendSkipSegments) {
-                StreamsRepository.setOverlayVisible(true, getString(Res.string.streams_loading_skip_segments))
-            }
-            val enrichedRequest = prepareExternalPlayerLaunch(
-                request = baseRequest,
-                type = launch.contentType ?: launch.parentMetaType,
-                videoId = launch.videoId ?: launch.parentMetaId,
-                contentId = launch.parentMetaId,
-                forwardSubtitles = playerSettingsUiState.externalPlayerForwardSubtitles,
-                sendSkipSegments = shouldSendSkipSegments,
-                preferredLanguage = playerSettingsUiState.preferredSubtitleLanguage,
-                secondaryLanguage = playerSettingsUiState.secondaryPreferredSubtitleLanguage,
-                subtitleExtras = launch.subtitleExtras,
-                onOverlayMessage = { message -> StreamsRepository.setOverlayVisible(true, message) },
+            val (prepare, open) = externalPlaybackActions(launch)
+            return launchPreparedExternalPlayback(
+                sessions = playerSessionController,
+                launch = launch,
+                prepare = prepare,
+                open = open,
             )
-            StreamsRepository.setOverlayVisible(false)
-            return when (
-                val intentResult = ExternalPlayerPlatform.buildIntent(
-                    request = enrichedRequest,
-                    playerId = playerSettingsUiState.externalPlayerId,
+        }
+
+        fun startExternalPlayback(launch: PlayerLaunch) {
+            if (!externalPlayerSupported) return
+            val token = playerSessionController.beginExternalPlayback(launch)
+            val (prepare, open) = externalPlaybackActions(launch)
+            coroutineScope.launch {
+                completeExternalPlayback(
+                    sessions = playerSessionController,
+                    token = token,
+                    prepare = prepare,
+                    open = open,
                 )
-            ) {
-                is ExternalPlayerIntentResult.Success -> {
-                    val launched = launchExternalPlayer(intentResult)
-                    if (!launched) {
-                        NuvioToastController.show(externalPlayerFailedText)
-                    }
-                    launched
-                }
-                ExternalPlayerIntentResult.NotConfigured -> {
-                    NuvioToastController.show(externalPlayerNotConfiguredText)
-                    false
-                }
-                ExternalPlayerIntentResult.Failed -> {
-                    NuvioToastController.show(externalPlayerFailedText)
-                    false
+            }.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    playerSessionController.finishExternalPlayback(token)
                 }
             }
         }
 
         suspend fun openExternalPlayback(launch: PlayerLaunch): Boolean {
             if (!externalPlayerSupported) return false
-            if (playerSessionController.hasActiveSession) {
+            if (playerSessionController.hasActivePlayback) {
                 playerSessionController.launchExternalOrAskToReplace(
                     launch = launch,
                     allowSameTargetReopen = false,
@@ -935,9 +970,7 @@ internal fun MainAppContent(
                     if (navController.currentRoute is StreamRoute) {
                         navController.popBackStack()
                     }
-                    coroutineScope.launch {
-                        launchExternalPlaybackNow(launch)
-                    }
+                    startExternalPlayback(launch)
                 }
                 return true
             }
@@ -1026,7 +1059,7 @@ internal fun MainAppContent(
                     launch = playerLaunch,
                     allowSameTargetReopen = false,
                 ) {
-                    coroutineScope.launch { launchExternalPlaybackNow(playerLaunch) }
+                    startExternalPlayback(playerLaunch)
                 }
                 return
             }
@@ -1107,7 +1140,7 @@ internal fun MainAppContent(
             ) {
                 return true
             }
-            if (playerSessionController.hasActiveSession) {
+            if (playerSessionController.hasActivePlayback) {
                 playerSessionController.launchOrAskToReplace(
                     incomingTitle = file.name.ifBlank { item.name },
                     videoId = cloudVideoId,
@@ -1218,7 +1251,7 @@ internal fun MainAppContent(
                             launch = playerLaunch,
                             allowSameTargetReopen = false,
                         ) {
-                            coroutineScope.launch { launchExternalPlaybackNow(playerLaunch) }
+                            startExternalPlayback(playerLaunch)
                         }
                         return
                     }
@@ -1261,7 +1294,7 @@ internal fun MainAppContent(
                 )
             }
 
-            if (promptBeforeStreamRoute && playerSessionController.hasActiveSession) {
+            if (promptBeforeStreamRoute && playerSessionController.hasActivePlayback) {
                 playerSessionController.launchOrAskToReplace(
                     incomingTitle = title,
                     videoId = videoId,
