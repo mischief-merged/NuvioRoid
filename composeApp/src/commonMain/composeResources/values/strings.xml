@@ -2219,6 +2219,7 @@
     <string name="downloads_result_could_not_compare">Could not check: no size or running time to compare</string>
     <string name="downloads_check_again">Check again</string>
     <string name="downloads_check_again_description">Check %1$s again</string>
+    <string name="downloads_open_settings">Download settings</string>
     <string name="downloads_check_all">Check all downloads</string>
     <string name="downloads_check_all_nothing">There are no finished downloads to check.</string>
     <string name="downloads_check_all_clear">Checked your downloads. Nothing looks wrong.</string>
@@ -3224,6 +3225,8 @@
     <string name="downloads_storage_summary_spoken_no_free">Downloads use %1$s</string>
     <string name="downloads_storage_measuring">Downloads: measuring…</string>
     <string name="downloads_storage_auto">Automatic downloads: %1$s of %2$s</string>
+    <string name="downloads_storage_auto_no_limit">Automatic downloads: No limit</string>
+    <string name="downloads_storage_change_limit">Change limit</string>
     <string name="downloads_storage_auto_spoken">Automatic downloads use %1$s of %2$s</string>
     <string name="downloads_storage_show_locations">Show locations</string>
     <string name="downloads_storage_hide_locations">Hide locations</string>

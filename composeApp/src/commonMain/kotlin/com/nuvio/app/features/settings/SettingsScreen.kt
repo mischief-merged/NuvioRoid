@@ -289,6 +289,7 @@ fun SettingsScreen(
         val previousPage = page.previousPage()
 
         fun openPage(targetPage: SettingsPage) {
+            if (targetPage != SettingsPage.Playback) SettingsSectionFocus.clear()
             if (!targetPage.isEnabledByPolicy()) return
             val externalNavigator = onNavigatePage
             if (externalNavigator == null) {
@@ -378,6 +379,7 @@ fun SettingsScreen(
             val requestedPage = requestedPageName ?: return@ScreenActivityEffect
             val targetPage = runCatching { SettingsPage.valueOf(requestedPage) }.getOrNull()
             if (targetPage == null || !targetPage.isEnabledByPolicy()) {
+                SettingsSectionFocus.clear()
                 onRequestedPageConsumed()
                 return@ScreenActivityEffect
             }

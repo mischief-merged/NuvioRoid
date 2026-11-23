@@ -2,6 +2,7 @@ package com.nuvio.app.features.downloads
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
@@ -14,28 +15,29 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.features.details.components.DownloadChoiceDialog
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 
-/** A size said for a screen reader: "48.2 gigabytes". Same rounding as [formatBytes]. */
+/** A size said for a screen reader: "48.2 gigabytes". Same units and rounding as [formatBytes]. */
 @Composable
 internal fun spokenBytes(bytes: Long): String {
-    val kib = 1024.0
-    val value = bytes.toDouble()
-    fun tenth(v: Double) = ((v * 10.0).toInt() / 10.0)
-    return when {
-        bytes <= 0L -> "0 " + stringResource(Res.string.downloads_unit_bytes)
-        value >= kib * kib * kib -> "${tenth(value / (kib * kib * kib))} " + stringResource(Res.string.downloads_unit_gigabytes)
-        value >= kib * kib -> "${tenth(value / (kib * kib))} " + stringResource(Res.string.downloads_unit_megabytes)
-        value >= kib -> "${tenth(value / kib)} " + stringResource(Res.string.downloads_unit_kilobytes)
-        else -> "$bytes " + stringResource(Res.string.downloads_unit_bytes)
+    val size = decimalByteSize(bytes)
+    val unit = when (size.scale) {
+        DecimalByteScale.Bytes -> stringResource(Res.string.downloads_unit_bytes)
+        DecimalByteScale.Kilobytes -> stringResource(Res.string.downloads_unit_kilobytes)
+        DecimalByteScale.Megabytes -> stringResource(Res.string.downloads_unit_megabytes)
+        DecimalByteScale.Gigabytes -> stringResource(Res.string.downloads_unit_gigabytes)
     }
+    return "${size.amount} $unit"
 }
 
 /**
@@ -49,8 +51,16 @@ internal fun DownloadStorageSummary(
     state: DownloadFolderState,
     autoLimitGb: Int?,
     onManageLocations: (() -> Unit)?,
+    /**
+     * Changes the storage limit for automatic downloads. Null where the screen cannot: the summary
+     * then shows the usage and no control. The first argument is the profile the control was opened
+     * for, so a profile change while the picker is open does not save against the new one.
+     */
+    onChangeStorageLimit: ((profileId: Int, limitGb: Int?) -> Unit)? = null,
+    profileId: Int = 0,
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
+    var pickerProfileId by rememberSaveable { mutableStateOf<Int?>(null) }
     val used = state.totalUsedBytes
     val free = state.totalFreeBytes
     val headline = when {
@@ -78,25 +88,41 @@ internal fun DownloadStorageSummary(
                 modifier = Modifier.semantics(mergeDescendants = true) { contentDescription = spoken },
                 style = MaterialTheme.typography.titleSmall,
             )
-            if (autoLimitGb != null && autoLimitGb > 0) {
-                val limitBytes = autoLimitGb * BytesPerGigabyte
-                val autoUsed = state.autoDownloadUsedBytes
-                val fraction = (autoUsed.toDouble() / limitBytes).toFloat().coerceIn(0f, 1f)
-                val label = stringResource(Res.string.downloads_storage_auto, formatBytes(autoUsed), formatBytes(limitBytes))
-                val spokenAuto = stringResource(Res.string.downloads_storage_auto_spoken, spokenBytes(autoUsed), spokenBytes(limitBytes))
-                Text(
-                    text = label,
-                    modifier = Modifier.semantics { contentDescription = spokenAuto },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                LinearProgressIndicator(
-                    progress = fraction,
-                    modifier = Modifier.fillMaxWidth().semantics {
-                        contentDescription = spokenAuto
-                        progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
-                    },
-                )
+            if ((autoLimitGb != null && autoLimitGb > 0) || onChangeStorageLimit != null) {
+                val limitBytes = autoLimitGb?.takeIf { it > 0 }?.times(BytesPerGigabyte)
+                if (limitBytes != null) {
+                    val autoUsed = state.autoDownloadUsedBytes
+                    val fraction = (autoUsed.toDouble() / limitBytes).toFloat().coerceIn(0f, 1f)
+                    val label = stringResource(Res.string.downloads_storage_auto, formatBytes(autoUsed), formatBytes(limitBytes))
+                    val spokenAuto = stringResource(Res.string.downloads_storage_auto_spoken, spokenBytes(autoUsed), spokenBytes(limitBytes))
+                    StorageLimitLine(
+                        label = label,
+                        spoken = spokenAuto,
+                        limitGb = autoLimitGb,
+                        onChange = if (onChangeStorageLimit != null) ({ pickerProfileId = profileId }) else null,
+                    )
+                    LinearProgressIndicator(
+                        progress = fraction,
+                        modifier = Modifier.fillMaxWidth().semantics {
+                            contentDescription = spokenAuto
+                            progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+                        },
+                    )
+                } else if (onChangeStorageLimit != null) {
+                    StorageLimitLine(
+                        label = stringResource(Res.string.downloads_storage_auto_no_limit),
+                        spoken = stringResource(Res.string.downloads_storage_auto_no_limit),
+                        limitGb = autoLimitGb,
+                        onChange = { pickerProfileId = profileId },
+                    )
+                }
+                if (onChangeStorageLimit != null) {
+                    Text(
+                        text = stringResource(Res.string.downloads_auto_storage_limit_profile_description),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             if (state.inUse.size > 1) {
                 TextButton(onClick = { expanded = !expanded }) {
@@ -125,6 +151,57 @@ internal fun DownloadStorageSummary(
                         }
                     }
                 }
+            }
+        }
+    }
+    if (pickerProfileId != null && onChangeStorageLimit != null) {
+        val change = onChangeStorageLimit
+        DownloadChoiceDialog(
+            title = stringResource(Res.string.downloads_auto_storage_limit),
+            options = AutoDownloadStore.storageLimitOptionsGb,
+            selected = autoLimitGb,
+            label = { autoDownloadStorageLimitLabel(it) },
+            onSelect = { limit ->
+                change(pickerProfileId ?: profileId, limit)
+                pickerProfileId = null
+            },
+            onDismiss = { pickerProfileId = null },
+        )
+    }
+}
+
+@Composable
+private fun StorageLimitLine(
+    label: String,
+    spoken: String,
+    limitGb: Int?,
+    onChange: (() -> Unit)?,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.weight(1f).semantics { contentDescription = spoken },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (onChange != null) {
+            val title = stringResource(Res.string.downloads_auto_storage_limit)
+            val value = autoDownloadStorageLimitLabel(limitGb)
+            TextButton(
+                onClick = onChange,
+                modifier = Modifier.semantics {
+                    contentDescription = title
+                    stateDescription = value
+                },
+            ) {
+                Text(
+                    text = stringResource(Res.string.downloads_storage_change_limit),
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
         }
     }

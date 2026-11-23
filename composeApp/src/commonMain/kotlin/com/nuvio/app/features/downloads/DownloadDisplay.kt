@@ -49,15 +49,12 @@ internal fun formatTimeLeft(remainingMs: Long): String {
 }
 
 internal fun formatBytes(bytes: Long): String {
-    if (bytes <= 0L) return "0 ${localizedByteUnit("B")}"
-    val kib = 1024.0
-    val mib = kib * 1024.0
-    val gib = mib * 1024.0
-    val value = bytes.toDouble()
-    return when {
-        value >= gib -> "${((value / gib) * 10.0).toInt() / 10.0} ${localizedByteUnit("GB")}"
-        value >= mib -> "${((value / mib) * 10.0).toInt() / 10.0} ${localizedByteUnit("MB")}"
-        value >= kib -> "${((value / kib) * 10.0).toInt() / 10.0} ${localizedByteUnit("KB")}"
-        else -> "$bytes ${localizedByteUnit("B")}"
+    val size = decimalByteSize(bytes)
+    val unit = when (size.scale) {
+        DecimalByteScale.Bytes -> localizedByteUnit("B")
+        DecimalByteScale.Kilobytes -> localizedByteUnit("KB")
+        DecimalByteScale.Megabytes -> localizedByteUnit("MB")
+        DecimalByteScale.Gigabytes -> localizedByteUnit("GB")
     }
+    return "${size.amount} $unit"
 }
