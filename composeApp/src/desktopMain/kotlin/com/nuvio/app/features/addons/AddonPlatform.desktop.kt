@@ -53,6 +53,7 @@ internal val desktopHttpClient = OkHttpClient.Builder()
     .build()
 
 internal val desktopTextClient = desktopHttpClient.newBuilder().callTimeout(60, TimeUnit.SECONDS).build()
+internal val desktopHttpCalls = DesktopHttpCalls()
 
 private const val truncationSuffix = "\n...[truncated]"
 
@@ -109,16 +110,16 @@ actual suspend fun httpRequestRaw(
     bodyBytes: ByteArray?,
 ): RawHttpResponse = withContext(Dispatchers.IO) {
     val client = if (followRedirects) {
-        desktopTextClient
+        desktopHttpClient
     } else {
-        desktopTextClient.newBuilder()
+        desktopHttpClient.newBuilder()
             .followRedirects(false)
             .followSslRedirects(false)
             .build()
     }
     val request = buildDesktopRequest(method, url, headers, body, bodyBytes)
 
-    client.newCall(request).execute().use { response ->
+    desktopHttpCalls.execute(client, request) { response ->
         val limited = readResponseBodyLimited(response.body, maxResponseBodyBytes)
         RawHttpResponse(
             status = response.code,
@@ -143,18 +144,16 @@ private suspend fun executeTextRequest(
     body: String = "",
 ): String = withContext(Dispatchers.IO) {
     val request = buildDesktopRequest(method, url, headers, body)
-    desktopTextClient.newCall(request).execute().use { response ->
-        val payload = try { readResponseBody(response.body) } catch (error: ResponseTooLarge) {
-            throw IllegalStateException(getString(Res.string.network_response_too_large), error)
+    val (status, payload) = try {
+        desktopHttpCalls.execute(desktopTextClient, request) { response ->
+            response.code to readResponseBody(response.body)
         }
-        if (!response.isSuccessful) {
-            error(getString(Res.string.network_request_failed_http, response.code))
-        }
-        if (payload.isBlank()) {
-            throw IllegalStateException(getString(Res.string.network_empty_response_body))
-        }
-        payload
+    } catch (error: ResponseTooLarge) {
+        throw IllegalStateException(getString(Res.string.network_response_too_large), error)
     }
+    if (status !in 200..299) error(getString(Res.string.network_request_failed_http, status))
+    if (payload.isBlank()) throw IllegalStateException(getString(Res.string.network_empty_response_body))
+    payload
 }
 
 private fun buildDesktopRequest(

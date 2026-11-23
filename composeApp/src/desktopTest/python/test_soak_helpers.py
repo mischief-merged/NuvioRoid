@@ -57,6 +57,49 @@ class SoakHelpersTest(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("mod=0", result.stdout)
 
+    def test_empty_plan_fields_are_rejected_before_actions(self):
+        phases = "open_player switch_episode minimize restore close_player home library search start_download pause_download resume_download delete_download sign_in_check".split()
+        rows = [phase + ("\tscroll\t1\t1\t-10\t0" if phase in ("home", "library", "search")
+                         else "\tkey\t27\t-\t-\t0") for phase in phases[:-1]]
+        validation = SCRIPT[SCRIPT.index("awk -F '\\t'"):SCRIPT.index('TOKEN=$(cat')]
+        with tempfile.TemporaryDirectory() as root:
+            plan = Path(root) / "steps.tsv"
+            for command in ("info", "type"):
+                for column in (2, 3, 4):
+                    with self.subTest(command=command, column=column):
+                        fields = ["sign_in_check", command, "text" if command == "type" else "-", "-", "-", "5"]
+                        fields[column] = ""
+                        plan.write_text("\n".join(rows + ["\t".join(fields)]) + "\n")
+                        result = self.run_shell(validation, PLAN=plan)
+                        self.assertEqual(2, result.returncode, result.stderr)
+                        self.assertIn("Invalid or incomplete plan", result.stderr)
+
+    def test_info_and_type_placeholders_keep_all_six_fields(self):
+        phases = "open_player switch_episode minimize restore close_player home library search start_download pause_download resume_download delete_download sign_in_check".split()
+        rows = [phase + ("\tscroll\t1\t1\t-10\t0" if phase in ("home", "library", "search")
+                         else "\tkey\t27\t-\t-\t0") for phase in phases[:-1]]
+        rows += ["sign_in_check\tinfo\t-\t-\t-\t5", "sign_in_check\ttype\tspace in text\t-\t-\t7"]
+        validation = SCRIPT[SCRIPT.index("awk -F '\\t'"):SCRIPT.index('TOKEN=$(cat')]
+        with tempfile.TemporaryDirectory() as root:
+            plan = Path(root) / "steps.tsv"
+            plan.write_text("\n".join(rows) + "\n")
+            result = self.run_shell(validation + "\nwhile IFS=$'\\t' read -r phase command a b c settle; do "
+                                    "if [ \"$phase\" = sign_in_check ]; then printf '%s|%s|%s\\n' \"$command\" \"$a\" \"$settle\"; fi; done < \"$PLAN\"", PLAN=plan)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("info|-|5", result.stdout)
+            self.assertIn("type|space in text|7", result.stdout)
+
+    def test_numeric_arguments_use_decimal_even_with_leading_zeroes(self):
+        validation = SCRIPT[SCRIPT.index('for number in '):SCRIPT.index('HEAP_TIMEOUT=$(awk')]
+        result = self.run_shell(validation + '\nprintf "%s|%s|%s\\n" "$DURATION" "$INTERVAL" "$PID"',
+                                DURATION="00600", INTERVAL="060", PID="00123")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("600|60|123\n", result.stdout)
+
+    def test_settling_time_with_a_leading_zero_is_decimal(self):
+        result = self.run_shell(function("wait_sampled") + "\nwait_sampled 08", END="0")
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def summary(self, rss, heap, status="ok"):
         with tempfile.TemporaryDirectory() as root:
             csv = Path(root) / "samples.csv"

@@ -2,9 +2,11 @@ package com.nuvio.app.features.player
 
 import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
+import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.httpRequestRaw
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -40,24 +42,22 @@ internal object ParentalGuideRepository {
     private val log = Logger.withTag("ParentalGuide")
     private val json = Json { ignoreUnknownKeys = true }
     private val cache = BoundedCache<String, ParentalGuideResult?>()
-    private val cacheMutex = Mutex()
+    internal var requestGuide: suspend (String) -> RawHttpResponse = { id ->
+        httpRequestRaw(
+            method = "GET",
+            url = "$PARENTAL_GUIDE_BASE_URL/titles/$id/parentsGuide",
+            headers = mapOf("Accept" to "application/json"),
+            body = "",
+        )
+    }
 
     suspend fun getParentalGuide(imdbId: String): ParentalGuideResult? {
         val normalizedImdbId = extractParentalGuideImdbId(imdbId) ?: return null
 
-        cacheMutex.withLock {
-            if (cache.containsKey(normalizedImdbId)) {
-                return cache[normalizedImdbId]
-            }
-        }
+        cache.lookup(normalizedImdbId)?.let { return it.value }
 
         val result = runCatching {
-            val response = httpRequestRaw(
-                method = "GET",
-                url = "$PARENTAL_GUIDE_BASE_URL/titles/$normalizedImdbId/parentsGuide",
-                headers = mapOf("Accept" to "application/json"),
-                body = "",
-            )
+            val response = requestGuide(normalizedImdbId)
             if (response.status !in 200..299 || response.body.isBlank()) {
                 return@runCatching null
             }
@@ -65,12 +65,12 @@ internal object ParentalGuideRepository {
             val categories = body.parentsGuide
             if (categories.isEmpty()) null else mapParentalGuideCategoriesToResult(categories)
         }.onFailure { error ->
+            if (error is CancellationException) throw error
             log.w(error) { "Failed to fetch parental guide for $normalizedImdbId" }
         }.getOrNull()
 
-        cacheMutex.withLock {
-            cache[normalizedImdbId] = result
-        }
+        currentCoroutineContext().ensureActive()
+        cache[normalizedImdbId] = result
         return result
     }
 }
