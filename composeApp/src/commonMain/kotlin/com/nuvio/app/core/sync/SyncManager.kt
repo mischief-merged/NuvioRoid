@@ -27,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -256,6 +257,10 @@ internal class ProfileSyncRequestGate {
     }
 
     fun cancel() {
+        cancelAndTakeJob()
+    }
+
+    fun cancelAndTakeJob(): Job? {
         val job = synchronized(lock) {
             activeJob.also {
                 activeJob = null
@@ -264,6 +269,7 @@ internal class ProfileSyncRequestGate {
             }
         }
         job?.cancel()
+        return job
     }
 }
 
@@ -314,7 +320,25 @@ object SyncManager {
     }
 
     internal fun cancelAccountSync() {
-        syncRequestGate.cancel()
+        cancelAccountSyncJobs()
+    }
+
+    internal suspend fun cancelAccountSyncAndWait() {
+        val jobs = cancelAccountSyncJobs()
+        val callerJob = currentCoroutineContext()[Job]
+        jobs.forEach { job ->
+            if (!isJobAncestorOf(ancestor = job, child = callerJob)) {
+                job.join()
+            }
+        }
+    }
+
+    internal fun resetForTest() {
+        cancelAccountSyncJobs()
+    }
+
+    private fun cancelAccountSyncJobs(): List<Job> {
+        val gateJob = syncRequestGate.cancelAndTakeJob()
         val previousAccountJob = synchronized(accountScopeLock) {
             accountScopeJob.also {
                 accountScopeJob = SupervisorJob()
@@ -331,7 +355,15 @@ object SyncManager {
             }
         }
         foregroundJob?.cancel()
+        val periodicJob = periodicNuvioSyncPullJob
         stopPeriodicNuvioSyncPull()
+        return listOfNotNull(gateJob, previousAccountJob, foregroundJob, periodicJob)
+    }
+
+    private fun isJobAncestorOf(ancestor: Job, child: Job?): Boolean {
+        if (child == null) return false
+        if (ancestor === child) return true
+        return ancestor.children.any { directChild -> isJobAncestorOf(directChild, child) }
     }
 
     private fun accountScopeSnapshot(): CoroutineScope = synchronized(accountScopeLock) {

@@ -86,6 +86,10 @@ internal object DesktopWindowModeStorage {
  * Holds window position and size until the window has stayed still for [quietMs], then asks for
  * one save. A drag therefore writes once, when it ends, and closing the window writes whatever is
  * still waiting. A save that fails stays waiting, so a later attempt can write it.
+ * A position noted while a quiet-period save is still writing stays waiting until the window has
+ * been still. Closing writes that newer position before it returns, and waits out a save that is
+ * already running so an older position cannot land after a newer one. The note lock is not held
+ * across the write.
  */
 internal class WindowGeometryWrites(
     val quietMs: Long = 300L,
@@ -93,55 +97,105 @@ internal class WindowGeometryWrites(
     private val persist: (wasMaximized: Boolean?, geometry: DesktopWindowGeometry?) -> Unit,
 ) {
     private val wakeups = Channel<Unit>(Channel.CONFLATED)
+    private val gate = Any()
+    /** One save at a time. Held across the write; [note] does not take it. */
+    private val writer = Any()
     private var pendingMax: Boolean? = null
     private var pendingGeometry: DesktopWindowGeometry? = null
     private var notedAt = 0L
     private var dirty = false
+    private var epoch = 0L
+    /** The newest epoch that has been written. Read and written only while holding [writer]. */
+    private var publishedEpoch = 0L
 
     /** How many times a save was written. */
     var writes: Int = 0
         private set
 
+    private class Pending(
+        val epoch: Long,
+        val wasMaximized: Boolean?,
+        val geometry: DesktopWindowGeometry?,
+    )
+
     /** Wakes when a position is waiting. Nothing is sent while the window is still. */
     internal fun wakeups(): ReceiveChannel<Unit> = wakeups
 
     fun note(wasMaximized: Boolean?, geometry: DesktopWindowGeometry?, now: Long = clock()) {
-        if (wasMaximized != null) pendingMax = wasMaximized
-        if (geometry != null) pendingGeometry = geometry
-        notedAt = now
-        dirty = true
+        synchronized(gate) {
+            if (wasMaximized != null) pendingMax = wasMaximized
+            if (geometry != null) pendingGeometry = geometry
+            notedAt = now
+            dirty = true
+            epoch += 1L
+        }
         wakeups.trySend(Unit)
     }
 
     /** Milliseconds until a save is due. Null when nothing is waiting, so the saver can sleep. */
-    fun millisUntilDue(now: Long = clock()): Long? {
+    fun millisUntilDue(now: Long = clock()): Long? = synchronized(gate) {
         if (!dirty) return null
         val remaining = quietMs - (now - notedAt)
-        return if (remaining <= 0L) 0L else remaining
+        if (remaining <= 0L) 0L else remaining
     }
 
     /** Saves when [quietMs] has passed since the latest [note]. */
     fun flushIfDue(now: Long = clock()): Boolean {
-        if (!dirty || now - notedAt < quietMs) return false
-        return write()
+        val due = synchronized(gate) { dirty && now - notedAt >= quietMs }
+        if (!due) return false
+        return savePending(follow = false)
     }
 
-    /** Saves immediately. Used when the window is closing, so the last position is not dropped. */
+    /**
+     * Saves immediately, then again when a newer position arrived during the write.
+     * Used when the window is closing, so the last position is not dropped.
+     * Waits for a save that is already running, then writes the newest position.
+     */
     fun flushNow() {
-        if (!dirty) return
-        write()
+        savePending(follow = true)
     }
 
-    /** False when the save failed. The position stays waiting for another attempt. */
-    private fun write(): Boolean {
-        if (!dirty) return false
-        return try {
-            persist(pendingMax, pendingGeometry)
-            dirty = false
-            writes++
-            true
-        } catch (_: Exception) {
-            false
+    /**
+     * One writer at a time. The snapshot is taken after any earlier save has finished, and an
+     * older snapshot is not written once a newer one has landed. [follow] is the close path:
+     * it keeps writing until the newest note is the one on disk. A quiet-period save writes
+     * once and leaves a note that arrived during the write waiting.
+     */
+    private fun savePending(follow: Boolean): Boolean {
+        synchronized(writer) {
+            while (true) {
+                val pending = snapshot() ?: return true
+                if (pending.epoch <= publishedEpoch) {
+                    synchronized(gate) {
+                        if (epoch <= publishedEpoch) dirty = false
+                    }
+                    return true
+                }
+                if (!persistSnapshot(pending)) return false
+                val caughtUp = synchronized(gate) {
+                    publishedEpoch = pending.epoch
+                    if (epoch == pending.epoch) {
+                        dirty = false
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!follow || caughtUp) return true
+            }
         }
+    }
+
+    private fun snapshot(): Pending? = synchronized(gate) {
+        if (!dirty) null else Pending(epoch, pendingMax, pendingGeometry)
+    }
+
+    /** [gate] is not held while [persist] writes. A failed write leaves the position waiting. */
+    private fun persistSnapshot(pending: Pending): Boolean = try {
+        persist(pending.wasMaximized, pending.geometry)
+        synchronized(gate) { writes += 1 }
+        true
+    } catch (_: Exception) {
+        false
     }
 }

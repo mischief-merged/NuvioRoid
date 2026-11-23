@@ -79,6 +79,7 @@ object PartyRepository {
     private var channel: PartyChannel? = null
     private var sessionScope: CoroutineScope? = null
     private var sessionJob: Job? = null
+    private var sessionAuthEpoch = -1L
     private var persistJob: Job? = null
     private var presenceJob: Job? = null
     private var localPresence: PartyPresence? = null
@@ -92,7 +93,9 @@ object PartyRepository {
             AuthRepository.state.collect { auth ->
                 val signedIn = auth is AuthState.Authenticated && !auth.isAnonymous
                 if (!signedIn && _state.value.party != null) {
-                    mutex.withLock { stopSession() }
+                    mutex.withLock {
+                        if (!AuthRepository.isRemoteAccountAuthenticated()) stopSession()
+                    }
                 }
             }
         }
@@ -109,7 +112,7 @@ object PartyRepository {
         get() = available.value
 
     val canUse: Boolean
-        get() = isSupported && (AuthRepository.state.value as? AuthState.Authenticated)?.isAnonymous == false
+        get() = isSupported && AuthRepository.isRemoteAccountAuthenticated()
 
     fun nowMs(): Long = clock.nowMs()
 
@@ -137,6 +140,32 @@ object PartyRepository {
                 val party = _state.value.party ?: return@withLock
                 stopSession()
                 runRemote { PartyApi.leave(party.id, deviceId()) }
+            }
+        }
+    }
+
+    // Auth callers may already own the party mutex through an outgoing request. Cleanup belongs
+    // to this scope, never to that caller or the auth coordinator. An older cleanup cannot stop
+    // a party started after the next sign-in.
+    internal fun requestStopForSignOut() {
+        val invalidatedEpoch = AuthRepository.currentAuthEpoch()
+        scope.launch {
+            try {
+                mutex.withLock {
+                    if (sessionAuthEpoch <= invalidatedEpoch) stopSession()
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                log.w(error) { "Watch party sign-out cleanup failed" }
+            }
+        }
+    }
+
+    internal suspend fun stopForSignOut() {
+        withContext(dispatcher) {
+            mutex.withLock {
+                stopSession()
             }
         }
     }
@@ -231,10 +260,13 @@ object PartyRepository {
         if (!canUse) return PartyError.SignInRequired
         return withContext(dispatcher) {
             mutex.withLock {
+                if (!canUse) return@withLock PartyError.SignInRequired
+                val authEpoch = AuthRepository.currentAuthEpoch()
                 _state.update { it.copy(busy = true) }
                 try {
                     val sentAt = clock.mark()
                     val snapshot = request(identity())
+                    if (!canUse || AuthRepository.currentAuthEpoch() != authEpoch) return@withLock PartyError.SignInRequired
                     partyErrorOf(snapshot.error)?.let { error ->
                         if (error == PartyError.Unavailable) _enabled.value = false
                         return@withLock error
@@ -244,7 +276,8 @@ object PartyRepository {
                     stopSession()
                     clock.reset()
                     snapshot.serverTimeMs?.let { clock.addSample(it, sentAt) }
-                    startSession(party, snapshot.party?.playback)
+                    if (!canUse || AuthRepository.currentAuthEpoch() != authEpoch) return@withLock PartyError.SignInRequired
+                    startSession(party, snapshot.party?.playback, authEpoch)
                     null
                 } catch (error: CancellationException) {
                     throw error
@@ -258,7 +291,8 @@ object PartyRepository {
         }
     }
 
-    private fun startSession(party: ActiveParty, playback: PartyPlayback?) {
+    private fun startSession(party: ActiveParty, playback: PartyPlayback?, authEpoch: Long) {
+        sessionAuthEpoch = authEpoch
         val job = SupervisorJob(scope.coroutineContext[Job])
         val session = CoroutineScope(dispatcher + job)
         val partyChannel = PartyChannel(party.id, party.memberId)
@@ -603,7 +637,9 @@ object PartyRepository {
             try {
                 mutex.withLock {
                     if (_state.value.party?.id != party.id) return@withLock
+                    val authEpoch = AuthRepository.currentAuthEpoch()
                     val snapshot = runRemote { PartyApi.join(party.code, identity()) }
+                    if (!canUse || AuthRepository.currentAuthEpoch() != authEpoch) return@withLock
                     val rejoined = snapshot?.takeIf { it.error == null }?.toActiveParty()
                     if (rejoined == null) {
                         stopSession()
@@ -616,7 +652,8 @@ object PartyRepository {
                     }
                     val playback = _playback.value
                     stopSession()
-                    startSession(rejoined, playback)
+                    if (!canUse || AuthRepository.currentAuthEpoch() != authEpoch) return@withLock
+                    startSession(rejoined, playback, authEpoch)
                 }
             } finally {
                 rejoining = false

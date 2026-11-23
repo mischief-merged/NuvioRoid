@@ -42,7 +42,9 @@ import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.test.assertEquals
@@ -1159,6 +1161,183 @@ class DownloadDiskRebuildTest {
         assertEquals(partial, saved.find { it.id == partial.id }, "Recovery dropped another copy's partial download")
         assertEquals(2, saved.size)
         assertEquals(saved, DownloadsRepository.uiState.value.items)
+    }
+
+    @Test
+    fun an_archived_catalog_keeps_its_files_out_of_a_fresh_profile_on_later_scans() {
+        val appDir = world.appFolder.createDirectories()
+        val archivedVideo = appDir.resolve("ArchivedFilm_lokg51c0_1.mp4").writeVideo(1)
+        writeSidecar(archivedVideo, manifest = manifestWithSubtitles())
+        val freshVideo = appDir.resolve("FreshFilm_lokg51c0_2.mp4").writeVideo(2)
+        writeSidecar(freshVideo, manifest = manifestWithSubtitles())
+        val archived = movieItem(
+            "archived",
+            locationId = DownloadLocations.AppId,
+            file = archivedVideo,
+            bytes = Files.size(archivedVideo),
+        ).copy(fileName = archivedVideo.fileName.toString())
+        val archive = world.root.resolve("account-former-1700000000000").createDirectories()
+        DesktopStorage.Store(archive.resolve("nuvio_downloads.properties"))
+            .putString(ProfileScopedKey.of("downloads", 4), DownloadsCodec.encode(listOf(archived), null))
+        world.root.resolve("account-without-a-catalog").createDirectories()
+            .resolve("readme.txt").also { Files.writeString(it, "no download list") }
+
+        withStorageRoot {
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = payloadBackend()
+            DownloadsRepository.ensureLoaded()
+            val owned = RepositoryDownloadsHooks.allRecords()
+            assertNotNull(owned)
+            val claim = owned.single { it.fileName == archived.fileName }
+            assertEquals(ArchivedDownloadProfileId, claim.profileId)
+            assertEquals(archived.id, claim.id)
+            val ownership = DownloadOwnership(world.locations, owned)
+            assertEquals(
+                archived.id,
+                ownership.otherOwner(1, archived.id, archivedVideo)?.id,
+                "A fresh profile that reuses the download id must still see the archived file as someone else's",
+            )
+
+            val first = scanWithProductionHooks()
+            val second = scanWithProductionHooks()
+            assertEquals(listOf(freshVideo.fileName.toString()), first.recoveredItems.map { it.fileName })
+            assertEquals(listOf(freshVideo.fileName.toString()), second.recoveredItems.map { it.fileName })
+            assertTrue(first.unrecognisedFiles.none { it.fileName == archivedVideo.fileName.toString() })
+            assertTrue(second.unrecognisedFiles.none { it.fileName == archivedVideo.fileName.toString() })
+        }
+    }
+
+    @Test
+    fun an_archived_catalog_that_cannot_be_read_stops_adoption() {
+        val appDir = world.appFolder.createDirectories()
+        val archivedVideo = appDir.resolve("ArchivedFilm_lokg51c0_1.mp4").writeVideo(1)
+        writeSidecar(archivedVideo, manifest = manifestWithSubtitles())
+        val freshVideo = appDir.resolve("FreshFilm_lokg51c0_2.mp4").writeVideo(2)
+        writeSidecar(freshVideo, manifest = manifestWithSubtitles())
+
+        withStorageRoot {
+            val empty = world.root.resolve("account-empty-1700000000000").createDirectories()
+            Files.write(empty.resolve("nuvio_downloads.properties"), ByteArray(0))
+            java.util.Properties().apply {
+                setProperty(ProfileScopedKey.of("downloads", 8), DownloadsCodec.encode(emptyList(), null))
+            }.also { props ->
+                Files.newOutputStream(empty.resolve("nuvio_downloads.properties.bak")).use { props.store(it, "previous") }
+            }
+            assertTrue(scanWithProductionHooks().recoveredItems.isEmpty(), "An empty catalog was treated as no owner")
+
+            empty.toFile().deleteRecursively()
+            val broken = world.root.resolve("account-broken-1700000000000").createDirectories()
+            DesktopStorage.Store(broken.resolve("nuvio_downloads.properties"))
+                .putString(ProfileScopedKey.of("downloads", 4), "not-a-download-list")
+            assertTrue(scanWithProductionHooks().recoveredItems.isEmpty(), "A catalog that cannot be decoded was ignored")
+
+            broken.toFile().deleteRecursively()
+            val linked = world.root.resolve("account-linked-1700000000000").createDirectories()
+            Files.createSymbolicLink(
+                linked.resolve("nuvio_downloads.properties"),
+                linked.resolve("real-catalog.properties"),
+            )
+            assertTrue(scanWithProductionHooks().recoveredItems.isEmpty(), "A linked catalog was followed or skipped")
+            assertTrue(Files.exists(archivedVideo) && Files.exists(freshVideo))
+        }
+    }
+
+    @Test
+    fun an_archive_that_cannot_be_searched_stops_adoption() {
+        val appDir = world.appFolder.createDirectories()
+        val sealedVideo = appDir.resolve("SealedFilm_lokg51c0_1.mp4").writeVideo(1)
+        writeSidecar(sealedVideo, manifest = manifestWithSubtitles())
+        val freshVideo = appDir.resolve("FreshFilm_lokg51c0_2.mp4").writeVideo(2)
+        writeSidecar(freshVideo, manifest = manifestWithSubtitles())
+        val sealed = movieItem(
+            "sealed",
+            locationId = DownloadLocations.AppId,
+            file = sealedVideo,
+            bytes = Files.size(sealedVideo),
+        ).copy(fileName = sealedVideo.fileName.toString())
+        val archive = world.root.resolve("account-sealed-1700000000000").createDirectories()
+        val catalog = archive.resolve("nuvio_downloads.properties")
+        DesktopStorage.Store(catalog)
+            .putString(ProfileScopedKey.of("downloads", 4), DownloadsCodec.encode(listOf(sealed), null))
+        val previous = Files.getPosixFilePermissions(archive)
+
+        withStorageRoot {
+            try {
+                Files.setPosixFilePermissions(archive, emptySet())
+                val searchable = try {
+                    Files.readAttributes(catalog, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                    true
+                } catch (_: java.io.IOException) {
+                    false
+                }
+                assertFalse(searchable, "The archive directory can still be searched")
+                assertTrue(scanWithProductionHooks().recoveredItems.isEmpty(), "An archive that could not be searched was skipped")
+                assertTrue(Files.exists(sealedVideo) && Files.exists(freshVideo))
+            } finally {
+                Files.setPosixFilePermissions(archive, previous)
+            }
+            val rebuilt = scanWithProductionHooks()
+            assertEquals(listOf(freshVideo.fileName.toString()), rebuilt.recoveredItems.map { it.fileName })
+            assertTrue(rebuilt.recoveredItems.none { it.fileName == sealedVideo.fileName.toString() })
+            assertTrue(rebuilt.unrecognisedFiles.none { it.fileName == sealedVideo.fileName.toString() })
+        }
+    }
+
+    @Test
+    fun an_archive_without_a_catalog_still_rebuilds_an_unclaimed_file() {
+        val appDir = world.appFolder.createDirectories()
+        val freshVideo = appDir.resolve("FreshFilm_lokg51c0_1.mp4").writeVideo(1)
+        writeSidecar(freshVideo, manifest = manifestWithSubtitles())
+        world.root.resolve("account-notes-1700000000000").createDirectories()
+        val emptyListArchive = world.root.resolve("account-empty-list-1700000000000").createDirectories()
+        DesktopStorage.Store(emptyListArchive.resolve("nuvio_downloads.properties"))
+            .putString(ProfileScopedKey.of("downloads", 3), DownloadsCodec.encode(emptyList(), null))
+
+        withStorageRoot {
+            val result = scanWithProductionHooks()
+            assertEquals(listOf(freshVideo.fileName.toString()), result.recoveredItems.map { it.fileName })
+        }
+    }
+
+    private fun scanWithProductionHooks(): DiskScanResult = DesktopDownloadFolders(
+        locations = world.locations,
+        validator = world.validator,
+        mover = world.mover(),
+        hooks = RepositoryDownloadsHooks,
+        trashPath = world.trash::send,
+    ).scanDownloadsOnDisk(
+        activeProfileId = 1,
+        inMemoryItems = emptyList(),
+        nextDownloadId = { "id_$it" },
+        nowEpochMs = 1_700_000_000_000L,
+    )
+
+    private fun payloadBackend() = object : DownloadsBackend {
+        override fun loadPayload(): String? = null
+        override fun savePayload(payload: String) = Unit
+        override fun restoreItem(item: DownloadItem): DownloadItem = item
+        override fun start(
+            request: DownloadPlatformRequest,
+            onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
+            onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
+            onFailure: (message: String) -> Unit,
+            onPaused: () -> Unit,
+        ): DownloadsTaskHandle = object : DownloadsTaskHandle {
+            override fun cancel() = Unit
+        }
+        override fun removeFile(localFileUri: String?): Boolean = false
+        override fun removePartialFile(destinationFileName: String): Boolean = false
+        override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = null
+    }
+
+    private inline fun <T> withStorageRoot(block: () -> T): T {
+        DesktopStorage.setRootDirForTest(world.root, world.root.resolve("cache"))
+        try {
+            return block()
+        } finally {
+            DownloadsRepository.clearLocalState()
+            DesktopStorage.setRootDirForTest(null, null)
+        }
     }
 
 }

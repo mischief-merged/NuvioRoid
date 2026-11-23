@@ -245,6 +245,7 @@ internal class PlayerScreenRuntime(
     )
     var lastProgressPersistEpochMs by mutableStateOf(0L)
     var previousIsPlaying by mutableStateOf(false)
+    var frozenForQuit by mutableStateOf(false)
     var hasRequestedScrobbleStartForCurrentItem by mutableStateOf(false)
     var scrobbleStartRequestGeneration by mutableStateOf(0L)
     var pendingSeekScrobbleRestart by mutableStateOf(false)

@@ -1,10 +1,17 @@
 package com.nuvio.app
 
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.action_ok
 import nuvio.composeapp.generated.resources.app_already_open
+import nuvio.composeapp.generated.resources.quit_blocked_title
 import com.nuvio.app.features.autosync.AutoSyncPreferencesDesktop
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.awt.SwingWindow
 import androidx.compose.ui.configureSwingGlobalsForCompose
@@ -14,16 +21,17 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import com.nuvio.app.features.downloads.flushDownloadProgressOnExit
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import org.jetbrains.compose.resources.painterResource
+import org.jetbrains.compose.resources.stringResource
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.application
@@ -31,16 +39,20 @@ import androidx.compose.ui.window.rememberWindowState
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.deeplink.handleAppUrl
 import com.nuvio.app.core.diagnostics.SentryInitializer
+import com.nuvio.app.core.storage.DesktopAccountDataLifecycle
+import com.nuvio.app.core.storage.DesktopLifecycleUiState
+import com.nuvio.app.core.ui.NuvioStatusModal
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.core.ui.ProvideDesktopWindowInsets
+import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.core.ui.platformTouchScroll
 import com.nuvio.app.features.discordrpc.DiscordPresenceManager
-import com.nuvio.app.features.downloads.DownloadsRepository
+import com.nuvio.app.features.downloads.DownloadRechecks
 import com.nuvio.app.features.downloads.DownloadStatus
 import com.nuvio.app.features.downloads.DownloadTraffic
-import com.nuvio.app.features.downloads.DownloadRechecks
-import com.nuvio.app.features.downloads.SourceReplacements
+import com.nuvio.app.features.downloads.DownloadsRepository
 import com.nuvio.app.features.downloads.MacDownloadPowerNative
+import com.nuvio.app.features.downloads.SourceReplacements
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.plugins.configureDesktopQuickJsLibrary
 import com.nuvio.app.features.player.ActivePlayerSessionRegistry
@@ -80,7 +92,6 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import nuvio.composeapp.generated.resources.downloads_sleep_reason
-import org.jetbrains.compose.resources.stringResource
 
 private val NuvioDesktopNativeBackground = AwtColor(0x0D, 0x0D, 0x0D)
 private const val MacosDarkAquaAppearance = "NSAppearanceNameDarkAqua"
@@ -92,6 +103,7 @@ fun main(args: Array<String>) {
         showAlreadyOpen()
         return
     }
+    DesktopAccountDataLifecycle.bootstrapAndInstall()
     // On Linux, initialize GTK BEFORE AWT/Compose/Skia to prevent GdkDisplayManager
     // type registration conflict (Skiko partially loads GDK without full GTK init).
     if (System.getProperty("os.name", "").lowercase().contains("linux")) {
@@ -105,19 +117,25 @@ fun main(args: Array<String>) {
     installDesktopOpenUriHandler()
     handleDesktopLaunchArgs(args)
     preloadNativePlayerBridgeAsync()
-    // Load cached profile data synchronously so the profile color is available
-    // on the very first Compose frame (matching Android's SharedPreferences behavior).
-    ProfileRepository.loadCachedProfiles()
-    // The quality checker is ready before a fresh path can release the startup or wake hold.
-    runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
-    runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
-    // Starts settling a cut-short folder move on a background thread. The downloads list is read
-    // there, after that finishes, so neither one runs on the interface thread.
-    runCatching { com.nuvio.app.features.downloads.DesktopDownloads.install() }
     AppIconRepository.ensureLoaded()
-    AutoSyncPreferencesDesktop.initialize()
-    DiscordPresenceManager.start()
-    Runtime.getRuntime().addShutdownHook(Thread({ flushDownloadProgressOnExit() }, "download-exit-checkpoint"))
+    if (DesktopAccountDataLifecycle.uiState.value == DesktopLifecycleUiState.Ready) {
+        // Load cached profile data synchronously so the profile color is available
+        // on the very first Compose frame (matching Android's SharedPreferences behavior).
+        ProfileRepository.loadCachedProfiles()
+        // The quality checker is ready before a fresh path can release the startup or wake hold.
+        runCatching { com.nuvio.app.features.downloads.DesktopPoliteDownloads.install() }
+        runCatching { com.nuvio.app.features.downloads.DesktopLimitedConnections.install() }
+        // Settles a folder move that was cut short, before the list of downloads is read.
+        runCatching {
+            com.nuvio.app.features.downloads.DesktopDownloads.install(
+                skipInitialRecovery = DesktopAccountDataLifecycle.didArchiveOnStartup,
+            )
+        }
+        AutoSyncPreferencesDesktop.initialize()
+        DiscordPresenceManager.start()
+        // A killed process still flushes the last download progress. The window close path does the same.
+        Runtime.getRuntime().addShutdownHook(Thread({ flushDownloadProgressOnExit() }, "download-exit-checkpoint"))
+    }
 
     application {
         DisposableEffect(Unit) {
@@ -125,6 +143,10 @@ fun main(args: Array<String>) {
             onDispose { watchdog.close() }
         }
         val appIconState by AppIconRepository.state.collectAsState()
+        val lifecycleUiState by DesktopAccountDataLifecycle.uiState.collectAsState()
+        val quitError by DesktopAccountDataLifecycle.quitError.collectAsState()
+        val quitErrorTitle by DesktopAccountDataLifecycle.quitErrorTitle.collectAsState()
+        val appScope = rememberCoroutineScope()
         val smokePlayerUrl = (
             System.getProperty("nuvio.desktop.smokePlayerUrl")
                 ?: System.getenv("NUVIO_DESKTOP_SMOKE_PLAYER_URL")
@@ -188,7 +210,6 @@ fun main(args: Array<String>) {
         val keepAfterClose by BackgroundDownloadPreferences.keepAfterClose.collectAsState()
         val rechecking by DownloadRechecks.app.isRunning.collectAsState()
         val replacementSearches by SourceReplacements.progress.collectAsState()
-        val scope = rememberCoroutineScope()
         var windowVisible by remember { mutableStateOf(true) }
         var mainWindow by remember { mutableStateOf<androidx.compose.ui.awt.ComposeWindow?>(null) }
         val showWindow = {
@@ -220,24 +241,25 @@ fun main(args: Array<String>) {
         DisposableEffect(sleepGuard) {
             onDispose { sleepGuard?.close() }
         }
-        var quitting by remember { mutableStateOf(false) }
-        val quitStarted = remember { AtomicBoolean(false) }
-        val closeApplication: () -> Unit = {
-            if (quitStarted.compareAndSet(false, true)) {
-                quitting = true
-                scope.launch {
-                    DownloadsRepository.awaitFinishingDownloads()
-                    withContext(Dispatchers.IO) { flushDownloadProgressOnExit() }
-                    geometryWrites.flushNow()
-                    sleepGuard?.close()
+        // Confirmed quit still waits for the account gates and the last download save.
+        // The player session is then closed and its native shutdown is awaited before the process exits.
+        val quitCoordinator = rememberDesktopQuitCoordinator(
+            appScope = appScope,
+            onExitApplication = {
+                geometryWrites.flushNow()
+                sleepGuard?.close()
+                val closeAndExit = {
                     performDesktopQuit(exitApplication = ::exitApplication)
                 }
-            }
-        }
-        // The number of running downloads the user is being asked about, or null when no question is open.
-        var askedAboutDownloads by remember { mutableStateOf<Int?>(null) }
+                if (SwingUtilities.isEventDispatchThread()) {
+                    closeAndExit()
+                } else {
+                    SwingUtilities.invokeAndWait(closeAndExit)
+                }
+            },
+        )
         val requestExit: (Boolean) -> Unit = requestExit@{ explicitQuit ->
-            if (quitting) return@requestExit
+            if (quitCoordinator.isQuitting) return@requestExit
             val running = activeDownloadCount(DownloadsRepository.uiState.value.items)
             when (downloadCloseDecision(
                 running = running,
@@ -246,11 +268,11 @@ fun main(args: Array<String>) {
                 explicitQuit = explicitQuit,
                 backgroundWork = rechecking || replacementSearches.isNotEmpty(),
             )) {
-                DownloadCloseDecision.QuitNow -> closeApplication()
+                DownloadCloseDecision.QuitNow -> quitCoordinator.confirmQuitNow()
                 DownloadCloseDecision.HideWindow -> windowVisible = false
                 DownloadCloseDecision.AskToQuit -> {
                     showWindow()
-                    askedAboutDownloads = running
+                    quitCoordinator.askAboutQuit(running)
                 }
             }
         }
@@ -278,9 +300,9 @@ fun main(args: Array<String>) {
             DesktopDownloadTray(
                 progress = trayProgress,
                 onShow = showWindow,
-                onPause = { scope.launch(Dispatchers.IO) { DownloadsRepository.pauseActiveDownloads() }; Unit },
+                onPause = { appScope.launch(Dispatchers.IO) { DownloadsRepository.pauseActiveDownloads() }; Unit },
                 onResume = {
-                    scope.launch(Dispatchers.IO) {
+                    appScope.launch(Dispatchers.IO) {
                         DownloadsRepository.uiState.value.items.filter { it.status == DownloadStatus.Paused }
                             .forEach { DownloadsRepository.resumeDownload(it.id) }
                     }
@@ -418,18 +440,49 @@ fun main(args: Array<String>) {
                         .platformTouchScroll()
                         .macosTitleBarDoubleClick(window = window, windowState = windowState),
                 ) {
-                    ProvideDesktopWindowInsets(
-                        isFullscreen = windowState.placement == WindowPlacement.Fullscreen,
-                    ) {
-                        MiddleClickAutoscroll { App() }
-                    }
-                    askedAboutDownloads?.let { running ->
-                        AppEnvironment {
-                            QuitWithDownloadsDialog(
-                                activeDownloads = running,
-                                onQuit = closeApplication,
-                                onKeepOpen = { askedAboutDownloads = null },
-                            )
+                    when (val currentLifecycle = lifecycleUiState) {
+                        DesktopLifecycleUiState.Ready -> {
+                            ProvideDesktopWindowInsets(
+                                isFullscreen = windowState.placement == WindowPlacement.Fullscreen,
+                            ) {
+                                MiddleClickAutoscroll { App() }
+                            }
+                            quitCoordinator.askedAboutDownloads?.let { running ->
+                                AppEnvironment {
+                                    QuitWithDownloadsDialog(
+                                        activeDownloads = running,
+                                        onQuit = quitCoordinator.confirmQuitNow,
+                                        onKeepOpen = quitCoordinator.keepOpen,
+                                    )
+                                }
+                            }
+                            quitError?.let { errorMessage ->
+                                AppEnvironment {
+                                    NuvioStatusModal(
+                                        title = quitErrorTitle ?: stringResource(Res.string.quit_blocked_title),
+                                        message = errorMessage,
+                                        isVisible = true,
+                                        confirmText = stringResource(Res.string.action_ok),
+                                        onConfirm = DesktopAccountDataLifecycle::clearQuitError,
+                                    )
+                                }
+                            }
+                        }
+                        is DesktopLifecycleUiState.Blocked -> {
+                            NuvioTheme {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(MaterialTheme.nuvio.colors.background)
+                                        .padding(32.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = currentLifecycle.message,
+                                        color = MaterialTheme.nuvio.colors.textPrimary,
+                                    )
+                                }
+                            }
                         }
                     }
                 }

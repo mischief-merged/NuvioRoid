@@ -7,28 +7,35 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.sourceLabelSaysNotCached
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
+import com.nuvio.app.isDesktop
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlin.coroutines.EmptyCoroutineContext
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -42,8 +49,16 @@ import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
 
+internal data class QuitTransfersStopResult(
+    val stoppedDownloadIds: Set<String>,
+    val allSettled: Boolean,
+)
+
 object DownloadsRepository {
     private const val MaxDownloadAttempts = 3
+    internal const val DefaultQuitCancelTimeoutMs = 10_000L
+    // Frame checks on a completed file are allowed up to 120s.
+    internal const val DefaultQuitFinishingTimeoutMs = 130_000L
 
     /** How often a delete looks again when the file moved while it waited for the per-video lock. */
     private const val LockAttempts = 3
@@ -51,6 +66,7 @@ object DownloadsRepository {
     private val _uiState = MutableStateFlow(DownloadsUiState())
     val uiState: StateFlow<DownloadsUiState> = _uiState.asStateFlow()
 
+    /** Finished videos only. Progress ticks do not change this, so a screen can collect it without redrawing on every byte. */
     internal val completedItems = uiState.map { it.completedItems }.distinctUntilChanged()
 
     private val _hasUnseenCompleted = MutableStateFlow(false)
@@ -118,6 +134,12 @@ object DownloadsRepository {
     private val loadLock = SynchronizedObject()
     private val stateLock = SynchronizedObject()
 
+    @Volatile
+    internal var quitCancelTimeoutMs: Long = DefaultQuitCancelTimeoutMs
+
+    @Volatile
+    internal var quitFinishingTimeoutMs: Long = DefaultQuitFinishingTimeoutMs
+
     // One frame look at a time, including its confirming frames, across finishes and rechecks.
     private val frameProbePermit = Semaphore(1)
     private val checkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -158,6 +180,8 @@ object DownloadsRepository {
     // The transfer that currently owns each download. A transfer that was paused, replaced or removed
     // is no longer in this map, so whatever it reports afterwards is ignored.
     private val activeTransfers = mutableMapOf<String, ActiveTransfer>()
+    // Kept separately: a failed record write must survive a pause, a failed delete or a profile change.
+    private val pendingFinishedRecords = mutableMapOf<String, ActiveTransfer>()
     internal val rateTracker = DownloadRateTracker()
     @Volatile
     private var finishingSteps = DownloadFinishingSteps()
@@ -165,6 +189,11 @@ object DownloadsRepository {
     /** Stops new publications and gives work already publishing or verifying a bounded time to save. */
     internal suspend fun awaitFinishingDownloads(timeoutMs: Long = 10_000L): Boolean =
         finishingSteps.awaitForQuit(timeoutMs)
+
+    /** A quit that stays open must accept publications again. Work already finishing keeps its place. */
+    internal fun reopenFinishingAfterAbortedQuit() {
+        finishingSteps.reopen()
+    }
     @kotlin.concurrent.Volatile
     private var hasLoaded = false
 
@@ -281,7 +310,11 @@ object DownloadsRepository {
         saved
     }
 
-    /** Stops byte callbacks before the final checkpoint, keeping running records resumable. */
+    /**
+     * Stops byte callbacks before the final checkpoint, keeping running records resumable.
+     * A transfer whose file is already complete stays registered: the quit gate waits for that check,
+     * and cancelling it here would drop the file.
+     */
     internal suspend fun prepareForQuit(): Boolean {
         val stopped = synchronized(stateLock) {
             activeTransfers.filterValues { !it.finishing }.toMap().also { transfers ->
@@ -293,6 +326,10 @@ object DownloadsRepository {
         }
         stopped.forEach(ActiveTransfer::cancel)
         return flushProgress()
+    }
+
+    internal fun hasActiveTransferForTest(downloadId: String): Boolean = synchronized(stateLock) {
+        downloadId in activeTransfers
     }
 
     fun ensureLoaded() {
@@ -340,12 +377,18 @@ object DownloadsRepository {
         val transfers = activeTransfers.values.toList()
         activeTransfers.clear()
         checkingTransfers.clear()
+        pendingFinishedRecords.clear()
         rateTracker.clearAll()
         finishingSteps = DownloadFinishingSteps()
-        transfers.forEach(ActiveTransfer::cancel)
+        transfers.forEach {
+            it.cancel()
+            it.markFinished()
+        }
         progressJob?.cancel()
         progressJob = null
         pendingProgress.clear()
+        quitCancelTimeoutMs = DefaultQuitCancelTimeoutMs
+        quitFinishingTimeoutMs = DefaultQuitFinishingTimeoutMs
         hasLoaded = false
         catalogLoadingThread = null
         loadedProfileId = null
@@ -937,14 +980,14 @@ object DownloadsRepository {
     internal fun markNoWorkingSourceFound(titleKey: String) {
         ensureLoaded()
         synchronized(stateLock) {
-            val items = _uiState.value.items
-            if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
-            publish(
-                items.map { item ->
-                    if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
-                },
-            )
-            persist()
+        val items = _uiState.value.items
+        if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
+        publish(
+            items.map { item ->
+                if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
+            },
+        )
+        persist()
         }
     }
 
@@ -978,6 +1021,121 @@ object DownloadsRepository {
             .filter { it.status == DownloadStatus.Downloading }
             .map { it.id }
             .forEach(::pauseDownload)
+    }
+
+    internal suspend fun stopActiveTransfersForQuit(
+        cancelTimeoutMs: Long = quitCancelTimeoutMs,
+        finishingTimeoutMs: Long = quitFinishingTimeoutMs,
+    ): QuitTransfersStopResult = withContext(Dispatchers.IO) {
+        // Refuse a new publication first, and let one that already started save. Cancelling it would drop the file.
+        // A publication that misses this deadline still blocks the quit. The other transfers are settled anyway,
+        // so one stuck check does not leave a download that will not cancel running.
+        val publicationsSettled = awaitFinishingDownloads(finishingTimeoutMs)
+        // That wait is the one deadline for a check already running. Do not start another full wait for it.
+        val finishingWaitMs = if (publicationsSettled) finishingTimeoutMs else 0L
+        val (cancelling, finishing) = synchronized(stateLock) {
+            val toCancel = mutableListOf<Triple<String, ActiveTransfer, Boolean>>()
+            val toAwait = mutableListOf<Pair<String, ActiveTransfer>>()
+            val statusById = _uiState.value.items.associate { it.id to it.status }
+            val iterator = activeTransfers.entries.iterator()
+            while (iterator.hasNext()) {
+                val (id, transfer) = iterator.next()
+                // A file that is being checked or whose record is still unsaved stays registered.
+                if (transfer.finishing || checkingTransfers[id] === transfer) {
+                    toAwait += id to transfer
+                } else {
+                    iterator.remove()
+                    toCancel += Triple(id, transfer, statusById[id] == DownloadStatus.Downloading)
+                }
+            }
+            toCancel to toAwait
+        }
+
+        val cancelOutcomes = coroutineScope {
+            cancelling.map { (id, transfer, wasDownloading) ->
+                async {
+                    val stoppedCleanly = runCatching { transfer.cancelAndWait(cancelTimeoutMs) }.getOrDefault(false)
+                    Triple(id, wasDownloading, stoppedCleanly)
+                }
+            }.awaitAll()
+        }
+
+        val cleanlyStoppedIds = LinkedHashSet<String>()
+        val timedOutCancelIds = LinkedHashSet<String>()
+        var allCancelled = true
+        for ((id, wasDownloading, stoppedCleanly) in cancelOutcomes) {
+            if (!stoppedCleanly) {
+                allCancelled = false
+                if (wasDownloading) timedOutCancelIds += id
+            } else if (wasDownloading) {
+                cleanlyStoppedIds += id
+            }
+        }
+
+        if (timedOutCancelIds.isNotEmpty()) {
+            synchronized(stateLock) {
+                timedOutCancelIds.forEach { id ->
+                    if (id !in activeTransfers) {
+                        mutateItem(id) { item ->
+                            if (item.status != DownloadStatus.Downloading) {
+                                item
+                            } else {
+                                item.copy(
+                                    status = DownloadStatus.Paused,
+                                    pausedByFolder = false,
+                                    pausedByConnection = false,
+                                    errorMessage = null,
+                                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val allFinishingSettled = coroutineScope {
+            finishing.map { (id, transfer) ->
+                async {
+                    transfer.awaitFinished(finishingWaitMs) && saveFinishedRecord(id, transfer)
+                }
+            }.awaitAll().all { it }
+        }
+
+        val additionalPending = synchronized(stateLock) {
+            val awaitedIds = finishing.mapTo(mutableSetOf()) { it.first }
+            pendingFinishedRecords.entries.filter { it.key !in awaitedIds }.map { it.key to it.value }
+        }
+        val allPendingSaved = additionalPending.map { (id, transfer) -> saveFinishedRecord(id, transfer) }.all { it }
+        val noPendingWrites = synchronized(stateLock) { pendingFinishedRecords.isEmpty() }
+        QuitTransfersStopResult(
+            stoppedDownloadIds = cleanlyStoppedIds,
+            allSettled = publicationsSettled && allCancelled && allFinishingSettled && allPendingSaved && noPendingWrites,
+        )
+    }
+
+    internal fun restoreTransfersAfterAbortedQuit(stoppedIds: Set<String>): Unit = synchronized(stateLock) {
+        if (!hasLoaded || stoppedIds.isEmpty()) return
+        stoppedIds.forEach { id ->
+            val current = _uiState.value.items.firstOrNull { it.id == id } ?: return@forEach
+            if (current.status != DownloadStatus.Downloading || id in activeTransfers) return@forEach
+            val resumed = runCatching { startDownload(current) }
+            if (resumed.isFailure) {
+                mutateItem(id) { item ->
+                    if (item.status != DownloadStatus.Downloading) {
+                        item
+                    } else {
+                        item.copy(
+                            status = DownloadStatus.Paused,
+                            pausedByFolder = false,
+                            pausedByConnection = false,
+                            errorMessage = null,
+                            updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fun resumePausedDownloads() {
@@ -1064,22 +1222,22 @@ object DownloadsRepository {
     fun clearFailed(): Int {
         ensureLoaded()
         return synchronized(stateLock) {
-            // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
-            val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && it.localFileUri == null && backend.isConnected(it) }
-                .filter { ItemLocks.tryAcquire(it.id) }
-            if (failed.isEmpty()) return 0
-            try {
-                failed.forEach { item ->
-                    removeTransfer(item.id)?.cancel()
-                    backend.removePartialOf(item)
-                }
-                val ids = failed.mapTo(mutableSetOf()) { it.id }
-                publish(_uiState.value.items.filterNot { it.id in ids })
-                persist()
-            } finally {
-                failed.forEach { ItemLocks.release(it.id) }
+        // A failed download on a location that is away is left alone: its partial file cannot be cleaned up now.
+        val failed = _uiState.value.items.filter { it.status == DownloadStatus.Failed && it.localFileUri == null && backend.isConnected(it) }
+            .filter { ItemLocks.tryAcquire(it.id) }
+        if (failed.isEmpty()) return 0
+        try {
+            failed.forEach { item ->
+                removeTransfer(item.id)?.cancel()
+                backend.removePartialOf(item)
             }
-            failed.size
+            val ids = failed.mapTo(mutableSetOf()) { it.id }
+            publish(_uiState.value.items.filterNot { it.id in ids })
+            persist()
+        } finally {
+            failed.forEach { ItemLocks.release(it.id) }
+        }
+        failed.size
         }
     }
 
@@ -1102,44 +1260,44 @@ object DownloadsRepository {
     internal fun rejectBatchSource(downloadId: String) {
         ensureLoaded()
         synchronized(stateLock) {
-            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-            if (item.status != DownloadStatus.Completed && item.status != DownloadStatus.Downloading) return
-            removeTransfer(downloadId)?.cancel()
-            mutateItem(downloadId) { current ->
-                current.copy(
-                    status = if (current.status == DownloadStatus.Completed) DownloadStatus.Completed else DownloadStatus.Failed,
-                    failureKind = DownloadFailureKind.BadFile,
-                    errorMessage = current.errorMessage ?: runBlocking { getString(Res.string.downloads_source_rejected) },
-                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                )
-            }
+        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+        if (item.status != DownloadStatus.Completed && item.status != DownloadStatus.Downloading) return
+        removeTransfer(downloadId)?.cancel()
+        mutateItem(downloadId) { current ->
+            current.copy(
+                status = if (current.status == DownloadStatus.Completed) DownloadStatus.Completed else DownloadStatus.Failed,
+                failureKind = DownloadFailureKind.BadFile,
+                errorMessage = current.errorMessage ?: runBlocking { getString(Res.string.downloads_source_rejected) },
+                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+            )
+        }
         }
     }
 
     fun cancelDownload(downloadId: String) {
         ensureLoaded()
         synchronized(stateLock) {
-            val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-            // On a location that is away, or while a move has the item, nothing is cancelled or removed.
-            if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
-            try {
-                backend.withListLock {
-                    val fileUri = playableLocalFileUri(item) ?: item.localFileUri
-                    // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
-                    val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
-                    if (used == null) return@withListLock
-                    removeTransfer(downloadId)?.cancel()
-                    // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
-                    if (!removeRecordDurably(item)) return@withListLock
-                    if (fileUri != null && !used && !backend.discardFile(fileUri)) {
-                        restoreRecord(item)
-                        return@withListLock
-                    }
-                    backend.removePartialOf(item)
+        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+        // On a location that is away, or while a move has the item, nothing is cancelled or removed.
+        if (!backend.isConnected(item) || !ItemLocks.tryAcquire(downloadId)) return
+        try {
+            backend.withListLock {
+                val fileUri = playableLocalFileUri(item) ?: item.localFileUri
+                // A file another record of any profile uses stays; one that cannot be told stays, and so does the entry.
+                val used = fileUri?.let { usedByAnother(item, _uiState.value.items, it) } ?: false
+                if (used == null) return@withListLock
+                removeTransfer(downloadId)?.cancel()
+                // The record goes first, durably; then the file. A failure after that leaves a file, never a dangling record.
+                if (!removeRecordDurably(item)) return@withListLock
+                if (fileUri != null && !used && !backend.discardFile(fileUri)) {
+                    restoreRecord(item)
+                    return@withListLock
                 }
-            } finally {
-                ItemLocks.release(downloadId)
+                backend.removePartialOf(item)
             }
+        } finally {
+            ItemLocks.release(downloadId)
+        }
         }
     }
 
@@ -1508,7 +1666,6 @@ object DownloadsRepository {
             removeTransfer(id)?.cancel()
         }
         hasLoaded = false
-        catalogLoadingThread = null
         loadedProfileId = null
         catalogGeneration += 1L
         pendingTripRecovery = null
@@ -1771,7 +1928,10 @@ object DownloadsRepository {
                             }
                         }
                     }
-                } finally { finishing.end(transfer) }
+                } finally {
+                    finishing.end(transfer)
+                    transfer.markFinished()
+                }
             },
             {
                 try {
@@ -1786,7 +1946,10 @@ object DownloadsRepository {
                             current.copy(status = DownloadStatus.Paused, errorMessage = null, pausedByFolder = backend.heldByFolder(current))
                         }
                     }
-                } finally { finishing.end(transfer) }
+                } finally {
+                    finishing.end(transfer)
+                    transfer.markFinished()
+                }
             },
         )
         transfer.attach(handle)
@@ -1819,20 +1982,33 @@ object DownloadsRepository {
         retireSupersededOnAccept: Boolean = false,
         transferProfileId: Int? = loadedProfileId,
     ) {
-        transfer.finishing = true
+        val owns = synchronized(stateLock) {
+            (activeTransfers[item.id] === transfer).also { if (it) transfer.finishing = true }
+        }
+        if (!owns) return
         try {
-            val saved = synchronized(stateLock) {
-                if (activeTransfers[item.id] !== transfer) return
-                val current = _uiState.value.items.firstOrNull { it.id == item.id } ?: return
-                if (current.awaitingCheck && current.localFileUri == localFileUri) true
-                else rememberPublished(item.id, transfer, localFileUri, totalBytes)
+            if (!isDesktop) {
+                val saved = synchronized(stateLock) {
+                    if (activeTransfers[item.id] !== transfer) return
+                    val current = _uiState.value.items.firstOrNull { it.id == item.id } ?: return
+                    if (current.awaitingCheck && current.localFileUri == localFileUri) true
+                    else rememberPublished(item.id, transfer, localFileUri, totalBytes)
+                }
+                if (!saved) return
             }
-            if (!saved) return
-            finishCheckedTransfer(item, transfer, localFileUri, totalBytes, retireSupersededOnAccept, transferProfileId)
+            finishCheckedTransfer(
+                item,
+                transfer,
+                localFileUri,
+                totalBytes,
+                retireSupersededOnAccept,
+                transferProfileId,
+            )
         } catch (_: CancellationException) {
             // The saved final address stays available for the next check after a pause or quit.
         } finally {
             synchronized(stateLock) { clearCheck(item.id, transfer) }
+            transfer.markFinished()
         }
     }
 
@@ -1851,6 +2027,24 @@ object DownloadsRepository {
             // Its network transfer is over. A season may use that slot while the file is checked.
             checkingTransfers[item.id] = transfer
             _uiState.update { it.copy(checkingIds = it.checkingIds + item.id) }
+            // The address has to be visible before the file is inspected. A pause during that
+            // inspection keeps it. The durable write waits until after this lock, and on the fast
+            // path until the completed row is shown, so a blocked store does not hold this lock.
+            if (isDesktop) {
+                val current = _uiState.value.items.firstOrNull { it.id == item.id }
+                if (
+                    current != null &&
+                    current.status == DownloadStatus.Downloading &&
+                    (!current.awaitingCheck || current.localFileUri != localFileUri)
+                ) {
+                    replaceItem(current.copy(
+                        localFileUri = localFileUri,
+                        awaitingCheck = true,
+                        publishedDigestVerified = transfer.digestVerified,
+                        downloadedBytes = totalBytes?.takeIf { it > 0L } ?: current.downloadedBytes,
+                    ))
+                }
+            }
             val facts = backend.inspectFile(localFileUri)
             FileInspection(facts, facts?.problem(announcedBytes = totalBytes, expectedVideoHash = item.expectedVideoHash))
         }
@@ -1866,8 +2060,17 @@ object DownloadsRepository {
             sourceSaysNotCached = sourceLabelSaysNotCached(item.streamTitle),
         )
         val initialVerdict = placeholderVerdict(evidence(facts?.durationMs))
+        // A long frame look can be cut short. Save the file address before it, the same as a
+        // publish that arrives before the check. A failed write does not skip the check: the
+        // completion record is what a later quit retries.
+        val needsLook = problem == null && facts != null && needsFrames(item, facts, runtime, initialVerdict)
+        if (isDesktop && needsLook) {
+            rememberPublished(item.id, transfer, localFileUri, totalBytes)
+        }
+        // A pause during the inspection has already dropped this transfer. Do not start a frame look then.
+        val stillOwns = synchronized(stateLock) { activeTransfers[item.id] === transfer }
         // Null samples mean no check was made, including when size and duration suffice.
-        val look = if (problem == null && facts != null && needsFrames(item, facts, runtime, initialVerdict)) {
+        val look = if (needsLook && stillOwns) {
             lookAtFrames(localFileUri, transfer)
         } else null
         val samples = look?.samples
@@ -1891,11 +2094,12 @@ object DownloadsRepository {
         }
 
         var rejected: DownloadItem? = null
-        var completedItem: DownloadItem? = null
+        var completed = false
+        var desktopSave = false
+        var acceptedItem: DownloadItem? = null
         ifCurrent(item.id, transfer) {
             val current = _uiState.value.items.firstOrNull { it.id == item.id } ?: return@ifCurrent
             if (current.status != DownloadStatus.Downloading) return@ifCurrent
-            removeTransfer(item.id)
             val failed = when {
                 problem != null -> current.failedBecauseOf(problem)
                 framesProblem != null -> current.failedBecauseOf(framesProblem)
@@ -1903,6 +2107,7 @@ object DownloadsRepository {
                 else -> null
             }
             if (failed != null) {
+                removeTransfer(item.id)
                 // Keep the final address durably until its file is confirmed out of the downloads folder.
                 val retained = failed.copy(
                     localFileUri = localFileUri, awaitingCheck = true,
@@ -1913,42 +2118,105 @@ object DownloadsRepository {
                 if (persist(durably = true)) rejected = retained
                 return@ifCurrent
             }
-            mutateItem(item.id) { latest ->
-                latest.copy(
-                    verifiedBy = facts?.verification(
-                        // Only a size the server announced while the transfer ran counts.
-                        announcedBytes = latest.totalBytes,
-                        expectedVideoHash = latest.expectedVideoHash,
-                        expectedSizeBytes = latest.expectedSizeBytes,
-                        digestVerified = transfer.digestVerified,
-                    ) ?: if (transfer.digestVerified) DownloadVerification.Digest else null,
-                    framesCheck = framesCheck,
-                    awaitingCheck = false,
-                    publishedDigestVerified = false,
-                    publishedFileKey = null,
-                    status = DownloadStatus.Completed,
-                    localFileUri = localFileUri,
-                    downloadedBytes = if (totalBytes != null && totalBytes > 0L) {
-                        totalBytes
-                    } else {
-                        latest.downloadedBytes
-                    },
-                    totalBytes = totalBytes?.takeIf { it > 0L } ?: latest.totalBytes,
-                    partialFileName = null,
-                    errorMessage = null,
-                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                ).also { completedItem = it }
+            val completedItem = current.copy(
+                verifiedBy = facts?.verification(
+                    // Only a size the server announced while the transfer ran counts.
+                    announcedBytes = current.totalBytes,
+                    expectedVideoHash = item.expectedVideoHash,
+                    expectedSizeBytes = item.expectedSizeBytes,
+                    digestVerified = transfer.digestVerified,
+                ) ?: if (transfer.digestVerified) DownloadVerification.Digest else null,
+                framesCheck = framesCheck,
+                awaitingCheck = false,
+                publishedDigestVerified = false,
+                publishedFileKey = null,
+                status = DownloadStatus.Completed,
+                localFileUri = localFileUri,
+                downloadedBytes = if (totalBytes != null && totalBytes > 0L) {
+                    totalBytes
+                } else {
+                    current.downloadedBytes
+                },
+                totalBytes = totalBytes?.takeIf { it > 0L } ?: current.totalBytes,
+                partialFileName = null,
+                errorMessage = null,
+                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+            )
+            // Older partials are removed only after this file is accepted. The downloader asks
+            // after this function returns; a check of an already published file asks below.
+            transfer.completionAccepted = true
+            acceptedItem = completedItem
+            if (isDesktop) {
+                // Show Completed before the record is on disk. The save runs outside this lock,
+                // and quit waits until that save succeeds.
+                transfer.pendingRecord = FinishedDownloadRecord(
+                    profileId = requireNotNull(loadedProfileId),
+                    // The base of the save is the last stored row. The in-memory row may already
+                    // show the file address, and that difference still has to be written.
+                    before = baseline.firstOrNull { it.id == item.id } ?: current,
+                    after = completedItem,
+                    wasStored = baseline.any { it.id == item.id },
+                    revision = baseRevision,
+                )
+                pendingFinishedRecords[item.id] = transfer
+                publish(_uiState.value.items.map { if (it.id == item.id) completedItem else it })
+                desktopSave = true
+                return@ifCurrent
             }
-            transfer.completionAccepted = completedItem != null
+            removeTransfer(item.id)
+            completed = true
+            mutateItem(item.id) { completedItem }
         }
         // File moves and companion writes can wait on the file system, so they never hold the state lock.
         rejected?.let(::trashRejectedFile)
-        completedItem?.let { accepted ->
+        val accepted = acceptedItem
+        if (desktopSave) {
+            if (saveFinishedRecord(item.id, transfer) && retireSupersededOnAccept && accepted != null) {
+                retireCompletedSupersededPartials(accepted, transferProfileId, transfer)
+            }
+        } else if (completed && accepted != null) {
             companions().saveAfterDownload(accepted, localFileUri)
             if (retireSupersededOnAccept) {
                 retireCompletedSupersededPartials(accepted, transferProfileId, transfer)
             }
         }
+    }
+
+    /** Saves outside the state lock. A failed write stays owned and can be retried before quit. */
+    private fun saveFinishedRecord(id: String, transfer: ActiveTransfer): Boolean {
+        val (pending, queuedProgress) = synchronized(stateLock) {
+            if (pendingFinishedRecords[id] !== transfer) return activeTransfers[id] !== transfer
+            if (transfer.savingRecord) return false
+            val record = transfer.pendingRecord ?: return false
+            transfer.savingRecord = true
+            record to pendingProgress[record.profileId]?.get(id)
+        }
+        val saved = runCatching { backend.saveFinishedRecord(pending) }.getOrDefault(false)
+        val retired = synchronized(stateLock) {
+            transfer.savingRecord = false
+            if (saved && pendingFinishedRecords[id] === transfer && transfer.pendingRecord === pending) {
+                pendingFinishedRecords.remove(id)
+                if (activeTransfers[id] === transfer) activeTransfers.remove(id)
+                transfer.pendingRecord = null
+                // The saved record already has this row's latest count. A newer still-running
+                // snapshot that arrived during the save is left for the next checkpoint.
+                val queued = pendingProgress[pending.profileId]
+                val snapshot = queued?.get(id)
+                if (queued != null && snapshot != null &&
+                    (snapshot === queuedProgress || snapshot.status != DownloadStatus.Downloading)
+                ) {
+                    queued.remove(id)
+                    if (queued.isEmpty()) pendingProgress.remove(pending.profileId)
+                }
+                true
+            } else {
+                false
+            }
+        }
+        if (retired && pending.after.status == DownloadStatus.Completed) {
+            pending.after.localFileUri?.let { companions().saveAfterDownload(pending.after, it) }
+        }
+        return saved
     }
 
     private fun retireCompletedSupersededPartials(
@@ -2517,9 +2785,32 @@ object DownloadsRepository {
                 pendingProgress.remove(profileId)
                 baseline = _uiState.value.items
                 if (revision != null) baseRevision = revision
-                !durably || backend.syncPayload()
+                val synced = !durably || backend.syncPayload()
+                if (synced) retireFinishedRecordsMissingFrom(loadedProfileId, baseline)
+                synced
             }
         }.getOrDefault(false)
+    }
+
+    /**
+     * Drops unsaved completions for rows this profile's list no longer has.
+     * Another profile's completion is left alone: this save did not touch its list.
+     * The transfer is released too, or quit keeps waiting on a save that can never land.
+     * Callers hold the state lock.
+     */
+    private fun retireFinishedRecordsMissingFrom(profileId: Int?, stored: List<DownloadItem>) {
+        if (profileId == null || pendingFinishedRecords.isEmpty()) return
+        val kept = stored.mapTo(mutableSetOf()) { it.id }
+        val dropped = pendingFinishedRecords.mapNotNull { (id, transfer) ->
+            val record = transfer.pendingRecord
+            if (record != null && record.profileId == profileId && id !in kept) id else null
+        }
+        dropped.forEach { id ->
+            val transfer = pendingFinishedRecords.remove(id) ?: return@forEach
+            transfer.pendingRecord = null
+            if (activeTransfers[id] === transfer) removeTransfer(id)
+            transfer.markFinished()
+        }
     }
 
     /**
@@ -2685,6 +2976,7 @@ private class ActiveTransfer {
     val checkJob = Job()
     private var handle: DownloadsTaskHandle? = null
     private var cancelled = false
+    private val finished = CompletableDeferred<Unit>()
 
     /** Set by the platform downloader when the body matched a digest the server sent. */
     @Volatile
@@ -2693,6 +2985,10 @@ private class ActiveTransfer {
     /** Set once the platform downloader reported the file complete: it is being checked and must not be stopped. */
     @Volatile
     var finishing = false
+
+    // Both fields are read or changed only under the repository state lock.
+    var pendingRecord: FinishedDownloadRecord? = null
+    var savingRecord = false
 
     /** Set only once repository validation accepted the published file and completed its record. */
     @Volatile
@@ -2704,18 +3000,68 @@ private class ActiveTransfer {
         if (cancelled) handle.cancel()
     }
 
+    fun markFinished() {
+        finished.complete(Unit)
+    }
+
+    suspend fun awaitFinished(timeoutMs: Long): Boolean {
+        if (finished.isCompleted) return true
+        if (timeoutMs <= 0L) return false
+        return withTimeoutOrNull(timeoutMs) {
+            finished.await()
+            true
+        } ?: false
+    }
+
     fun cancel() {
         checkJob.cancel()
         cancelled = true
         handle?.cancel()
+        // A finishing look ends itself and then marks finished. Completing early would let quit
+        // move on before that look has stopped.
+        if (!finishing) finished.complete(Unit)
     }
 
     /** Cancels and waits for the transfer to have stopped writing. True when there was nothing to wait for. */
     fun cancelAndWait(timeoutMs: Long): Boolean {
-        checkJob.cancel()
+        if (!finishing) checkJob.cancel()
         cancelled = true
-        return handle?.cancelAndWait(timeoutMs) ?: true
+        return try {
+            handle?.cancelAndWait(timeoutMs) ?: true
+        } finally {
+            if (!finishing) finished.complete(Unit)
+        }
     }
+}
+
+internal data class FinishedDownloadRecord(
+    val profileId: Int,
+    val before: DownloadItem,
+    val after: DownloadItem,
+    val wasStored: Boolean,
+    val revision: Long,
+)
+
+/** Called under the store's file lock, without the repository state lock. Keeps other rows and unknown fields. */
+internal fun persistFinishedDownloadRecord(
+    record: FinishedDownloadRecord,
+    load: () -> String?,
+    save: (String) -> Unit,
+    sync: () -> Boolean,
+): Boolean {
+    val payload = load().orEmpty()
+    val decoded = if (payload.isBlank()) null else DownloadsCodec.decode(payload) ?: return false
+    val items = decoded?.items.orEmpty()
+    // Missing rows can mean a failed read or a concurrent removal. Neither proves this save succeeded.
+    // Deliberate deletions retire pending records only after their own durable write.
+    if (items.none { it.id == record.before.id } && (record.wasStored || DownloadsCodec.revisionOf(payload) > record.revision)) return false
+    val merged = DownloadsCodec.merge(
+        stored = items,
+        base = if (items.any { it.id == record.before.id }) listOf(record.before) else emptyList(),
+        ours = listOf(record.after),
+    )
+    save(DownloadsCodec.encode(merged, decoded, DownloadsCodec.revisionOf(payload) + 1L))
+    return sync()
 }
 
 internal interface DownloadsBackend {
@@ -2727,12 +3073,17 @@ internal interface DownloadsBackend {
     /** Opt in only when counter updates are atomic with ordinary list writes. */
     val batchesProgress: Boolean get() = false
 
-    /** Updates counters only; it must never add a record or change its status or file address. */
+    /** Updates counters only; it must never add a record or change its status or file address. An unchanged list is not written. */
     fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean = withListLock {
         val payload = loadPayload() ?: return@withListLock true
         val updated = DownloadsCodec.withProgress(payload, items) ?: return@withListLock false
+        if (updated == payload) return@withListLock true
         savePayload(updated)
         true
+    }
+
+    fun saveFinishedRecord(record: FinishedDownloadRecord): Boolean = withListLock {
+        persistFinishedDownloadRecord(record, ::loadPayload, ::savePayload, ::syncPayload)
     }
 
     /** The payload from before the last one that was saved. Null where no such copy is kept. */
@@ -2909,6 +3260,8 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean =
         DownloadsStorage.saveProgress(profileId, items)
+
+    override fun saveFinishedRecord(record: FinishedDownloadRecord): Boolean = DownloadsStorage.saveFinishedRecord(record)
 
     override fun loadPreviousPayload(): String? = DownloadsStorage.loadPreviousPayload()
 

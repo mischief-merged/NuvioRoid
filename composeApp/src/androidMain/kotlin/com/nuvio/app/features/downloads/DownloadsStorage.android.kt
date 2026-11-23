@@ -39,6 +39,13 @@ internal actual object DownloadsStorage {
     actual val batchesProgress: Boolean = false
     actual fun saveProgress(profileId: Int, items: List<DownloadItem>): Boolean = false
 
+    actual fun saveFinishedRecord(record: FinishedDownloadRecord): Boolean = persistFinishedDownloadRecord(
+        record,
+        { preferences?.getString(ProfileScopedKey.of(payloadKey, record.profileId), null) },
+        { preferences?.edit()?.putString(ProfileScopedKey.of(payloadKey, record.profileId), it)?.apply() },
+        { true },
+    )
+
     actual fun loadPreviousPayload(): String? = null
 
     actual fun loadPreviousPayload(profileId: Int): String? = null

@@ -1,14 +1,24 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.ui.Modifier
+import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.features.addons.AddonPlayerAction
+import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.player.skip.NextEpisodeInfo
+import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.tracking.TrackingScrobbleAction
+import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.resolvePlaybackCompletion
 import com.nuvio.app.features.watchprogress.shouldCascadeCompletedProgressToWatchedHistory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -17,7 +27,7 @@ import kotlin.test.assertTrue
 
 /**
  * Sleep timer, the one-time stop after this episode, and the progress row it leaves behind.
- * These tests do not touch the watch-progress store.
+ * The quit tests redirect the app data folder. The other tests do not touch the watch-progress store.
  */
 class SleepTimerTest {
     @Test
@@ -691,6 +701,101 @@ class SleepTimerTest {
         )
     }
 
+    @Test
+    fun `quitting after a sleep stop keeps the episode unfinished`() {
+        withIsolatedProgress { scope ->
+            val position = 900_000L
+            val duration = 1_000_000L
+            val actions = mutableListOf<AddonPlayerAction>()
+            val runtime = downloadedPlayer(scope, actions)
+            runtime.shouldPlay = false
+            runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+                isLoading = false,
+                isPlaying = false,
+                durationMs = duration,
+                positionMs = position,
+            )
+            runtime.sleepTimer = SleepTimerState(
+                phase = SleepTimerPhase.Stopped,
+                holdIncomplete = true,
+                holdPositionMs = position,
+            )
+            assertTrue(runtime.playbackHoldIncomplete())
+
+            runtime.stopPlaybackAndFlushForQuit()
+
+            val saved = savedProgress()
+            assertFalse(saved.isCompleted)
+            assertTrue(saved.completionHeld)
+            assertEquals(position, saved.lastPositionMs)
+            assertFalse(runtime.hasSentCompletionScrobbleForCurrentItem)
+            assertEquals(listOf(AddonPlayerAction.PAUSE), actions)
+            assertTrue(runtime.frozenForQuit)
+        }
+    }
+
+    @Test
+    fun `quitting while an armed minute timer holds the watched line keeps the episode unfinished`() {
+        withIsolatedProgress { scope ->
+            val duration = 20 * 60_000L
+            val position = 18 * 60_000L
+            val actions = mutableListOf<AddonPlayerAction>()
+            val runtime = downloadedPlayer(scope, actions)
+            runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+                isLoading = false,
+                isPlaying = true,
+                durationMs = duration,
+                positionMs = position,
+            )
+            runtime.sleepTimer = SleepTimerState(
+                option = SleepTimerOption.Minutes15,
+                phase = SleepTimerPhase.Armed,
+                deadlineEpochMs = System.currentTimeMillis() + 60_000L,
+            )
+            assertTrue(runtime.playbackHoldIncomplete())
+
+            runtime.stopPlaybackAndFlushForQuit()
+
+            val saved = savedProgress()
+            assertFalse(saved.isCompleted)
+            assertTrue(saved.completionHeld)
+            assertEquals(position, saved.lastPositionMs)
+            assertFalse(runtime.hasSentCompletionScrobbleForCurrentItem)
+            assertEquals(listOf(AddonPlayerAction.PAUSE), actions)
+        }
+    }
+
+    @Test
+    fun `quitting after playback has moved past a sleep stop can finish the episode`() {
+        withIsolatedProgress { scope ->
+            val duration = 1_000_000L
+            val position = 900_000L
+            val actions = mutableListOf<AddonPlayerAction>()
+            val runtime = downloadedPlayer(scope, actions)
+            runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+                isLoading = false,
+                isPlaying = true,
+                durationMs = duration,
+                positionMs = position,
+            )
+            runtime.sleepTimer = SleepTimerState(
+                phase = SleepTimerPhase.Stopped,
+                holdIncomplete = true,
+                holdPositionMs = position - SleepTimerResumeReleaseMs - 1L,
+            )
+            assertFalse(runtime.playbackHoldIncomplete())
+
+            runtime.stopPlaybackAndFlushForQuit()
+
+            val saved = savedProgress()
+            assertTrue(saved.isCompleted)
+            assertFalse(saved.completionHeld)
+            assertEquals(duration, saved.lastPositionMs)
+            assertTrue(runtime.hasSentCompletionScrobbleForCurrentItem)
+            assertEquals(listOf(AddonPlayerAction.STOP), actions)
+        }
+    }
+
     private fun episodeNearTheEnd(): PlayerScreenRuntime {
         val runtime = player()
         runtime.initialSeekApplied = true
@@ -781,4 +886,45 @@ class SleepTimerTest {
         completionHeld = completionHeld,
         progressPercent = progressPercent,
     )
+
+    private fun downloadedPlayer(
+        scope: CoroutineScope,
+        actions: MutableList<AddonPlayerAction>,
+    ): PlayerScreenRuntime {
+        val runtime = player()
+        runtime.scope = scope
+        runtime.activeSourceUrl = "file:///downloads/Show.mkv"
+        runtime.activeAddonPlayerEventTarget = AddonPlayerEventTarget(type = "series", videoId = "tt123:1:2")
+        runtime.dispatchAddonPlayerEvent = { _, action, _, _ -> actions += action }
+        return runtime
+    }
+
+    private fun savedProgress() = WatchProgressRepository.progressForVideo(
+        videoId = "tt123:1:2",
+        parentMetaId = "tt123",
+        seasonNumber = 1,
+        episodeNumber = 2,
+    ).let { entry ->
+        kotlin.test.assertNotNull(entry, "Quit did not save playback progress")
+    }
+
+    private fun withIsolatedProgress(block: (CoroutineScope) -> Unit) {
+        val root = Files.createTempDirectory("quit-hold")
+        val job = SupervisorJob()
+        val scope = CoroutineScope(job + Dispatchers.Unconfined)
+        DesktopStorage.setRootDirForTest(root, root.resolve("cache"))
+        try {
+            WatchProgressRepository.resetForTest()
+            WatchedRepository.clearLocalState()
+            ProfileRepository.clearInMemory()
+            block(scope)
+        } finally {
+            job.cancel()
+            WatchProgressRepository.resetForTest()
+            WatchedRepository.clearLocalState()
+            ProfileRepository.clearInMemory()
+            DesktopStorage.setRootDirForTest(null, null)
+            root.toFile().deleteRecursively()
+        }
+    }
 }

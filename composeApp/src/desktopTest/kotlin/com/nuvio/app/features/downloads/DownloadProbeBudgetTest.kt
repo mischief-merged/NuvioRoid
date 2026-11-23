@@ -312,7 +312,11 @@ class DownloadProbeBudgetTest {
         enqueue(1); backend.facts[uri(1)] = video
         val writesBefore = backend.writes.get()
         finish(1)
-        assertEquals(2, backend.writes.get() - writesBefore)
+        // No frame look, so the completed row and its file address are one save, after the row is shown.
+        assertEquals(1, backend.writes.get() - writesBefore)
+        val stored = DownloadsCodec.decode(backend.payload!!)!!.items.single()
+        assertEquals(DownloadStatus.Completed, stored.status)
+        assertEquals(uri(1), stored.localFileUri)
         assertEquals(DownloadStatus.Completed, item(1).status)
         assertEquals(0, backend.sampled.size)
         assertEquals(DownloadFramesCheck.NotChecked, item(1).framesCheck)

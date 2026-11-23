@@ -88,6 +88,7 @@ object MemberAccessRepository {
         _access.value = cached ?: MemberAccess.None
         warmMemberAssets(_access.value)
         val remote = fetchWithRetry() ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(account.userId)) return
         val effective = saveRemote(account.userId, remote)
         _access.value = effective
         warmMemberAssets(effective)
@@ -148,15 +149,19 @@ object MemberAccessRepository {
     }
 
     private fun saveRemote(userId: String, remote: MemberAccess): MemberAccess {
-        MemberAssetStorage.saveAccessPayload(
-            json.encodeToString(
-                StoredMemberAccess(
-                    userId = userId,
-                    tier = remote.tier?.name,
-                    entitlements = remote.entitlements.names(),
+        runCatching {
+            MemberAssetStorage.saveAccessPayload(
+                json.encodeToString(
+                    StoredMemberAccess(
+                        userId = userId,
+                        tier = remote.tier?.name,
+                        entitlements = remote.entitlements.names(),
+                    ),
                 ),
-            ),
-        )
+            )
+        }.onFailure { error ->
+            log.w(error) { "Failed to persist cached member access" }
+        }
         return remote
     }
 }

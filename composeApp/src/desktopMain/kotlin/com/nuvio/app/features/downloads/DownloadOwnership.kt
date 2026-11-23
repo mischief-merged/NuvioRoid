@@ -6,6 +6,13 @@ import java.nio.file.Path
 import java.text.Normalizer
 import java.util.Locale
 
+/**
+ * Profile id used only while judging ownership of a file named in an account archive.
+ * No live profile uses it, so a new download that reuses an old id still counts as
+ * someone else and cannot take the archived file.
+ */
+internal const val ArchivedDownloadProfileId = -1
+
 /** What a move needs to know of one record of one profile. */
 internal data class RecordRef(
     val profileId: Int,

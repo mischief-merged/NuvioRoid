@@ -304,6 +304,7 @@ fun NuvioPosterCard(
                     hoverScaleEnabled = false,
                 )
                 .then(
+                    // The name stays when the picture cannot be fetched. A card with no address still has none.
                     if (!imageUrl.isNullOrBlank()) Modifier.semantics { contentDescription = title }
                     else Modifier
                 ),

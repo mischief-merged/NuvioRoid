@@ -250,6 +250,11 @@ internal class RemoteProgressWriteDeduplicator(
     }
 }
 
+private class ActivePlayerQuitHook(
+    val onStopAndFlush: () -> Unit,
+    val onQuitAborted: () -> Unit,
+)
+
 object WatchProgressRepository {
     private val syncScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val accountScopeLock = SynchronizedObject()
@@ -277,8 +282,11 @@ object WatchProgressRepository {
     private val metadataEnrichmentAttempts = mutableMapOf<String, Int>()
     private val persistLock = SynchronizedObject()
     private var persistSequence = 0L
-    private var persistedSequence = 0L
+    private val persistedSequenceByProfile = mutableMapOf<Int, Long>()
     private val pendingPersists = mutableMapOf<Int, PendingWatchProgressPayload>()
+    private val activePersistJobs = mutableSetOf<Job>()
+    private val activePlayerFlushHooks = LinkedHashSet<ActivePlayerQuitHook>()
+    internal var beforePersistWriteForTest: (suspend () -> Unit)? = null
     private val providerMetadataOverlay = ProviderProgressMetadataOverlay()
     private val nuvioPullMutex = Mutex()
     private var lastSuccessfulPushEpochMs = 0L
@@ -361,6 +369,103 @@ object WatchProgressRepository {
         remoteWriteDeduplicator.clear()
         TrackingProviderRegistry.progressProviders().forEach(TrackingProgressProvider::clearLocalState)
         _uiState.value = WatchProgressUiState()
+    }
+
+    internal fun resetForTest() {
+        beforePersistWriteForTest = null
+        val jobs = synchronized(persistLock) {
+            pendingPersists.clear()
+            persistedSequenceByProfile.clear()
+            persistSequence = 0L
+            activePlayerFlushHooks.clear()
+            activePersistJobs.toList().also { activePersistJobs.clear() }
+        }
+        jobs.forEach(Job::cancel)
+        clearLocalState()
+    }
+
+    internal fun registerActivePlayerFlushHook(
+        onQuitAborted: () -> Unit = {},
+        onStopAndFlush: () -> Unit,
+    ): () -> Unit {
+        val entry = ActivePlayerQuitHook(
+            onStopAndFlush = onStopAndFlush,
+            onQuitAborted = onQuitAborted,
+        )
+        synchronized(persistLock) {
+            activePlayerFlushHooks.add(entry)
+        }
+        return {
+            synchronized(persistLock) {
+                activePlayerFlushHooks.remove(entry)
+            }
+        }
+    }
+
+    internal fun flushActivePlayers() {
+        val hooks = synchronized(persistLock) { activePlayerFlushHooks.toList() }
+        var firstFailure: Throwable? = null
+        hooks.forEach { hook ->
+            try {
+                hook.onStopAndFlush.invoke()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (error: Throwable) {
+                log.e(error) { "Active player progress flush hook failed" }
+                if (firstFailure == null) {
+                    firstFailure = error
+                } else {
+                    firstFailure.addSuppressed(error)
+                }
+            }
+        }
+        if (firstFailure != null) {
+            throw firstFailure
+        }
+    }
+
+    internal fun unfreezeActivePlayersAfterAbortedQuit() {
+        val hooks = synchronized(persistLock) { activePlayerFlushHooks.toList() }
+        hooks.forEach { hook ->
+            runCatching { hook.onQuitAborted.invoke() }
+                .onFailure { error -> log.w(error) { "Active player quit-abort hook failed" } }
+        }
+    }
+
+    internal fun hasPendingOrActivePersistenceForTest(): Boolean = synchronized(persistLock) {
+        pendingPersists.isNotEmpty() || activePersistJobs.isNotEmpty()
+    }
+
+    suspend fun drainPendingPersistence() {
+        while (true) {
+            while (true) {
+                val jobs = synchronized(persistLock) { activePersistJobs.toList() }
+                if (jobs.isEmpty()) break
+                jobs.forEach { it.join() }
+            }
+            val remaining = synchronized(persistLock) { pendingPersists.toMap() }
+            if (remaining.isEmpty()) break
+            remaining.forEach { (profileId, pending) ->
+                val payload = WatchProgressCodec.encodePayload(
+                    entries = pending.entries,
+                    lastSuccessfulPushEpochMs = pending.lastSuccessfulPushEpochMs,
+                    deltaCursorEventId = pending.deltaCursorEventId,
+                    deltaInitialized = pending.deltaInitialized,
+                    dirtyProgressKeys = pending.dirtyProgressKeys,
+                    locallyFinishedEpisodeGroups = pending.locallyFinishedEpisodeGroups,
+                )
+                synchronized(persistLock) {
+                    if (pendingPersists[profileId]?.sequence == pending.sequence) {
+                        val lastPersisted = persistedSequenceByProfile[profileId] ?: 0L
+                        if (pending.sequence > lastPersisted) {
+                            WatchProgressStorage.savePayload(profileId, payload)
+                            persistedSequenceByProfile[profileId] = pending.sequence
+                        }
+                        pendingPersists.remove(profileId)
+                    }
+                }
+            }
+        }
     }
 
     private fun loadFromDisk(profileId: Int) {
@@ -699,6 +804,7 @@ object WatchProgressRepository {
                 return
             }
             if (!isActiveOperation(profileId, operationGeneration)) return
+            if (!AuthRepository.isRemoteAccountAuthenticated()) return
             if (events.isEmpty()) {
                 log.d { "Watch progress delta page $page returned no events for profile $profileId at cursor $cursor" }
                 break
@@ -760,6 +866,7 @@ object WatchProgressRepository {
     ) {
         val serverEntries = syncAdapter.pull(profileId = profileId)
         if (!isActiveOperation(profileId, operationGeneration)) return
+        if (!AuthRepository.isRemoteAccountAuthenticated()) return
         log.d {
             "Watch progress snapshot fetched ${serverEntries.size} entries for profile $profileId " +
                 "resetDeltaState=$resetDeltaState preserveLocalEntries=$preserveLocalEntries"
@@ -1774,30 +1881,48 @@ object WatchProgressRepository {
             dirtyProgressKeys = dirtyProgressKeysSnapshot(),
             locallyFinishedEpisodeGroups = locallyFinishedEpisodeGroupsSnapshot(),
         )
+        lateinit var persistJob: Job
         val pending = synchronized(persistLock) {
             persistSequence += 1
             snapshot.copy(sequence = persistSequence).also { pendingPersists[profileId] = it }
         }
         // The JSON encode and the SharedPreferences write run off the caller's dispatcher:
         // the player persists progress ticks from the main thread.
-        syncScope.launch {
-            val payload = WatchProgressCodec.encodePayload(
-                entries = pending.entries,
-                lastSuccessfulPushEpochMs = pending.lastSuccessfulPushEpochMs,
-                deltaCursorEventId = pending.deltaCursorEventId,
-                deltaInitialized = pending.deltaInitialized,
-                dirtyProgressKeys = pending.dirtyProgressKeys,
-                locallyFinishedEpisodeGroups = pending.locallyFinishedEpisodeGroups,
-            )
-            synchronized(persistLock) {
-                if (pending.sequence <= persistedSequence) return@synchronized
-                persistedSequence = pending.sequence
-                WatchProgressStorage.savePayload(profileId, payload)
-                if (pendingPersists[profileId]?.sequence == pending.sequence) {
-                    pendingPersists.remove(profileId)
+        persistJob = syncScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                val payload = WatchProgressCodec.encodePayload(
+                    entries = pending.entries,
+                    lastSuccessfulPushEpochMs = pending.lastSuccessfulPushEpochMs,
+                    deltaCursorEventId = pending.deltaCursorEventId,
+                    deltaInitialized = pending.deltaInitialized,
+                    dirtyProgressKeys = pending.dirtyProgressKeys,
+                    locallyFinishedEpisodeGroups = pending.locallyFinishedEpisodeGroups,
+                )
+                beforePersistWriteForTest?.invoke()
+                synchronized(persistLock) {
+                    val lastPersisted = persistedSequenceByProfile[profileId] ?: 0L
+                    if (pending.sequence <= lastPersisted) return@synchronized
+                    WatchProgressStorage.savePayload(profileId, payload)
+                    persistedSequenceByProfile[profileId] = pending.sequence
+                    if (pendingPersists[profileId]?.sequence == pending.sequence) {
+                        pendingPersists.remove(profileId)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                log.e(e) { "Failed to persist watch progress for profile $profileId" }
+            } finally {
+                synchronized(persistLock) {
+                    activePersistJobs.remove(persistJob)
                 }
             }
         }
+        synchronized(persistLock) {
+            activePersistJobs.add(persistJob)
+        }
+        persistJob.start()
+
     }
 
     private fun recordSuccessfulPush(

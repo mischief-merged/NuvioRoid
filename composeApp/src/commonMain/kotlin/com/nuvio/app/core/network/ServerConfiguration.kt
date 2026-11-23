@@ -32,8 +32,9 @@ object ServerConfigurationRepository {
 
     fun saveCustom(configuration: ServerConfiguration): Boolean {
         if (!AppFeaturePolicy.customServerConnectionsEnabled) return false
-        if (!ServerConfigurationStorage.saveCustom(configuration)) return false
-        _active.value = configuration
+        val canonical = configuration.canonicalized()
+        if (!ServerConfigurationStorage.saveCustom(canonical)) return false
+        _active.value = canonical
         return true
     }
 
@@ -43,14 +44,39 @@ object ServerConfigurationRepository {
         return true
     }
 
+    internal fun stageCustom(configuration: ServerConfiguration): Boolean {
+        if (!AppFeaturePolicy.customServerConnectionsEnabled) return false
+        return ServerConfigurationStorage.saveCustom(configuration.canonicalized())
+    }
+
+    internal fun stageOfficial(): Boolean = ServerConfigurationStorage.useOfficial()
+
+    internal fun restoreActiveToStorage(): Boolean {
+        val current = _active.value
+        return if (current.isCustom) {
+            ServerConfigurationStorage.saveCustom(current)
+        } else {
+            ServerConfigurationStorage.useOfficial()
+        }
+    }
+
+    internal fun reloadFromStorage() {
+        _active.value = loadActiveConfiguration()
+    }
+
     private fun loadActiveConfiguration(): ServerConfiguration {
         if (!AppFeaturePolicy.customServerConnectionsEnabled) return officialConfiguration()
-        return ServerConfigurationStorage.loadCustom() ?: officialConfiguration()
+        return ServerConfigurationStorage.loadCustom()?.canonicalized() ?: officialConfiguration()
     }
 }
 
+private fun ServerConfiguration.canonicalized(): ServerConfiguration {
+    val canonicalBackend = ServerDiscoveryPolicy.canonicalBackendUrlOrNull(backendUrl) ?: backendUrl.trim().trimEnd('/')
+    return copy(backendUrl = canonicalBackend)
+}
+
 internal fun officialConfiguration() = ServerConfiguration(
-    backendUrl = SupabaseConfig.URL.trim().trimEnd('/'),
+    backendUrl = ServerDiscoveryPolicy.canonicalBackendUrlOrNull(SupabaseConfig.URL) ?: SupabaseConfig.URL.trim().trimEnd('/'),
     publishableKey = SupabaseConfig.ANON_KEY.trim(),
     capabilities = ServerCapabilities(
         emailPasswordAuth = true,

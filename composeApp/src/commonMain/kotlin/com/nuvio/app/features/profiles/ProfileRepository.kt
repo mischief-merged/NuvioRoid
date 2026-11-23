@@ -37,6 +37,7 @@ import com.nuvio.app.features.tmdb.TmdbSettingsRepository
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
+import com.nuvio.app.isDesktop
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.rpc
 import kotlinx.coroutines.CoroutineScope
@@ -82,6 +83,7 @@ object ProfileRepository {
 
     private var activeProfileIndex: Int = 1
     private var loadedCacheForUserId: String? = null
+    private var storedPayloadOwnerId: String? = null
 
     val activeProfileId: Int get() = activeProfileIndex
 
@@ -98,6 +100,7 @@ object ProfileRepository {
 
     fun loadCachedProfiles(): Boolean {
         val stored = decodeStoredPayload() ?: return false
+        storedPayloadOwnerId = stored.userId
         loadedCacheForUserId = stored.userId
         applyStoredPayload(stored)
         ThemeSettingsRepository.onProfileChanged()
@@ -105,10 +108,25 @@ object ProfileRepository {
     }
 
     fun ensureLoaded(userId: String) {
+        val currentAuth = AuthRepository.state.value as? AuthState.Authenticated
+        if (isDesktop && currentAuth?.isAnonymous == true && currentAuth.userId == userId) {
+            if (_state.value.isLoaded) return
+            val stored = decodeStoredPayload()
+            if (stored != null) {
+                storedPayloadOwnerId = stored.userId
+                loadedCacheForUserId = stored.userId
+                applyStoredPayload(stored)
+            } else {
+                _state.value = _state.value.copy(isLoaded = true)
+            }
+            return
+        }
+
         if (loadedCacheForUserId == userId && _state.value.isLoaded) return
 
         val stored = decodeStoredPayload()
         loadedCacheForUserId = userId
+        storedPayloadOwnerId = userId
         if (stored == null) {
             _state.value = ProfileState()
             activeProfileIndex = 1
@@ -124,22 +142,64 @@ object ProfileRepository {
         applyStoredPayload(stored)
     }
 
+    internal fun adoptLocalProfilesForOwner(ownerUserId: String) {
+        val trimmedOwner = ownerUserId.trim()
+        if (trimmedOwner.isEmpty()) return
+        val stored = decodeStoredPayload()
+        storedPayloadOwnerId = trimmedOwner
+        loadedCacheForUserId = trimmedOwner
+        if (stored != null) {
+            val reownedProfiles = stored.profiles.map { it.copy(userId = trimmedOwner) }
+            val reownedPayload = stored.copy(
+                userId = trimmedOwner,
+                profiles = reownedProfiles,
+            )
+            ProfileStorage.savePayload(json.encodeToString(reownedPayload))
+            applyStoredPayload(reownedPayload)
+        } else if (_state.value.profiles.isNotEmpty()) {
+            val reownedProfiles = _state.value.profiles.map { it.copy(userId = trimmedOwner) }
+            _state.value = _state.value.copy(
+                profiles = reownedProfiles,
+                activeProfile = reownedProfiles.find { it.profileIndex == activeProfileIndex } ?: reownedProfiles.firstOrNull(),
+                isLoaded = true,
+            )
+            ProfileStorage.savePayload(
+                json.encodeToString(
+                    StoredProfilePayload(
+                        userId = trimmedOwner,
+                        activeProfileIndex = activeProfileIndex,
+                        hasEverSelectedProfile = _state.value.hasEverSelectedProfile,
+                        rememberLastProfileEnabled = _state.value.rememberLastProfileEnabled,
+                        profiles = reownedProfiles,
+                    ),
+                ),
+            )
+        }
+    }
+
     fun clearInMemory() {
+        storedPayloadOwnerId = null
         loadedCacheForUserId = null
         activeProfileIndex = 1
         _state.value = ProfileState()
     }
 
     suspend fun pullProfiles() {
-        if (AuthRepository.state.value.isAnonymous) {
+        val currentAuth = AuthRepository.state.value
+        if (currentAuth.isAnonymous) {
             if (!_state.value.isLoaded) {
                 _state.value = _state.value.copy(isLoaded = true)
             }
             return
         }
+        val expectedUserId = (currentAuth as? AuthState.Authenticated)?.userId ?: return
+        if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
         try {
             val result = SupabaseProvider.client.postgrest.rpc("sync_pull_profiles")
             val profiles = result.decodeList<NuvioProfile>()
+            if (!AuthRepository.isRemoteAccountAuthenticated(expectedUserId)) return
+            storedPayloadOwnerId = expectedUserId
+            loadedCacheForUserId = expectedUserId
             _state.value = _state.value.copy(
                 profiles = profiles.sortedBy { it.profileIndex },
                 isLoaded = true,
@@ -433,10 +493,16 @@ object ProfileRepository {
 
     private fun applyPayloadsLocally(payloads: List<ProfilePushPayload>) {
         val authState = AuthRepository.state.value as? AuthState.Authenticated ?: return
+        val effectiveOwnerId = if (isDesktop && authState.isAnonymous) {
+            storedPayloadOwnerId ?: decodeStoredPayload()?.userId ?: authState.userId
+        } else {
+            authState.userId
+        }
+        val existingByIndex = _state.value.profiles.associateBy { it.profileIndex }
         val profiles = payloads.map { p ->
             NuvioProfile(
-                id = "",
-                userId = authState.userId,
+                id = existingByIndex[p.profileIndex]?.id.orEmpty(),
+                userId = existingByIndex[p.profileIndex]?.userId?.takeIf { it.isNotBlank() } ?: effectiveOwnerId,
                 profileIndex = p.profileIndex,
                 name = p.name,
                 avatarColorHex = p.avatarColorHex,
@@ -566,11 +632,16 @@ object ProfileRepository {
 
     private fun persist() {
         val authState = AuthRepository.state.value as? AuthState.Authenticated ?: return
+        val effectiveOwnerId = if (isDesktop && authState.isAnonymous) {
+            storedPayloadOwnerId ?: decodeStoredPayload()?.userId ?: authState.userId
+        } else {
+            authState.userId
+        }
         val state = _state.value
         ProfileStorage.savePayload(
             json.encodeToString(
                 StoredProfilePayload(
-                    userId = authState.userId,
+                    userId = effectiveOwnerId,
                     activeProfileIndex = activeProfileIndex,
                     hasEverSelectedProfile = state.hasEverSelectedProfile,
                     rememberLastProfileEnabled = state.rememberLastProfileEnabled,

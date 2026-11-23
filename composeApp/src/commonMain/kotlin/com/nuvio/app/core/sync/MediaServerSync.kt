@@ -132,6 +132,8 @@ object MediaServerSync {
 
     private fun canSync(profileId: Int): Boolean {
         val state = AuthRepository.state.value as? AuthState.Authenticated ?: return false
-        return !state.isAnonymous && ProfileRepository.activeProfileId == profileId
+        return !state.isAnonymous &&
+            ProfileRepository.activeProfileId == profileId &&
+            AuthRepository.isRemoteAccountAuthenticated(state.userId)
     }
 }
