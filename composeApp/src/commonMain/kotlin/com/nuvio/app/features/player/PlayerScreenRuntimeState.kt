@@ -376,6 +376,8 @@ internal class PlayerScreenRuntime(
     var showPartyPanel by mutableStateOf(false)
     /** True while an embedded desktop native controls popup (audio, subtitles, speed, etc.) is open. */
     var nativeControlsModalOpen by mutableStateOf(false)
+    /** Written from composition so a late native popup event can be ignored once the full player is gone. */
+    var pictureInPictureActive: Boolean = false
     var partyPanelToken by mutableStateOf(0L)
     var partyMessage by mutableStateOf("")
     var partyMessageToken by mutableStateOf(0L)

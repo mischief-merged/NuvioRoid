@@ -9,6 +9,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.nuvio.app.AppScreenTab
@@ -35,6 +36,8 @@ fun ControllerNavigationHost(
     onBack: () -> Boolean,
     onBumperLeft: (() -> Boolean)? = null,
     onBumperRight: (() -> Boolean)? = null,
+    fullPlayerOwnsInput: Boolean = false,
+    miniDockClearance: Dp = 0.dp,
 ) {
     val routeIdentity = when (currentRoute) {
         is DetailRoute -> "DetailRoute:${currentRoute.type}:${currentRoute.id}"
@@ -46,75 +49,18 @@ fun ControllerNavigationHost(
         else -> currentRoute::class.simpleName ?: ""
     }
 
-    LaunchedEffect(currentRoute, selectedTab) {
-        ControllerFocusEngine.isHomeTabActive =
-            currentRoute is TabsRoute && selectedTab == AppScreenTab.Home
-        ControllerFocusEngine.deferNavigationToCompose = when (currentRoute) {
-            // Screens instrumented with controllerFocusable are driven by the spatial engine.
-            is TabsRoute, is CatalogRoute, is FolderDetailRoute, is EntityBrowseRoute -> false
-            // Details, streams, player and settings leaves rely on Compose focus instead.
-            null -> false
-            else -> true
-        }
-        ControllerFocusEngine.onRouteOrTabChanged("$routeIdentity:$selectedTab")
-        ControllerManager.updateScreenContext(
-            when {
-                currentRoute is PlayerRoute -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Player,
-                    selectLabel = "Play / Pause",
-                    backLabel = "Exit Player",
-                )
-                currentRoute is DetailRoute -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Details,
-                    selectLabel = "Select",
-                    backLabel = "Back",
-                    rightStickLabel = "Scroll",
-                )
-                currentRoute is StreamRoute -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Streams,
-                    selectLabel = "Play Stream",
-                    backLabel = "Back",
-                )
-                currentRoute is FolderDetailRoute || currentRoute is CatalogRoute || currentRoute is EntityBrowseRoute ->
-                    ControllerScreenContext(
-                        screenType = ControllerScreenType.Catalog,
-                        selectLabel = "Open",
-                        backLabel = "Back",
-                        rightStickLabel = "Scroll",
-                    )
-                currentRoute != null && currentRoute !is TabsRoute -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Settings,
-                    selectLabel = "Select",
-                    backLabel = "Back",
-                    rightStickLabel = "Scroll",
-                )
-                selectedTab == AppScreenTab.Home -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Home,
-                    selectLabel = "Open",
-                    backLabel = "Exit",
-                    rightStickLabel = "Scroll",
-                )
-                selectedTab == AppScreenTab.Search -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Search,
-                    selectLabel = "Select",
-                    backLabel = "Home",
-                    rightStickLabel = "Scroll",
-                )
-                selectedTab == AppScreenTab.Library -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Library,
-                    selectLabel = "Open",
-                    backLabel = "Home",
-                    rightStickLabel = "Scroll",
-                )
-                selectedTab == AppScreenTab.Settings -> ControllerScreenContext(
-                    screenType = ControllerScreenType.Settings,
-                    selectLabel = "Select",
-                    backLabel = "Home",
-                    rightStickLabel = "Scroll",
-                )
-                else -> ControllerScreenContext()
-            },
+    LaunchedEffect(currentRoute, selectedTab, fullPlayerOwnsInput, miniDockClearance) {
+        val navigation = resolveControllerNavigation(
+            currentRoute = currentRoute,
+            selectedTab = selectedTab,
+            fullPlayerOwnsInput = fullPlayerOwnsInput,
+            miniDockClearance = miniDockClearance,
         )
+        ControllerFocusEngine.isHomeTabActive =
+            !fullPlayerOwnsInput && currentRoute is TabsRoute && selectedTab == AppScreenTab.Home
+        ControllerFocusEngine.deferNavigationToCompose = navigation.deferNavigationToCompose
+        ControllerFocusEngine.onRouteOrTabChanged("$routeIdentity:$selectedTab:$fullPlayerOwnsInput")
+        ControllerManager.updateScreenContext(navigation.screenContext)
     }
 
     RegisterControllerHandler(
@@ -125,15 +71,128 @@ fun ControllerNavigationHost(
     )
 }
 
-/** Bottom-right controller hint toolbar; hidden inside the native player. */
+/** Bottom-right controller hint toolbar; hidden while the full player owns the screen. */
 @Composable
-fun BoxScope.ControllerMainOverlay(currentRoute: AppRoute?) {
-    if (currentRoute !is PlayerRoute) {
+fun BoxScope.ControllerMainOverlay(
+    currentRoute: AppRoute?,
+    selectedTab: AppScreenTab = AppScreenTab.Home,
+    fullPlayerOwnsInput: Boolean = false,
+    miniDockClearance: Dp = 0.dp,
+) {
+    val navigation = resolveControllerNavigation(
+        currentRoute = currentRoute,
+        selectedTab = selectedTab,
+        fullPlayerOwnsInput = fullPlayerOwnsInput,
+        miniDockClearance = miniDockClearance,
+    )
+    if (!navigation.hideHintToolbar) {
         ControllerHintToolbar(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .padding(end = 24.dp, bottom = 20.dp)
+                .padding(end = 24.dp, bottom = navigation.hintBottomInset)
                 .zIndex(100f),
         )
     }
+}
+
+internal data class ControllerNavigationState(
+    val screenContext: ControllerScreenContext,
+    val deferNavigationToCompose: Boolean,
+    val hideHintToolbar: Boolean,
+    val hintBottomInset: Dp,
+)
+
+/**
+ * Keyboard and gamepad context for the screen the user is actually looking at.
+ * A full player session owns input even though it is not a navigation route.
+ * Minimized and picture-in-picture playback leave the route underneath in charge,
+ * and lift the hint row clear of the dock.
+ */
+internal fun resolveControllerNavigation(
+    currentRoute: AppRoute?,
+    selectedTab: AppScreenTab,
+    fullPlayerOwnsInput: Boolean,
+    miniDockClearance: Dp = 0.dp,
+): ControllerNavigationState {
+    val routeDefersToCompose = when (currentRoute) {
+        // Screens instrumented with controllerFocusable are driven by the spatial engine.
+        is TabsRoute, is CatalogRoute, is FolderDetailRoute, is EntityBrowseRoute -> false
+        // Details, streams, player and settings leaves rely on Compose focus instead.
+        null -> false
+        else -> true
+    }
+    val routeContext = when {
+        currentRoute is PlayerRoute -> ControllerScreenContext(
+            screenType = ControllerScreenType.Player,
+            selectLabel = "Play / Pause",
+            backLabel = "Exit Player",
+        )
+        currentRoute is DetailRoute -> ControllerScreenContext(
+            screenType = ControllerScreenType.Details,
+            selectLabel = "Select",
+            backLabel = "Back",
+            rightStickLabel = "Scroll",
+        )
+        currentRoute is StreamRoute -> ControllerScreenContext(
+            screenType = ControllerScreenType.Streams,
+            selectLabel = "Play Stream",
+            backLabel = "Back",
+        )
+        currentRoute is FolderDetailRoute || currentRoute is CatalogRoute || currentRoute is EntityBrowseRoute ->
+            ControllerScreenContext(
+                screenType = ControllerScreenType.Catalog,
+                selectLabel = "Open",
+                backLabel = "Back",
+                rightStickLabel = "Scroll",
+            )
+        currentRoute != null && currentRoute !is TabsRoute -> ControllerScreenContext(
+            screenType = ControllerScreenType.Settings,
+            selectLabel = "Select",
+            backLabel = "Back",
+            rightStickLabel = "Scroll",
+        )
+        selectedTab == AppScreenTab.Home -> ControllerScreenContext(
+            screenType = ControllerScreenType.Home,
+            selectLabel = "Open",
+            backLabel = "Exit",
+            rightStickLabel = "Scroll",
+        )
+        selectedTab == AppScreenTab.Search -> ControllerScreenContext(
+            screenType = ControllerScreenType.Search,
+            selectLabel = "Select",
+            backLabel = "Home",
+            rightStickLabel = "Scroll",
+        )
+        selectedTab == AppScreenTab.Library -> ControllerScreenContext(
+            screenType = ControllerScreenType.Library,
+            selectLabel = "Open",
+            backLabel = "Home",
+            rightStickLabel = "Scroll",
+        )
+        selectedTab == AppScreenTab.Settings -> ControllerScreenContext(
+            screenType = ControllerScreenType.Settings,
+            selectLabel = "Select",
+            backLabel = "Home",
+            rightStickLabel = "Scroll",
+        )
+        else -> ControllerScreenContext()
+    }
+    if (!fullPlayerOwnsInput) {
+        return ControllerNavigationState(
+            screenContext = routeContext,
+            deferNavigationToCompose = routeDefersToCompose,
+            hideHintToolbar = currentRoute is PlayerRoute,
+            hintBottomInset = 20.dp + miniDockClearance,
+        )
+    }
+    return ControllerNavigationState(
+        screenContext = ControllerScreenContext(
+            screenType = ControllerScreenType.Player,
+            selectLabel = "Play / Pause",
+            backLabel = "Exit Player",
+        ),
+        deferNavigationToCompose = true,
+        hideHintToolbar = true,
+        hintBottomInset = 20.dp + miniDockClearance,
+    )
 }

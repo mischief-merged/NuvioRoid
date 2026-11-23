@@ -93,7 +93,16 @@ internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
         }
         onDispose { systemBackRegistration(null) }
     }
-    if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
+    val playerInPicture = rememberIsInPictureInPicture()
+    val ownsInput = playerOwnsControllerInput(
+        isMinimized = args.isMinimized,
+        isInPictureInPicture = playerInPicture,
+    )
+    // Leaving the full player drops popups that would otherwise keep Escape for a hidden surface.
+    LaunchedEffect(ownsInput) {
+        if (!ownsInput) closeModalsForMiniPlayer()
+    }
+    if (ownsInput && (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null)) {
         PlatformModalBackHandler(
             dismissOnBackPress = true,
             onDismiss = { dismissNativeControlsModal() },
@@ -123,7 +132,11 @@ internal fun PlayerScreenRuntime.BindPlayerSessionBridge() {
             seekForward = { runtime.seekBy(10_000L) },
             playNextEpisode = { latestNextEpisodeAction.value?.invoke() },
             requestClose = { onClosed -> runtime.requestClose(afterClosed = onClosed) },
-            requestBack = { runtime.requestBack() },
+            requestBack = {
+                if (!runtime.dismissOpenPlayerOverlay()) {
+                    runtime.requestBack()
+                }
+            },
         )
     }
     SideEffect {
@@ -1149,9 +1162,16 @@ internal fun PlayerScreenRuntime.shouldMinimizeOnBack(): Boolean =
         initialLoadCompleted = initialLoadCompleted,
     )
 
+/** True while this player is the full-screen surface, so it may take keyboard and gamepad input. */
+internal fun playerOwnsControllerInput(isMinimized: Boolean, isInPictureInPicture: Boolean): Boolean =
+    !isMinimized && !isInPictureInPicture
+
 internal fun PlayerScreenRuntime.closeModalsForMiniPlayer() {
     controlsVisible = false
     playerControlsCloseModalsToken += 1
+    nativeControlsModalOpen = false
+    playerControlsPendingP2pSwitch = null
+    pendingP2pSwitch = null
     showSourcesPanel = false
     showEpisodesPanel = false
     showChaptersPanel = false
@@ -1590,7 +1610,9 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
             showParentalGuide = false
         }
         "nativeModalState" -> {
-            nativeControlsModalOpen = value >= 0.5
+            if (playerOwnsControllerInput(args.isMinimized, pictureInPictureActive)) {
+                nativeControlsModalOpen = value >= 0.5
+            }
         }
         else -> return handlePartyControlsEvent(type, value)
     }

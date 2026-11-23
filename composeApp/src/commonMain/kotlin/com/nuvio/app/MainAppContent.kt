@@ -1695,6 +1695,7 @@ internal fun MainAppContent(
 
                 PlatformEscapeShortcut(navigateBack)
 
+                val playbackMode = playerSessionController.activeSession?.mode
                 ControllerNavigationHost(
                     currentRoute = currentRoute,
                     selectedTab = selectedTab,
@@ -1704,6 +1705,8 @@ internal fun MainAppContent(
                         }
                         true
                     },
+                    fullPlayerOwnsInput = fullPlayerOwnsControllerInput(playbackMode),
+                    miniDockClearance = miniPlayerHintClearance(playbackMode),
                 )
 
                 NavDisplay(
@@ -2628,7 +2631,12 @@ internal fun MainAppContent(
                     .zIndex(20f),
             )
 
-            ControllerMainOverlay(currentRoute = currentRoute)
+            ControllerMainOverlay(
+                currentRoute = currentRoute,
+                selectedTab = selectedTab,
+                fullPlayerOwnsInput = fullPlayerOwnsControllerInput(playerSessionController.activeSession?.mode),
+                miniDockClearance = miniPlayerHintClearance(playerSessionController.activeSession?.mode),
+            )
 
             }
         }

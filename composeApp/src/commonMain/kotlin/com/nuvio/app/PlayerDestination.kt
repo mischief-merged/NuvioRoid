@@ -19,6 +19,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.nuvio.app.core.ui.NuvioToastController
@@ -51,6 +52,17 @@ internal val MiniPlayerVideoHeight = 189.dp
 internal val MiniPlayerHorizontalInset = 20.dp
 internal val MiniPlayerBottomInset = 20.dp
 internal val MiniPlayerCornerRadius = 14.dp
+
+internal fun fullPlayerOwnsControllerInput(mode: PlayerPresentationMode?): Boolean =
+    mode == PlayerPresentationMode.Full
+
+/** Extra space that lifts the browsing hint row above the dock. */
+internal fun miniPlayerHintClearance(mode: PlayerPresentationMode?): Dp =
+    if (mode == PlayerPresentationMode.Mini) {
+        MiniPlayerVideoHeight + MiniPlayerControlsHeight + 12.dp
+    } else {
+        0.dp
+    }
 
 @Composable
 internal fun BoxScope.PlayerSessionHost(

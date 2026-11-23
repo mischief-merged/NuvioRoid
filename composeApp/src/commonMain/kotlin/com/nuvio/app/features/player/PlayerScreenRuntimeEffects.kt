@@ -489,8 +489,12 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     val isInPipForSearch = rememberIsInPictureInPicture()
-    val playbackInFocus = !args.isMinimized && !isInPipForSearch
+    val playbackInFocus = playerOwnsControllerInput(
+        isMinimized = args.isMinimized,
+        isInPictureInPicture = isInPipForSearch,
+    )
     SideEffect {
+        pictureInPictureActive = isInPipForSearch
         PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
     }
     LaunchedEffect(args.isMinimized) {
@@ -500,7 +504,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     DisposableEffect(Unit) {
-        PlayerStreamsRepository.setPlaybackInFocus(!args.isMinimized && !isInPipForSearch)
+        PlayerStreamsRepository.setPlaybackInFocus(playbackInFocus)
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
             emitAddonPlayerProgressEvent()

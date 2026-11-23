@@ -220,6 +220,31 @@ class MiniPlayerSessionTest {
     }
 
     @Test
+    fun system_back_while_full_closes_an_open_player_panel_before_minimizing() {
+        val harness = startSessionHarness()
+        compose.runOnIdle {
+            harness.runtime.initialLoadCompleted = true
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    positionMs = 420_000L,
+                    durationMs = 1_500_000L,
+                ),
+            )
+            harness.runtime.showAudioModal = true
+            harness.sessionController.dispatchSystemBack()
+        }
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertFalse(harness.runtime.showAudioModal)
+            assertTrue(harness.sessionController.isFullScreen)
+            assertEquals(0, harness.controller.releaseCalls)
+        }
+    }
+
+    @Test
     fun back_while_playing_minimizes_instead_of_closing_and_navigates_to_exit_target() {
         val harness = startSessionHarness()
         compose.runOnIdle {
