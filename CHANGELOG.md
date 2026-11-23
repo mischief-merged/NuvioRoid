@@ -25,6 +25,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
+- Network security: certificates are verified with the macOS trust store, and add-on and download network rules are tighter ([#72](https://github.com/mischief-merged/NuvioRoid/pull/72)).
 - Clear empty and error states with a working Retry, and accessible player controls ([#74](https://github.com/mischief-merged/NuvioRoid/pull/74)).
 - Downloads screen polish: header icons are easier to see, there is a settings button, and sizes use one GB unit ([#68](https://github.com/mischief-merged/NuvioRoid/pull/68)).
 - Downloads use less disk and CPU while running: progress is saved at most every five seconds instead of on every network read, and only the parts of the screen that show progress redraw ([#131](https://github.com/mischief-merged/NuvioRoid/pull/131)).
