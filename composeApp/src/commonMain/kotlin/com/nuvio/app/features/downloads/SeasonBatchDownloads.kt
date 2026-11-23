@@ -84,10 +84,7 @@ internal object SeasonBatchDownloads {
 
     val running: StateFlow<Map<String, SeasonBatchProgress>> get() = downloader.running
 
-    internal var startOverrideForTest: ((SeasonBatchRequest) -> SeasonBatchStart)? = null
-
     fun start(request: SeasonBatchRequest): SeasonBatchStart {
-        startOverrideForTest?.let { return it(request) }
         DownloadsRepository.ensureLoaded()
         downloader.adoptRunning(DownloadsRepository.takeDownloadsResumedAtLoad())
         return downloader.start(request)

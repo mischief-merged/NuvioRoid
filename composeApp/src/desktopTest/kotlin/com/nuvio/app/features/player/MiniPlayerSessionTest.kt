@@ -46,6 +46,7 @@ import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaDetailsUiState
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.details.components.DetailActions
+import com.nuvio.app.features.details.components.LocalSeasonDownloadStarter
 import com.nuvio.app.features.details.components.SeasonDownloadButton
 import com.nuvio.app.features.downloads.AutoDownloadController
 import com.nuvio.app.features.downloads.AutoDownloadRemoval
@@ -57,10 +58,7 @@ import com.nuvio.app.features.downloads.DownloadEnqueueResult
 import com.nuvio.app.features.downloads.DownloadItem
 import com.nuvio.app.features.downloads.DownloadStatus
 import com.nuvio.app.features.downloads.DownloadsUiState
-import com.nuvio.app.features.downloads.SeasonBatchDownloads
 import com.nuvio.app.features.downloads.SeasonBatchDownloader
-import com.nuvio.app.features.downloads.SeasonBatchRequest
-import com.nuvio.app.features.downloads.SeasonBatchStart
 import com.nuvio.app.features.downloads.SeasonDownloadDefaultsStorage
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.player.desktop.NativePlayerLifecycleCoordinator
@@ -178,7 +176,6 @@ class MiniPlayerSessionTest {
         MetaDetailsRepository.removeCachedMetaForTest("series", browsedSeriesId)
         MetaDetailsRepository.removeCachedMetaForTest("series", appSeriesId)
         MetaDetailsRepository.removeCachedMetaForTest("series", appBrowsedSeriesId)
-        SeasonBatchDownloads.startOverrideForTest = null
         StreamsRepository.clear()
         SeasonDownloadDefaultsStorage.savePayload(testDialogProfileId, "")
         TrackingScrobbleCoordinator.scrobblersOverrideForTest = null
@@ -1260,11 +1257,39 @@ class MiniPlayerSessionTest {
             MetaDetailsRepository.putCachedMetaForTest(playingMeta)
             MetaDetailsRepository.putCachedMetaForTest(browsedMeta)
 
-            val capturedSeasonBatches = mutableListOf<SeasonBatchRequest>()
-            SeasonBatchDownloads.startOverrideForTest = { request ->
-                capturedSeasonBatches += request
-                SeasonBatchStart.Started
-            }
+            val queuedSeasonUrls = mutableListOf<String>()
+            val fakeDownloadsState = MutableStateFlow(DownloadsUiState())
+            val seasonDownloader = SeasonBatchDownloader(
+                scope = scope,
+                downloads = fakeDownloadsState,
+                fetchStreams = { batchEp -> MetaDetailsRepository.findEmbeddedStreams(batchEp.videoId) },
+                prepareStream = { stream, _ -> stream },
+                enqueue = { req, batchEp, stream ->
+                    queuedSeasonUrls += stream.url.orEmpty()
+                    val added = DownloadItem(
+                        id = "app-dl-${batchEp.episodeNumber}",
+                        contentType = req.contentType,
+                        parentMetaId = req.parentMetaId,
+                        parentMetaType = req.parentMetaType,
+                        videoId = batchEp.videoId,
+                        title = "${req.title} — ${batchEp.title}",
+                        seasonNumber = batchEp.seasonNumber,
+                        episodeNumber = batchEp.episodeNumber,
+                        episodeTitle = batchEp.title,
+                        streamTitle = stream.name.orEmpty(),
+                        providerName = stream.addonName,
+                        sourceUrl = stream.url.orEmpty(),
+                        fileName = "browsed-ep${batchEp.episodeNumber}.mp4",
+                        status = DownloadStatus.Downloading,
+                        createdAtEpochMs = 1L,
+                        updatedAtEpochMs = 1L,
+                    )
+                    fakeDownloadsState.value = DownloadsUiState(items = fakeDownloadsState.value.items + added)
+                    DownloadEnqueueResult.Started
+                },
+                onFinished = { _, _ -> },
+                discard = {},
+            )
 
             val backend = CountingNativePlayerBackend()
             val hooks = backend.toDesktopHooks()
@@ -1273,7 +1298,10 @@ class MiniPlayerSessionTest {
 
             compose.setContent {
                 NuvioTheme {
-                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                    CompositionLocalProvider(
+                        LocalDesktopNativePlayerHooks provides hooks,
+                        LocalSeasonDownloadStarter provides seasonDownloader::start,
+                    ) {
                         MainAppContent(
                             initialRoute = TabsRoute,
                             ownsAppRuntime = false,
@@ -1367,11 +1395,13 @@ class MiniPlayerSessionTest {
             compose.onNodeWithContentDescription(text(Res.string.downloads_season_dialog_title, seasonLabel)).performClick()
             compose.waitForIdle()
             compose.onNode(hasText(text(Res.string.downloads_season_button)) and hasAnyAncestor(isDialog())).performClick()
+            compose.runOnIdle { testDispatcher.scheduler.runCurrent() }
             compose.waitForIdle()
-            assertEquals(1, capturedSeasonBatches.size)
-            assertEquals(appBrowsedSeriesId, capturedSeasonBatches.single().parentMetaId)
-            assertEquals(1, capturedSeasonBatches.single().seasonNumber)
-            assertEquals(2, capturedSeasonBatches.single().episodes.size)
+            assertEquals(
+                listOf("https://example.com/browsed-ep1.mp4", "https://example.com/browsed-ep2.mp4"),
+                queuedSeasonUrls,
+            )
+            assertEquals(2, fakeDownloadsState.value.items.size)
 
             // 6. Navigate Back through MainAppContent to TabsRoute (Library), open DownloadsRoute, and switch to Home tab.
             compose.onNodeWithContentDescription(text(Res.string.action_back)).performClick()
