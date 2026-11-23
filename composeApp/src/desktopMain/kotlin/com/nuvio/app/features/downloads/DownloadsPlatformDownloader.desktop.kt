@@ -32,6 +32,7 @@ import java.net.InetAddress
 import java.net.URI
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.createDirectories
 
 private val desktopDownloadHttpClient = com.nuvio.app.core.network.guardedHttpClient()
@@ -653,9 +654,9 @@ internal actual object DownloadsPlatformDownloader {
         }
 
         val active = AtomicBoolean(true)
-        @Volatile var activeResponse: DownloadResponse = opened.response
+        val activeResponse = AtomicReference(opened.response)
         val cancelConnection = launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
-            try { awaitCancellation() } finally { if (active.get()) activeResponse.cancel() }
+            try { awaitCancellation() } finally { if (active.get()) activeResponse.get().cancel() }
         }
         try {
         if (needsIdentityVerification) {
@@ -705,7 +706,7 @@ internal actual object DownloadsPlatformDownloader {
                         } catch (_: RangeNotSatisfiableException) {
                             throw RefreshNeedsNewPartial()
                         }
-                        activeResponse = reOpened.response
+                        activeResponse.set(reOpened.response)
                         val reCrHeader = reOpened.response.header("Content-Range")
                         val reCr = parseContentRange(reCrHeader)
                         val reTotal = resolveTotalBytes(
@@ -867,7 +868,7 @@ internal actual object DownloadsPlatformDownloader {
         } finally {
             active.set(false)
             cancelConnection.cancel()
-            activeResponse.close()
+            activeResponse.get().close()
         }
     }
 
