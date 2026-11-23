@@ -123,7 +123,7 @@ class NativePlayerControllerSubtitlesTest {
                 onError = {},
             )
 
-            controller.setNativeHandleForTest(99L)
+            controller.assignNativeHandleForTest(99L)
             controller.applyStartupSubtitlesIfNeeded(
                 sourceUrl = "https://cdn.example.invalid/movie.mkv",
                 externalSubtitles = listOf(
@@ -163,7 +163,7 @@ class NativePlayerControllerSubtitlesTest {
                 },
                 subtitleBridgeOps = bridgeOps,
             )
-            controller.setNativeHandleForTest(77L)
+            controller.assignNativeHandleForTest(77L)
 
             val addLatch = CountDownLatch(1).also { bridgeOps.addLatch.set(it) }
             controller.setSubtitleUri("https://subs.example.invalid/good.srt")
@@ -346,7 +346,7 @@ class NativePlayerControllerSubtitlesTest {
                 startupSubtitleSelection = runtime.startupSubtitleSelection,
                 onError = { error(it ?: "Player creation failed") },
             )
-            controller.setNativeHandleForTest(99L)
+            controller.assignNativeHandleForTest(99L)
             controller.applyStartupSubtitlesIfNeeded(
                 sourceUrl = runtime.activeSourceUrl,
                 externalSubtitles = runtime.externalSubtitles,
