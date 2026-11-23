@@ -230,9 +230,9 @@ class PendingDownloadFileTest {
         assertEquals(0, partials.get())
     }
 
-    @Test fun a_pending_file_uses_trash_even_when_direct_removal_was_requested() {
+    @Test fun deleting_a_pending_file_sends_it_to_trash() {
         load()
-        assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item().id, permanently = true))
+        assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload(item().id))
         assertArchived()
     }
 
