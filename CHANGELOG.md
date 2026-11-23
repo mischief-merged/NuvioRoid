@@ -41,6 +41,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- Desktop account data is never wiped by sign-out, a lost session or an account change: a different account is offered Start fresh, which archives the old data instead of deleting it, and quitting waits for downloads and the player to finish saving ([#133](https://github.com/mischief-merged/NuvioRoid/pull/133)).
 - An expired download link is refreshed and the same file resumes instead of starting over ([#94](https://github.com/mischief-merged/NuvioRoid/pull/94)).
 - Memory stays bounded during long sessions: caches, lists and player resources that could grow without a limit now have one, the image cache is sized from the available memory, and the app clears its caches if memory stays high ([#132](https://github.com/mischief-merged/NuvioRoid/pull/132)).
 - Finished downloaded episodes now count as watched, so automatic downloads move on to the next episodes; only episodes finished on this device count, and unwatching an episode cancels its pending removal ([#118](https://github.com/mischief-merged/NuvioRoid/pull/118)).
