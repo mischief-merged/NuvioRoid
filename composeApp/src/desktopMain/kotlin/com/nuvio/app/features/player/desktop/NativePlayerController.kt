@@ -1719,16 +1719,13 @@ internal class NativePlayerController(
         ) {
             return
         }
-        val updated = pending.copy(
-            externalSubtitles = externalSubtitles,
-            startupSubtitleSelection = startupSubtitleSelection,
-        )
-        pendingSource = updated
+        // The attachment keeps its identity: events and the certificate prompt compare against it.
+        pending.startupSubtitles = StartupSubtitles(externalSubtitles, startupSubtitleSelection)
         if (externalSubtitles.any { it.url.isLocalSubtitleUri() }) {
             subtitleOps.clearExternalSubtitles(current)
-            configureStartupSubtitlesSafe(current, updated)
+            configureStartupSubtitlesSafe(current, pending)
         } else {
-            triggerFallbackRemoteStartupSubtitleIfNeeded(updated)
+            triggerFallbackRemoteStartupSubtitleIfNeeded(pending)
         }
     }
 
@@ -1959,7 +1956,17 @@ private fun Int.toHexByte(): String {
     }
 }
 
-private data class PendingSource(
+private class StartupSubtitles(
+    val externalSubtitles: List<StreamSubtitle>,
+    val selection: StartupSubtitleSelection?,
+)
+
+/**
+ * One attachment. Native events, errors and the certificate prompt all check that the controller still
+ * holds this same object, so it is never replaced: the startup subtitles are swapped in place when they
+ * arrive late.
+ */
+private class PendingSource(
     val sourceUrl: String,
     val headerLines: List<String>,
     val playWhenReady: Boolean,
@@ -1967,10 +1974,16 @@ private data class PendingSource(
     val decoderPriority: Int,
     val nvidiaRtxSuperResolutionEnabled: Boolean,
     val nvidiaRtxHdrEnabled: Boolean,
-    val externalSubtitles: List<StreamSubtitle> = emptyList(),
-    val startupSubtitleSelection: StartupSubtitleSelection? = null,
+    externalSubtitles: List<StreamSubtitle> = emptyList(),
+    startupSubtitleSelection: StartupSubtitleSelection? = null,
     val onError: (String?) -> Unit,
-)
+) {
+    @Volatile
+    var startupSubtitles: StartupSubtitles = StartupSubtitles(externalSubtitles, startupSubtitleSelection)
+
+    val externalSubtitles: List<StreamSubtitle> get() = startupSubtitles.externalSubtitles
+    val startupSubtitleSelection: StartupSubtitleSelection? get() = startupSubtitles.selection
+}
 
 internal fun Map<String, String>.toHeaderLines(): List<String> =
     entries.mapNotNull { (key, value) ->

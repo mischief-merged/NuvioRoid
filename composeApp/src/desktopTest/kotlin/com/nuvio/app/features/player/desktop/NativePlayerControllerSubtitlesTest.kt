@@ -373,4 +373,67 @@ class NativePlayerControllerSubtitlesTest {
         }
     }
 
+    @Test
+    fun lateStartupSubtitlesKeepNativeEventsAndTheCertificatePromptWorking() {
+        val dir = Files.createTempDirectory("nuvio-npc-sub-identity").toFile()
+        val created = CountDownLatch(1)
+        val sink = AtomicReference<NativePlayerEventSink?>(null)
+        val prompts = AtomicInteger(0)
+        val retries = AtomicInteger(0)
+        val bridgeOps = RecordingSubtitleBridgeOps()
+        val controller = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = { _, _, _, _, _, _, _, _, _, eventSink ->
+                sink.set(eventSink)
+                created.countDown()
+                41L
+            },
+            nativeDispose = {},
+            nativeRetryUnverified = { _, _ -> retries.incrementAndGet(); true },
+            rememberPlaybackNetwork = {},
+            isHostDisplayable = { true },
+            resolveHostView = { 1L },
+            networkIdentity = { "session:1" },
+            confirmUnverified = { prompts.incrementAndGet(); true },
+            subtitleBridgeOps = bridgeOps,
+        )
+        try {
+            val subtitleFile = File(dir, "late.srt").apply { writeText("1\n00:00:01,000 --> 00:00:02,000\nHi\n") }
+            val source = "https://cdn.example.invalid/movie.mkv"
+            controller.attach(
+                sourceUrl = source,
+                sourceHeaders = emptyMap(),
+                playWhenReady = true,
+                initialPositionMs = 0L,
+                decoderPriority = 0,
+                nvidiaRtxSuperResolutionEnabled = false,
+                onError = {},
+            )
+            assertTrue(created.await(5, TimeUnit.SECONDS), "the player was never created")
+            val deadline = System.nanoTime() + 5_000_000_000L
+            val handleField = controller.javaClass.getDeclaredField("handle").apply { isAccessible = true }
+            while (handleField.getLong(controller) != 41L && System.nanoTime() < deadline) Thread.sleep(10)
+            SwingUtilities.invokeAndWait {}
+
+            val loaded = CountDownLatch(1).also { bridgeOps.startupLatch.set(it) }
+            controller.applyStartupSubtitlesIfNeeded(
+                sourceUrl = source,
+                externalSubtitles = listOf(StreamSubtitle(url = subtitleFile.toURI().toString(), language = "en", name = "English")),
+                startupSubtitleSelection = StartupSubtitleSelection(selectedUrl = subtitleFile.toURI().toString()),
+            )
+            assertTrue(loaded.await(2, TimeUnit.SECONDS), "the late subtitles were never added")
+
+            // The same attachment must still be accepted: a certificate failure after the update asks and retries.
+            sink.get()!!.onPlayerEvent("certificateFailure", 0.0)
+            SwingUtilities.invokeAndWait {}
+            SwingUtilities.invokeAndWait {}
+            assertEquals(1, prompts.get(), "the certificate prompt was dropped after the subtitle update")
+            assertEquals(1, retries.get())
+        } finally {
+            controller.assignNativeHandleForTest(0L)
+            controller.dispose()
+            SwingUtilities.invokeAndWait {}
+            dir.deleteRecursively()
+        }
+    }
 }
