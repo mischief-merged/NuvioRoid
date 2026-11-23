@@ -18,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
+- The app window appears and responds sooner at startup: loading the downloads list and saving the window position no longer run on the interface thread ([#129](https://github.com/mischief-merged/NuvioRoid/pull/129)).
 - Updated to the latest upstream Nuvio Desktop, adding Stremio tracking add-ons, keyboard and gamepad navigation, Plex and Silo servers, the redesigned downloads screen, library filters, subtitle improvements, precise seeking, more translations, and memory settings that let an idle app hand memory back ([#128](https://github.com/mischief-merged/NuvioRoid/pull/128)).
 - Source ranking now checks release names for title, episode, film year, and audio language: sources that clearly belong to another title, episode, or year are moved to the back of the list (never hidden), subtitle languages are separated from audio languages, and untagged foreign-looking sources no longer count as the chosen audio language ([#46](https://github.com/mischief-merged/NuvioRoid/pull/46)).
 - Widened playback placeholder detection to catch clips under ten minutes and under a fifth of the title's running time ([#50](https://github.com/mischief-merged/NuvioRoid/pull/50)).
