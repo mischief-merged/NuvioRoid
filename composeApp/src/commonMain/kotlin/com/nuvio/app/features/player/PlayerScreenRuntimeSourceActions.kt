@@ -272,7 +272,7 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
         return
     }
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = resolveEpisodeResume(epVideoId, episode)
@@ -420,7 +420,7 @@ internal fun PlayerScreenRuntime.switchToEpisodeStream(
     if (openExternalSourceUrl(stream)) return
     val url = stream.playableDirectUrl ?: return
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
     val epVideoId = episode.id
     val resume = serverResumeMs?.let { EpisodeResume(positionMs = it, fraction = null) } ?: resolveEpisodeResume(epVideoId, episode)
@@ -442,7 +442,7 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
     val localFileUri = DownloadsRepository.playableLocalFileUri(downloadItem) ?: return
     restartSourceFailoverAfterUserChoice(newVideo = true)
     resetEpisodePanelAndNextEpisodeState()
-    flushWatchProgress()
+    flushProgressForEpisodeChange(episode)
     stopActiveP2pStream()
 
     val fallbackVideoId = buildPlaybackVideoId(
@@ -497,6 +497,10 @@ internal fun PlayerScreenRuntime.switchToDownloadedEpisode(downloadItem: Downloa
 }
 
 internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false) {
+    if (automatic && sleepTimer.blocksAutomaticNextEpisode()) {
+        cancelNextEpisodeAutoPlay()
+        return
+    }
     if (nextEpisodeAutoPlaySearching || nextEpisodeAutoPlayCountdown != null) return
     nextEpisodePreloadTriggered = false
     val playbackKey = activePlaybackKey
@@ -505,7 +509,9 @@ internal fun PlayerScreenRuntime.playNextEpisode(automatic: Boolean = false) {
         nextEpisodeInfo?.videoId == nextVideoId &&
         (!automatic || (
             playerSettingsUiState.streamAutoPlayNextEpisodeEnabled &&
-                !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
+                !nextEpisodeCardDismissed &&
+                isAtNextEpisodeThreshold() &&
+                !sleepTimer.blocksAutomaticNextEpisode()
             ))
     if (!isCurrentRequest()) return
     nextEpisodeAutoPlayAutomatic = automatic
@@ -580,6 +586,19 @@ internal fun PlayerScreenRuntime.openEpisodesPanel() {
 }
 
 private data class EpisodeResume(val positionMs: Long, val fraction: Float?)
+
+private fun PlayerScreenRuntime.flushProgressForEpisodeChange(episode: MetaVideo) {
+    flushWatchProgress(
+        leavingEpisode = isLeavingPlaybackEpisode(
+            currentVideoId = activeVideoId,
+            currentSeason = activeSeasonNumber,
+            currentEpisode = activeEpisodeNumber,
+            nextVideoId = episode.id,
+            nextSeason = episode.season,
+            nextEpisode = episode.episode,
+        ),
+    )
+}
 
 private fun PlayerScreenRuntime.resetEpisodePanelAndNextEpisodeState() {
     showNextEpisodeCard = false

@@ -487,4 +487,81 @@ class AddonPlayerEventsTest {
         assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
         assertNull(runtime.activeAddonPlayerEventTarget)
     }
+
+    @Test
+    fun sleep_timer_end_of_episode_at_eof_sends_pause_not_stop_and_exit_does_not_stop() {
+        val runtime = runtime(runtimeMinutes = 45)
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 2_600_000L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.selectSleepTimerOption(SleepTimerOption.EndOfEpisode)
+        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+            isLoading = false,
+            isPlaying = false,
+            isEnded = true,
+            durationMs = 2_700_000L,
+            positionMs = 2_700_000L,
+        )
+        runtime.advanceSleepTimer(clockNowMs + 5_000L)
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+        // Player disposal runs DisposableEffect(Unit) then DisposableEffect(videoId, ...).
+        runtime.emitAddonPlayerProgressEvent()
+        runtime.flushWatchProgress(TrackingScrobbleAction.STOP)
+
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.PAUSE), events.map { it.action })
+        assertEquals(AddonPlayerEventTarget("series", "tt1234567:1:2"), runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun sleep_timer_hold_on_exit_before_eof_sends_pause_not_stop() {
+        val runtime = runtime(runtimeMinutes = 45)
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 2_500_000L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.selectSleepTimerOption(SleepTimerOption.EndOfEpisode)
+        // Exit while still playing: DisposableEffect(Unit) runs before the flush effect.
+        runtime.emitAddonPlayerProgressEvent()
+        runtime.flushWatchProgress()
+
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.PAUSE), events.map { it.action })
+        assertEquals(AddonPlayerEventTarget("series", "tt1234567:1:2"), runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun sleep_timer_stopped_with_zero_duration_teardown_never_sends_stop() {
+        val runtime = runtime(runtimeMinutes = 45)
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 2_500_000L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.sleepTimer = SleepTimerState(
+            phase = SleepTimerPhase.Stopped,
+            holdIncomplete = true,
+            holdPositionMs = 2_500_000L,
+        )
+        runtime.playbackSnapshot = PlayerPlaybackSnapshot(
+            isLoading = false,
+            isPlaying = false,
+            isEnded = false,
+            durationMs = 0L,
+            positionMs = 2_500_000L,
+        )
+        runtime.emitAddonPlayerProgressEvent()
+        runtime.flushWatchProgress()
+
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+        assertEquals(AddonPlayerEventTarget("series", "tt1234567:1:2"), runtime.activeAddonPlayerEventTarget)
+    }
+
+    @Test
+    fun normal_exit_without_sleep_hold_sends_stop() {
+        val runtime = runtime(runtimeMinutes = 45)
+        settlePlayback(runtime, durationMs = 2_700_000L, startPositionMs = 60_000L)
+        assertEquals(listOf(AddonPlayerAction.START), events.map { it.action })
+
+        runtime.emitAddonPlayerProgressEvent()
+        runtime.flushWatchProgress()
+
+        assertEquals(listOf(AddonPlayerAction.START, AddonPlayerAction.STOP), events.map { it.action })
+        assertNull(runtime.activeAddonPlayerEventTarget)
+    }
 }

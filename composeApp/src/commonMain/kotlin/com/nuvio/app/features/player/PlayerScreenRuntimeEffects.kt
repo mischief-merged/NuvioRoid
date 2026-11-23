@@ -19,7 +19,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.downloads.SidecarIo
 import com.nuvio.app.features.downloads.savedEpisodeVideosFor
@@ -486,7 +485,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     DisposableEffect(Unit) {
         PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
-            emitAddonPlayerEvent(AddonPlayerAction.STOP)
+            emitAddonPlayerProgressEvent()
             args.launchId?.let { launchId ->
                 PlayerLaunchStore.update(launchId) { currentLaunch(it) }
                 // The player is gone: release the launch payload once the restore window has
@@ -614,6 +613,16 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         }
         if (playbackSnapshot.isPlaying) {
             persistPlaybackProgressTick()
+        }
+    }
+
+    if (isDesktop) {
+        LaunchedEffect(Unit) {
+            while (true) {
+                val fading = sleepTimer.phase == SleepTimerPhase.Fading
+                delay(if (fading) 200L else 1_000L)
+                advanceSleepTimer(System.currentTimeMillis())
+            }
         }
     }
 }
@@ -937,21 +946,11 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
         playerSettingsUiState.streamAutoPlayNextEpisodeEnabled,
         nextEpisodeCardDismissed,
+        sleepTimer.option,
+        sleepTimer.phase,
+        sleepTimer.stopAfterEpisode,
     ) {
-        val shouldShow = nextEpisodeInfo != null && !nextEpisodeCardDismissed && isAtNextEpisodeThreshold()
-        if (nextEpisodeAutoPlayAutomatic &&
-            (!shouldShow || !playerSettingsUiState.streamAutoPlayNextEpisodeEnabled)
-        ) {
-            cancelNextEpisodeAutoPlay()
-        }
-        if (shouldShow && !showNextEpisodeCard) {
-            showNextEpisodeCard = true
-            if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true && !isPartyControlLocked) {
-                playNextEpisode(automatic = true)
-            }
-        } else if (!shouldShow) {
-            showNextEpisodeCard = false
-        }
+        onNextEpisodeThresholdChanged()
     }
 }
 

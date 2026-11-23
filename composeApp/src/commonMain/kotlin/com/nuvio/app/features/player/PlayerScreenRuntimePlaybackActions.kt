@@ -176,6 +176,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         currentTrackingMedia = null
         resetTrackSelectionState()
     }
+    noteSleepTimerEpisode()
 }
 
 private fun PlayerScreenRuntime.resetTrackSelectionState() {
@@ -394,6 +395,7 @@ internal suspend fun PlayerScreenRuntime.resolveParentalGuideImdbId(): String? {
 
 internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     durationMs: Long = playbackSnapshot.durationMs,
+    allowEnded: Boolean = false,
 ): Boolean {
     val url = activeSourceUrl
     if (url.isBlank()) return false
@@ -403,7 +405,7 @@ internal fun PlayerScreenRuntime.isSourceAcceptedForAddonPlayerEvents(
     if (sourceFailoverForPlaceholder) return false
     if (placeholderDetectedUrl == url) return false
     if (isDesktop && activeVideoId != null && !url.startsWith("file:") && addonTrackingDurationSettledUrl != url) return false
-    if (playbackSnapshot.isEnded) return false
+    if (!allowEnded && playbackSnapshot.isEnded) return false
     if (durationMs <= 0L) return false
     if (isShortPlaceholderDuration(durationMs)) return false
     val assessment = if (activeTorrentInfoHash == null) {
@@ -456,20 +458,35 @@ internal fun PlayerScreenRuntime.emitAddonPlayerEvent(
         lastAddonPlayerAction = null
         dispatchAddonPlayerEvent(active, AddonPlayerAction.STOP, positionMs, durationMs)
     }
-    if (!isSourceAcceptedForAddonPlayerEvents(durationMs)) {
+    if (action == AddonPlayerAction.PAUSE && activeAddonPlayerEventTarget == null) return
+    if (!forceResend && activeAddonPlayerEventTarget == target && lastAddonPlayerAction == action) return
+    if (!isSourceAcceptedForAddonPlayerEvents(
+            durationMs = durationMs,
+            allowEnded = action == AddonPlayerAction.PAUSE,
+        )
+    ) {
         val current = activeAddonPlayerEventTarget
-        if (current != null) {
+        if (current != null && !(action == AddonPlayerAction.PAUSE && playbackHoldIncomplete())) {
             activeAddonPlayerEventTarget = null
             lastAddonPlayerAction = null
             dispatchAddonPlayerEvent(current, AddonPlayerAction.STOP, positionMs, durationMs)
         }
         return
     }
-    if (action == AddonPlayerAction.PAUSE && activeAddonPlayerEventTarget == null) return
-    if (!forceResend && activeAddonPlayerEventTarget == target && lastAddonPlayerAction == action) return
     activeAddonPlayerEventTarget = target
     lastAddonPlayerAction = action
     dispatchAddonPlayerEvent(target, action, positionMs, durationMs)
+}
+
+internal fun PlayerScreenRuntime.emitAddonPlayerProgressEvent(
+    scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
+    holdIncomplete: Boolean = playbackHoldIncomplete(),
+) {
+    when (scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)) {
+        TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
+        TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
+        TrackingScrobbleAction.START -> Unit
+    }
 }
 
 internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
@@ -478,14 +495,43 @@ internal fun PlayerScreenRuntime.resendAddonPlayerStateAfterSeek() {
     emitAddonPlayerEvent(action, forceResend = true)
 }
 
+/**
+ * True when this save is the episode being left, not another source for the same one.
+ * Season and episode come first. Ids are the tie-break when those numbers match.
+ */
+internal fun isLeavingPlaybackEpisode(
+    currentVideoId: String?,
+    currentSeason: Int?,
+    currentEpisode: Int?,
+    nextVideoId: String?,
+    nextSeason: Int?,
+    nextEpisode: Int?,
+): Boolean {
+    if (nextSeason != currentSeason || nextEpisode != currentEpisode) return true
+    val currentId = currentVideoId?.takeIf { it.isNotBlank() } ?: return false
+    val nextId = nextVideoId?.takeIf { it.isNotBlank() } ?: return false
+    return currentId != nextId
+}
+
+/**
+ * The save every minute stays on this computer. Pause, seek, and stop are what reach the server.
+ * [holdIncomplete] only changes the row stored here. It does not send the tick.
+ */
+internal fun playbackProgressTickSyncsRemote(holdIncomplete: Boolean): Boolean = false
+
 internal fun PlayerScreenRuntime.flushWatchProgress(
     scrobbleAction: TrackingScrobbleAction = TrackingScrobbleAction.STOP,
+    leavingEpisode: Boolean = false,
+    holdIncomplete: Boolean = playbackHoldIncomplete(leavingEpisode = leavingEpisode),
 ) {
+    val action = scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)
     WatchProgressRepository.flushPlaybackProgress(
         session = playbackSession,
         snapshot = playbackSnapshot,
+        syncRemote = !holdIncomplete,
+        holdIncomplete = holdIncomplete,
     )
-    when (scrobbleAction) {
+    when (action) {
         TrackingScrobbleAction.PAUSE -> emitTrackingScrobblePause()
         TrackingScrobbleAction.STOP -> {
             emitStopScrobbleForCurrentProgress()
@@ -493,11 +539,10 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
         }
         TrackingScrobbleAction.START -> Unit
     }
-    when (scrobbleAction) {
-        TrackingScrobbleAction.PAUSE -> emitAddonPlayerEvent(AddonPlayerAction.PAUSE)
-        TrackingScrobbleAction.STOP -> emitAddonPlayerEvent(AddonPlayerAction.STOP)
-        TrackingScrobbleAction.START -> Unit
-    }
+    emitAddonPlayerProgressEvent(
+        scrobbleAction = scrobbleAction,
+        holdIncomplete = holdIncomplete,
+    )
 }
 
 /** Tells automatic downloads that a downloaded file was played to the point that counts as watched. */
@@ -517,10 +562,15 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
+        // A seek during a sleep stop must not mark the episode watched or scrobble past it.
+        val holdIncomplete = playbackHoldIncomplete()
         WatchProgressRepository.upsertPlaybackProgress(
             session = playbackSession,
             snapshot = playbackSnapshot,
+            syncRemote = !holdIncomplete,
+            holdIncomplete = holdIncomplete,
         )
+        if (holdIncomplete) return@launch
         resendAddonPlayerStateAfterSeek()
 
         val progressPercent = currentPlaybackProgressPercent()
@@ -569,10 +619,12 @@ internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now
+    val holdIncomplete = playbackHoldIncomplete(now)
     WatchProgressRepository.upsertPlaybackProgress(
         session = playbackSession,
         snapshot = playbackSnapshot,
-        syncRemote = false,
+        syncRemote = playbackProgressTickSyncsRemote(holdIncomplete),
+        holdIncomplete = holdIncomplete,
     )
 }
 
