@@ -49,6 +49,19 @@ internal object NativePlayerBridge {
      */
     external fun initGtkEarly(): Boolean
 
+    external fun playbackNetworkIdentity(): String
+    external fun systemTrustPem(): String
+    external fun systemTrustCertificates(): Array<ByteArray>
+    external fun verifyServerCertificates(chain: Array<ByteArray>, hostname: String): Boolean
+    external fun retryUnverified(handle: Long, network: String): Boolean
+    external fun requireVerifiedPlayback()
+    external fun createMac(
+        hostViewPtr: Long, sourceUrl: String, headerLines: Array<String>, playWhenReady: Boolean,
+        initialPositionMs: Long, controlsPageUrl: String, decoderPriority: Int,
+        nvidiaRtxSuperResolutionEnabled: Boolean, eventSink: NativePlayerEventSink,
+        caFile: String, network: String, allowUnverified: Boolean, warning: String,
+    ): Long
+
     external fun create(
         hostViewPtr: Long,
         sourceUrl: String,

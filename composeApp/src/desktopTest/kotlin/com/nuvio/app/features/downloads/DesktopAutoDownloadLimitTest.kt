@@ -16,7 +16,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopAutoDownloadLimitTest {
+class DesktopAutoDownloadLimitTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val megabyte = 1024 * 1024
     private val bodyBytes = 6 * megabyte
     private val shortBodyBytes = megabyte / 2

@@ -1,5 +1,6 @@
 package com.nuvio.app.core.memory
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.addons.readResponseBody
 import com.nuvio.app.features.downloads.DownloadCompanions
@@ -28,7 +29,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFails
 import kotlin.test.assertTrue
 
-class MemoryLifecycleTest {
+class MemoryLifecycleTest : TrustedLocalServerTest() {
     @Test fun companionAndOverlayCachesHaveFiniteCapacity() {
         checkMaps(EpisodeListCompanion(), "shows")
         checkMaps(DownloadCompanions(emptyList()), "failedAt")

@@ -11,7 +11,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /** The raw response carries the body exactly as it came, not the decoded text encoded again. */
-class DesktopRawBytesTest {
+class DesktopRawBytesTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private lateinit var server: HttpServer
     private val binary = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0x80.toByte(), 0xC0.toByte(), 0x00, 0x7F, 0xFE.toByte()) +
         ByteArray(256) { it.toByte() }

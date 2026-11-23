@@ -1,7 +1,7 @@
 package com.nuvio.app.features.downloads
 
 import com.nuvio.app.core.memory.SharedLookup
-import com.nuvio.app.features.addons.httpGetTextWithHeaders
+import com.nuvio.app.features.addons.httpGetSubtitleText
 import com.nuvio.app.features.player.PlayerSubtitleCueParser
 import com.nuvio.app.features.player.AddonSubtitle
 import com.nuvio.app.features.player.loadAddonSubtitles
@@ -36,7 +36,7 @@ internal object DownloadSubtitles {
 
     /** Fetches the text of a subtitle. Replaced in tests. */
     internal var fetchText: suspend (url: String, headers: Map<String, String>) -> String =
-        { url, headers -> httpGetTextWithHeaders(url, headers) }
+        { url, headers -> httpGetSubtitleText(url, headers) }
 
     /** Asks the subtitle add-ons. Replaced in tests. */
     internal var loadAddon: suspend (List<SubtitleAddonRequest>) -> List<AddonSubtitle> =

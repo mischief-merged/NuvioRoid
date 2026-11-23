@@ -18,7 +18,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /** The desktop downloader over loopback: how often it reports, how fast it stops, and the speed limit. */
-class DownloadSpeedAndCancelTest {
+class DownloadSpeedAndCancelTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val payload = ByteArray(3 * 1024 * 1024) { (it * 31).toByte() }
     private val servers = mutableListOf<HttpServer>()
     private val files = mutableListOf<File>()

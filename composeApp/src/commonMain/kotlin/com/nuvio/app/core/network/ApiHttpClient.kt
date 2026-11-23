@@ -6,6 +6,7 @@ import io.ktor.utils.io.errors.IOException
 import io.ktor.utils.io.readAvailable
 
 internal expect fun createApiHttpClient(): HttpClient
+internal expect fun createBackendHttpEngine(): io.ktor.client.engine.HttpClientEngine?
 
 internal const val API_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 

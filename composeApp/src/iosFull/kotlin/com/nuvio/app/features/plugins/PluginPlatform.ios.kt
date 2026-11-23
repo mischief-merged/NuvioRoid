@@ -145,3 +145,5 @@ internal fun currentPluginPlatformTags(): Set<String> = setOf(currentPluginPlatf
 
 internal fun currentEpochMillis(): Long =
     (platform.Foundation.NSDate().timeIntervalSince1970 * 1000.0).toLong()
+
+internal suspend fun fetchPluginText(url: String): String = com.nuvio.app.features.addons.httpGetText(url)

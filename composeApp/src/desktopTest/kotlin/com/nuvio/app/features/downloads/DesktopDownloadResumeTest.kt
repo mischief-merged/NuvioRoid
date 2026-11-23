@@ -15,7 +15,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadResumeTest {
+class DesktopDownloadResumeTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     @Test
     fun dropped_connections_resume_from_the_partial_file_instead_of_failing() {
         val payload = Random(42).nextBytes(3 * 1024 * 1024)

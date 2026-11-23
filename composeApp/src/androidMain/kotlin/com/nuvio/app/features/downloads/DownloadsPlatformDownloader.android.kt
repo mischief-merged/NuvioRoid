@@ -145,3 +145,5 @@ private fun String.toLocalFileOrNull(): File? {
         }
     }.getOrNull()
 }
+
+internal actual fun isTrustedHomeDownloadHost(host: String): Boolean = false

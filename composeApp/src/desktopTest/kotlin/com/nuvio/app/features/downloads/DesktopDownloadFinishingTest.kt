@@ -19,7 +19,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadFinishingTest {
+class DesktopDownloadFinishingTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val world = FolderWorld()
     private val originalBackend = DownloadsRepository.backend
     private val originalCompanions = DownloadsRepository.companions

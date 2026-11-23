@@ -409,7 +409,7 @@ actual object PluginRepository {
     ): Pair<PluginRepositoryItem, List<PluginScraper>> {
         val storageProfileId = currentProfileId
         return withContext(Dispatchers.Default) {
-            val payload = httpGetText(manifestUrl)
+            val payload = fetchPluginText(manifestUrl)
             val manifest = PluginManifestParser.parse(payload)
             val baseUrl = manifestUrl.substringBefore("?").removeSuffix("/manifest.json")
 
@@ -422,7 +422,7 @@ actual object PluginRepository {
                         "$baseUrl/${info.filename.trimStart('/')}"
                     }
                     runCatching {
-                        val code = httpGetText(codeUrl)
+                        val code = fetchPluginText(codeUrl)
                         val scraperId = "${manifestUrl.lowercase()}:${info.id}"
                         val cached = PluginStorage.saveScraperCode(
                             profileId = storageProfileId,

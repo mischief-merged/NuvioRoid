@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
  * Review 5 follow-up, 2b: the downloader resumes, cuts back or removes only a partial file it created, proven
  * by the identity it recorded then; and removes a just-published file only while it is still that file.
  */
-class PartialOwnershipTest {
+class PartialOwnershipTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val dir = Files.createTempDirectory("nuvio-partial-own").toRealPath()
     private val payload = Random(7).nextBytes(64 * 1024)
     private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {

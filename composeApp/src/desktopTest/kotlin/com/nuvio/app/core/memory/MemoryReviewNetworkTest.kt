@@ -1,5 +1,6 @@
 package com.nuvio.app.core.memory
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.features.addons.*
 import com.nuvio.app.features.mdblist.*
 import com.nuvio.app.features.autosync.EmbeddedSubtitleTimelineLoader
@@ -20,7 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.json.Json
 import kotlin.test.*
 
-class MemoryReviewNetworkTest {
+class MemoryReviewNetworkTest : TrustedLocalServerTest() {
     @Test fun catalogPaginationKeepsFetchingAfterTheWindowFills() = runBlocking {
         withServer(::catalogBody) { base ->
             CatalogRepository.clear()

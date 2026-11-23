@@ -7,6 +7,7 @@ package com.nuvio.app.features.downloads
  */
 internal fun String.hasPublicDownloadHost(): Boolean {
     val host = downloadUrlHost(this) ?: return false
+    if (isTrustedHomeDownloadHost(host)) return true
     return when {
         host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local") -> false
         ':' in host -> !isPrivateIpv6Literal(host)
@@ -57,3 +58,5 @@ private fun isPrivateIpv6Literal(host: String): Boolean {
         firstGroup.startsWith("fe8") || firstGroup.startsWith("fe9") ||
         firstGroup.startsWith("fea") || firstGroup.startsWith("feb")
 }
+
+internal expect fun isTrustedHomeDownloadHost(host: String): Boolean

@@ -21,3 +21,5 @@ internal actual fun createApiHttpClient(): HttpClient = HttpClient(OkHttp) {
         addInterceptor(NetworkErrorInterceptor())
     }
 }
+
+internal actual fun createBackendHttpEngine(): io.ktor.client.engine.HttpClientEngine? = null

@@ -17,7 +17,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /** A download the user started checks the room on the disk against the size the server announces. Loopback only. */
-class DesktopDownloadFreeSpaceTest {
+class DesktopDownloadFreeSpaceTest : com.nuvio.app.core.network.TrustedLocalServerTest() {
     private val payload = ByteArray(2 * 1024 * 1024) { it.toByte() }
 
     private class Outcome(val success: Boolean, val message: String?)

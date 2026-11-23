@@ -1,5 +1,6 @@
 package com.nuvio.app.core.memory
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.DesktopHttpCalls
@@ -21,7 +22,7 @@ import kotlinx.coroutines.*
 import okhttp3.Request
 import kotlin.test.*
 
-class MemoryBoundaryRegressionTest {
+class MemoryBoundaryRegressionTest : TrustedLocalServerTest() {
     private val guidePayload = """{"parentsGuide":[{"category":"VIOLENCE","severityBreakdowns":[{"severityLevel":"mild","voteCount":4}]}]}"""
 
     @Test fun parentalGuideHitsStayConsistentDuringPressureClears() = runBlocking {
