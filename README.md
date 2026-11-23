@@ -61,7 +61,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for what changed in each release and what i
 
 ## 📦 Download
 
-**macOS (Apple silicon):** [**Download NuvioRoid 1.1.36.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.36.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
+**macOS (Apple silicon):** [**Download NuvioRoid 1.1.38.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.38.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
 
 1. Open the DMG and drag NuvioRoid to Applications.
 2. The build is not signed with an Apple developer certificate, so macOS blocks the first launch. Open it once, then go to System Settings > Privacy & Security and choose "Open Anyway".
