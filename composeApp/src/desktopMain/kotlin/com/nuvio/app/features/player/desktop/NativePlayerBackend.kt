@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.desktop
 
+import nuvio.composeapp.generated.resources.*
 import java.lang.ref.WeakReference
 
 /**
