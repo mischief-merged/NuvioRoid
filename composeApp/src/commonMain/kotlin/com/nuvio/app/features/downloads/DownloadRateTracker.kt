@@ -62,6 +62,8 @@ internal class DownloadRateTracker(
         }
     }
 
+    fun hasSamples(downloadId: String): Boolean = synchronized(lock) { downloadId in samplesById }
+
     fun clearAll() {
         synchronized(lock) {
             samplesById.clear()

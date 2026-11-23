@@ -290,6 +290,9 @@ internal interface DownloadFolderController {
      */
     fun adoptFile(item: DownloadItem, path: String): Boolean = false
 
+    /** Whether a folder move is currently running. */
+    val isMoveRunning: Boolean get() = false
+
     /** Scans every available storage location for completed downloads whose records are missing. */
     fun scanDownloadsOnDisk(
         activeProfileId: Int,

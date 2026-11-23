@@ -562,4 +562,28 @@ class DesktopDownloadFoldersTest {
 
         assertFalse(first.id in world.locations.all().map { it.id })
     }
+
+    @Test
+    fun refresh_survives_a_throwing_volume_store_lookup_for_volume_key() {
+        val drive = world.driveLocation("Archive")
+        val folders = DesktopDownloadFolders(
+            locations = world.locations,
+            validator = world.validator,
+            mover = world.mover(),
+            hooks = Hooks(emptyList()),
+            freeSpaceOf = { 500_000_000L },
+            fileStoreKeyOf = { path ->
+                if (path == drive.path) throw java.io.IOException("volume gone")
+                "store:${path.fileName}"
+            },
+        )
+
+        folders.refresh()
+
+        val state = folders.state.value
+        val driveInfo = assertNotNull(state.location(drive.id))
+        assertEquals(drive.id, driveInfo.volumeKey)
+        assertNotNull(state.totalFreeBytes)
+        assertTrue(state.totalFreeBytes!! > 0L)
+    }
 }

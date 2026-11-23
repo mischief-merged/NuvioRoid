@@ -145,6 +145,8 @@ internal class DesktopDownloadFolders(
     private val filePicker: () -> String? = { null },
     /** The usable space of the volume of a folder. Replaced in tests, where the real one changes between two reads. */
     private val freeSpaceOf: (File) -> Long? = { f -> f.usableSpace.takeIf { it > 0L || f.totalSpace > 0L } },
+    /** The underlying file store identifier of a folder, used to deduplicate volumes. */
+    private val fileStoreKeyOf: (Path) -> String = { path -> Files.getFileStore(path).toString() },
 ) : DownloadFolderController {
     override val supported: Boolean = true
 
@@ -173,6 +175,8 @@ internal class DesktopDownloadFolders(
     @Volatile
     internal var recoveryRunner: Thread? = null
         private set
+
+    override val isMoveRunning: Boolean get() = moveRunning.get()
 
     override fun pickFolder(): String? = picker()
 
@@ -326,7 +330,9 @@ internal class DesktopDownloadFolders(
                 usedBytes = used?.usedBytes ?: members.sumOf { it.moveBytes },
                 usedIsLastKnown = used?.lastKnown ?: false,
                 volumeKey = if (availability == FolderAvailability.Available) {
-                    FsGuard.call(3_000L, location.id) { Files.getFileStore(location.path).toString() }
+                    FsGuard.call(3_000L, location.id) {
+                        runCatching { fileStoreKeyOf(location.path) }.getOrDefault(location.id)
+                    }
                 } else {
                     location.id
                 },
@@ -693,11 +699,11 @@ internal class DesktopDownloadFolders(
                 tokens.forEach { id -> runCatching { WriterTokens.release(id) } }
                 locked.forEach { id -> runCatching { ItemLocks.release(id) } }
                 paused.distinct().forEach { id -> runCatching { hooks.resume(id) } }
-                runCatching { hooks.resumeHeld() }
             } finally {
                 _progress.value = null
                 moveRunning.set(false)
                 runCatching { refresh() }
+                runCatching { hooks.resumeHeld() }
             }
         }
     }

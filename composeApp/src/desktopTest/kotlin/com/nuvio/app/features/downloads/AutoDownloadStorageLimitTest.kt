@@ -18,12 +18,27 @@ class AutoDownloadStorageLimitTest {
     private inner class FakeBackend : DownloadsBackend {
         var payload: String? = null
         var removedPartials = 0
+        var diskScanSupported = false
+        var moveRunning = false
+        var scanResult = DiskScanResult()
+        var failStartForId: String? = null
 
         override fun loadPayload(): String? = payload
 
         override fun savePayload(payload: String) {
             this.payload = payload
         }
+
+        override val supportsDiskScan: Boolean get() = diskScanSupported
+
+        override fun isMoveRunning(): Boolean = moveRunning
+
+        override fun scanDownloadsOnDisk(
+            activeProfileId: Int,
+            inMemoryItems: List<DownloadItem>,
+            nextDownloadId: (Long) -> String,
+            nowEpochMs: Long,
+        ): DiskScanResult = scanResult
 
         override fun restoreItem(item: DownloadItem): DownloadItem = item
 
@@ -34,6 +49,7 @@ class AutoDownloadStorageLimitTest {
             onFailure: (message: String) -> Unit,
             onPaused: () -> Unit,
         ): DownloadsTaskHandle {
+            if (request.item.id == failStartForId) error("boom")
             transfers += Transfer(request, onProgress, onSuccess)
             return object : DownloadsTaskHandle {
                 override fun cancel() = Unit
@@ -62,12 +78,14 @@ class AutoDownloadStorageLimitTest {
     private val limits = FakeLimits(limitBytes = 1_000)
     private val realBackend = DownloadsRepository.backend
     private val realLimits = DownloadsRepository.autoDownloadLimits
+    private val realOnProfileReadyForTrip = DownloadsRepository.onProfileReadyForTrip
 
     @BeforeTest
     fun use_an_empty_in_memory_repository() {
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
         DownloadsRepository.autoDownloadLimits = limits
+        DownloadsRepository.onProfileReadyForTrip = {}
         DownloadsRepository.ensureLoaded()
     }
 
@@ -76,6 +94,7 @@ class AutoDownloadStorageLimitTest {
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = realBackend
         DownloadsRepository.autoDownloadLimits = realLimits
+        DownloadsRepository.onProfileReadyForTrip = realOnProfileReadyForTrip
     }
 
     private fun enqueue(episode: Int, automatic: Boolean, trip: Boolean = false): Transfer {
@@ -295,5 +314,95 @@ class AutoDownloadStorageLimitTest {
 
         assertNull(limits.stopFor(downloadedBytes = 0, totalBytes = 100, freeBytes = 150))
         assertEquals(AutoDownloadStop.LowDiskSpace, limits.stopFor(downloadedBytes = 0, totalBytes = 100, freeBytes = 149))
+    }
+
+    @Test
+    fun busy_disk_scan_defers_trip_recovery_until_the_move_finishes_and_merges_recovered_files() {
+        val readyProfiles = mutableListOf<Int>()
+        val seenItemCountAtTripStart = mutableListOf<Int>()
+        val recovered = testDownload(
+            episode = 1,
+            status = DownloadStatus.Completed,
+            showId = showId,
+            localFileUri = "file:/downloads/recovered-1.mp4",
+            id = "recovered-1",
+        )
+
+        DownloadsRepository.clearLocalState()
+        backend.diskScanSupported = true
+        backend.moveRunning = true
+        backend.scanResult = DiskScanResult(busy = true)
+        DownloadsRepository.onProfileReadyForTrip = { profileId ->
+            readyProfiles += profileId
+            seenItemCountAtTripStart += DownloadsRepository.uiState.value.items.size
+        }
+
+        DownloadsRepository.ensureLoaded()
+        assertEquals(emptyList(), readyProfiles)
+
+        backend.moveRunning = false
+        backend.scanResult = DiskScanResult(recoveredItems = listOf(recovered), busy = false)
+        DownloadsRepository.resumeHeldByFolder()
+
+        assertEquals(listOf(com.nuvio.app.features.profiles.ProfileRepository.activeProfileId), readyProfiles)
+        assertEquals(listOf(1), seenItemCountAtTripStart)
+        assertEquals(listOf("recovered-1"), DownloadsRepository.uiState.value.items.map { it.id })
+
+        // Subsequent resumeHeldByFolder calls do not re-trigger trip recovery.
+        DownloadsRepository.resumeHeldByFolder()
+        assertEquals(1, readyProfiles.size)
+    }
+
+    @Test
+    fun busy_disk_scan_recovers_immediately_if_the_move_ended_before_recording_pending() {
+        val readyProfiles = mutableListOf<Int>()
+        val recovered = testDownload(
+            episode = 2,
+            status = DownloadStatus.Completed,
+            showId = showId,
+            localFileUri = "file:/downloads/recovered-2.mp4",
+            id = "recovered-2",
+        )
+
+        DownloadsRepository.clearLocalState()
+        backend.diskScanSupported = true
+        backend.moveRunning = false
+        backend.scanResult = DiskScanResult(busy = true)
+        var calls = 0
+        val switchingBackend = object : DownloadsBackend by backend {
+            override fun scanDownloadsOnDisk(
+                activeProfileId: Int,
+                inMemoryItems: List<DownloadItem>,
+                nextDownloadId: (Long) -> String,
+                nowEpochMs: Long,
+            ): DiskScanResult {
+                calls++
+                return if (calls == 1) DiskScanResult(busy = true) else DiskScanResult(recoveredItems = listOf(recovered))
+            }
+        }
+        DownloadsRepository.backend = switchingBackend
+        DownloadsRepository.onProfileReadyForTrip = { readyProfiles += it }
+
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(2, calls)
+        assertEquals(listOf(com.nuvio.app.features.profiles.ProfileRepository.activeProfileId), readyProfiles)
+        assertEquals(listOf("recovered-2"), DownloadsRepository.uiState.value.items.map { it.id })
+    }
+
+    @Test
+    fun failed_catalog_read_clears_rate_tracker_samples_for_aborted_transfers() {
+        val first = testDownload(episode = 1, status = DownloadStatus.Downloading, showId = showId, id = "dl-first")
+        val second = testDownload(episode = 2, status = DownloadStatus.Downloading, showId = showId, id = "dl-second")
+        backend.payload = storedPayload(listOf(first, second))
+        backend.failStartForId = second.id
+
+        DownloadsRepository.clearLocalState()
+        kotlin.test.assertFailsWith<IllegalStateException> {
+            DownloadsRepository.ensureLoaded()
+        }
+
+        assertEquals(false, DownloadsRepository.rateTracker.hasSamples(first.id))
+        assertEquals(false, DownloadsRepository.rateTracker.hasSamples(second.id))
     }
 }

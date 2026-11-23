@@ -154,6 +154,15 @@ object DownloadsRepository {
     // Saves what a download that finished needs beside it (subtitles, skip times). Always the app's in the app.
     internal var companions: () -> DownloadCompanions = { DownloadCompanions.app }
 
+    // Triggered once a profile's list and its initial disk scan have settled. Always TripFillHost for the platform backend.
+    @Volatile
+    internal var onProfileReadyForTrip: (Int) -> Unit = { profileId ->
+        if (backend === PlatformDownloadsBackend) TripFillHost.onProfileLoaded(profileId)
+    }
+
+    // Profile waiting for a busy folder move to finish before scanning disk and starting trip fill.
+    private var pendingTripRecoveryProfileId: Int? = null
+
     // What limits automatic downloads. Always the saved setting in the app.
     internal var autoDownloadLimits: AutoDownloadLimits = SavedAutoDownloadLimits
 
@@ -302,6 +311,7 @@ object DownloadsRepository {
         hasLoaded = false
         catalogLoadingThread = null
         loadedProfileId = null
+        pendingTripRecoveryProfileId = null
         baseline = emptyList()
         baseRevision = 0L
         _hasUnseenCompleted.value = false
@@ -976,6 +986,7 @@ object DownloadsRepository {
                 _hasUnseenCompleted.value = false
                 val profileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
                 loadedProfileId = profileId
+                pendingTripRecoveryProfileId = null
                 loadedPayload = null
                 baseline = emptyList()
                 baseRevision = 0L
@@ -1061,37 +1072,46 @@ object DownloadsRepository {
             }
         }
 
+        var tripReadyProfileId: Int? = null
+        var retryBusyProfileId: Int? = null
         try {
-            if (!backend.supportsDiskScan) return
-            val scanResult = runCatching {
-                backend.scanDownloadsOnDisk(
-                    activeProfileId = published.first,
-                    inMemoryItems = published.third,
-                    nextDownloadId = ::nextDownloadId,
-                    nowEpochMs = DownloadsClock.nowEpochMs(),
-                )
-            }.getOrDefault(DiskScanResult())
-            // A scan that could not run (a move has the folders) must not replace what is already shown.
-            if (scanResult.busy) return
-            synchronized(stateLock) {
-                if (!hasLoaded || loadedProfileId != published.first) return@synchronized
-                val currentItems = _uiState.value.items
-                val newRecovered = scanResult.recoveredItems.filterNot { candidate ->
-                    currentItems.any { existing -> existing.sameRecoveredFileAs(candidate) }
+            if (!backend.supportsDiskScan) {
+                tripReadyProfileId = published.first
+            } else {
+                val scanResult = runCatching {
+                    backend.scanDownloadsOnDisk(
+                        activeProfileId = published.first,
+                        inMemoryItems = published.third,
+                        nextDownloadId = ::nextDownloadId,
+                        nowEpochMs = DownloadsClock.nowEpochMs(),
+                    )
+                }.getOrDefault(DiskScanResult())
+                // A scan that could not run (a move has the folders) must not replace what is already shown.
+                if (scanResult.busy) {
+                    val retryNow = synchronized(stateLock) {
+                        if (hasLoaded && loadedProfileId == published.first) {
+                            pendingTripRecoveryProfileId = published.first
+                            !backend.isMoveRunning()
+                        } else {
+                            false
+                        }
+                    }
+                    if (retryNow) retryBusyProfileId = published.first
+                } else {
+                    synchronized(stateLock) {
+                        if (!hasLoaded || loadedProfileId != published.first) return@synchronized
+                        pendingTripRecoveryProfileId = null
+                        mergeDiskScanLocked(scanResult, storeProblem = published.second)
+                        tripReadyProfileId = published.first
+                    }
                 }
-                _uiState.value = _uiState.value.copy(
-                    items = currentItems + newRecovered,
-                    storeProblem = published.second,
-                    unrecognisedFiles = scanResult.unrecognisedFiles,
-                )
-                notifyLiveStatusPlatform()
-                if (newRecovered.isNotEmpty()) persist()
             }
         } finally {
             synchronized(stateLock) {
                 if (catalogLoadingThread === Thread.currentThread()) catalogLoadingThread = null
             }
-            if (backend === PlatformDownloadsBackend) TripFillHost.onProfileLoaded(published.first)
+            tripReadyProfileId?.let { onProfileReadyForTrip(it) }
+            retryBusyProfileId?.let(::recoverAndStartTripAfterBusyScan)
         }
     }
 
@@ -1126,26 +1146,69 @@ object DownloadsRepository {
         if (result.busy) {
             return DiskScanSummary(0, _uiState.value.unrecognisedFiles.size, skippedBusy = true)
         }
-        return synchronized(stateLock) {
+        val (summary, tripProfileToStart) = synchronized(stateLock) {
             // The profile changed, or the list was cleared, while the walk ran. Those results belong to neither.
             if (!hasLoaded || loadedProfileId != profileId) {
-                return@synchronized DiskScanSummary(0, _uiState.value.unrecognisedFiles.size)
+                return@synchronized DiskScanSummary(0, _uiState.value.unrecognisedFiles.size) to null
             }
-            val currentItems = _uiState.value.items
-            val newRecovered = result.recoveredItems.filterNot { candidate ->
-                currentItems.any { existing -> existing.sameRecoveredFileAs(candidate) }
-            }
-            _uiState.value = _uiState.value.copy(
-                items = currentItems + newRecovered,
-                unrecognisedFiles = result.unrecognisedFiles,
-            )
-            notifyLiveStatusPlatform()
-            if (newRecovered.isNotEmpty()) persist()
+            val startTrip = profileId.takeIf { pendingTripRecoveryProfileId == it }
+            if (startTrip != null) pendingTripRecoveryProfileId = null
+            val addedCount = mergeDiskScanLocked(result)
             DiskScanSummary(
-                addedCount = newRecovered.size,
+                addedCount = addedCount,
                 unrecognisedCount = result.unrecognisedFiles.size,
-            )
+            ) to startTrip
         }
+        tripProfileToStart?.let(onProfileReadyForTrip)
+        return summary
+    }
+
+    private fun mergeDiskScanLocked(
+        result: DiskScanResult,
+        storeProblem: DownloadsStoreProblem? = _uiState.value.storeProblem,
+    ): Int {
+        val currentItems = _uiState.value.items
+        val newRecovered = result.recoveredItems.filterNot { candidate ->
+            currentItems.any { existing -> existing.sameRecoveredFileAs(candidate) }
+        }
+        _uiState.value = _uiState.value.copy(
+            items = currentItems + newRecovered,
+            storeProblem = storeProblem,
+            unrecognisedFiles = result.unrecognisedFiles,
+        )
+        notifyLiveStatusPlatform()
+        if (newRecovered.isNotEmpty()) persist()
+        return newRecovered.size
+    }
+
+    private fun recoverAndStartTripAfterBusyScan(profileId: Int) {
+        val snapshotItems = synchronized(stateLock) {
+            if (!hasLoaded || loadedProfileId != profileId || pendingTripRecoveryProfileId != profileId) return
+            _uiState.value.items
+        }
+        val result = if (backend.supportsDiskScan) {
+            runCatching {
+                backend.scanDownloadsOnDisk(
+                    activeProfileId = profileId,
+                    inMemoryItems = snapshotItems,
+                    nextDownloadId = ::nextDownloadId,
+                    nowEpochMs = DownloadsClock.nowEpochMs(),
+                )
+            }.getOrDefault(DiskScanResult())
+        } else {
+            DiskScanResult()
+        }
+        if (result.busy) return
+        val shouldStartTrip = synchronized(stateLock) {
+            if (!hasLoaded || loadedProfileId != profileId || pendingTripRecoveryProfileId != profileId) {
+                false
+            } else {
+                pendingTripRecoveryProfileId = null
+                mergeDiskScanLocked(result)
+                true
+            }
+        }
+        if (shouldStartTrip) onProfileReadyForTrip(profileId)
     }
 
     private fun DownloadItem.sameRecoveredFileAs(other: DownloadItem): Boolean {
@@ -1172,11 +1235,13 @@ object DownloadsRepository {
         transfersBefore: Map<String, ActiveTransfer>,
     ) {
         activeTransfers.filter { (id, transfer) -> transfersBefore[id] !== transfer }.keys.toList().forEach { id ->
-            activeTransfers.remove(id)?.cancel()
+            removeTransfer(id)?.cancel()
         }
         hasLoaded = false
         catalogLoadingThread = null
         loadedProfileId = null
+        pendingTripRecoveryProfileId = null
+        pendingTripRecoveryProfileId = null
         loadedPayload = null
         baseline = emptyList()
         baseRevision = 0L
@@ -2282,11 +2347,17 @@ object DownloadsRepository {
     }
 
     /** Starts again the downloads that waited for a location or a move, now that they can run. */
-    internal fun resumeHeldByFolder(): Unit = synchronized(stateLock) {
-        if (!hasLoaded) return
-        _uiState.value.items
-            .filter { it.status == DownloadStatus.Paused && it.pausedByFolder && !backend.heldByFolder(it) }
-            .forEach { resumeDownloadLocked(it.id) }
+    internal fun resumeHeldByFolder() {
+        val pendingProfile = synchronized(stateLock) {
+            if (!hasLoaded) return@synchronized null
+            _uiState.value.items
+                .filter { it.status == DownloadStatus.Paused && it.pausedByFolder && !backend.heldByFolder(it) }
+                .forEach { resumeDownloadLocked(it.id) }
+            pendingTripRecoveryProfileId?.takeIf { it == loadedProfileId }
+        }
+        if (pendingProfile != null) {
+            recoverAndStartTripAfterBusyScan(pendingProfile)
+        }
     }
 
     internal fun nextDownloadId(nowEpochMs: Long): String {
@@ -2467,6 +2538,9 @@ internal interface DownloadsBackend {
     /** The location a new download goes to. Null where there are no locations. */
     fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? = null
 
+    /** Whether a folder move is currently running. */
+    fun isMoveRunning(): Boolean = false
+
     /** Whether this backend can scan storage locations on disk for missing downloads. */
     val supportsDiskScan: Boolean get() = false
 
@@ -2635,6 +2709,8 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? =
         DownloadFolders.controller.placementFor(items, parentMetaId, isEpisode)
+
+    override fun isMoveRunning(): Boolean = DownloadFolders.controller.isMoveRunning
 
     override val supportsDiskScan: Boolean get() = DownloadFolders.controller.supported
 
