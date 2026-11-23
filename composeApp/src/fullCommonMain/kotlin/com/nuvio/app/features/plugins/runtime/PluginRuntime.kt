@@ -185,7 +185,14 @@ internal object PluginRuntime {
         bytecode: com.dokar.quickjs.QuickJs.() -> ByteArray,
         source: String,
     ) {
-        val compiled = runCatching { bytecode() }.getOrNull()
+        val compiled = try {
+            bytecode()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        currentCoroutineContext().ensureActive()
         if (compiled != null) {
             evaluate<Any?>(compiled)
         } else {
