@@ -21,9 +21,10 @@ private const val SkipSegmentResolveTimeoutMs = 4_000L
 
 /**
  * Marks [launch] as playing, runs [prepare], then calls [open] only when this
- * launch is still the current one. Subtitle and skip-segment lookup can take
- * several seconds after the in-app session is gone; a newer playback start
- * during that wait must win, and the older lookup must not open a second player.
+ * launch is still the current one and no replacement prompt is waiting on it.
+ * Subtitle and skip-segment lookup can take several seconds after the in-app
+ * session is gone; a newer playback start, or a choice that is still open,
+ * must win, and the older lookup must not open a second player.
  */
 internal suspend fun launchPreparedExternalPlayback(
     sessions: PlayerSessionController,
@@ -44,7 +45,7 @@ internal suspend fun completeExternalPlayback(
     try {
         if (!sessions.isCurrentExternalPlayback(token)) return false
         prepare()
-        if (!sessions.isCurrentExternalPlayback(token)) return false
+        if (!sessions.awaitExternalOpenAllowed(token)) return false
         return open()
     } finally {
         sessions.finishExternalPlayback(token)

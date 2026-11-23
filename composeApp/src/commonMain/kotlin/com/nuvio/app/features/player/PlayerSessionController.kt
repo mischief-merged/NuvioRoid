@@ -4,6 +4,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import com.nuvio.app.features.watchprogress.ResumePromptRepository
 import kotlin.concurrent.Volatile
 import kotlinx.atomicfu.locks.SynchronizedObject
@@ -11,6 +12,7 @@ import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 
 internal enum class PlayerPresentationMode {
     Full,
@@ -215,6 +217,21 @@ internal class PlayerSessionController(
 
     fun isCurrentExternalPlayback(token: Long): Boolean = synchronized(externalPlaybackLock) {
         token == externalPlaybackToken && pendingExternalPlayback != null
+    }
+
+    /**
+     * Preparation may finish while a replacement prompt is still open.
+     * Opening is held until that choice is made, and a confirm retires this launch.
+     */
+    suspend fun awaitExternalOpenAllowed(token: Long): Boolean {
+        while (true) {
+            val blockedOnPrompt = synchronized(externalPlaybackLock) {
+                if (token != externalPlaybackToken || pendingExternalPlayback == null) return false
+                pendingReplacement != null
+            }
+            if (!blockedOnPrompt) return true
+            snapshotFlow { pendingReplacement }.first { it == null }
+        }
     }
 
     fun cancelPendingExternalPlayback() {
@@ -445,9 +462,12 @@ internal class PlayerSessionController(
 
     fun confirmPendingReplacement() {
         val pending = pendingReplacement ?: return
+        val current = activeSession
+        // Retire the external launch before the prompt closes, so a prepare that
+        // finished while the prompt was up cannot open in the gap.
+        cancelPendingExternalPlayback()
         pendingReplacement = null
-        val current = activeSession ?: run {
-            cancelPendingExternalPlayback()
+        if (current == null) {
             pending.onConfirm()
             return
         }

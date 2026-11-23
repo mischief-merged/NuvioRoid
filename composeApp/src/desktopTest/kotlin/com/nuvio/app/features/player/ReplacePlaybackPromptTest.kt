@@ -1115,6 +1115,128 @@ class ReplacePlaybackPromptTest {
     }
 
     @Test
+    fun external_preparation_waits_for_the_replacement_choice_before_it_opens() {
+        val controller = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        val backend = CountingNativePlayerBackend()
+        val opened = mutableListOf<String>()
+        val first = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/severance-external.mp4",
+        )
+        val kept = sampleLaunch(
+            title = "The Bear",
+            videoId = secondVideoId,
+            parentMetaId = "tt2222222",
+            sourceUrl = "https://example.com/the-bear.mp4",
+        )
+        val confirmed = sampleLaunch(
+            title = "Andor",
+            videoId = "tt3333333:1:1",
+            parentMetaId = "tt3333333",
+            sourceUrl = "https://example.com/andor.mp4",
+        )
+        var resumeFirst: (() -> Unit)? = null
+        val launchScope = CoroutineScope(Dispatchers.Unconfined)
+        val firstJob = launchScope.launch {
+            launchPreparedExternalPlayback(
+                sessions = controller,
+                launch = first,
+                prepare = {
+                    suspendCancellableCoroutine { cont ->
+                        resumeFirst = { if (cont.isActive) cont.resume(Unit) }
+                    }
+                },
+                open = {
+                    opened += first.sourceUrl
+                    true
+                },
+            )
+        }
+
+        try {
+            assertNotNull(resumeFirst)
+            mountPlayerSessionHost(controller, navigator, backend)
+            compose.runOnIdle {
+                controller.launchOrAskToReplace(
+                    incomingTitle = kept.title,
+                    videoId = kept.videoId,
+                    parentMetaId = kept.parentMetaId,
+                    seasonNumber = kept.seasonNumber,
+                    episodeNumber = kept.episodeNumber,
+                    sourceUrl = kept.sourceUrl,
+                    allowSameTargetReopen = false,
+                ) {
+                    controller.open(launch = kept, launchId = 911L)
+                }
+            }
+            compose.waitForIdle()
+            compose.onNodeWithText(text(Res.string.player_replace_playback_title)).assertIsDisplayed()
+
+            // Preparation finishes while the prompt is still unanswered.
+            resumeFirst.invoke()
+            compose.waitForIdle()
+            assertTrue(opened.isEmpty(), "external player must not open before the choice is made")
+            compose.onNodeWithText(text(Res.string.player_replace_playback_title)).assertIsDisplayed()
+            assertNull(controller.activeSession)
+
+            compose.onNodeWithText(text(Res.string.player_replace_playback_keep)).performClick()
+            compose.waitForIdle()
+            runBlocking { firstJob.join() }
+            assertEquals(listOf(first.sourceUrl), opened)
+            assertNull(controller.activeSession)
+
+            opened.clear()
+            var resumeSecond: (() -> Unit)? = null
+            val secondJob = launchScope.launch {
+                launchPreparedExternalPlayback(
+                    sessions = controller,
+                    launch = first,
+                    prepare = {
+                        suspendCancellableCoroutine { cont ->
+                            resumeSecond = { if (cont.isActive) cont.resume(Unit) }
+                        }
+                    },
+                    open = {
+                        opened += first.sourceUrl
+                        true
+                    },
+                )
+            }
+            assertNotNull(resumeSecond)
+            compose.runOnIdle {
+                controller.launchOrAskToReplace(
+                    incomingTitle = confirmed.title,
+                    videoId = confirmed.videoId,
+                    parentMetaId = confirmed.parentMetaId,
+                    seasonNumber = confirmed.seasonNumber,
+                    episodeNumber = confirmed.episodeNumber,
+                    sourceUrl = confirmed.sourceUrl,
+                    allowSameTargetReopen = false,
+                ) {
+                    controller.open(launch = confirmed, launchId = 912L)
+                }
+            }
+            compose.waitForIdle()
+            resumeSecond.invoke()
+            compose.waitForIdle()
+            assertTrue(opened.isEmpty(), "external player must stay held while the prompt is open")
+
+            compose.onNodeWithText(text(Res.string.player_replace_playback_confirm)).performClick()
+            compose.waitForIdle()
+            runBlocking { secondJob.join() }
+            assertTrue(opened.isEmpty(), "confirming must not leave the external player running")
+            assertEquals(912L, controller.activeSession?.launchId)
+        } finally {
+            resumeFirst?.invoke()
+            runBlocking { firstJob.join() }
+            launchScope.cancel()
+        }
+    }
+
+    @Test
     fun close_active_session_trailing_lambda_runs_when_idle_or_closed_and_never_on_close_failure() {
         val controller = PlayerSessionController(onExitPictureInPicture = {})
         var continuations = 0
