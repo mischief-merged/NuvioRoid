@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player.skip
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.tmdb.TmdbService
 import kotlinx.coroutines.async
@@ -7,8 +8,8 @@ import kotlinx.coroutines.coroutineScope
 
 object SkipIntroRepository {
 
-    private val cache = HashMap<String, List<SkipInterval>>()
-    private val animeSkipShowIdCache = HashMap<String, String>()
+    private val cache = BoundedCache<String, List<SkipInterval>>()
+    private val animeSkipShowIdCache = BoundedCache<String, String>()
     private const val NO_ID = "__none__"
 
     internal val introDbConfigured: Boolean

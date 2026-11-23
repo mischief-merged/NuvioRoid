@@ -1,5 +1,6 @@
 package com.nuvio.app.features.collection
 
+import com.nuvio.app.core.memory.retainBrowseWindow
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.catalog.CATALOG_PAGE_SIZE
@@ -375,7 +376,7 @@ object FolderDetailRepository {
                         consecutiveDuplicatePages = if (reset) 0 else tab.consecutiveDuplicatePages,
                     )
                     tab.copy(
-                        items = mergedItems,
+                        items = retainBrowseWindow(mergedItems),
                         supportsPagination = supportsPagination,
                         isLoading = false,
                         isLoadingMore = false,
@@ -431,7 +432,7 @@ object FolderDetailRepository {
             val hasLoadMore = sourceTabs.any { it.isLoadingMore }
             val errorMessage = sourceTabs.firstOrNull { it.error != null }?.error
             updatedTabs[allTabIndex] = updatedTabs[allTabIndex].copy(
-                items = merged,
+                items = retainBrowseWindow(merged),
                 isLoading = hasInitialLoads,
                 isLoadingMore = hasLoadMore,
                 error = errorMessage.takeIf { merged.isEmpty() },

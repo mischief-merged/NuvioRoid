@@ -3,11 +3,11 @@ package com.nuvio.app.features.addons
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.network.DesktopIPv4FirstDns
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.network_response_too_large
 import nuvio.composeapp.generated.resources.network_empty_response_body
 import nuvio.composeapp.generated.resources.network_request_failed_http
 import okhttp3.MediaType.Companion.toMediaType
@@ -51,6 +51,9 @@ internal val desktopHttpClient = OkHttpClient.Builder()
     .followRedirects(true)
     .followSslRedirects(true)
     .build()
+
+internal val desktopTextClient = desktopHttpClient.newBuilder().callTimeout(60, TimeUnit.SECONDS).build()
+internal val desktopHttpCalls = DesktopHttpCalls()
 
 private const val truncationSuffix = "\n...[truncated]"
 
@@ -116,7 +119,7 @@ actual suspend fun httpRequestRaw(
     }
     val request = buildDesktopRequest(method, url, headers, body, bodyBytes)
 
-    client.newCall(request).execute().use { response ->
+    desktopHttpCalls.execute(client, request) { response ->
         val limited = readResponseBodyLimited(response.body, maxResponseBodyBytes)
         RawHttpResponse(
             status = response.code,
@@ -141,16 +144,16 @@ private suspend fun executeTextRequest(
     body: String = "",
 ): String = withContext(Dispatchers.IO) {
     val request = buildDesktopRequest(method, url, headers, body)
-    desktopHttpClient.newCall(request).execute().use { response ->
-        val payload = readResponseBody(response.body)
-        if (!response.isSuccessful) {
-            error(runBlocking { getString(Res.string.network_request_failed_http, response.code) })
+    val (status, payload) = try {
+        desktopHttpCalls.execute(desktopTextClient, request) { response ->
+            response.code to readResponseBody(response.body)
         }
-        if (payload.isBlank()) {
-            throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
-        }
-        payload
+    } catch (error: ResponseTooLarge) {
+        throw IllegalStateException(getString(Res.string.network_response_too_large), error)
     }
+    if (status !in 200..299) error(getString(Res.string.network_request_failed_http, status))
+    if (payload.isBlank()) throw IllegalStateException(getString(Res.string.network_empty_response_body))
+    payload
 }
 
 private fun buildDesktopRequest(
@@ -236,9 +239,13 @@ private fun readResponseBodyLimited(body: ResponseBody?, maxBytes: Int): Limited
     return LimitedBody(if (readResult.truncated) decoded + truncationSuffix else decoded, readResult.bytes)
 }
 
-private fun readResponseBody(body: ResponseBody?): String {
+internal fun readResponseBody(body: ResponseBody?, maxBytes: Int = 16 * 1024 * 1024): String {
     if (body == null) return ""
-    val bytes = body.bytes()
+    require(maxBytes > 0)
+    if (body.contentLength() > maxBytes) throw ResponseTooLarge()
+    val result = body.byteStream().use { readAtMostBytes(it, maxBytes) }
+    if (result.truncated) throw ResponseTooLarge()
+    val bytes = result.bytes
     return runCatching {
         val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
         String(bytes, charset)
@@ -246,3 +253,5 @@ private fun readResponseBody(body: ResponseBody?): String {
         String(bytes, Charsets.UTF_8)
     }
 }
+
+internal class ResponseTooLarge : IllegalStateException()

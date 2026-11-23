@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.player.skip.SkipIntervalLookup
@@ -178,7 +179,7 @@ internal class OfflineSkipTimes(
 ) : DownloadCompanion {
     private val lock = SynchronizedObject()
     private val running = mutableSetOf<String>()
-    private val failedAt = mutableMapOf<String, Long>()
+    private val failedAt = BoundedCache<String, Long>()
 
     override val name: String get() = "skip times"
 

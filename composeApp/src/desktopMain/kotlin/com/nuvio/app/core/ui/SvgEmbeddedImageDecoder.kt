@@ -25,8 +25,9 @@ import org.jetbrains.skia.MipmapMode
 import org.jetbrains.skia.Rect
 import org.jetbrains.skia.svg.SVGDOM
 
-private const val TARGET_WIDTH = 800f
-private const val MAX_SCALE = 4f
+internal const val MaxEmbeddedSvgImages = 8
+internal const val MaxEmbeddedSvgDepth = 2
+private val SvgDepthKey = coil3.Extras.Key(default = 0)
 
 private val imageTag = Regex("<image\\b[^>]*>", RegexOption.IGNORE_CASE)
 private val rootTag = Regex("<svg\\b[^>]*>", RegexOption.IGNORE_CASE)
@@ -42,7 +43,8 @@ private class EmbeddedImage(
 )
 
 internal suspend fun renderSvgWithImages(svg: String, loadImage: suspend (String) -> Image?): Bitmap? {
-    val tags = imageTag.findAll(svg).map { it.value }.toList()
+    val tags = imageTag.findAll(svg).take(MaxEmbeddedSvgImages + 1).map { it.value }.toList()
+    check(tags.size <= MaxEmbeddedSvgImages)
     val stripped = svg.replace(imageTag, "").replace("</image>", "", ignoreCase = true)
     val root = rootTag.find(stripped)?.value ?: return null
 
@@ -53,8 +55,9 @@ internal suspend fun renderSvgWithImages(svg: String, loadImage: suspend (String
         ?.takeIf { it.size == 4 }
     val width = length(attr(root, "width")) ?: viewBox?.get(2) ?: return null
     val height = length(attr(root, "height")) ?: viewBox?.get(3) ?: return null
-    if (width <= 0f || height <= 0f) return null
+    val scale = svgRasterScale(width, height)
     val box = viewBox ?: listOf(0f, 0f, width, height)
+    require(box.all { it.isFinite() } && box[2] > 0 && box[3] > 0)
     val sx = width / box[2]
     val sy = height / box[3]
 
@@ -73,38 +76,37 @@ internal suspend fun renderSvgWithImages(svg: String, loadImage: suspend (String
         images.map { async { loadImage(it.href) } }.map { it.await() }
     }
 
-    val scale = (TARGET_WIDTH / width).coerceIn(1f, MAX_SCALE)
-    val bitmap = Bitmap().apply {
-        allocPixels(ImageInfo.makeN32Premul((width * scale).toInt().coerceAtLeast(1), (height * scale).toInt().coerceAtLeast(1)))
-    }
-    val dom = SVGDOM(Data.makeFromBytes(stripped.encodeToByteArray()))
-    val canvas = Canvas(bitmap)
+    val bitmap = Bitmap()
     try {
-        dom.setContainerSize(width, height)
-        canvas.scale(scale, scale)
-        dom.render(canvas)
-        images.forEachIndexed { index, embedded ->
-            val image = loaded[index] ?: return@forEachIndexed
-            val dx = (embedded.x - box[0]) * sx
-            val dy = (embedded.y - box[1]) * sy
-            val dw = embedded.width * sx
-            val dh = embedded.height * sy
-            val dst = fit(image.width.toFloat(), image.height.toFloat(), dx, dy, dw, dh, embedded.preserveAspectRatio)
-            canvas.drawImageRect(
-                image,
-                Rect.makeWH(image.width.toFloat(), image.height.toFloat()),
-                dst,
-                FilterMipmap(FilterMode.LINEAR, MipmapMode.LINEAR),
-                null,
-                true,
-            )
+        bitmap.allocPixels(ImageInfo.makeN32Premul((width * scale).toInt().coerceAtLeast(1), (height * scale).toInt().coerceAtLeast(1)))
+        Data.makeFromBytes(stripped.encodeToByteArray()).use { data ->
+            SVGDOM(data).use { dom ->
+                Canvas(bitmap).use { canvas ->
+                    dom.setContainerSize(width, height)
+                    canvas.scale(scale, scale)
+                    dom.render(canvas)
+                    images.forEachIndexed { index, embedded ->
+                        val image = loaded[index] ?: return@forEachIndexed
+                        val dx = (embedded.x - box[0]) * sx
+                        val dy = (embedded.y - box[1]) * sy
+                        val dw = embedded.width * sx
+                        val dh = embedded.height * sy
+                        val dst = fit(image.width.toFloat(), image.height.toFloat(), dx, dy, dw, dh, embedded.preserveAspectRatio)
+                        canvas.drawImageRect(
+                            image, Rect.makeWH(image.width.toFloat(), image.height.toFloat()), dst,
+                            FilterMipmap(FilterMode.LINEAR, MipmapMode.LINEAR), null, true,
+                        )
+                    }
+                }
+            }
         }
+        return bitmap
+    } catch (error: Throwable) {
+        bitmap.close()
+        throw error
     } finally {
-        canvas.close()
-        dom.close()
         loaded.forEach { it?.close() }
     }
-    return bitmap
 }
 
 private fun fit(iw: Float, ih: Float, x: Float, y: Float, w: Float, h: Float, preserveAspectRatio: String): Rect {
@@ -138,7 +140,7 @@ private fun attr(tag: String, name: String): String? {
 private fun length(value: String?): Float? =
     value?.trim()?.removeSuffix("px")?.toFloatOrNull()
 
-private fun decodeDataUri(uri: String): Image? {
+private fun decodeDataUri(uri: String): ByteArray? {
     val comma = uri.indexOf(',')
     if (comma < 0) return null
     val payload = uri.substring(comma + 1)
@@ -147,7 +149,8 @@ private fun decodeDataUri(uri: String): Image? {
     } else {
         URLDecoder.decode(payload, "UTF-8").encodeToByteArray()
     }
-    return Image.makeFromEncoded(bytes)
+    check(bytes.size <= MaxEncodedImageBytes)
+    return bytes
 }
 
 class SvgEmbeddedImageDecoder(
@@ -162,10 +165,11 @@ class SvgEmbeddedImageDecoder(
     }
 
     private suspend fun load(href: String): Image? = runCatching {
-        if (href.startsWith("data:", ignoreCase = true)) return@runCatching decodeDataUri(href)
+        val data = if (href.startsWith("data:", ignoreCase = true)) decodeDataUri(href) ?: return@runCatching null else href
         val request = ImageRequest.Builder(options.context)
-            .data(href)
-            .size(Size.ORIGINAL)
+            .data(data)
+            .size(512)
+            .apply { extras[SvgDepthKey] = (options.extras[SvgDepthKey] ?: 0) + 1 }
             .build()
         val result = imageLoader.execute(request) as? SuccessResult ?: return@runCatching null
         Image.makeFromBitmap(result.image.toBitmap())
@@ -180,8 +184,9 @@ class SvgEmbeddedImageDecoder(
             val isSvg = result.mimeType?.contains("svg", ignoreCase = true) == true ||
                 result.source.fileOrNull()?.name?.endsWith(".svg", ignoreCase = true) == true
             if (!isSvg) return null
-            val svg = runCatching { result.source.source().peek().readUtf8() }.getOrNull() ?: return null
+            val svg = result.source.source().peek().readBoundedImageBytes().decodeToString()
             if (!imageTag.containsMatchIn(svg)) return null
+            check((options.extras[SvgDepthKey] ?: 0) < MaxEmbeddedSvgDepth)
             return SvgEmbeddedImageDecoder(svg, options, imageLoader)
         }
     }

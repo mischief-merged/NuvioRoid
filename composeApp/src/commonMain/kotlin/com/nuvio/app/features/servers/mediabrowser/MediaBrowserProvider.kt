@@ -1,5 +1,6 @@
 package com.nuvio.app.features.servers.mediabrowser
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.servers.ServerCandidate
 import com.nuvio.app.features.servers.ServerCapability
 import com.nuvio.app.features.servers.ServerEpisode
@@ -50,8 +51,8 @@ internal abstract class MediaBrowserProvider(
 
     private val client = MediaBrowserClient(authorizationHeader, http)
     private val lock = SynchronizedObject()
-    private val aioStreamsServers = mutableMapOf<String, Boolean>()
-    private val libraryGenres = mutableMapOf<String, String>()
+    private val aioStreamsServers = BoundedCache<String, Boolean>()
+    private val libraryGenres = BoundedCache<String, String>()
 
     protected abstract fun viewsEndpoint(userId: String): Endpoint
 

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.watchprogress
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.tracking.WatchProgressSource
 import kotlinx.atomicfu.locks.SynchronizedObject
@@ -53,7 +54,7 @@ internal fun WatchProgressEntry.needsRemoteMetadataEnrichment(): Boolean =
 internal class ProviderProgressMetadataOverlay {
     private val lock = SynchronizedObject()
     private var source: WatchProgressSource? = null
-    private val metadataByKey = mutableMapOf<WatchProgressMetadataKey, MetaDetails>()
+    private val metadataByKey = BoundedCache<WatchProgressMetadataKey, MetaDetails>()
 
     fun clear() {
         synchronized(lock) {

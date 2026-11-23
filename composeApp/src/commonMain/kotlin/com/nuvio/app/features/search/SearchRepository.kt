@@ -1,5 +1,6 @@
 package com.nuvio.app.features.search
 
+import com.nuvio.app.core.memory.retainBrowseWindow
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.i18n.localizedMediaTypeLabel
 import com.nuvio.app.features.addons.AddonCatalog
@@ -592,7 +593,7 @@ object SearchRepository {
                             "sample=${page.items.previewNames()}"
                     }
                     _discoverUiState.value = latest.copy(
-                        items = mergedItems,
+                        items = retainBrowseWindow(mergedItems),
                         isLoading = false,
                         nextSkip = paginationState.nextSkip,
                         consecutiveDuplicatePages = paginationState.consecutiveDuplicatePages,

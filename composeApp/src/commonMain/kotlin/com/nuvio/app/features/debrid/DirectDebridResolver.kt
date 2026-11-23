@@ -1,5 +1,6 @@
 package com.nuvio.app.features.debrid
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamClientResolve
 import com.nuvio.app.features.streams.StreamDebridCacheState
@@ -26,7 +27,7 @@ object DirectDebridPlaybackResolver {
     private val localAddonStreamResolver = LocalDebridAddonStreamResolver()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutex = Mutex()
-    private val resolvedCache = mutableMapOf<String, CachedDirectDebridResolve>()
+    private val resolvedCache = BoundedCache<String, CachedDirectDebridResolve>()
     private val inFlightResolves = mutableMapOf<String, Deferred<DirectDebridResolveResult>>()
 
     /** [forceRefresh] drops the in-memory resolved link first, so a new one is requested from the provider. */

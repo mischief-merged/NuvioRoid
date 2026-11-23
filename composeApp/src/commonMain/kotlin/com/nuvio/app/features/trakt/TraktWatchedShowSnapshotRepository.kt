@@ -4,7 +4,9 @@ import com.nuvio.app.features.addons.RawHttpResponse
 import com.nuvio.app.features.addons.httpRequestRaw
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
-import kotlinx.coroutines.CompletableDeferred
+import com.nuvio.app.core.memory.SharedLookup
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -101,75 +103,37 @@ internal class TraktWatchedShowSnapshotStore(
         explicitNulls = false
     }
     private val stateLock = SynchronizedObject()
-    private val inFlightByCredential = mutableMapOf<String, CompletableDeferred<List<TraktWatchedShowSnapshotItem>>>()
+    private val inFlightByCredential = SharedLookup<Pair<String, Long>, List<TraktWatchedShowSnapshotItem>>()
     private var cachedSnapshot: CachedWatchedShowSnapshot? = null
     private var generation = 0L
 
     suspend fun get(headers: Map<String, String>): List<TraktWatchedShowSnapshotItem> {
         val credentialKey = credentialKey(headers)
-        val now = nowEpochMs()
-        val lease = synchronized(stateLock) {
-            val cached = cachedSnapshot?.takeIf { snapshot ->
-                snapshot.credentialKey == credentialKey &&
-                    now - snapshot.fetchedAtEpochMs in 0..cacheTtlMs
-            }
-            if (cached != null) {
-                SnapshotFetchLease(cachedItems = cached.items)
-            } else {
-                val existing = inFlightByCredential[credentialKey]
-                if (existing != null) {
-                    SnapshotFetchLease(deferred = existing)
-                } else {
-                    val created = CompletableDeferred<List<TraktWatchedShowSnapshotItem>>()
-                    inFlightByCredential[credentialKey] = created
-                    SnapshotFetchLease(
-                        deferred = created,
-                        ownsFetch = true,
-                        generation = generation,
-                    )
-                }
-            }
+        val requestedGeneration = synchronized(stateLock) {
+            cached(credentialKey)?.let { return it }
+            generation
         }
-
-        lease.cachedItems?.let { return it }
-
-        val deferred = requireNotNull(lease.deferred)
-        if (!lease.ownsFetch) {
-            return deferred.await()
-        }
-
-        return try {
+        return inFlightByCredential.get(credentialKey to requestedGeneration) {
+            synchronized(stateLock) { cached(credentialKey)?.let { return@get it } }
             val items = fetchPages(headers)
+            currentCoroutineContext().ensureActive()
             synchronized(stateLock) {
-                if (lease.generation == generation) {
-                    cachedSnapshot = CachedWatchedShowSnapshot(
-                        credentialKey = credentialKey,
-                        fetchedAtEpochMs = nowEpochMs(),
-                        items = items,
-                    )
-                }
-                if (inFlightByCredential[credentialKey] === deferred) {
-                    inFlightByCredential.remove(credentialKey)
+                if (requestedGeneration == generation) {
+                    cachedSnapshot = CachedWatchedShowSnapshot(credentialKey, nowEpochMs(), items)
                 }
             }
-            deferred.complete(items)
             items
-        } catch (error: Throwable) {
-            synchronized(stateLock) {
-                if (inFlightByCredential[credentialKey] === deferred) {
-                    inFlightByCredential.remove(credentialKey)
-                }
-            }
-            deferred.completeExceptionally(error)
-            throw error
         }
     }
+
+    private fun cached(credentialKey: String): List<TraktWatchedShowSnapshotItem>? = cachedSnapshot?.takeIf {
+        it.credentialKey == credentialKey && nowEpochMs() - it.fetchedAtEpochMs in 0..cacheTtlMs
+    }?.items
 
     fun clear() {
         synchronized(stateLock) {
             generation += 1
             cachedSnapshot = null
-            inFlightByCredential.clear()
         }
     }
 
@@ -209,12 +173,6 @@ internal class TraktWatchedShowSnapshotStore(
             ?.toIntOrNull()
 }
 
-private data class SnapshotFetchLease(
-    val cachedItems: List<TraktWatchedShowSnapshotItem>? = null,
-    val deferred: CompletableDeferred<List<TraktWatchedShowSnapshotItem>>? = null,
-    val ownsFetch: Boolean = false,
-    val generation: Long = 0L,
-)
 
 private data class CachedWatchedShowSnapshot(
     val credentialKey: String,

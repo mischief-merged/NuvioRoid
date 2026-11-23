@@ -1,5 +1,6 @@
 package com.nuvio.app.features.tmdb
 
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.isDesktop
 
 import co.touchlab.kermit.Logger
@@ -43,16 +44,16 @@ object TmdbMetadataService {
         }
     }
 
-    private val enrichmentCache = mutableMapOf<String, TmdbEnrichment>()
+    private val enrichmentCache = BoundedCache<String, TmdbEnrichment>()
     private val enrichmentCacheLock = SynchronizedObject()
-    private val episodeCache = mutableMapOf<String, Map<Pair<Int, Int>, TmdbEpisodeEnrichment>>()
-    private val moreLikeThisCache = mutableMapOf<String, List<MetaPreview>>()
-    private val collectionCache = mutableMapOf<String, Pair<String?, List<MetaPreview>>>()
-    private val trailerCache = mutableMapOf<String, List<MetaTrailer>>()
-    private val personCache = mutableMapOf<String, PersonDetail>()
-    private val entityBrowseCache = mutableMapOf<String, TmdbEntityBrowseData>()
-    private val entityHeaderCache = mutableMapOf<String, TmdbEntityHeader>()
-    private val entityRailCache = mutableMapOf<String, List<MetaPreview>>()
+    private val episodeCache = BoundedCache<String, Map<Pair<Int, Int>, TmdbEpisodeEnrichment>>()
+    private val moreLikeThisCache = BoundedCache<String, List<MetaPreview>>()
+    private val collectionCache = BoundedCache<String, Pair<String?, List<MetaPreview>>>()
+    private val trailerCache = BoundedCache<String, List<MetaTrailer>>()
+    private val personCache = BoundedCache<String, PersonDetail>()
+    private val entityBrowseCache = BoundedCache<String, TmdbEntityBrowseData>()
+    private val entityHeaderCache = BoundedCache<String, TmdbEntityHeader>()
+    private val entityRailCache = BoundedCache<String, List<MetaPreview>>()
     private val backdropCache = linkedMapOf<String, String?>()
     private val backdropCacheMutex = Mutex()
     private val backdropRequests = Semaphore(4)

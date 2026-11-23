@@ -2,7 +2,7 @@ package com.nuvio.app.features.autosync
 
 import com.nuvio.app.features.player.SubtitleSyncCue
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
+import com.nuvio.app.core.memory.SharedLookup
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -98,7 +98,8 @@ internal object EmbeddedSubtitleTimelineLoader {
 
     private val cacheLock = SynchronizedObject()
     private val cache = AutoSyncLruCache<String, CachedLoadResult>(MAX_CACHE_ENTRIES)
-    private val inFlight = mutableMapOf<String, CompletableDeferred<IndexedEmbeddedTimeline?>>()
+    private val inFlight = SharedLookup<String, IndexedEmbeddedTimeline?>()
+    internal var indexLoader: suspend (String, Map<String, String>) -> IndexedEmbeddedTimeline? = ::loadMatroskaCueIndex
 
     /**
      * Starts loading the index in [scope] so a later [load] finds it cached or joins the
@@ -123,39 +124,20 @@ internal object EmbeddedSubtitleTimelineLoader {
         }
 
         val cacheKey = "$sourceUrl#${sourceHeaders.hashCode()}"
-        val nowNs = autoSyncNanoTime()
-        val ownedLoad = CompletableDeferred<IndexedEmbeddedTimeline?>()
-        val activeLoad = synchronized(cacheLock) {
-            val cached = cache[cacheKey]
-            if (cached != null) {
-                if (cached.timeline != null) return cached.timeline
-                val ageMs = (nowNs - cached.createdAtNs).coerceAtLeast(0L) / 1_000_000L
-                if (ageMs < NEGATIVE_CACHE_TTL_MS) return null
-                cache.remove(cacheKey)
-            }
-            inFlight.getOrPut(cacheKey) { ownedLoad }
+        cachedLoad(cacheKey)?.let { return it.timeline }
+        return inFlight.get(cacheKey) {
+            cachedLoad(cacheKey)?.let { return@get it.timeline }
+            loadAndCache(cacheKey, sourceUrl, sourceHeaders)
         }
+    }
 
-        if (activeLoad !== ownedLoad) {
-            return try {
-                activeLoad.await()
-            } catch (cancel: CancellationException) {
-                // The owning load was cancelled (e.g. its player closed). Load for this caller
-                // unless this caller itself is the one being cancelled.
-                currentCoroutineContext().ensureActive()
-                load(sourceUrl, sourceHeaders)
-            }
-        }
-
-        try {
-            return loadAndCache(cacheKey, sourceUrl, sourceHeaders)
-                .also(ownedLoad::complete)
-        } finally {
-            ownedLoad.cancel()
-            synchronized(cacheLock) {
-                if (inFlight[cacheKey] === ownedLoad) inFlight.remove(cacheKey)
-            }
-        }
+    private fun cachedLoad(cacheKey: String): CachedLoadResult? = synchronized(cacheLock) {
+        val result = cache[cacheKey] ?: return@synchronized null
+        if (result.timeline == null &&
+            (autoSyncNanoTime() - result.createdAtNs).coerceAtLeast(0L) / 1_000_000L >= NEGATIVE_CACHE_TTL_MS) {
+            cache.remove(cacheKey)
+            null
+        } else result
     }
 
     private suspend fun loadAndCache(
@@ -167,7 +149,7 @@ internal object EmbeddedSubtitleTimelineLoader {
             val loaded = try {
                 withTimeout(TOTAL_TIMEOUT_MS) {
                     withContext(Dispatchers.IO) {
-                        loadMatroskaCueIndex(sourceUrl, sourceHeaders)
+                        indexLoader(sourceUrl, sourceHeaders)
                     }
                 }
             } catch (_: TimeoutCancellationException) {
