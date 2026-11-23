@@ -1715,7 +1715,7 @@ class MiniPlayerSessionTest {
     @Test
     fun minimized_snapshot_polling_slows_to_one_second_skips_dimension_reads_and_restores_on_reopen() {
         assertEquals(250L, desktopSnapshotPollIntervalMs(isInMiniPlayer = false))
-        assertEquals(1_000L, desktopSnapshotPollIntervalMs(isInMiniPlayer = true))
+        assertEquals(2_000L, desktopSnapshotPollIntervalMs(isInMiniPlayer = true))
 
         val backend = CountingNativePlayerBackend()
         val hooks = backend.toDesktopHooks()
@@ -1746,19 +1746,15 @@ class MiniPlayerSessionTest {
         val fullModeDimensionQueries = backend.videoDimensionQueries.get()
         assertTrue(fullModeDimensionQueries >= 2, "full mode reads video dimensions")
 
-        // Switch to mini mode on macOS: zero timer polling, updates arrive only on native mpv property events.
+        // Switch to mini mode: slow 2,000 ms sync cadence, zero video-dimension string reads.
         snapshots.clear()
         inMini = true
         compose.mainClock.advanceTimeBy(50L)
-        val miniEntrySnapshots = snapshots.size
         val queriesAtMiniStart = backend.videoDimensionQueries.get()
 
-        compose.mainClock.advanceTimeBy(5_000L)
-        assertEquals(miniEntrySnapshots, snapshots.size, "zero timer polling while minimized on macOS")
-
-        backend.emitPlaybackPosition(1L, 123_000L)
-        compose.waitUntil(5_000L) { snapshots.any { it.positionMs == 123_000L } }
-        compose.mainClock.advanceTimeBy(50L)
+        backend.statesByHandle[1L]?.positionMs = 123_000L
+        compose.mainClock.advanceTimeBy(6_500L)
+        assertTrue(snapshots.size in 3..5, "expected slow 2s mini snapshot cadence across 6.5s, got ${snapshots.size}")
         assertEquals(123_000L, snapshots.last().positionMs)
         assertEquals(1920, snapshots.last().videoWidth)
         assertEquals(queriesAtMiniStart, backend.videoDimensionQueries.get(), "no dimension queries while minimized")
@@ -1821,8 +1817,7 @@ class MiniPlayerSessionTest {
         assertTrue(backend.audioTrackQueries.get() >= 2, "Full mode scans audio tracks")
         assertTrue(sourceHealthTicks.get() >= 2, "Full mode source-health monitor runs while playing")
 
-        // Minimize while playing: zero timer polls, zero source-health wakeups, zero audio-track or dimension reads;
-        // updates occur only when native mpv property events push a state tick.
+        // Minimize while playing: slow 2s cadence, zero audio-track scans, zero video-dimension reads.
         sessionController.minimize()
         compose.mainClock.advanceTimeBy(100L)
         val audioQueriesAtMiniPlay = backend.audioTrackQueries.get()
@@ -1830,15 +1825,14 @@ class MiniPlayerSessionTest {
         val snapQueriesAtMiniPlay = backend.snapshotQueries.get()
         val healthTicksAtMiniPlay = sourceHealthTicks.get()
 
+        backend.emitPlaybackPosition(1L, 105_000L)
         compose.mainClock.advanceTimeBy(10_000L)
-        assertEquals(snapQueriesAtMiniPlay, backend.snapshotQueries.get(), "zero snapshot timer polls while playing minimized")
-        assertEquals(healthTicksAtMiniPlay, sourceHealthTicks.get(), "zero source-health wakeups while playing minimized")
+        val miniSnapDelta = backend.snapshotQueries.get() - snapQueriesAtMiniPlay
+        val miniHealthDelta = sourceHealthTicks.get() - healthTicksAtMiniPlay
+        assertTrue(miniSnapDelta in 4..6, "expected ~2s snapshot sync across 10s while playing minimized, got $miniSnapDelta")
+        assertTrue(miniHealthDelta in 4..6, "expected ~2s source-health sync across 10s while playing minimized, got $miniHealthDelta")
         assertEquals(audioQueriesAtMiniPlay, backend.audioTrackQueries.get(), "no audio-track scans while minimized")
         assertEquals(dimQueriesAtMiniPlay, backend.videoDimensionQueries.get(), "no video-dimension reads while minimized")
-
-        backend.emitPlaybackPosition(1L, 105_000L)
-        compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapQueriesAtMiniPlay }
-        compose.mainClock.advanceTimeBy(50L)
         assertEquals(105_000L, sessionController.playbackState?.positionMs)
 
         // Pause from MiniPlayerDock: zero snapshot polls and zero source-health wakeups across 10 seconds.
@@ -1882,11 +1876,9 @@ class MiniPlayerSessionTest {
     }
 
     @Test
-    fun minimized_stalled_stream_recovers_via_event_driven_deadline_without_polling() {
+    fun minimized_stalled_stream_observes_buffer_growth_and_fails_over_without_stealing_focus() {
         PlayerSettingsRepository.ensureLoaded()
         val previousSettings = PlayerSettingsRepository.uiState.value
-        val sourceHealthTicks = AtomicInteger(0)
-        sourceHealthTickObserverForTest = { sourceHealthTicks.incrementAndGet() }
         sourceHealthNowMsForTest = { compose.mainClock.currentTime }
 
         try {
@@ -1964,6 +1956,9 @@ class MiniPlayerSessionTest {
             }
             compose.mainClock.advanceTimeBy(50L)
             compose.waitUntil(5_000L) { backend.createCount == 1 }
+            assertEquals(listOf(false), backend.createdInMiniPlayerModes.toList())
+            assertEquals(listOf(1L), backend.focusedHandles.toList())
+
             backend.statesByHandle[1L]?.apply {
                 loading = false
                 paused = false
@@ -1971,53 +1966,43 @@ class MiniPlayerSessionTest {
                 bufferedPositionMs = 120_000L
                 durationMs = 1_800_000L
             }
-
-            // Let full-screen startup watch observe active playback and arm the stall detector.
             compose.mainClock.advanceTimeBy(2_500L)
-            assertTrue(sourceHealthTicks.get() >= 2)
 
-            // Minimize and reset tick counter: 24 seconds (> STALL_DEADLINE_MS) of healthy progress fires zero wakeups.
+            // Minimize and enter rebuffering where position stands still at 124s, but buffer grows every 2s.
             sessionController.minimize()
             compose.mainClock.advanceTimeBy(100L)
-            sourceHealthTicks.set(0)
-
-            for (nextPosMs in listOf(108_000L, 116_000L, 124_000L)) {
-                compose.mainClock.advanceTimeBy(8_000L)
-                assertEquals(0, sourceHealthTicks.get(), "zero deadline wakeups during healthy minimized playback")
-                val snapsBefore = backend.snapshotQueries.get()
-                backend.statesByHandle[1L]?.bufferedPositionMs = nextPosMs + 20_000L
-                backend.emitPlaybackPosition(1L, nextPosMs)
-                compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapsBefore }
-                compose.mainClock.advanceTimeBy(50L)
-                assertEquals(nextPosMs, sessionController.playbackState?.positionMs)
-            }
-            assertEquals(0, sourceHealthTicks.get(), "24s of advancing minimized playback incurred zero wakeups")
-
-            // Freeze the stream at 124s (buffering with no position or buffer progress).
-            val snapsBeforeStall = backend.snapshotQueries.get()
             backend.statesByHandle[1L]?.apply {
                 loading = true
                 paused = false
                 positionMs = 124_000L
                 bufferedPositionMs = 124_000L
-                eventSink.onPlayerEvent("nativeStateTick", 124_000.0)
             }
-            compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapsBeforeStall }
-            compose.mainClock.advanceTimeBy(50L)
 
-            // Before STALL_DEADLINE_MS (20s), still zero wakeups and no failover.
-            compose.mainClock.advanceTimeBy(19_000L)
-            assertEquals(0, sourceHealthTicks.get(), "no premature wakeup before stall deadline")
-            assertEquals(1, backend.createCount)
+            // Across 28 seconds (> 20s short deadline), growing buffer holds off premature failover.
+            repeat(14) { stepIndex ->
+                backend.statesByHandle[1L]?.bufferedPositionMs = 124_500L + stepIndex * 1_000L
+                compose.mainClock.advanceTimeBy(2_000L)
+            }
+            assertEquals(1, backend.createCount, "rebuffering stream with growing buffer must not fail over at 20s")
+            assertEquals(0, backend.disposeCount)
 
-            // Cross the 20s deadline: one event-driven wakeup fires stall recovery and switches to fallbackUrl while minimized.
-            compose.mainClock.advanceTimeBy(1_500L)
+            // Once buffer growth also stops for 20s, stall recovery fails over to fallbackUrl with inMiniPlayer=true on create.
+            compose.mainClock.advanceTimeBy(22_000L)
             compose.mainClock.advanceTimeBy(200L)
             compose.waitUntil(5_000L) { backend.createCount == 2 && backend.disposeCount == 1 }
             compose.mainClock.advanceTimeBy(200L)
 
-            assertEquals(1, sourceHealthTicks.get(), "single deadline wakeup triggered stall recovery")
             assertEquals(listOf(stallingUrl, fallbackUrl), backend.createdSources.toList())
+            assertEquals(
+                listOf(false, true),
+                backend.createdInMiniPlayerModes.toList(),
+                "minimized failover must apply mini presentation on handle creation",
+            )
+            assertEquals(
+                listOf(1L),
+                backend.focusedHandles.toList(),
+                "replacement handle created while minimized must never steal focus",
+            )
             assertEquals(1, backend.maxConcurrentHandles)
             assertTrue(sessionController.isMinimized)
             assertEquals(fallbackUrl, sessionController.playbackState?.sourceUrl)

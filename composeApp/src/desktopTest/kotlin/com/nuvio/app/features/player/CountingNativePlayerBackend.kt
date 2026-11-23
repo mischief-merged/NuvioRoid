@@ -44,6 +44,8 @@ internal class CountingNativePlayerBackend(
     val statesByHandle = ConcurrentHashMap<Long, HandleState>()
     val events: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val createdSources: MutableList<String> = Collections.synchronizedList(mutableListOf())
+    val createdInMiniPlayerModes: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
+    val focusedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     val disposedHandles: MutableList<Long> = Collections.synchronizedList(mutableListOf())
     val snapshotQueries = AtomicInteger(0)
     val audioTrackQueries = AtomicInteger(0)
@@ -74,7 +76,6 @@ internal class CountingNativePlayerBackend(
         if (state.remoteCommandsEnabled && seeked) {
             state.nowPlayingPositionMs = positionMs
         }
-        state.eventSink.onPlayerEvent("nativeStateTick", positionMs.toDouble())
     }
 
     fun toDesktopHooks(
@@ -131,6 +132,10 @@ internal class CountingNativePlayerBackend(
             }
         }
         createdSources += sourceUrl
+        createdInMiniPlayerModes += inMiniPlayer
+        if (!inMiniPlayer) {
+            focusedHandles += handle
+        }
         events += "create-$handle:$sourceUrl"
         return handle
     }
@@ -171,7 +176,11 @@ internal class CountingNativePlayerBackend(
         events += "mini-mode-$handle:$inMiniPlayer"
     }
 
-    override fun requestFocus(handle: Long) = Unit
+    override fun requestFocus(handle: Long) {
+        if (statesByHandle[handle]?.miniPlayerMode == false) {
+            focusedHandles += handle
+        }
+    }
     override fun beginWindowDrag(handle: Long) = Unit
     override fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean = true
     override fun layoutNativeSubviews(handle: Long) = Unit
