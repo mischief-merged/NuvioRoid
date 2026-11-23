@@ -254,6 +254,8 @@ internal class PlayerScreenRuntime(
     var submitIntroStatusMessage by mutableStateOf<String?>(null)
     var playerControlsPendingP2pSwitch by mutableStateOf<PendingPlayerP2pSwitch?>(null)
     var playerControlsCloseModalsToken by mutableStateOf(0L)
+    var playerControlsModalNavigationAction by mutableStateOf("")
+    var playerControlsModalNavigationToken by mutableStateOf(0L)
     var playerControlsSubmitIntroSuccessToken by mutableStateOf(0L)
     var playerNotificationMessage by mutableStateOf("")
     var playerNotificationToken by mutableStateOf(0L)

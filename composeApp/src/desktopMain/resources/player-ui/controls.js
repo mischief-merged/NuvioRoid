@@ -391,6 +391,8 @@ let state = {
   subtitleColorSwatches: [],
   subtitleOutlineColorSwatches: [],
   closeModalsToken: 0,
+  modalNavigationAction: "",
+  modalNavigationToken: 0,
   submitIntroContentKey: "",
   notificationMessage: "",
   notificationToken: 0,
@@ -3662,8 +3664,94 @@ window.playerUpdate = update => {
   }
 };
 
+const handleNativeModalNavigation = action => {
+  if (!activeModal) return;
+  noteChromeActivity(true);
+  const modalEl = isPartyConfirmOpen() ? partyConfirm : modalByName[activeModal];
+  if (!modalEl) return;
+
+  if (action === "select") {
+    const active = document.activeElement;
+    if (active && modalEl.contains(active) && !active.disabled && !active.hidden && (active.offsetWidth > 0 || active.offsetHeight > 0)) {
+      active.click();
+      return;
+    }
+    const preferred =
+      modalEl.querySelector('.subtitle-language-row.selected:not([disabled]):not([hidden]), .track-row.selected:not([disabled]):not([hidden]), button.primary:not([disabled]):not([hidden])') ||
+      modalEl.querySelector('button:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])');
+    if (preferred && (preferred.offsetWidth > 0 || preferred.offsetHeight > 0)) {
+      preferred.focus();
+      preferred.click();
+    }
+    return;
+  }
+
+  if ((activeModal === "episodes" || activeModal === "sources") && (action === "left" || action === "right")) {
+    const chips = Array.from(modalEl.querySelectorAll('.filter-chip:not([hidden])')).filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+    if (chips.length > 0) {
+      let selectedIndex = chips.findIndex(el => el.classList.contains('selected'));
+      if (selectedIndex === -1) selectedIndex = 0;
+      const nextIndex = action === "right"
+        ? (selectedIndex < chips.length - 1 ? selectedIndex + 1 : 0)
+        : (selectedIndex > 0 ? selectedIndex - 1 : chips.length - 1);
+      if (nextIndex !== selectedIndex) {
+        chips[nextIndex].focus();
+        chips[nextIndex].click();
+      }
+      return;
+    }
+  }
+
+  if (activeModal === "audio" && (action === "up" || action === "down")) {
+    if (state.audioTracks && state.audioTracks.length > 0) {
+      const currentIndex = state.audioTracks.findIndex(t => t.selected);
+      const nextIndex = action === "up"
+        ? (currentIndex > 0 ? currentIndex - 1 : state.audioTracks.length - 1)
+        : (currentIndex >= 0 && currentIndex < state.audioTracks.length - 1 ? currentIndex + 1 : 0);
+      if (nextIndex !== currentIndex && nextIndex >= 0) {
+        send("selectAudioTrack", trackIdValue(state.audioTracks[nextIndex]));
+      }
+    }
+    return;
+  }
+
+  if (activeModal === "speed" && (action === "up" || action === "down")) {
+    const currentSpeedStr = String(state.playbackSpeedLabel || "1x");
+    let currentIndex = pendingSpeedIndex !== null ? pendingSpeedIndex : speedOptions.findIndex(o => currentSpeedStr.startsWith(o.label.split(" ")[0]));
+    if (currentIndex >= 0) {
+      currentIndex = action === "up"
+        ? (currentIndex > 0 ? currentIndex - 1 : speedOptions.length - 1)
+        : (currentIndex < speedOptions.length - 1 ? currentIndex + 1 : 0);
+      pendingSpeedIndex = currentIndex;
+      window.clearTimeout(pendingSpeedTimer);
+      pendingSpeedTimer = window.setTimeout(() => pendingSpeedIndex = null, 1000);
+      queueSettingToast("speed");
+      send("setPlaybackSpeed", speedOptions[currentIndex].value);
+    }
+    return;
+  }
+
+  const focusable = Array.from(modalEl.querySelectorAll('button:not([disabled]):not([hidden]), input:not([disabled]):not([hidden]), [tabindex]:not([tabindex="-1"])'))
+    .filter(el => el.offsetWidth > 0 || el.offsetHeight > 0);
+  if (!focusable.length) return;
+  const activeIndex = focusable.indexOf(document.activeElement);
+  const baseIndex = activeIndex >= 0
+    ? activeIndex
+    : focusable.findIndex(el => el.classList.contains('selected'));
+  const startIndex = baseIndex >= 0 ? baseIndex : 0;
+  const nextIndex = (action === "down" || action === "right")
+    ? (activeIndex >= 0 || baseIndex >= 0 ? (startIndex + 1) % focusable.length : 0)
+    : (activeIndex >= 0 || baseIndex >= 0 ? (startIndex > 0 ? startIndex - 1 : focusable.length - 1) : focusable.length - 1);
+  const nextEl = focusable[nextIndex];
+  nextEl.focus();
+  if (typeof nextEl.scrollIntoView === "function") {
+    nextEl.scrollIntoView({ block: "nearest" });
+  }
+};
+
 window.playerControls = nextState => {
   const previousCloseToken = Number(state.closeModalsToken) || 0;
+  const previousModalNavToken = Number(state.modalNavigationToken) || 0;
   const previousSubmitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
   const previousNotificationToken = Number(state.notificationToken) || 0;
   const previousResizeLabel = state.resizeModeLabel || "";
@@ -3688,9 +3776,13 @@ window.playerControls = nextState => {
   }
   hasReceivedPlayerControls = true;
   const closeToken = Number(state.closeModalsToken) || 0;
+  const modalNavToken = Number(state.modalNavigationToken) || 0;
   const submitIntroSuccessToken = Number(state.submitIntroSuccessToken) || 0;
   if (closeToken !== previousCloseToken) {
     closePlayerModal();
+  }
+  if (modalNavToken !== previousModalNavToken && activeModal && state.modalNavigationAction) {
+    handleNativeModalNavigation(state.modalNavigationAction);
   }
   if (submitIntroSuccessToken !== previousSubmitIntroSuccessToken) {
     submitIntroDraft.segmentType = "intro";

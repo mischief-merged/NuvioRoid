@@ -22,6 +22,11 @@ internal enum class PlayerCommand {
     Audio,
     Episodes,
     Sources,
+    NativeModalUp,
+    NativeModalDown,
+    NativeModalLeft,
+    NativeModalRight,
+    NativeModalSelect,
 }
 
 internal object PlayerControllerBridge {

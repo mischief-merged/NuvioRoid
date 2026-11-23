@@ -15,6 +15,8 @@ internal actual fun PlatformModalBackHandler(
     // No-op on iOS — dismissal is handled by the platform.
 }
 
+internal actual fun dispatchPlatformModalBack(): Boolean = false
+
 internal actual fun dispatchPlatformLocalBack(): Boolean = false
 
 internal actual fun hasOpenPlatformModal(): Boolean = false

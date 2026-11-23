@@ -52,13 +52,16 @@ internal object DesktopEscapeShortcut {
         }
     }
 
+    /** Runs the innermost active modal back handler, returning true if one handled back. */
+    fun dispatchModalBack(): Boolean {
+        val modal = synchronized(modalHandlers) { modalHandlers.lastOrNull() } ?: return false
+        modal()
+        return true
+    }
+
     /** Runs the innermost active modal or local back handler, returning true if one handled back. */
     fun dispatchLocalBack(): Boolean {
-        val modal = synchronized(modalHandlers) { modalHandlers.lastOrNull() }
-        if (modal != null) {
-            modal()
-            return true
-        }
+        if (dispatchModalBack()) return true
         val local = synchronized(localHandlers) { localHandlers.lastOrNull() } ?: return false
         local()
         return true

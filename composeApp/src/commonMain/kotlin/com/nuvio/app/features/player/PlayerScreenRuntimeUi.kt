@@ -46,7 +46,9 @@ import com.nuvio.app.controller.ControllerDirection
 import com.nuvio.app.controller.ControllerEvent
 import com.nuvio.app.controller.XboxButton
 import com.nuvio.app.controller.audio.ControllerSoundPlayer
+import com.nuvio.app.core.ui.PlatformModalBackHandler
 import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.core.ui.dispatchPlatformModalBack
 import com.nuvio.app.core.ui.hasOpenPlatformModal
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.p2p.formatP2pMegabytes
@@ -87,6 +89,12 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
             }
         }
         onDispose { systemBackRegistration(null) }
+    }
+    if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
+        PlatformModalBackHandler(
+            dismissOnBackPress = true,
+            onDismiss = { dismissNativeControlsModal() },
+        )
     }
     val isInPip = rememberIsInPictureInPicture()
     val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
@@ -508,6 +516,8 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi(
         subtitleAutoSyncIsLoading = subtitleAutoSyncState.isLoading,
         subtitleAutoSyncErrorMessage = subtitleAutoSyncState.errorMessage.orEmpty(),
         closeModalsToken = playerControlsCloseModalsToken,
+        modalNavigationAction = playerControlsModalNavigationAction,
+        modalNavigationToken = playerControlsModalNavigationToken,
         submitIntroSuccessToken = playerControlsSubmitIntroSuccessToken,
         notificationMessage = playerNotificationMessage,
         notificationToken = playerNotificationToken,
@@ -1399,7 +1409,25 @@ internal fun PlayerScreenRuntime.handlePlayerControllerCommand(command: PlayerCo
             openSourcesPanel()
             true
         }
+        PlayerCommand.NativeModalUp -> dispatchNativeModalNavigation("up")
+        PlayerCommand.NativeModalDown -> dispatchNativeModalNavigation("down")
+        PlayerCommand.NativeModalLeft -> dispatchNativeModalNavigation("left")
+        PlayerCommand.NativeModalRight -> dispatchNativeModalNavigation("right")
+        PlayerCommand.NativeModalSelect -> dispatchNativeModalNavigation("select")
     }
+
+private fun PlayerScreenRuntime.dispatchNativeModalNavigation(action: String): Boolean {
+    if (!nativeControlsModalOpen && playerControlsPendingP2pSwitch == null) return false
+    playerControlsModalNavigationAction = action
+    playerControlsModalNavigationToken += 1
+    return true
+}
+
+internal fun PlayerScreenRuntime.dismissNativeControlsModal() {
+    nativeControlsModalOpen = false
+    playerControlsPendingP2pSwitch = null
+    playerControlsCloseModalsToken += 1
+}
 
 /**
  * True while any Compose or embedded native player overlay owns focus, so keyboard arrows/Enter
@@ -1414,9 +1442,11 @@ internal val PlayerScreenRuntime.hasOpenPlayerOverlay: Boolean
         nativeControlsModalOpen
 
 /**
- * Translates a controller event while the player is active. When a player modal, dialog, or side
- * panel is open, directional navigation and A/Select yield (`false`) so Compose focus operates the
- * overlay while B/Back still dismisses it.
+ * Translates a controller event while the player is active.
+ * - When an embedded native popup (audio, subtitles, speed, P2P consent, etc.) is open, D-pad
+ *   navigation and A/Select are forwarded into the native controls WebView while B/Back closes it.
+ * - When a Compose player modal, dialog, or side panel is open, directional navigation and
+ *   A/Select yield (`false`) so Compose focus operates the overlay while B/Back dismisses it.
  */
 internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
     event: ControllerEvent,
@@ -1424,28 +1454,48 @@ internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
     dispatch: (PlayerCommand) -> Boolean = PlayerControllerBridge::dispatch,
     onNavigateHandled: () -> Unit = ControllerSoundPlayer::playNavigate,
 ): Boolean {
-    val overlayOpen = hasOpenPlayerOverlay || modalOpen
+    val composePanelOrDialogOpen = isPanelOpen ||
+        showChaptersPanel ||
+        showSwitchEngineConfirm ||
+        pendingP2pSwitch != null
+    val nativeModalOpen = (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) && !composePanelOrDialogOpen
+    val composeOverlayOpen = composePanelOrDialogOpen || (modalOpen && !nativeModalOpen)
+    val anyOverlayOpen = nativeModalOpen || composeOverlayOpen
     return when (event) {
         is ControllerEvent.Navigate -> {
-            if (overlayOpen) return false
-            val handled = when (event.direction) {
-                ControllerDirection.Left -> dispatch(PlayerCommand.SeekBack)
-                ControllerDirection.Right -> dispatch(PlayerCommand.SeekForward)
-                ControllerDirection.Up -> dispatch(PlayerCommand.VolumeUp)
-                ControllerDirection.Down -> dispatch(PlayerCommand.VolumeDown)
+            if (composeOverlayOpen) return false
+            val command = if (nativeModalOpen) {
+                when (event.direction) {
+                    ControllerDirection.Left -> PlayerCommand.NativeModalLeft
+                    ControllerDirection.Right -> PlayerCommand.NativeModalRight
+                    ControllerDirection.Up -> PlayerCommand.NativeModalUp
+                    ControllerDirection.Down -> PlayerCommand.NativeModalDown
+                }
+            } else {
+                when (event.direction) {
+                    ControllerDirection.Left -> PlayerCommand.SeekBack
+                    ControllerDirection.Right -> PlayerCommand.SeekForward
+                    ControllerDirection.Up -> PlayerCommand.VolumeUp
+                    ControllerDirection.Down -> PlayerCommand.VolumeDown
+                }
             }
+            val handled = dispatch(command)
             if (handled) onNavigateHandled()
             handled
         }
         is ControllerEvent.ButtonPressed -> when (event.button) {
             XboxButton.B -> dispatch(PlayerCommand.Back)
-            XboxButton.A -> if (overlayOpen) false else dispatch(PlayerCommand.TogglePlayback)
-            XboxButton.X -> if (overlayOpen) false else dispatch(PlayerCommand.Audio)
-            XboxButton.Y -> if (overlayOpen) false else dispatch(PlayerCommand.Subtitles)
-            XboxButton.LB, XboxButton.LT -> if (overlayOpen) false else dispatch(PlayerCommand.SeekBack)
-            XboxButton.RB, XboxButton.RT -> if (overlayOpen) false else dispatch(PlayerCommand.SeekForward)
-            XboxButton.Menu -> if (overlayOpen) false else dispatch(PlayerCommand.Episodes)
-            XboxButton.View -> if (overlayOpen) false else dispatch(PlayerCommand.Sources)
+            XboxButton.A -> when {
+                composeOverlayOpen -> false
+                nativeModalOpen -> dispatch(PlayerCommand.NativeModalSelect)
+                else -> dispatch(PlayerCommand.TogglePlayback)
+            }
+            XboxButton.X -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Audio)
+            XboxButton.Y -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Subtitles)
+            XboxButton.LB, XboxButton.LT -> if (anyOverlayOpen) false else dispatch(PlayerCommand.SeekBack)
+            XboxButton.RB, XboxButton.RT -> if (anyOverlayOpen) false else dispatch(PlayerCommand.SeekForward)
+            XboxButton.Menu -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Episodes)
+            XboxButton.View -> if (anyOverlayOpen) false else dispatch(PlayerCommand.Sources)
             else -> false
         }
         else -> false
@@ -1454,25 +1504,23 @@ internal fun PlayerScreenRuntime.handlePlayerControllerEvent(
 
 /**
  * Dismisses any open player modal, dialog, or side panel before exiting playback.
+ * Priority: Compose modal dialogs -> embedded native controls popups -> page-level handlers
+ * (such as NextEpisodeCard or side panels) -> runtime overlay flags.
  * Returns true if an overlay was dismissed (so the Back press is consumed).
  */
 internal fun PlayerScreenRuntime.dismissOpenPlayerOverlay(): Boolean {
-    if (dispatchPlatformLocalBack()) return true
-    if (nativeControlsModalOpen) {
-        nativeControlsModalOpen = false
-        playerControlsCloseModalsToken += 1
+    if (dispatchPlatformModalBack()) return true
+    if (nativeControlsModalOpen || playerControlsPendingP2pSwitch != null) {
+        dismissNativeControlsModal()
         return true
     }
+    if (dispatchPlatformLocalBack()) return true
     if (showSwitchEngineConfirm) {
         showSwitchEngineConfirm = false
         return true
     }
     if (pendingP2pSwitch != null) {
         pendingP2pSwitch = null
-        return true
-    }
-    if (playerControlsPendingP2pSwitch != null) {
-        playerControlsPendingP2pSwitch = null
         return true
     }
     if (showSubmitIntroModal) {

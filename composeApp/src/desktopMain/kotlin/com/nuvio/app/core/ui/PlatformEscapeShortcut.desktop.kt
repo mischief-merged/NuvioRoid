@@ -32,6 +32,8 @@ internal actual fun PlatformModalBackHandler(
     }
 }
 
+internal actual fun dispatchPlatformModalBack(): Boolean = DesktopEscapeShortcut.dispatchModalBack()
+
 internal actual fun dispatchPlatformLocalBack(): Boolean = DesktopEscapeShortcut.dispatchLocalBack()
 
 internal actual fun hasOpenPlatformModal(): Boolean = DesktopEscapeShortcut.hasOpenModal()

@@ -21,6 +21,9 @@ internal expect fun PlatformModalBackHandler(
     onDismiss: () -> Unit,
 )
 
+/** Runs the innermost active modal [PlatformModalBackHandler] on desktop; returns false when none is active. */
+internal expect fun dispatchPlatformModalBack(): Boolean
+
 /** Runs the innermost active modal or local [PlatformBackHandler] on desktop; returns false when none is active. */
 internal expect fun dispatchPlatformLocalBack(): Boolean
 

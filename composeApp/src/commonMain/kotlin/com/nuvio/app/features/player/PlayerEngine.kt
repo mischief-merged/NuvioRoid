@@ -311,6 +311,8 @@ data class PlayerControlsState(
     val subtitleAutoSyncIsLoading: Boolean = false,
     val subtitleAutoSyncErrorMessage: String = "",
     val closeModalsToken: Long = 0L,
+    val modalNavigationAction: String = "",
+    val modalNavigationToken: Long = 0L,
     val submitIntroContentKey: String = "",
     val submitIntroSuccessToken: Long = 0L,
     val notificationMessage: String = "",

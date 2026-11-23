@@ -7,6 +7,7 @@ import com.nuvio.app.controller.XboxButton
 import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.plugins.PluginRepository
+import com.nuvio.app.features.streams.StreamItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -15,6 +16,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PlayerControllerCommandTest {
@@ -185,19 +187,29 @@ class PlayerControllerCommandTest {
     }
 
     @Test
-    fun native_player_popup_suspends_playback_controls_and_back_closes_popup_before_exiting() {
+    fun native_player_popup_forwards_gamepad_navigation_and_select_and_back_closes_popup_before_exiting() {
         var exitCalls = 0
         val runtime = createRuntime(isSeries = true, onExit = { exitCalls += 1 })
         val initialCloseToken = runtime.playerControlsCloseModalsToken
+        val initialNavToken = runtime.playerControlsModalNavigationToken
 
-        // Native macOS WebView popup (e.g. Audio or Subtitles) opens.
+        // Native macOS WebView popup (e.g. Audio, Subtitles, or Speed) opens.
         assertTrue(runtime.handlePlayerControlsEvent("nativeModalState", 1.0))
         assertTrue(runtime.nativeControlsModalOpen)
         assertTrue(runtime.hasOpenPlayerOverlay)
 
-        // D-pad and A yield while the native popup is open.
-        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Down), modalOpen = false, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
-        assertFalse(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = false, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        // D-pad and A forward into the native popup (even when PlatformModalBackHandler marks modalOpen = true).
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Down), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        assertEquals("down", runtime.playerControlsModalNavigationAction)
+        assertEquals(initialNavToken + 1L, runtime.playerControlsModalNavigationToken)
+
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Up), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        assertEquals("up", runtime.playerControlsModalNavigationAction)
+        assertEquals(initialNavToken + 2L, runtime.playerControlsModalNavigationToken)
+
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        assertEquals("select", runtime.playerControlsModalNavigationAction)
+        assertEquals(initialNavToken + 3L, runtime.playerControlsModalNavigationToken)
 
         // First Back closes the native popup via closeModalsToken without exiting playback.
         assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
@@ -208,6 +220,63 @@ class PlayerControllerCommandTest {
         // Second Back exits playback now that the native popup is closed.
         assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
         assertEquals(1, exitCalls)
+    }
+
+    @Test
+    fun back_dismisses_desktop_p2p_consent_popup_and_clears_pending_switch_in_one_step() {
+        var exitCalls = 0
+        val runtime = createRuntime(isSeries = true, onExit = { exitCalls += 1 })
+        val initialCloseToken = runtime.playerControlsCloseModalsToken
+
+        runtime.playerControlsPendingP2pSwitch = PendingPlayerP2pSwitch(
+            stream = StreamItem(name = "P2P", infoHash = "abcdef1234567890", addonName = "Addon", addonId = "addon"),
+            episode = null,
+            isAutoPlay = false,
+        )
+        assertTrue(runtime.handlePlayerControlsEvent("nativeModalState", 1.0))
+
+        // First Back clears BOTH nativeControlsModalOpen and playerControlsPendingP2pSwitch so controls.js cannot re-open p2pConsent.
+        assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+        assertFalse(runtime.nativeControlsModalOpen)
+        assertNull(runtime.playerControlsPendingP2pSwitch)
+        assertEquals(initialCloseToken + 1L, runtime.playerControlsCloseModalsToken)
+        assertEquals(0, exitCalls)
+
+        // Second Back leaves playback cleanly.
+        assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+        assertEquals(1, exitCalls)
+    }
+
+    @Test
+    fun back_closes_native_popup_before_dismissing_local_next_episode_card_handler() {
+        var exitCalls = 0
+        var nextEpisodeCardDismissals = 0
+        val runtime = createRuntime(isSeries = true, onExit = { exitCalls += 1 })
+        val localNextEpisodeHandler: () -> Unit = { nextEpisodeCardDismissals += 1 }
+
+        DesktopEscapeShortcut.registerLocal(localNextEpisodeHandler)
+        try {
+            assertTrue(runtime.handlePlayerControlsEvent("nativeModalState", 1.0))
+
+            // First Back closes the open native Audio/Subtitles popup while leaving the next-episode card visible.
+            assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+            assertFalse(runtime.nativeControlsModalOpen)
+            assertEquals(0, nextEpisodeCardDismissals)
+            assertEquals(0, exitCalls)
+
+            // Second Back dismisses the local next-episode card handler.
+            assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+            assertEquals(1, nextEpisodeCardDismissals)
+            assertEquals(0, exitCalls)
+
+            DesktopEscapeShortcut.unregisterLocal(localNextEpisodeHandler)
+
+            // Third Back exits playback.
+            assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))
+            assertEquals(1, exitCalls)
+        } finally {
+            DesktopEscapeShortcut.unregisterLocal(localNextEpisodeHandler)
+        }
     }
 
     @Test
