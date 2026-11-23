@@ -674,43 +674,41 @@ internal fun MainAppContent(
     }
 
     LaunchedEffect(
-        initialHomeReady,
+        ownsAppRuntime,
         offlineLaunchRouteHandled,
         networkCondition,
         completedDownloads,
         downloadsCatalogReady,
     ) {
         if (!ownsAppRuntime) return@LaunchedEffect
-        if (!initialHomeReady || offlineLaunchRouteHandled) return@LaunchedEffect
-
-        when (networkCondition) {
-            NetworkCondition.Unknown,
-            NetworkCondition.Checking,
-            -> return@LaunchedEffect
-
-            NetworkCondition.Online -> {
-                offlineLaunchRouteHandled = true
-            }
-
-            NetworkCondition.NoInternet,
-            NetworkCondition.ServersUnreachable,
-            -> {
-                if (!AppFeaturePolicy.downloadsEnabled) {
-                    offlineLaunchRouteHandled = true
-                    return@LaunchedEffect
-                }
-                // The list is read off the interface thread. Wait for it, or an offline launch
-                // would miss downloads that are still being read.
-                if (!downloadsCatalogReady) return@LaunchedEffect
-                offlineLaunchRouteHandled = true
-                val hasPlayableDownload = completedDownloads.any {
-                    !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
-                }
-                if (hasPlayableDownload) {
-                    activateTab(AppScreenTab.Library)
-                    navController.navigate(DownloadsRoute(downloadsTitle)) {
-                        launchSingleTop = true
+        val condition = networkCondition
+        val networkKnown = condition != NetworkCondition.Unknown && condition != NetworkCondition.Checking
+        val offline = condition == NetworkCondition.NoInternet || condition == NetworkCondition.ServersUnreachable
+        if (revealShellForOffline(offline)) {
+            initialHomeReady = true
+        }
+        when (
+            offlineLaunch(
+                alreadyHandled = offlineLaunchRouteHandled,
+                networkKnown = networkKnown,
+                offline = offline,
+                downloadsEnabled = AppFeaturePolicy.downloadsEnabled,
+                // Only checked after the downloads list is ready, because the check can wait on it.
+                hasPlayableDownload = {
+                    completedDownloads.any {
+                        !it.isPlaceholder && DownloadsRepository.playableLocalFileUri(it) != null
                     }
+                },
+                downloadsListReady = downloadsCatalogReady,
+            )
+        ) {
+            OfflineLaunch.Wait -> Unit
+            OfflineLaunch.StayHere -> offlineLaunchRouteHandled = true
+            OfflineLaunch.OpenDownloads -> {
+                offlineLaunchRouteHandled = true
+                activateTab(AppScreenTab.Library)
+                navController.navigate(DownloadsRoute(downloadsTitle)) {
+                    launchSingleTop = true
                 }
             }
         }
@@ -1148,6 +1146,13 @@ internal fun MainAppContent(
             }
             requestedSettingsPageName = page.name
             activateTab(AppScreenTab.Settings)
+        }
+
+        fun openHome() {
+            repeat(navController.routes.size) {
+                if (navController.currentRoute !is TabsRoute) navController.popBackStack()
+            }
+            activateTab(AppScreenTab.Home)
         }
 
         fun openPartyMedia(media: PartyMedia) {
@@ -1628,6 +1633,9 @@ internal fun MainAppContent(
                                 onMetaScreenSettingsClick = { navController.navigate(MetaScreenSettingsRoute(metaScreenSettingsTitle)) },
                                 onContinueWatchingSettingsClick = { navController.navigate(ContinueWatchingSettingsRoute(continueWatchingSettingsTitle)) },
                                 onAddonsSettingsClick = { navController.navigate(AddonsSettingsRoute(addonsSettingsTitle)) },
+                                onAddSource = { openSettingsPage(SettingsPage.Addons) },
+                                onConnectServer = { openSettingsPage(SettingsPage.MediaServers) },
+                                onOpenDownloads = { navController.navigate(DownloadsRoute(downloadsTitle)) },
                                 onPluginsSettingsClick = {
                                     if (AppFeaturePolicy.pluginsEnabled) {
                                         navController.navigate(PluginsSettingsRoute(pluginsSettingsTitle))
@@ -1846,6 +1854,7 @@ internal fun MainAppContent(
                         useNativeNavigation = useNativeNavigation,
                         onOpenDownload = ::openDownloadedItem,
                         onChooseAnotherSource = ::chooseAnotherSourceForDownload,
+                        onBrowse = ::openHome,
                     )
                 }
                 entry<DownloadShowRoute> { route ->

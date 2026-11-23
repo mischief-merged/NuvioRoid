@@ -24,6 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
+- Clear empty and error states with a working Retry, and accessible player controls ([#74](https://github.com/mischief-merged/NuvioRoid/pull/74)).
 - Downloads screen polish: header icons are easier to see, there is a settings button, and sizes use one GB unit ([#68](https://github.com/mischief-merged/NuvioRoid/pull/68)).
 - Downloads use less disk and CPU while running: progress is saved at most every five seconds instead of on every network read, and only the parts of the screen that show progress redraw ([#131](https://github.com/mischief-merged/NuvioRoid/pull/131)).
 - Finished downloads are checked frame by frame only when their size and running time cannot already confirm them, one at a time, so completing several downloads no longer slows the app; a file that fails its check goes to the Trash ([#130](https://github.com/mischief-merged/NuvioRoid/pull/130)).

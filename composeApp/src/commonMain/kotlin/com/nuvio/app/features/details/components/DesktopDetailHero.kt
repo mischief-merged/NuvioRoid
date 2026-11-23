@@ -79,6 +79,8 @@ import nuvio.composeapp.generated.resources.detail_logo_content_description
 import nuvio.composeapp.generated.resources.hero_add_to_library
 import nuvio.composeapp.generated.resources.hero_mark_unwatched
 import nuvio.composeapp.generated.resources.playback_unavailable
+import nuvio.composeapp.generated.resources.player_control_mute
+import nuvio.composeapp.generated.resources.player_control_unmute
 import nuvio.composeapp.generated.resources.random_episode_title
 import nuvio.composeapp.generated.resources.shuffle_stop
 import nuvio.composeapp.generated.resources.hero_mark_watched
@@ -392,7 +394,13 @@ fun DesktopDetailHero(
                         } else {
                             Icons.AutoMirrored.Rounded.VolumeUp
                         },
-                        contentDescription = null,
+                        contentDescription = stringResource(
+                            if (heroTrailerMuted) {
+                                Res.string.player_control_unmute
+                            } else {
+                                Res.string.player_control_mute
+                            },
+                        ),
                         modifier = Modifier.size(24.dp),
                     )
                 }
