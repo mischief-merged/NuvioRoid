@@ -7,6 +7,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.nuvio.app.core.network.NetworkCondition
 import com.nuvio.app.features.addons.AddonPlayerAction
 import com.nuvio.app.features.addons.AddonPlayerEventTarget
 import com.nuvio.app.features.addons.AddonsUiState
@@ -329,9 +330,9 @@ internal class PlayerScreenRuntime(
     var autoSelectedSourceUrl: String? = args.sourceUrl.takeIf { args.sourceAutoSelected && it.isNotBlank() }
     var sourceFallbackAttempts = 0
     val sourceFallbackTriedKeys = mutableSetOf<String>()
-    var sourceFallbackJob: Job? = null
+    var sourceFallbackJob by mutableStateOf<Job?>(null)
     /** Set when the user presses Back, so a source that is still being looked up is not started after leaving. */
-    var sourceFailoverCancelled = false
+    var sourceFailoverCancelled by mutableStateOf(false)
     /** The source being tried in place of one that failed, named on the loading screen until it plays. */
     var sourceFailoverTryingName by mutableStateOf<String?>(null)
     /** Set when a failed source was replaced; the message that it plays now is shown on its first frame. */
@@ -343,8 +344,9 @@ internal class PlayerScreenRuntime(
     /** The placeholder being moved on from was recognised by its length alone, not by a status clip link. */
     var sourceFailoverPlaceholderByLength = false
     /** How many seeks the runtime asked the player for, and the target of the latest (null when relative). The stall watch reads them. */
-    var seekRequestCount = 0L
+    var seekRequestCount by mutableStateOf(0L)
     var lastSeekTargetMs: Long? = null
+    var networkCondition by mutableStateOf(NetworkCondition.Unknown)
     /** The source whose link or name makes it suspect of being a placeholder, which a second signal must confirm. */
     var placeholderSuspectUrl: String? = null
     /** The source confirmed as a placeholder clip; never receives tracking events. */

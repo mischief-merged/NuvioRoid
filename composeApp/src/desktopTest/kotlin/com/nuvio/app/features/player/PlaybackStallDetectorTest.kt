@@ -268,4 +268,64 @@ class PlaybackStallDetectorTest {
         val step = PlaybackStallDetector.step((first as Step.Continue).state, sample(5_000L + 600_000L))
         assertEquals(5_000L + 600_000L, (step as Step.Continue).state.pendingSeekSinceMs)
     }
+
+    @Test
+    fun eventDrivenDeadlinesMatchStallTricklePendingSeekAndExemptionRules() {
+        assertEquals(null, PlaybackStallDetector.nextDeadlineDelayMs(armed(), sample(0L, wantsToPlay = false)))
+        assertEquals(null, PlaybackStallDetector.nextDeadlineDelayMs(armed(), sample(0L, isOffline = true)))
+        assertEquals(null, PlaybackStallDetector.nextDeadlineDelayMs(armed(), sample(0L, isEnded = true)))
+        assertEquals(null, PlaybackStallDetector.nextDeadlineDelayMs(armed(), sample(0L, isLoading = false, isPlaying = false)))
+
+        // Single event-driven jump across STALL_DEADLINE_MS fires Stalled immediately without 1-second polling.
+        val initialStep = PlaybackStallDetector.step(
+            armed(0L),
+            sample(0L, isLoading = false, isPlaying = true),
+            discontinuityOverride = false,
+        ) as Step.Continue
+        val armedState = PlaybackStallDetector.armForDeadline(initialStep.state, sample(0L, isLoading = false, isPlaying = true))
+        val waitMs = PlaybackStallDetector.nextDeadlineDelayMs(armedState, sample(0L, isLoading = false, isPlaying = true))
+        assertEquals(PlaybackStallDetector.STALL_DEADLINE_MS, waitMs)
+
+        val woken = PlaybackStallDetector.step(
+            armedState,
+            sample(waitMs!!, isLoading = false, isPlaying = true),
+            discontinuityOverride = false,
+        )
+        assertIs<Step.Stalled>(woken)
+        assertEquals(PlaybackStallDetector.STALL_DEADLINE_MS, woken.stillForMs)
+
+        // Machine sleep during a scheduled deadline resets the clocks instead of stalling.
+        val slept = PlaybackStallDetector.step(
+            armedState,
+            sample(600_000L, isLoading = false, isPlaying = true),
+            discontinuityOverride = true,
+        )
+        assertIs<Step.Continue>(slept)
+        assertEquals(null, slept.state.positionStillSinceMs)
+
+        // Buffer trickle computes exact remaining time to TRICKLE_DEADLINE_MS when < STALL_DEADLINE_MS remains.
+        val trickling = State(
+            lastNowMs = 50_000L,
+            referencePositionMs = 60_000L,
+            referenceBufferedMs = 80_000L,
+            positionStillSinceMs = 0L,
+            bufferStillSinceMs = 50_000L,
+        )
+        val trickleWaitMs = PlaybackStallDetector.nextDeadlineDelayMs(trickling, sample(50_000L, bufferedPositionMs = 80_000L))
+        assertEquals(PlaybackStallDetector.TRICKLE_DEADLINE_MS - 50_000L, trickleWaitMs)
+        val trickleStalled = PlaybackStallDetector.step(
+            trickling,
+            sample(50_000L + trickleWaitMs!!, bufferedPositionMs = 80_000L),
+            discontinuityOverride = false,
+        )
+        assertIs<Step.Stalled>(trickleStalled)
+        assertEquals(PlaybackStallDetector.TRICKLE_DEADLINE_MS, trickleStalled.stillForMs)
+
+        // Pending seek computes remaining time to SEEK_NEVER_SETTLES_MS.
+        val seekStarted = (PlaybackStallDetector.step(armed(5_000L), sample(5_000L, seekRequest = seekTo)) as Step.Continue).state
+        assertEquals(
+            PlaybackStallDetector.SEEK_NEVER_SETTLES_MS - 12_000L,
+            PlaybackStallDetector.nextDeadlineDelayMs(seekStarted, sample(17_000L, positionMs = 3_000_000L, bufferedPositionMs = 3_000_000L)),
+        )
+    }
 }

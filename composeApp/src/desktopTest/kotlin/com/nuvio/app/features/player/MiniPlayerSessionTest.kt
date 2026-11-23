@@ -183,6 +183,7 @@ class MiniPlayerSessionTest {
         SeasonDownloadDefaultsStorage.savePayload(testDialogProfileId, "")
         TrackingScrobbleCoordinator.scrobblersOverrideForTest = null
         sourceHealthTickObserverForTest = null
+        sourceHealthNowMsForTest = null
         PlayerStreamsRepository.clearAll()
         ActivePlayerSessionRegistry.setActive(false)
         scope.cancel()
@@ -1745,6 +1746,7 @@ class MiniPlayerSessionTest {
     fun minimized_session_host_skips_audio_track_scans_and_stops_polling_while_paused() {
         val sourceHealthTicks = AtomicInteger(0)
         sourceHealthTickObserverForTest = { sourceHealthTicks.incrementAndGet() }
+        sourceHealthNowMsForTest = { compose.mainClock.currentTime }
 
         val backend = CountingNativePlayerBackend()
         val hooks = backend.toDesktopHooks()
@@ -1847,6 +1849,156 @@ class MiniPlayerSessionTest {
         assertTrue(backend.videoDimensionQueries.get() > dimQueriesWhenPaused, "dimension queries restored on reopen")
         assertTrue(backend.audioTrackQueries.get() > audioQueriesWhenPaused, "audio-track checks restored on reopen")
         compose.mainClock.autoAdvance = true
+    }
+
+    @Test
+    fun minimized_stalled_stream_recovers_via_event_driven_deadline_without_polling() {
+        PlayerSettingsRepository.ensureLoaded()
+        val previousSettings = PlayerSettingsRepository.uiState.value
+        val sourceHealthTicks = AtomicInteger(0)
+        sourceHealthTickObserverForTest = { sourceHealthTicks.incrementAndGet() }
+        sourceHealthNowMsForTest = { compose.mainClock.currentTime }
+
+        try {
+            PlayerSettingsRepository.setExternalPlayerEnabled(false)
+            PlayerSettingsRepository.setStreamAutoPlayFallbackOnFailure(true)
+            PlayerSettingsRepository.setStreamAutoPlayMode(StreamAutoPlayMode.MANUAL)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(false)
+
+            val stallingUrl = "https://example.com/stalling-ep1.mp4"
+            val fallbackUrl = "https://example.com/fallback-ep1.mp4"
+            MetaDetailsRepository.putCachedMetaForTest(
+                MetaDetails(
+                    id = testSeriesId,
+                    type = "series",
+                    name = "Series",
+                    videos = listOf(
+                        MetaVideo(
+                            id = episodes[0].id,
+                            title = "Episode 1",
+                            season = 1,
+                            episode = 1,
+                            streams = listOf(
+                                StreamItem(
+                                    name = "Primary 1080p",
+                                    url = stallingUrl,
+                                    addonName = "Embedded",
+                                    addonId = "embedded",
+                                ),
+                                StreamItem(
+                                    name = "Backup 1080p",
+                                    url = fallbackUrl,
+                                    addonName = "Embedded",
+                                    addonId = "embedded",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+
+            val backend = CountingNativePlayerBackend()
+            val hooks = backend.toDesktopHooks()
+            val sessionController = PlayerSessionController(onExitPictureInPicture = {})
+            val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+            sessionController.open(
+                launch = sampleSeriesLaunch().copy(
+                    sourceUrl = stallingUrl,
+                    providerName = "Embedded",
+                    providerAddonId = "embedded",
+                    streamTitle = "Primary 1080p",
+                    sourceAutoSelected = true,
+                ),
+                launchId = 906L,
+            )
+
+            compose.mainClock.autoAdvance = false
+            compose.setContent {
+                NuvioTheme {
+                    CompositionLocalProvider(LocalDesktopNativePlayerHooks provides hooks) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            PlayerSessionHost(
+                                controller = sessionController,
+                                navController = navigator,
+                                externalPlayerId = null,
+                                externalPlayerNotConfiguredText = "",
+                                externalPlayerFailedText = "",
+                                onExternalPlayerLaunch = {},
+                                launchExternalPlayer = { false },
+                                openExternalStreamUrl = { false },
+                                onOpenPartyMedia = {},
+                            )
+                        }
+                    }
+                }
+            }
+            compose.mainClock.advanceTimeBy(50L)
+            compose.waitUntil(5_000L) { backend.createCount == 1 }
+            backend.statesByHandle[1L]?.apply {
+                loading = false
+                paused = false
+                positionMs = 100_000L
+                bufferedPositionMs = 120_000L
+                durationMs = 1_800_000L
+            }
+
+            // Let full-screen startup watch observe active playback and arm the stall detector.
+            compose.mainClock.advanceTimeBy(2_500L)
+            assertTrue(sourceHealthTicks.get() >= 2)
+
+            // Minimize and reset tick counter: 24 seconds (> STALL_DEADLINE_MS) of healthy progress fires zero wakeups.
+            sessionController.minimize()
+            compose.mainClock.advanceTimeBy(100L)
+            sourceHealthTicks.set(0)
+
+            for (nextPosMs in listOf(108_000L, 116_000L, 124_000L)) {
+                compose.mainClock.advanceTimeBy(8_000L)
+                assertEquals(0, sourceHealthTicks.get(), "zero deadline wakeups during healthy minimized playback")
+                val snapsBefore = backend.snapshotQueries.get()
+                backend.statesByHandle[1L]?.bufferedPositionMs = nextPosMs + 20_000L
+                backend.emitPlaybackPosition(1L, nextPosMs)
+                compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapsBefore }
+                compose.mainClock.advanceTimeBy(50L)
+                assertEquals(nextPosMs, sessionController.playbackState?.positionMs)
+            }
+            assertEquals(0, sourceHealthTicks.get(), "24s of advancing minimized playback incurred zero wakeups")
+
+            // Freeze the stream at 124s (buffering with no position or buffer progress).
+            val snapsBeforeStall = backend.snapshotQueries.get()
+            backend.statesByHandle[1L]?.apply {
+                loading = true
+                paused = false
+                positionMs = 124_000L
+                bufferedPositionMs = 124_000L
+                eventSink.onPlayerEvent("nativeStateTick", 124_000.0)
+            }
+            compose.waitUntil(5_000L) { backend.snapshotQueries.get() > snapsBeforeStall }
+            compose.mainClock.advanceTimeBy(50L)
+
+            // Before STALL_DEADLINE_MS (20s), still zero wakeups and no failover.
+            compose.mainClock.advanceTimeBy(19_000L)
+            assertEquals(0, sourceHealthTicks.get(), "no premature wakeup before stall deadline")
+            assertEquals(1, backend.createCount)
+
+            // Cross the 20s deadline: one event-driven wakeup fires stall recovery and switches to fallbackUrl while minimized.
+            compose.mainClock.advanceTimeBy(1_500L)
+            compose.mainClock.advanceTimeBy(200L)
+            compose.waitUntil(5_000L) { backend.createCount == 2 && backend.disposeCount == 1 }
+            compose.mainClock.advanceTimeBy(200L)
+
+            assertEquals(1, sourceHealthTicks.get(), "single deadline wakeup triggered stall recovery")
+            assertEquals(listOf(stallingUrl, fallbackUrl), backend.createdSources.toList())
+            assertEquals(1, backend.maxConcurrentHandles)
+            assertTrue(sessionController.isMinimized)
+            assertEquals(fallbackUrl, sessionController.playbackState?.sourceUrl)
+            assertEquals(true, backend.statesByHandle[2L]?.miniPlayerMode)
+        } finally {
+            compose.mainClock.autoAdvance = true
+            PlayerSettingsRepository.setExternalPlayerEnabled(previousSettings.externalPlayerEnabled)
+            PlayerSettingsRepository.setStreamAutoPlayFallbackOnFailure(previousSettings.streamAutoPlayFallbackOnFailure)
+            PlayerSettingsRepository.setStreamAutoPlayMode(previousSettings.streamAutoPlayMode)
+            PlayerSettingsRepository.setStreamReuseLastLinkEnabled(previousSettings.streamReuseLastLinkEnabled)
+        }
     }
 
     @Test

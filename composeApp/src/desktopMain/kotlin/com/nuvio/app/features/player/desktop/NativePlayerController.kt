@@ -466,6 +466,7 @@ internal class NativePlayerController(
                             certificateFailurePending = null
                             handlePlayerEvent("certificateFailure", 0.0, eventToken)
                         }
+                        _manualRefreshTick.update { it + 1L }
                     }
                 }.onFailure { error ->
                     log.w(error) { "attach failed source=${pending.sourceUrl.toPlaybackLogKey()}" }

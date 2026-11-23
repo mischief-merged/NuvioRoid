@@ -89,6 +89,7 @@ private fun rememberNetworkCondition(): NetworkCondition {
 @Composable
 internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     val networkCondition = rememberNetworkCondition()
+    this.networkCondition = networkCondition
     val currentFeedback = liveGestureFeedback ?: gestureFeedback
     LaunchedEffect(currentFeedback) {
         if (currentFeedback != null) {
