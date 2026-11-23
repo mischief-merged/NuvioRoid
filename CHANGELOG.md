@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- A download source that fails or turns out to be a placeholder is replaced by the next untried source by itself, and tried sources are remembered across retries and restarts ([#62](https://github.com/mischief-merged/NuvioRoid/pull/62)).
 - Delete after watching can now cover downloads you start yourself, not only automatic ones; a finished title moves to the Trash after the delay unless you tap Keep, and Keep can be undone ([#107](https://github.com/mischief-merged/NuvioRoid/pull/107)).
 - Downloads let other apps go first and wait on very slow or blocking networks, judging each host on its own so a good connection is never held back ([#60](https://github.com/mischief-merged/NuvioRoid/pull/60)).
 - Automatic source failover during playback: when a source fails to start, stops working mid-play, or turns out to be a short placeholder clip, the player moves to the next ranked source and resumes where playback left off, with a setting to turn it off (on by default on desktop) ([#42](https://github.com/mischief-merged/NuvioRoid/pull/42)).

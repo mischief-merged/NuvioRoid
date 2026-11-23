@@ -91,6 +91,9 @@ import nuvio.composeapp.generated.resources.downloads_store_problem_title
 import nuvio.composeapp.generated.resources.downloads_retry_all_failed
 import nuvio.composeapp.generated.resources.downloads_status_failed_reason
 import nuvio.composeapp.generated.resources.downloads_try_source_again
+import nuvio.composeapp.generated.resources.downloads_pick_source_myself
+import nuvio.composeapp.generated.resources.downloads_source_search_none_found
+import nuvio.composeapp.generated.resources.downloads_source_search_waiting
 import nuvio.composeapp.generated.resources.downloads_status_auto
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.PluralStringResource
@@ -242,9 +245,18 @@ class DownloadsScreenTest {
         }
     }
 
-    private fun failedRow(id: String, kind: String?, message: String, episode: Int = 3) = stored(
+    private fun failedRow(
+        id: String,
+        kind: String?,
+        message: String,
+        episode: Int = 3,
+        noWorkingSourceFound: Boolean = false,
+        ruleKey: String? = null,
+    ) = stored(
         id, "Failed", episode = episode,
-        extra = ""","errorMessage":"$message"${kind?.let { ""","failureKind":"$it"""" }.orEmpty()}""",
+        extra = ""","errorMessage":"$message"${kind?.let { ""","failureKind":"$it"""" }.orEmpty()}""" +
+            (if (noWorkingSourceFound) ""","noWorkingSourceFound":true""" else "") +
+            (ruleKey?.let { ""","autoDownloadRuleKey":"$it"""" }.orEmpty()),
     )
 
     @Test
@@ -323,31 +335,35 @@ class DownloadsScreenTest {
     }
 
     @Test
-    fun a_file_that_failed_its_check_says_why_and_offers_another_source_before_the_same_one() {
+    fun a_file_that_failed_its_check_says_why_and_that_another_source_will_be_tried() {
         show(failedRow("a", "BadFile", "The downloaded video is blank"))
 
         compose.onNodeWithText(text(Res.string.downloads_status_failed_reason, "The downloaded video is blank")).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_failed_next_bad_file)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertIsDisplayed()
-        compose.onNodeWithText(text(Res.string.downloads_try_source_again)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_waiting)).assertIsDisplayed()
+        // The app looks for another source by itself first: no choice is asked of the user yet.
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.action_retry)).assertDoesNotExist()
     }
 
     @Test
-    fun choosing_another_source_hands_over_the_failed_download() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"))
+    fun picking_a_source_after_none_was_found_hands_over_the_failed_download() {
+        show(failedRow("a", "BadFile", "The downloaded video is blank", noWorkingSourceFound = true))
 
-        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_none_found)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).performClick()
 
         assertEquals("a", chooseSourceFor?.id)
-        assertEquals(0, backend.started.count { it == "a" }, "choosing another source fetched the old one again")
+        assertEquals(0, backend.started.count { it == "a" }, "picking another source fetched the old one again")
     }
 
     @Test
-    fun trying_the_same_source_again_is_a_separate_labelled_action() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"))
+    fun trying_the_same_source_again_is_a_separate_labelled_action_for_an_automatic_download() {
+        // A download of an automatic rule is retried by its rule, so its row keeps the user's own actions.
+        show(failedRow("a", "BadFile", "The downloaded video is blank", ruleKey = "rule"))
         val startsBefore = backend.started.count { it == "a" }
 
+        compose.onNodeWithText(text(Res.string.downloads_failed_next_bad_file)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertIsDisplayed()
         compose.onNodeWithText(text(Res.string.downloads_try_source_again)).performClick()
 
         compose.waitForIdle()
@@ -357,10 +373,11 @@ class DownloadsScreenTest {
 
     @Test
     fun without_a_way_to_open_the_sources_the_action_is_not_offered() {
-        show(failedRow("a", "BadFile", "The downloaded video is blank"), withChooseSource = false)
+        show(failedRow("a", "BadFile", "The downloaded video is blank", noWorkingSourceFound = true), withChooseSource = false)
 
+        compose.onNodeWithText(text(Res.string.downloads_source_search_none_found)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_pick_source_myself)).assertDoesNotExist()
         compose.onNodeWithText(text(Res.string.downloads_choose_another_source)).assertDoesNotExist()
-        compose.onNodeWithText(text(Res.string.downloads_try_source_again)).assertIsDisplayed()
     }
 
     @Test
@@ -387,7 +404,7 @@ class DownloadsScreenTest {
         show(failedRow("a", "SourceRefused", "Download failed with HTTP 404"))
 
         compose.onNodeWithText("HTTP", substring = true).assertDoesNotExist()
-        compose.onNodeWithText(text(Res.string.downloads_failed_next_source_refused)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_source_search_waiting)).assertIsDisplayed()
     }
 
     @Test

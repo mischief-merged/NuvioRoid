@@ -367,6 +367,8 @@ object DownloadsRepository {
 
         var replacedExisting = false
         val currentItems = _uiState.value.items.toMutableList()
+        // The sources this title had, and how many the app started by itself, go on with the new download.
+        val history = sourceHistoryFor(currentItems.filter { it.logicalContentKey == logicalKey }, stream, userChoseReplacement)
         // What is replaced: a download that has no finished file. A finished file, marked as not the
         // real video or not, is a stored file of the user: it is replaced only when the user chose
         // to ([userChoseReplacement]), and then a marked one goes to the trash. Anything automatic
@@ -432,6 +434,8 @@ object DownloadsRepository {
             updatedAtEpochMs = now,
             expectedVideoHash = stream.behaviorHints.videoHash.asVideoHash(),
             autoDownloadRuleKey = autoDownloadRuleKey,
+            triedSources = history.triedSources,
+            autoSourceAttempts = history.autoSourceAttempts,
         )
 
         // The size the source claims for the selected file, where that is established (see SourceSizeClaim).
@@ -451,7 +455,7 @@ object DownloadsRepository {
                 backend.ownershipOf(existing, oldUri).let { it == FileOwnership.Owned || it == FileOwnership.Unknown }
             if (!keep) {
                 if (existing.isPlaceholder) oldUri?.let(backend::trashFile) else backend.discardFile(oldUri)
-                backend.removePartialOf(existing)
+                // Each source has its own destination. Leave the previous partial file for the user.
             }
         }
         startDownload(queued)
@@ -461,6 +465,23 @@ object DownloadsRepository {
         } else {
             DownloadEnqueueResult.Started
         }
+    }
+
+    /**
+     * The app found no working source for the title [titleKey] ([DownloadItem.logicalContentKey]): its
+     * downloads with a bad source are marked, so that the app does not look again and the user is
+     * offered to pick one. Nothing else about them changes; a file stays where it is.
+     */
+    internal fun markNoWorkingSourceFound(titleKey: String): Unit = synchronized(stateLock) {
+        ensureLoaded()
+        val items = _uiState.value.items
+        if (items.none { it.logicalContentKey == titleKey && it.hasBadSource && !it.noWorkingSourceFound }) return
+        publish(
+            items.map { item ->
+                if (item.logicalContentKey == titleKey && item.hasBadSource) item.copy(noWorkingSourceFound = true) else item
+            },
+        )
+        persist()
     }
 
     fun pauseDownload(downloadId: String): Unit = synchronized(stateLock) {
@@ -593,6 +614,27 @@ object DownloadsRepository {
         replaceItem(restored)
         persist()
         if (restored.status == DownloadStatus.Downloading) startDownload(restored)
+    }
+
+    /**
+     * Rejects a batch source without removing its record or anything it wrote. Its history is still
+     * on disk if the app stops before the next source is queued. Finished files stay beside the
+     * replacement; unfinished transfers stop, leaving their partial files intact. A folder hold
+     * protects those files, but must not prevent recording the rejection or stopping the transfer.
+     */
+    internal fun rejectBatchSource(downloadId: String): Unit = synchronized(stateLock) {
+        ensureLoaded()
+        val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
+        if (item.status != DownloadStatus.Completed && item.status != DownloadStatus.Downloading) return
+        removeTransfer(downloadId)?.cancel()
+        mutateItem(downloadId) { current ->
+            current.copy(
+                status = if (current.status == DownloadStatus.Completed) DownloadStatus.Completed else DownloadStatus.Failed,
+                failureKind = DownloadFailureKind.BadFile,
+                errorMessage = current.errorMessage ?: runBlocking { getString(Res.string.downloads_source_rejected) },
+                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+            )
+        }
     }
 
     fun cancelDownload(downloadId: String): Unit = synchronized(stateLock) {
@@ -1089,6 +1131,7 @@ object DownloadsRepository {
     /** No state lock while waiting for the Trash; keep the failed record if any guard or move refuses. */
     private fun trashRejectedFile(item: DownloadItem) {
         val uri = item.localFileUri ?: return
+        var moved = false
         SidecarLocks.withLock(uri) {
             if (!ItemLocks.tryAcquire(item.id)) return@withLock
             try {
@@ -1099,18 +1142,30 @@ object DownloadsRepository {
                     true
                 }
                 // The saved record keeps its ownership claim during the move; UI saves need neither lock.
-                val moved = mayMove && backend.removeJustPublished(uri, item.publishedFileKey)
-                if (moved) mutateItem(item.id) { current ->
-                    if (current.localFileUri != uri || current.publishedFileKey != item.publishedFileKey || !current.awaitingCheck) current
-                    else current.copy(
-                        status = DownloadStatus.Failed, localFileUri = null, awaitingCheck = false,
-                        publishedFileKey = null, publishedDigestVerified = false,
-                        pausedByFolder = false, pausedByConnection = false,
-                    )
-                }
+                moved = mayMove && backend.removeJustPublished(uri, item.publishedFileKey)
             } finally {
                 ItemLocks.release(item.id)
             }
+        }
+        // The completion event must reach the replacement watcher after the file is no longer held.
+        if (moved) synchronized(stateLock) {
+            val items = _uiState.value.items
+            val current = items.firstOrNull { it.id == item.id } ?: return@synchronized
+            if (current.localFileUri != uri || current.publishedFileKey != item.publishedFileKey || !current.awaitingCheck) return@synchronized
+            // A replacement may have started while Trash waited. Its saved history owns the
+            // rejected source now; after the file moves, no empty failed row needs to remain.
+            val replaced = current.hasBadSource && items.any { other ->
+                other.id != current.id && other.logicalContentKey == current.logicalContentKey &&
+                    other.triedSources.containsAll(current.sourceIdentityKeys)
+            }
+            publish(if (replaced) items.filterNot { it.id == current.id } else items.map { other ->
+                if (other.id != current.id) other else current.copy(
+                    status = DownloadStatus.Failed, localFileUri = null, awaitingCheck = false,
+                    publishedFileKey = null, publishedDigestVerified = false,
+                    pausedByFolder = false, pausedByConnection = false,
+                )
+            })
+            persist()
         }
     }
 

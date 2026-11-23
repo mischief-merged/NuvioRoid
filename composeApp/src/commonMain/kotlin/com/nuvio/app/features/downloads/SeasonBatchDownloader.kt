@@ -84,7 +84,29 @@ internal data class SeasonBatchRequest(
     val audioLanguage: DebridStreamLanguage? = null,
     /** Set when an automatic-download rule asked for these episodes, not the user. */
     val autoDownloadRuleKey: String? = null,
+    /**
+     * Set when the app looks by itself for another source for one title whose source was bad
+     * ([AutoSourceReplacer]). Such a request runs under a key of its own ([batchKey]), so it never shows
+     * as a season download, and it is reported to the search, not to the user.
+     */
+    val replacesBadSource: Boolean = false,
+    /** Sources that are not tried, by [sourceIdentityKeys]: the ones already downloaded for the title. */
+    val skipSources: Set<String> = emptySet(),
+    /** Most sources tried for one item. */
+    val maxSources: Int = SeasonBatchDownloader.MaxSourcesPerEpisode,
 )
+
+/** The key of the title of [episode] in this request, as [DownloadItem.logicalContentKey] writes it. */
+internal fun SeasonBatchRequest.titleKey(episode: SeasonBatchEpisode): String =
+    episode.movie?.let { "${it.metaId.trim()}|movie" } ?: "${parentMetaId.trim()}|${episode.seasonNumber}|${episode.episodeNumber}"
+
+/** The key a request runs under: its season, or for the search for another source, its one title. */
+internal val SeasonBatchRequest.batchKey: String
+    get() = if (replacesBadSource && episodes.isNotEmpty()) {
+        "replace|" + titleKey(episodes.first())
+    } else {
+        seasonBatchKey(parentMetaId, seasonNumber)
+    }
 
 internal enum class SeasonBatchEpisodeResult {
     Completed,
@@ -392,7 +414,7 @@ internal class SeasonBatchDownloader(
     private val enqueue: (SeasonBatchRequest, SeasonBatchEpisode, StreamItem) -> DownloadEnqueueResult,
     private val onFinished: suspend (SeasonBatchRequest, SeasonBatchSummary) -> Unit = { _, _ -> },
     private val maxConcurrent: Int = DefaultMaxConcurrent,
-    /** Removes a download this batch queued, with its file, because it is not the video. */
+    /** Rejects a source this batch queued, keeping its history and any file it wrote. */
     private val discard: (DownloadItem) -> Unit = {},
     /** Looks at the file of a finished download, for the duration and the audio tracks its container states. */
     private val inspect: (DownloadItem) -> DownloadedFileFacts? = { null },
@@ -402,11 +424,29 @@ internal class SeasonBatchDownloader(
     private val verifyCompleted: (DownloadItem) -> Boolean = { true },
     /** The size below which the download of an episode is a placeholder. */
     private val minVideoBytes: (SeasonBatchEpisode) -> Long = { minPlausibleVideoBytes(it.runtimeMinutes) },
+    /** An episode moved on to its [attempt]th source (counted from 1). */
+    private val onSourceTried: (request: SeasonBatchRequest, episode: SeasonBatchEpisode, attempt: Int) -> Unit = { _, _, _ -> },
 ) {
     private val _running = MutableStateFlow<Map<String, SeasonBatchProgress>>(emptyMap())
 
     /** Batches currently running, keyed by [seasonBatchKey]. */
     val running: StateFlow<Map<String, SeasonBatchProgress>> = _running.asStateFlow()
+
+    // How many running batches hold each title, from the moment an episode waits for its slot until it is done.
+    private val titleHolds = mutableMapOf<String, Int>()
+    private val _titlesInFlight = MutableStateFlow<Set<String>>(emptySet())
+
+    /**
+     * The titles ([titleKey]) a running batch is working on: it looks up, queues and replaces their
+     * sources itself, so nothing else should.
+     */
+    val titlesInFlight: StateFlow<Set<String>> = _titlesInFlight.asStateFlow()
+
+    private fun holdTitle(key: String, held: Boolean) = synchronized(lock) {
+        val count = (titleHolds[key] ?: 0) + if (held) 1 else -1
+        if (count > 0) titleHolds[key] = count else titleHolds.remove(key)
+        _titlesInFlight.value = titleHolds.keys.toSet()
+    }
 
     // Guards the running batches and the step that queues an episode, so a stop or a pause is either
     // seen by that step or happens after the episode was queued.
@@ -419,7 +459,7 @@ internal class SeasonBatchDownloader(
 
     fun start(request: SeasonBatchRequest): SeasonBatchStart {
         if (request.episodes.isEmpty()) return SeasonBatchStart.NothingToDownload
-        val key = seasonBatchKey(request.parentMetaId, request.seasonNumber)
+        val key = request.batchKey
         val batch = Batch()
         val job = synchronized(lock) {
             if (key in batches) return SeasonBatchStart.AlreadyRunning
@@ -482,41 +522,47 @@ internal class SeasonBatchDownloader(
             coroutineScope {
                 request.episodes.forEach { episode ->
                     launch {
-                        val slot = TransferSlot()
-                        slot.acquire()
-                        var slotHandedOver = false
-                        val result = try {
-                            // Once something is paused the batch stops starting more episodes.
-                            if (synchronized(lock) { batch.sawPause(downloads.value, request) }) {
-                                SeasonBatchEpisodeResult.Paused
-                            } else {
-                                processEpisode(request, episode, batch, slot).also {
-                                    if (it == SeasonBatchEpisodeResult.Paused) synchronized(lock) { batch.pauseSeen = true }
-                                }
-                            }
-                        } catch (error: CancellationException) {
-                            // Stop queueing leaves a running download in the Downloads screen. It keeps
-                            // its slot until it settles, so stopping never raises the number of transfers.
-                            val current = downloads.value.itemFor(request, episode)
-                            if (slot.held && current?.status == DownloadStatus.Downloading && current.id !in downloads.value.checkingIds) {
-                                slotHandedOver = true
-                                scope.launch {
-                                    try {
-                                        downloads.first { state ->
-                                            state.itemFor(request, episode).let { it.isSettledOrGone() || it?.id in state.checkingIds }
-                                        }
-                                    } finally {
-                                        slot.release()
+                        val titleKey = request.titleKey(episode)
+                        holdTitle(titleKey, held = true)
+                        try {
+                            val slot = TransferSlot()
+                            slot.acquire()
+                            var slotHandedOver = false
+                            val result = try {
+                                // Once something is paused the batch stops starting more episodes.
+                                if (synchronized(lock) { batch.sawPause(downloads.value, request) }) {
+                                    SeasonBatchEpisodeResult.Paused
+                                } else {
+                                    processEpisode(request, episode, batch, slot).also {
+                                        if (it == SeasonBatchEpisodeResult.Paused) synchronized(lock) { batch.pauseSeen = true }
                                     }
                                 }
+                            } catch (error: CancellationException) {
+                                // Stop queueing leaves a running download in the Downloads screen. It keeps
+                                // its slot until it settles, so stopping never raises the number of transfers.
+                                val current = downloads.value.itemFor(request, episode)
+                                if (slot.held && current?.status == DownloadStatus.Downloading && current.id !in downloads.value.checkingIds) {
+                                    slotHandedOver = true
+                                    scope.launch {
+                                        try {
+                                            downloads.first { state ->
+                                                state.itemFor(request, episode).let { it.isSettledOrGone() || it?.id in state.checkingIds }
+                                            }
+                                        } finally {
+                                            slot.release()
+                                        }
+                                    }
+                                }
+                                throw error
+                            } finally {
+                                if (!slotHandedOver) slot.release()
                             }
-                            throw error
+                            results.update { it + (episode to result) }
+                            _running.update { current ->
+                                current[key]?.let { current + (key to it.copy(finished = it.finished + 1)) } ?: current
+                            }
                         } finally {
-                            if (!slotHandedOver) slot.release()
-                        }
-                        results.update { it + (episode to result) }
-                        _running.update { current ->
-                            current[key]?.let { current + (key to it.copy(finished = it.finished + 1)) } ?: current
+                            holdTitle(titleKey, held = false)
                         }
                     }
                 }
@@ -568,11 +614,13 @@ internal class SeasonBatchDownloader(
 
         // Every source that is prepared counts, whether or not it could be queued, so an episode with
         // many unusable sources does not trigger a lookup for each of them.
+        val tried = request.skipSources.toMutableSet()
         var attempts = 0
         var started = 0
         var sourceFailed = false
+        val maxSources = request.maxSources.coerceIn(0, MaxSourcesPerEpisode)
         for (source in listOfNotNull(fetchStreams, fetchFallbackStreams)) {
-            if (attempts >= MaxSourcesPerEpisode) break
+            if (attempts >= maxSources) break
             slot.acquire()
             val candidates = try {
                 rankBatchCandidates(
@@ -591,11 +639,16 @@ internal class SeasonBatchDownloader(
             }
 
             for (candidate in candidates) {
-                if (attempts >= MaxSourcesPerEpisode) break
+                if (attempts >= maxSources) break
+                // A source that was downloaded already for this title is not fetched again.
+                if (candidate.wasTried(tried)) continue
                 // A source that says itself that its file is tiny is not worth a lookup or a transfer.
                 if (candidate.announcedSizeBytes()?.let { it < minBytes } == true) continue
                 slot.acquire()
+                val previouslyTried = tried.toSet()
+                tried += candidate.sourceIdentityKeys
                 attempts++
+                onSourceTried(request, episode, attempts)
                 val prepared = try {
                     prepareStream(candidate, episode)
                 } catch (error: CancellationException) {
@@ -604,6 +657,12 @@ internal class SeasonBatchDownloader(
                     sourceFailed = true
                     null
                 } ?: continue
+
+                // A resolver can give different listings the same final address. Remember both
+                // spellings, and do not transfer an address another candidate already used.
+                val alreadyTried = prepared.wasTried(previouslyTried)
+                tried += prepared.sourceIdentityKeys
+                if (alreadyTried) continue
 
                 currentCoroutineContext().ensureActive()
                 when (queueIfStillWanted(request, episode, prepared, batch)) {
