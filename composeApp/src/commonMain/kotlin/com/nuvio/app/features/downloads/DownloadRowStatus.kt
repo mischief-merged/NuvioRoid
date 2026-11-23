@@ -1,5 +1,9 @@
 package com.nuvio.app.features.downloads
 
+import nuvio.composeapp.generated.resources.downloads_held_travel
+import nuvio.composeapp.generated.resources.downloads_checking_network
+import nuvio.composeapp.generated.resources.downloads_status_waiting_travel
+import nuvio.composeapp.generated.resources.downloads_status_checking_network
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_announce_checking
 import nuvio.composeapp.generated.resources.downloads_announce_completed
@@ -103,6 +107,10 @@ internal enum class DownloadPhase(
     /** Paused because its location is away or being moved. It goes on by itself. */
     WaitingForDrive(Res.string.downloads_status_waiting_drive, showsSize = true, Res.string.downloads_announce_waiting_drive),
 
+    /** Travel mode pauses automatic downloads. */
+    WaitingOnTravel(Res.string.downloads_status_waiting_travel, showsSize = true, Res.string.downloads_held_travel),
+    CheckingNetwork(Res.string.downloads_status_checking_network, showsSize = true, Res.string.downloads_checking_network),
+
     /** Waiting because the Mac is on a hotspot or tethered. It goes on by itself when that ends. */
     WaitingOnHotspot(Res.string.downloads_status_waiting_hotspot, showsSize = true, Res.string.downloads_announce_waiting_hotspot),
 
@@ -121,6 +129,8 @@ internal enum class DownloadPhase(
 
 /** The row phase of a download that waits because the connection is limited for [reason]. */
 internal fun waitingPhaseFor(reason: LimitedConnectionReason?): DownloadPhase = when (reason) {
+    LimitedConnectionReason.Travel -> DownloadPhase.WaitingOnTravel
+    LimitedConnectionReason.CheckingNetwork -> DownloadPhase.CheckingNetwork
     LimitedConnectionReason.Hotspot -> DownloadPhase.WaitingOnHotspot
     LimitedConnectionReason.LowDataMode -> DownloadPhase.WaitingOnLowDataMode
     LimitedConnectionReason.SlowConnection -> DownloadPhase.WaitingOnSlowNetwork

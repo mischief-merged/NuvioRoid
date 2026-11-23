@@ -31,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import kotlinx.coroutines.flow.map
@@ -367,6 +368,13 @@ internal fun DownloadsScreenContent(
                 },
                 actions = {
                     val headerColor = MaterialTheme.nuvio.colors.textPrimary
+                    if (com.nuvio.app.isDesktop) {
+                        FilterChip(
+                            selected = holdState.travel.enabled,
+                            onClick = { connectionHold.updateInBackground { setTravelEnabled(!state.value.travel.enabled) } },
+                            label = { Text(stringResource(if (holdState.travel.enabled) Res.string.travel_mode_on else Res.string.travel_mode_off)) },
+                        )
+                    }
                     if (selectedShowId == null && canScanDisk) {
                         TextButton(
                             enabled = !scanningDisk,
@@ -487,12 +495,23 @@ internal fun DownloadsScreenContent(
                     )
                 }
             }
-            holdState.holdReason?.let { reason ->
+            if (holdState.travel.enabled) {
+                item(key = "travel-state") {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
+                        .semantics { liveRegion = LiveRegionMode.Polite }) {
+                        Text(stringResource(Res.string.travel_status, (holdState.travel.capBytesPerSecond / 1000).toInt()),
+                            style = MaterialTheme.typography.bodyMedium)
+                        if (holdState.travel.remembered) Text(stringResource(Res.string.travel_network_remembered),
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            holdState.holdReason?.takeUnless { it == LimitedConnectionReason.Travel }?.let { reason ->
                 item(key = "connection-hold") {
                     ConnectionHoldLine(reason = reason, onDownloadAnyway = connectionHold::downloadAnyway)
                 }
             }
-            if (polite.yielding && holdState.holdReason == null && anyDownloading) {
+            if (polite.yielding && (holdState.holdReason == null || holdState.holdReason == LimitedConnectionReason.Travel) && anyDownloading) {
                 item(key = "yielding") {
                     Text(
                         text = stringResource(Res.string.downloads_yielding_line),
@@ -1814,13 +1833,13 @@ private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
-            Text(
+            if (reason != LimitedConnectionReason.CheckingNetwork) Text(
                 text = stringResource(Res.string.downloads_held_detail),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        TextButton(
+        if (reason != LimitedConnectionReason.CheckingNetwork) TextButton(
             modifier = Modifier.semantics { contentDescription = anywayDescription },
             onClick = onDownloadAnyway,
         ) {
@@ -1831,6 +1850,8 @@ private fun ConnectionHoldLine(reason: LimitedConnectionReason, onDownloadAnyway
 
 /** The line at the top of the Downloads screen for each reason downloads can wait. */
 internal fun connectionHoldTitle(reason: LimitedConnectionReason): StringResource = when (reason) {
+    LimitedConnectionReason.Travel -> Res.string.downloads_held_travel
+    LimitedConnectionReason.CheckingNetwork -> Res.string.downloads_checking_network
     LimitedConnectionReason.Hotspot -> Res.string.downloads_held_hotspot
     LimitedConnectionReason.LowDataMode -> Res.string.downloads_held_low_data
     LimitedConnectionReason.SlowConnection -> Res.string.downloads_held_slow

@@ -119,12 +119,12 @@ class ConnectionHoldRuleTest : com.nuvio.app.core.network.TrustedLocalServerTest
         hold.listen { calls++ }
         hold.report(home)
         hold.report(home)
-        assertEquals(0, calls, "nothing changed for a regular network")
+        assertEquals(1, calls, "the current network can now be remembered")
         hold.report(hotspot)
         hold.report(hotspot)
-        assertEquals(1, calls)
-        hold.setEnabled(false)
         assertEquals(2, calls)
+        hold.setEnabled(false)
+        assertEquals(3, calls)
     }
 
     @Test
@@ -270,6 +270,42 @@ class LimitedConnectionDownloadsTest {
     }
 
     private fun item(id: String) = DownloadsRepository.uiState.value.items.single { it.id == id }
+
+    @Test
+    fun travel_pauses_automatic_transfers_keeps_partials_and_allows_manual_downloads() {
+        val automatic = enqueue(1, autoRule = "rule")
+        backend.progress.getValue(automatic)(1234, 10_000)
+        val manual = enqueue(2)
+        hold.setTravelEnabled(true)
+        assertEquals(DownloadStatus.Paused, item(automatic).status)
+        assertEquals(1234L, item(automatic).downloadedBytes)
+        assertEquals(DownloadStatus.Downloading, item(manual).status)
+        val queued = enqueue(3, autoRule = "rule")
+        assertEquals(0, backend.startsOf(queued))
+        hold.setTravelEnabled(false)
+        assertEquals(2, backend.startsOf(automatic))
+        assertEquals(1, backend.startsOf(queued))
+        assertTrue(backend.partialsRemoved.isEmpty())
+    }
+
+    @Test
+    fun sleep_stops_transfers_and_a_new_hotspot_keeps_them_paused_after_wake() {
+        val id = enqueue(1)
+        backend.progress.getValue(id)(4321, 10_000)
+        hold.beginNetworkRecheck()
+        val applied = java.util.concurrent.CountDownLatch(1)
+        ConnectionUpdates.submit { applied.countDown() }
+        assertTrue(applied.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertEquals(DownloadStatus.Paused, item(id).status)
+        DownloadsRepository.resumeDownload(id)
+        assertEquals(1, backend.startsOf(id))
+        hold.report(hotspot)
+        assertEquals(1, backend.startsOf(id))
+        hold.report(home)
+        assertEquals(2, backend.startsOf(id))
+        assertEquals(4321L, backend.partials.getValue(id))
+        assertTrue(backend.partialsRemoved.isEmpty())
+    }
 
     @Test
     fun on_a_limited_connection_a_new_download_waits_instead_of_starting() {

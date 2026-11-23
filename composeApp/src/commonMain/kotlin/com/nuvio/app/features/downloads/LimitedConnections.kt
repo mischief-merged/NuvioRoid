@@ -2,15 +2,29 @@ package com.nuvio.app.features.downloads
 
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.encodeToString
 
 /**
  * Why the connection counts as limited, so downloads wait. Each reason is one rule; later rules (a
  * measured speed below what the user set, a Wi-Fi network the user named) are added as further cases.
  */
 internal sealed interface LimitedConnectionReason {
+    /** The user chose Travel mode. Only automatic downloads wait for this reason. */
+    data object Travel : LimitedConnectionReason
+
+    /** A fresh network check must finish before any transfer can resume. */
+    data object CheckingNetwork : LimitedConnectionReason
+
     /** The system says traffic is expensive: a phone's hotspot, tethering or a cellular link. */
     data object Hotspot : LimitedConnectionReason
 
@@ -26,7 +40,7 @@ internal sealed interface LimitedConnectionReason {
 
 /** Whether a download the user started waits for [reason] too, or only automatic ones do. */
 internal val LimitedConnectionReason.holdsUserDownloads: Boolean
-    get() = this != LimitedConnectionReason.SlowConnection
+    get() = this != LimitedConnectionReason.SlowConnection && this != LimitedConnectionReason.Travel
 
 /** What the system says about the path traffic takes now. */
 internal sealed interface NetworkPathReport {
@@ -89,6 +103,26 @@ internal fun limitedReasonOf(report: NetworkPathReport): LimitedConnectionReason
     }
 }
 
+internal const val DefaultTravelCapBytesPerSecond = 1_000_000L
+
+@Serializable
+internal data class TravelPreferences(
+    val enabled: Boolean = false,
+    val capBytesPerSecond: Long = DefaultTravelCapBytesPerSecond,
+    val networks: Set<String> = emptySet(),
+)
+
+internal data class TravelState(
+    val enabled: Boolean = false,
+    val remembered: Boolean = false,
+    val canRemember: Boolean = false,
+    val capBytesPerSecond: Long = DefaultTravelCapBytesPerSecond,
+) {
+    val downloadCapBytesPerSecond: Long? get() = capBytesPerSecond.takeIf { enabled }
+    val previewsAllowed: Boolean get() = !enabled
+    fun yieldingEnabled(savedChoice: Boolean): Boolean = enabled || savedChoice
+}
+
 internal data class ConnectionHoldState(
     /** Why the network path is limited now (hotspot, Low Data Mode), or null. Whatever the setting. */
     val pathReason: LimitedConnectionReason? = null,
@@ -98,14 +132,21 @@ internal data class ConnectionHoldState(
     val enabled: Boolean = true,
     /** The user chose "Download anyway" on this network, in this run of the app. */
     val overridden: Boolean = false,
+    val travel: TravelState = TravelState(),
+    val checkingNetwork: Boolean = false,
 ) {
-    /** Why the connection is limited now, whatever the setting: the path first, then what downloads found. */
-    val reason: LimitedConnectionReason? get() = pathReason ?: quality
+    /** The current hold first, then a detected limit whose pause setting is off. */
+    val reason: LimitedConnectionReason? get() = holdReason ?: pathReason ?: quality
 
     /** Why a download waits now, or null when it does not. [automatic]: queued by an automatic-download rule. */
     fun holdReasonFor(automatic: Boolean): LimitedConnectionReason? {
+        if (checkingNetwork) return LimitedConnectionReason.CheckingNetwork
+        if (travel.enabled && automatic) {
+            if (!overridden && quality == LimitedConnectionReason.NetworkBlocksDownloads) return quality
+            return LimitedConnectionReason.Travel
+        }
         if (overridden) return null
-        pathReason?.takeIf { enabled }?.let { return it }
+        pathReason?.takeIf { enabled && !travel.enabled }?.let { return it }
         return quality?.takeIf { automatic || it.holdsUserDownloads }
     }
 
@@ -117,7 +158,7 @@ internal data class ConnectionHoldState(
 }
 
 /**
- * Decides whether downloads wait because of the connection. It never holds on an unknown path. A
+ * Decides whether downloads wait because of the connection, Travel mode or a pending wake check. A
  * "Download anyway" lasts until the network changes or the app quits: it is not saved.
  *
  * Whoever applies the hold listens with [listen]; it is told after every change of [state], outside
@@ -126,11 +167,18 @@ internal data class ConnectionHoldState(
 internal class ConnectionHold(
     private val loadEnabled: () -> Boolean? = { null },
     private val saveEnabled: (Boolean) -> Unit = {},
+    loadTravel: () -> TravelPreferences = { TravelPreferences() },
+    private val saveTravel: (TravelPreferences) -> Unit = {},
+    private val applyTravelCap: (Long?) -> Unit = {},
 ) {
     private val lock = SynchronizedObject()
     private var report: NetworkPathReport = NetworkPathReport.Unknown
     private var quality: LimitedConnectionReason? = null
     private var enabled: Boolean? = null
+    private var travel = runCatching { loadTravel() }.getOrDefault(TravelPreferences()).let {
+        it.copy(capBytesPerSecond = it.capBytesPerSecond.coerceIn(250_000L, 10_000_000L))
+    }
+    private var checkingNetwork = false
 
     // The network the user said "Download anyway" for, null when there is no such choice.
     private var overrideKey: String? = null
@@ -140,7 +188,10 @@ internal class ConnectionHold(
     val state: StateFlow<ConnectionHoldState> = _state.asStateFlow()
 
     init {
-        synchronized(lock) { _state.value = computeLocked() }
+        synchronized(lock) {
+            _state.value = computeLocked()
+            applyTravelCap(_state.value.travel.downloadCapBytesPerSecond)
+        }
     }
 
     /** Why some download waits now, or null. Reads the published state only, so it never waits for a lock. */
@@ -158,8 +209,9 @@ internal class ConnectionHold(
         synchronized(lock) { this.listener = listener }
     }
 
-    fun report(report: NetworkPathReport) = change {
+    fun report(report: NetworkPathReport, notifyInBackground: Boolean = false) = change(notifyInBackground) {
         this.report = report
+        if (report is NetworkPathReport.Known && report.networkKey.isNotBlank()) checkingNetwork = false
         val key = (report as? NetworkPathReport.Known)?.networkKey
         // Another network, or one that is not limited, ends a "Download anyway".
         val chosen = overrideKey
@@ -173,9 +225,46 @@ internal class ConnectionHold(
         }
     }
 
+    /** Startup and wake fallback for platforms without a working path monitor. */
+    fun networkMonitorUnavailable() = change {
+        checkingNetwork = false
+        report = NetworkPathReport.Unknown
+        overrideKey = null
+    }
+
+    /** Holds transfers before sleep. Only a fresh, usable path ends this barrier. */
+    fun beginNetworkRecheck() = change(notifyInBackground = true) {
+        checkingNetwork = true
+        overrideKey = null
+        report = NetworkPathReport.Unknown
+    }
+
+    fun setTravelEnabled(value: Boolean) = change {
+        val key = currentNetworkKey()
+        // Switching off also forgets this network, so the next report cannot turn it straight back on.
+        travel = travel.copy(enabled = value, networks = if (!value && key != null) {
+            travel.networks - key
+        } else travel.networks)
+    }
+
+    fun rememberTravelNetwork(value: Boolean) = change {
+        val key = currentNetworkKey() ?: return@change
+        val others = travel.networks - key
+        travel = travel.copy(enabled = if (value) false else travel.enabled, networks = if (value) others + key else others)
+    }
+
+    fun setTravelCap(value: Long) = change {
+        travel = travel.copy(capBytesPerSecond = value.coerceIn(250_000L, 10_000_000L))
+    }
+
+    private fun currentNetworkKey(): String? = (report as? NetworkPathReport.Known)?.networkKey
+        ?.takeIf { key ->
+            !checkingNetwork && key.substringBefore('|').isNotBlank() &&
+                key.substringAfter('|', "").split(',').any { it.substringAfter('@', "").isNotBlank() }
+        }
+
     fun setEnabled(value: Boolean) = change {
         enabled = value
-        runCatching { saveEnabled(value) }
     }
 
     /**
@@ -196,19 +285,59 @@ internal class ConnectionHold(
             pathReason = limitedReasonOf(report),
             quality = quality,
             enabled = enabledLocked(),
+            travel = TravelState(
+                enabled = travel.enabled || currentNetworkKey() in travel.networks,
+                remembered = currentNetworkKey() in travel.networks,
+                canRemember = currentNetworkKey() != null,
+                capBytesPerSecond = travel.capBytesPerSecond,
+            ),
+            checkingNetwork = checkingNetwork,
             overridden = overrideKey?.let { it == key || (key != UnknownNetworkKey && it != UnknownNetworkKey && sameNetwork(it, key)) } == true,
         )
     }
 
-    private inline fun change(block: () -> Unit) {
-        val notify = synchronized(lock) {
+    private fun change(notifyInBackground: Boolean = false, block: () -> Unit) {
+        val effects = synchronized(lock) {
             val before = _state.value
+            val beforeTravel = travel
+            val beforeEnabled = enabled
             block()
-            _state.value = computeLocked()
-            listener.takeIf { _state.value != before }
+            val next = computeLocked()
+            _state.value = next
+            val travelToSave = travel.takeIf { it != beforeTravel }
+            val enabledToSave = enabled.takeIf { it != beforeEnabled }
+            val notify = listener.takeIf { next != before }
+            val work: () -> Unit = {
+                // Read the latest cap: an older queued notification must not restore an old limit.
+                applyTravelCap(_state.value.travel.downloadCapBytesPerSecond)
+                travelToSave?.let { runCatching { saveTravel(it) } }
+                enabledToSave?.let { runCatching { saveEnabled(it) } }
+                notify?.invoke()
+            }
+            work
         }
-        notify?.invoke()
+        if (notifyInBackground) ConnectionUpdates.submit(effects) else effects()
     }
+}
+
+/** Keeps settings writes and download-list work ordered, away from UI and native power callbacks. */
+internal object ConnectionUpdates {
+    private val pending = Channel<() -> Unit>(Channel.UNLIMITED)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        scope.launch {
+            for (update in pending) runCatching { update() }.onFailure {
+                co.touchlab.kermit.Logger.w(it) { "connection update failed" }
+            }
+        }
+    }
+
+    fun submit(update: () -> Unit) { pending.trySend(update) }
+}
+
+internal fun ConnectionHold.updateInBackground(update: ConnectionHold.() -> Unit) {
+    ConnectionUpdates.submit { update() }
 }
 
 /** The network key of a "Download anyway" given while the path is not known (no detector). */
@@ -216,14 +345,22 @@ private const val UnknownNetworkKey = "?"
 
 /** The app's hold, with the setting saved where the platform keeps settings. */
 internal object LimitedConnections {
+    private val travelJson = Json { ignoreUnknownKeys = true }
     val hold: ConnectionHold = ConnectionHold(
         loadEnabled = LimitedConnectionStorage::loadPauseOnLimited,
         saveEnabled = LimitedConnectionStorage::savePauseOnLimited,
+        loadTravel = {
+            LimitedConnectionStorage.loadTravel()?.let { travelJson.decodeFromString<TravelPreferences>(it) } ?: TravelPreferences()
+        },
+        saveTravel = { LimitedConnectionStorage.saveTravel(travelJson.encodeToString(it)) },
+        applyTravelCap = DownloadBandwidth::setTravelCap,
     )
 }
 
 /** Where the setting "Pause downloads on hotspots and Low Data Mode networks" is kept. Null: never set (on). */
 internal expect object LimitedConnectionStorage {
+    fun loadTravel(): String?
+    fun saveTravel(value: String)
     fun loadPauseOnLimited(): Boolean?
     fun savePauseOnLimited(value: Boolean)
 
