@@ -1,5 +1,7 @@
 package com.nuvio.app.features.trakt
 
+import com.nuvio.app.core.memory.rememberRecentPage
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpGetTextWithHeaders
 import com.nuvio.app.features.addons.httpRequestRaw
@@ -32,7 +34,7 @@ object TraktCommentsRepository {
     )
 
     private val cacheMutex = Mutex()
-    private val cache = mutableMapOf<String, TimedCache>()
+    private val cache = BoundedCache<String, TimedCache>()
 
     suspend fun getCommentsPage(
         meta: MetaDetails,
@@ -107,7 +109,7 @@ object TraktCommentsRepository {
         cacheMutex.withLock {
             val cached = cache[cacheKey]
             cache[cacheKey] = TimedCache(
-                pages = (cached?.pages.orEmpty()) + (page to selected),
+                pages = rememberRecentPage(cached?.pages.orEmpty(), page, selected),
                 pageCount = pageCount,
                 itemCount = itemCount,
                 updatedAtMs = currentTimeMillis(),

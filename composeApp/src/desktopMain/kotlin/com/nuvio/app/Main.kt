@@ -103,6 +103,10 @@ fun main(args: Array<String>) {
     Runtime.getRuntime().addShutdownHook(Thread({ flushDownloadProgressOnExit() }, "download-exit-checkpoint"))
 
     application {
+        DisposableEffect(Unit) {
+            val watchdog = com.nuvio.app.core.memory.HeapWatchdog()
+            onDispose { watchdog.close() }
+        }
         val appIconState by AppIconRepository.state.collectAsState()
         val smokePlayerUrl = (
             System.getProperty("nuvio.desktop.smokePlayerUrl")

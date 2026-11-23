@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.network_response_too_large
 import nuvio.composeapp.generated.resources.network_empty_response_body
 import nuvio.composeapp.generated.resources.network_request_failed_http
 import okhttp3.MediaType.Companion.toMediaType
@@ -45,6 +46,7 @@ internal actual object AddonStorage {
 
 internal val desktopHttpClient = OkHttpClient.Builder()
     .dns(DesktopIPv4FirstDns())
+    .callTimeout(60, TimeUnit.SECONDS)
     .connectTimeout(60, TimeUnit.SECONDS)
     .readTimeout(60, TimeUnit.SECONDS)
     .writeTimeout(60, TimeUnit.SECONDS)
@@ -236,9 +238,13 @@ private fun readResponseBodyLimited(body: ResponseBody?, maxBytes: Int): Limited
     return LimitedBody(if (readResult.truncated) decoded + truncationSuffix else decoded, readResult.bytes)
 }
 
-private fun readResponseBody(body: ResponseBody?): String {
+internal fun readResponseBody(body: ResponseBody?, maxBytes: Int = 16 * 1024 * 1024): String {
     if (body == null) return ""
-    val bytes = body.bytes()
+    require(maxBytes > 0)
+    if (body.contentLength() > maxBytes) throw oversizedResponse()
+    val result = body.byteStream().use { readAtMostBytes(it, maxBytes) }
+    if (result.truncated) throw oversizedResponse()
+    val bytes = result.bytes
     return runCatching {
         val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
         String(bytes, charset)
@@ -246,3 +252,5 @@ private fun readResponseBody(body: ResponseBody?): String {
         String(bytes, Charsets.UTF_8)
     }
 }
+
+private fun oversizedResponse() = IllegalStateException(runBlocking { getString(Res.string.network_response_too_large) })

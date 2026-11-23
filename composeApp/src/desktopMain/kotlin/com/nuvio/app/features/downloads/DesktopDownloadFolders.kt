@@ -350,6 +350,7 @@ internal class DesktopDownloadFolders(
 
     /** True when a folder that was away can be used again. */
     private fun noteAvailability(states: Map<String, FolderAvailability>): Boolean {
+        lastAvailability.keys.retainAll(states.keys)
         var returned = false
         states.forEach { (id, availability) ->
             val before = lastAvailability.put(id, availability)

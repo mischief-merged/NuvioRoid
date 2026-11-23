@@ -1,5 +1,6 @@
 package com.nuvio.app.features.tmdb
 
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpGetText
 import kotlinx.coroutines.sync.Mutex
@@ -11,8 +12,8 @@ import kotlinx.serialization.json.Json
 object TmdbService {
     private val log = Logger.withTag("TmdbService")
     private val json = Json { ignoreUnknownKeys = true }
-    private val imdbToTmdbCache = linkedMapOf<String, String>()
-    private val tmdbToImdbCache = linkedMapOf<String, String>()
+    private val imdbToTmdbCache = BoundedCache<String, String>()
+    private val tmdbToImdbCache = BoundedCache<String, String>()
     private val cacheMutex = Mutex()
 
     suspend fun ensureTmdbId(videoId: String, mediaType: String, fallbackImdbId: String? = null): String? {

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.details
 
+import com.nuvio.app.core.memory.BoundedCache
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.library.LibraryClock
 import kotlinx.coroutines.CoroutineScope
@@ -19,7 +20,7 @@ object ImdbEpisodeRatingsRepository {
     private val log = Logger.withTag("ImdbEpisodeRatingsRepo")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mutex = Mutex()
-    private val cache = mutableMapOf<String, CacheEntry>()
+    private val cache = BoundedCache<String, CacheEntry>()
     private val inFlight = mutableMapOf<String, Deferred<List<ExternalEpisodeRating>>>()
 
     internal suspend fun getEpisodeRatings(

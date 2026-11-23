@@ -25,8 +25,8 @@ internal object DesktopStorage {
         resolveCacheDir().also { Files.createDirectories(it) }
     }
 
-    fun store(name: String): Store = synchronized(stores) {
-        stores.getOrPut(name) { Store(rootDir.resolve("$name.properties")) }
+    fun store(name: String, cacheEntries: Int? = null): Store = synchronized(stores) {
+        stores.getOrPut(name) { Store(rootDir.resolve("$name.properties"), cacheEntries) }
     }
 
     fun wipe() {
@@ -96,12 +96,22 @@ internal object DesktopStorage {
      */
     internal class Store(
         private val file: Path,
+        private val cacheEntries: Int? = null,
         private val write: (Properties, OutputStream) -> Unit = { properties, output ->
             properties.store(output, "Nuvio desktop preferences")
         },
     ) {
         private val gate = FileGate.of(file.resolveSibling("${file.fileName}.lock"))
-        private val properties = Properties()
+        private val properties = object : Properties() {
+            override fun put(key: Any, value: Any): Any? {
+                val old = super.put(key, value)
+                cacheEntries?.let { limit ->
+                    require(limit > 0)
+                    while (size > limit) remove(keys.first { it != key })
+                }
+                return old
+            }
+        }
         private var loaded = false
         private var fileIsGood = false
         private val temporaryFile = file.resolveSibling("${file.fileName}.tmp")
@@ -346,9 +356,13 @@ internal object DesktopStorage {
         }
 
         companion object {
-            private val gates = java.util.concurrent.ConcurrentHashMap<Path, FileGate>()
+            private val gates = mutableMapOf<Path, java.lang.ref.WeakReference<FileGate>>()
 
-            fun of(lockFile: Path): FileGate = gates.computeIfAbsent(lockFile.toAbsolutePath().normalize()) { FileGate(it) }
+            fun of(lockFile: Path): FileGate = synchronized(gates) {
+                gates.entries.removeAll { it.value.get() == null }
+                val key = lockFile.toAbsolutePath().normalize()
+                gates[key]?.get() ?: FileGate(key).also { gates[key] = java.lang.ref.WeakReference(it) }
+            }
         }
     }
 }

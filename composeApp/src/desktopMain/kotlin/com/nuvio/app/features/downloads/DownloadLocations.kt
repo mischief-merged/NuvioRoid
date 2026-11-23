@@ -27,16 +27,22 @@ internal interface DownloadVolumes {
 
 /** Runs a file-system call that may hang on its own thread and gives up after a time. */
 internal object FsGuard {
-    private val pool = java.util.concurrent.Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "download-fs").apply { isDaemon = true }
-    }
+    private val pool = java.util.concurrent.ThreadPoolExecutor(
+        0, 4, 30, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.SynchronousQueue(),
+        java.util.concurrent.ThreadFactory { runnable -> Thread(runnable, "download-fs").apply { isDaemon = true } },
+    )
 
     fun <T> call(timeoutMs: Long, onTimeout: T, block: () -> T): T {
-        val future = pool.submit(java.util.concurrent.Callable { block() })
+        val future = try { pool.submit(java.util.concurrent.Callable { block() }) }
+        catch (_: java.util.concurrent.RejectedExecutionException) { return onTimeout }
         return try {
             future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         } catch (_: java.util.concurrent.TimeoutException) {
             future.cancel(true)
+            onTimeout
+        } catch (_: InterruptedException) {
+            future.cancel(true)
+            Thread.currentThread().interrupt()
             onTimeout
         } catch (error: java.util.concurrent.ExecutionException) {
             throw error.cause ?: error

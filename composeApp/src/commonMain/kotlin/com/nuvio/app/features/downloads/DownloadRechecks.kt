@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.memory.BoundedCache
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -78,7 +79,7 @@ internal class DownloadRechecks(
     private val io: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val running = Mutex()
-    private val lookedAt = HashMap<String, Long>()
+    private val lookedAt = BoundedCache<String, Long>()
     private val lookedAtLock = kotlinx.atomicfu.locks.SynchronizedObject()
 
     /**

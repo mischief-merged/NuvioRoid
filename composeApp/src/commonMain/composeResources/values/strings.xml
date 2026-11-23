@@ -3297,4 +3297,5 @@
     <string name="downloads_movie_delete_now_message_held">The Trash is not available. %1$s will stay where it is.</string>
     <string name="downloads_movie_delete_now_message_trash">%1$s is moved to the Trash.</string>
     <string name="downloads_source_rejected">This source did not pass the download checks.</string>
+    <string name="network_response_too_large">This response is too large. Try a different source.</string>
 </resources>

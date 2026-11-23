@@ -171,24 +171,39 @@ internal actual object DownloadsPlatformDownloader {
                         return@launch
                     }
 
-                    // Reported finished only once the file is on disk under its final name, which never replaces
-                    // a file this download did not create (a taken name gets " (2)", " (3)", ...).
-                    val published = try {
-                        publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
-                            val key = rememberPublishedFile(path)
-                            request.onPublished(path.toFile().toURI().toString(), Files.size(path), key)
-                        }).toFile()
-                    } catch (_: DownloadNotDurable) {
-                        // The partial file keeps its name: the download is not finished and goes on from it.
-                        onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
-                        return@launch
-                    }
+                    var rememberedUri: String? = null
+                    var rememberedKey: String? = null
+                    try {
+                        // Reported finished only once the file is on disk under its final name, which never replaces
+                        // a file this download did not create (a taken name gets " (2)", " (3)", ...).
+                        val published = try {
+                            publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
+                                val key = rememberPublishedFile(path)
+                                val uri = path.toFile().toURI().toString()
+                                rememberedUri = uri
+                                rememberedKey = key
+                                request.onPublished(uri, Files.size(path), key)
+                            }).toFile()
+                        } catch (_: DownloadNotDurable) {
+                            // The partial file keeps its name: the download is not finished and goes on from it.
+                            onFailure(runBlocking { getString(Res.string.downloads_error_not_durable) })
+                            return@launch
+                        }
 
-                    val finalSize = published.length()
-                    // Remembered, so that a file found bad right after this can be removed only while it is still this one.
-                    rememberPublishedFile(published.toPath())
-                    onSuccess(published.toURI().toString(), totalBytes ?: finalSize)
-                    return@launch
+                        val finalSize = published.length()
+                        // Remembered, so that a file found bad right after this can be removed only while it is still this one.
+                        val uri = published.toURI().toString()
+                        rememberedUri = uri
+                        rememberedKey = rememberPublishedFile(published.toPath())
+                        onSuccess(uri, totalBytes ?: finalSize)
+                        return@launch
+                    } finally {
+                        val uri = rememberedUri
+                        if (uri != null) {
+                            val key = rememberedKey
+                            if (key != null) publishedKeys.remove(uri, key) else publishedKeys.remove(uri)
+                        }
+                    }
                 } catch (error: CancellationException) {
                     onPaused()
                     throw error

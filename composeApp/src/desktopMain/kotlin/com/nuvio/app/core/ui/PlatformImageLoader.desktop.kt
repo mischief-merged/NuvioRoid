@@ -4,15 +4,31 @@ import coil3.ComponentRegistry
 import coil3.ImageLoader
 import coil3.memory.MemoryCache
 
-private const val ImageMemoryCacheBytes = 256L * 1024 * 1024
+import com.nuvio.app.core.memory.imageMemoryBudget
+import java.lang.ref.WeakReference
+
+private val imageCaches = mutableListOf<WeakReference<MemoryCache>>()
+
+internal fun trimImageMemoryCaches() {
+    val live = synchronized(imageCaches) {
+        imageCaches.removeAll { it.get() == null }
+        imageCaches.mapNotNull { it.get() }
+    }
+    live.forEach { runCatching { it.clear() } }
+}
 
 internal actual val platformProvidesImageLoader: Boolean = false
 
 internal actual fun ImageLoader.Builder.configurePlatformImageLoader(): ImageLoader.Builder {
     return memoryCache {
         MemoryCache.Builder()
-            .maxSizeBytes(ImageMemoryCacheBytes)
-            .build()
+            .maxSizeBytes(imageMemoryBudget(Runtime.getRuntime().maxMemory()))
+            .build().also { cache ->
+                synchronized(imageCaches) {
+                    imageCaches.removeAll { it.get() == null }
+                    imageCaches.add(WeakReference(cache))
+                }
+            }
     }
 }
 

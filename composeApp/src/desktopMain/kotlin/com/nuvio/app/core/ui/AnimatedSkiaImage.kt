@@ -83,7 +83,7 @@ internal class AnimatedSkiaImage(
     val contentKey: String,
 ) : coil3.Image {
 
-    override val size: Long = data.size.toLong() + width.toLong() * height.toLong() * 4L
+    override val size: Long = data.size.toLong() + width.toLong() * height.toLong() * 4L + frameDelaysMs.size.toLong() * 8
 
     override val shareable: Boolean = true
 
@@ -239,13 +239,17 @@ internal class FramePlayer(private val source: AnimatedSkiaImage) {
     private fun enqueue() {
         if (queued) return
         queued = true
-        synchronized(waitingPlayers) { waitingPlayers.addLast(WeakReference(this)) }
+        synchronized(waitingPlayers) {
+            waitingPlayers.removeAll { it.get() == null }
+            waitingPlayers.addLast(WeakReference(this))
+        }
     }
 
     /** Hands a freed slot to the longest-waiting animation. */
     private fun startNextWaiting() {
         while (true) {
-            val next = synchronized(waitingPlayers) { waitingPlayers.removeFirstOrNull() }?.get() ?: return
+            val reference = synchronized(waitingPlayers) { waitingPlayers.removeFirstOrNull() } ?: return
+            val next = reference.get() ?: continue
             next.queued = false
             val started = synchronized(next.lock) {
                 if (next.failed || next.finished || next.job?.isActive == true) false

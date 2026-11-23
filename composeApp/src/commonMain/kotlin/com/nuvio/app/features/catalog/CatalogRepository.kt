@@ -1,5 +1,7 @@
 package com.nuvio.app.features.catalog
 
+import com.nuvio.app.core.memory.retainBrowseWindow
+import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.core.poster.CustomPosterUrlRepository
 import com.nuvio.app.core.poster.withCustomPosterUrls
 import com.nuvio.app.features.collection.CollectionRepository
@@ -31,7 +33,7 @@ object CatalogRepository {
 
     private var activeJob: Job? = null
     private var activeRequest: CatalogRequest? = null
-    private val scrollPositions = linkedMapOf<CatalogRequest, CatalogScrollPosition>()
+    private val scrollPositions = BoundedCache<CatalogRequest, CatalogScrollPosition>(64)
 
     fun load(
         target: CatalogTarget,
@@ -186,7 +188,7 @@ object CatalogRepository {
                     }
                     val posterPattern = CustomPosterUrlRepository.patternForScreen(posterScreen)
                     _uiState.value = CatalogUiState(
-                        items = mergedItems.withCustomPosterUrls(posterPattern),
+                        items = retainBrowseWindow(mergedItems).withCustomPosterUrls(posterPattern),
                         isLoading = false,
                         nextSkip = paginationState.nextSkip,
                         consecutiveDuplicatePages = paginationState.consecutiveDuplicatePages,

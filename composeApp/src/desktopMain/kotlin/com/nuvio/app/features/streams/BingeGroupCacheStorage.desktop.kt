@@ -4,7 +4,7 @@ import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
 
 internal actual object BingeGroupCacheStorage {
-    private val store = DesktopStorage.store("nuvio_binge_group_cache")
+    private val store = DesktopStorage.store("nuvio_binge_group_cache", cacheEntries = 384)
 
     actual fun load(hashedKey: String): String? =
         store.getString(ProfileScopedKey.of(hashedKey))

@@ -93,7 +93,10 @@ class MdbListEpisodeMappingService internal constructor(
         val pending = contentIds.filterTo(linkedSetOf()) { it !in mutableResolved.value && it !in prefetched.value }
         if (pending.isEmpty()) return
         prefetched.update { it + pending }
-        coroutineScope.launch { pending.forEach { resolve(it, projection) } }
+        coroutineScope.launch {
+            try { pending.forEach { resolve(it, projection) } }
+            finally { prefetched.update { it - pending } }
+        }
     }
 
     /**
@@ -126,8 +129,11 @@ class MdbListEpisodeMappingService internal constructor(
         val ids = projection.showIdSiblings[contentId].orEmpty() + contentId
         if (ids.any { mutableResolved.value[it] !== mapping }) {
             val added = ids.associateWith { mapping }
-            mutableResolved.update { current -> current + added }
-            if (mapping.remaps) mutableRemapped.update { current -> current + added }
+            val wanted = projection.showIdSiblings.keys + ids
+            mutableResolved.update { current -> current.filterKeys { it in wanted } + added }
+            mutableRemapped.update { current ->
+                current.filterKeys { it in wanted } + if (mapping.remaps) added else emptyMap()
+            }
         }
         return mapping
     }

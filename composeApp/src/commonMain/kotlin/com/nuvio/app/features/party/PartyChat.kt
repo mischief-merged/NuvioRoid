@@ -94,7 +94,7 @@ object PartyChat {
                 clientId = clientId,
                 status = PartyChatStatus.Sending,
             )
-            _messages.update { it + message }
+            _messages.update { appendPartyChatMessage(it, message, MESSAGE_LIMIT) }
             deliver(current.partyId, message)
         }
     }
@@ -112,6 +112,7 @@ object PartyChat {
         scope.launch {
             if (room?.partyId != next.partyId) reset()
             room = next
+            ownMemberIds.retainAll(_messages.value.filter { it.mine }.map { it.memberId }.toSet())
             ownMemberIds += next.memberId
             sync()
         }
@@ -264,3 +265,9 @@ internal fun mergePartyChat(
     val merged = confirmed.values.sortedBy { it.id } + pending
     return PartyChatMerge(merged.takeLast(limit), added)
 }
+
+internal fun appendPartyChatMessage(
+    current: List<PartyChatMessage>,
+    message: PartyChatMessage,
+    limit: Int,
+): List<PartyChatMessage> = (current + message).takeLast(limit)

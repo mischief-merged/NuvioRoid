@@ -78,7 +78,9 @@ internal class DownloadStorageUsage(
         val result = mutableMapOf<String, LocationUsage>()
         var auto = 0L
         val byLocation = items.groupBy { locations.locationOfRecord(it.locationId, it.localFileUri).id }
-        locations.all().forEach { location ->
+        val currentLocations = locations.all()
+        lastKnown.keys.retainAll(currentLocations.map { it.id }.toSet())
+        currentLocations.forEach { location ->
             val members = byLocation[location.id].orEmpty()
             if (availability[location.id] != FolderAvailability.Available) {
                 // Away: the size it had when it was last seen, or what the records say.
