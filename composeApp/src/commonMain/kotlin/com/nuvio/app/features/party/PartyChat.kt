@@ -53,6 +53,7 @@ object PartyChat {
     private val log = Logger.withTag("PartyChat")
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
     private val syncLock = Mutex()
+    internal var loadHistory: suspend (String, String, Long?) -> PartyChatHistory = PartyApi::listMessages
 
     private val _messages = MutableStateFlow<List<PartyChatMessage>>(emptyList())
     val messages: StateFlow<List<PartyChatMessage>> = _messages.asStateFlow()
@@ -147,7 +148,7 @@ object PartyChat {
             val target = room?.partyId ?: return
             val after = if (loaded) _messages.value.lastOrNull { it.id != null }?.id else null
             val history = try {
-                PartyApi.listMessages(target, SyncClientIdentity.currentClientId(), after)
+                loadHistory(target, SyncClientIdentity.currentClientId(), after)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {

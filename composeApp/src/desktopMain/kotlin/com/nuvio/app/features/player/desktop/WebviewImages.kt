@@ -17,28 +17,9 @@ import javax.imageio.ImageIO
 internal object WebviewImages {
     private const val SIZE = 112
     private val images = BoundedCache<String, String>(64)
-    private val loading = ConcurrentHashMap.newKeySet<String>()
-    private val workers = ThreadPoolExecutor(0, 2, 30, TimeUnit.SECONDS, SynchronousQueue(),
-        ThreadFactory { work -> Thread(work, "controls-image").apply { isDaemon = true } })
+    private val loader = WebviewImageLoader(images, ::encode)
 
-    fun resolve(url: String, onReady: () -> Unit): String {
-        if (!url.startsWith("file:", ignoreCase = true)) return url
-        images[url]?.let { return it }
-        if (loading.add(url)) {
-            try {
-                workers.execute {
-                    try {
-                        val image = runCatching { encode(url) }.getOrNull()
-                        if (image != null) {
-                            images[url] = image
-                            runCatching(onReady)
-                        }
-                    } finally { loading.remove(url) }
-                }
-            } catch (_: java.util.concurrent.RejectedExecutionException) { loading.remove(url) }
-        }
-        return ""
-    }
+    fun resolve(url: String, onReady: () -> Unit): String = loader.resolve(url, onReady)
 
     internal fun encode(url: String): String? {
         val source = ImageIO.createImageInputStream(File(URI(url)))?.use { input ->
@@ -65,4 +46,36 @@ internal object WebviewImages {
             "data:image/png;base64," + Base64.getEncoder().encodeToString(bytes)
         } finally { source.flush(); scaled.flush() }
     }
+}
+
+internal class WebviewImageLoader(
+    private val images: BoundedCache<String, String>,
+    private val encode: (String) -> String?,
+) : AutoCloseable {
+    private val loading = ConcurrentHashMap.newKeySet<String>()
+    private val workers = ThreadPoolExecutor(0, 2, 30, TimeUnit.SECONDS, SynchronousQueue(),
+        ThreadFactory { work -> Thread(work, "controls-image").apply { isDaemon = true } })
+    val pendingCount: Int get() = loading.size
+    val maximumWorkers: Int get() = workers.maximumPoolSize
+
+    fun resolve(url: String, onReady: () -> Unit): String {
+        if (!url.startsWith("file:", ignoreCase = true)) return url
+        images[url]?.let { return it }
+        if (loading.add(url)) {
+            try {
+                workers.execute {
+                    try {
+                        val image = runCatching { encode(url) }.getOrNull()
+                        if (image != null) {
+                            images[url] = image
+                            runCatching(onReady)
+                        }
+                    } finally { loading.remove(url) }
+                }
+            } catch (_: java.util.concurrent.RejectedExecutionException) { loading.remove(url) }
+        }
+        return ""
+    }
+
+    override fun close() { workers.shutdown() }
 }

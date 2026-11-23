@@ -33,6 +33,10 @@ object TraktCommentsRepository {
         val updatedAtMs: Long,
     )
 
+    internal var requestHeaders: suspend () -> Map<String, String>? = { TraktAuthRepository.authorizedHeaders() }
+    internal var requestPage: suspend (String, Map<String, String>) -> com.nuvio.app.features.addons.RawHttpResponse = { url, headers ->
+        httpRequestRaw(method = "GET", url = url, headers = headers, body = "")
+    }
     private val cacheMutex = Mutex()
     private val cache = BoundedCache<String, TimedCache>()
 
@@ -67,7 +71,7 @@ object TraktCommentsRepository {
             }
         }
 
-        val headers = TraktAuthRepository.authorizedHeaders()
+        val headers = requestHeaders()
             ?: return TraktCommentsPage(emptyList(), page, 0, 0)
 
         val endpoint = when (target.type) {
@@ -77,12 +81,7 @@ object TraktCommentsRepository {
         val url = "https://api.trakt.tv/$endpoint/${target.pathId}/comments/$COMMENTS_SORT?page=$page&limit=$COMMENTS_LIMIT"
 
         val response = try {
-            httpRequestRaw(
-                method = "GET",
-                url = url,
-                headers = headers,
-                body = "",
-            )
+            requestPage(url, headers)
         } catch (e: Exception) {
             log.e(e) { "Failed to load comments from $url" }
             throw e
@@ -174,7 +173,7 @@ object TraktCommentsRepository {
         type: TraktCommentsType,
         tmdbId: Int,
     ): ResolvedCommentsTarget? {
-        val headers = TraktAuthRepository.authorizedHeaders() ?: return null
+        val headers = requestHeaders() ?: return null
         val url = "https://api.trakt.tv/search/tmdb/$tmdbId?type=${type.apiValue}"
         return try {
             val responseText = httpGetTextWithHeaders(url, headers)

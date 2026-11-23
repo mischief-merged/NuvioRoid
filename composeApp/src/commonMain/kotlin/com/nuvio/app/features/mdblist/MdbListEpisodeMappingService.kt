@@ -1,5 +1,8 @@
 package com.nuvio.app.features.mdblist
 
+import com.nuvio.app.core.memory.SharedLookup
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import co.touchlab.kermit.Logger
 import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.tmdb.TmdbService
@@ -11,7 +14,6 @@ import com.nuvio.app.features.tracking.parseTrackingExternalIds
 import com.nuvio.app.features.trakt.EpisodeMappingEntry
 import com.nuvio.app.features.trakt.TraktEpisodeMappingService
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -21,9 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -49,8 +49,7 @@ class MdbListEpisodeMappingService internal constructor(
     private val mutableResolved = MutableStateFlow<Map<String, MdbListEpisodeMapping>>(emptyMap())
     private val mutableRemapped = MutableStateFlow<Map<String, MdbListEpisodeMapping>>(emptyMap())
     private val prefetched = MutableStateFlow<Set<String>>(emptySet())
-    private val inFlightMutex = Mutex()
-    private val inFlight = mutableMapOf<String, CompletableDeferred<MdbListEpisodeMapping?>>()
+    private val inFlight = SharedLookup<String, MdbListEpisodeMapping?>()
 
     internal val remapped: StateFlow<Map<String, MdbListEpisodeMapping>> = mutableRemapped.asStateFlow()
 
@@ -65,26 +64,18 @@ class MdbListEpisodeMappingService internal constructor(
     internal suspend fun resolve(contentId: String, projection: MdbListProgressProjection): MdbListEpisodeMapping? {
         val key = contentId.trim().takeIf(String::isNotBlank) ?: return null
         cached(key)?.let { return remember(key, it, projection) }
-        val (deferred, owner) = inFlightMutex.withLock {
-            cached(key)?.let { return remember(key, it, projection) }
-            inFlight[key]?.let { it to false }
-                ?: CompletableDeferred<MdbListEpisodeMapping?>().also { inFlight[key] = it }.let { it to true }
-        }
-        if (!owner) return deferred.await()
-        return try {
-            load(key, projection.tmdbShowId(key)).also { mapping ->
-                if (mapping != null) remember(key, mapping, projection)
-                deferred.complete(mapping)
+        return inFlight.get(key) {
+            cached(key)?.let { return@get remember(key, it, projection) }
+            try {
+                val mapping = load(key, projection.tmdbShowId(key))
+                currentCoroutineContext().ensureActive()
+                mapping?.also { remember(key, it, projection) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                log.w { "episode mapping failed for $key: ${error.message}" }
+                null
             }
-        } catch (error: CancellationException) {
-            deferred.complete(null)
-            throw error
-        } catch (error: Exception) {
-            log.w { "episode mapping failed for $key: ${error.message}" }
-            deferred.complete(null)
-            null
-        } finally {
-            inFlightMutex.withLock { inFlight.remove(key) }
         }
     }
 

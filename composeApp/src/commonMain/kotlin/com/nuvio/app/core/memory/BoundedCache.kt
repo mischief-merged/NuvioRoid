@@ -15,13 +15,15 @@ internal class BoundedCache<K, V>(val capacity: Int = 128) : AbstractMutableMap<
 
     override val size: Int get() = synchronized(lock) { data.size }
     override fun containsKey(key: K): Boolean = synchronized(lock) { data.containsKey(key) }
-    override fun get(key: K): V? = synchronized(lock) {
+    data class Hit<V>(val value: V)
+    fun lookup(key: K): Hit<V>? = synchronized(lock) {
         if (!data.containsKey(key)) return@synchronized null
-        val value = data.remove(key)
         @Suppress("UNCHECKED_CAST")
-        data[key] = value as V
-        value
+        val value = data.remove(key) as V
+        data[key] = value
+        Hit(value)
     }
+    override fun get(key: K): V? = lookup(key)?.value
     override fun put(key: K, value: V): V? = synchronized(lock) {
         val previous = data.remove(key)
         data[key] = value

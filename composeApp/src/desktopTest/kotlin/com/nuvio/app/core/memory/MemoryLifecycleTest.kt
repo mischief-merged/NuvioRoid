@@ -63,23 +63,28 @@ class MemoryLifecycleTest {
         } finally { scope.coroutineContext[kotlinx.coroutines.Job]?.cancel() }
     }
 
-    @Test fun cancelledEpisodeLookupsReleaseTheirFlightsAndWaiters() = runBlocking {
+    @Test fun cancelledEpisodeOwnersReleaseTheirFlightAndActiveWaitersRetry() = runBlocking {
         val started = CompletableDeferred<Unit>()
-        val companion = EpisodeListCompanion(fetchMeta = { _, _ -> started.complete(Unit); CompletableDeferred<Nothing>().await() })
+        var calls = 0
+        val companion = EpisodeListCompanion(fetchMeta = { _, _ ->
+            if (++calls == 1) { started.complete(Unit); kotlinx.coroutines.awaitCancellation() }
+            com.nuvio.app.features.details.MetaDetails("tt1", "series", "Show")
+        })
         val item = item()
         val owner = async { companion.run(item, "file:/test/video") }
         started.await()
-        val waiter = async { companion.run(item, "file:/test/video") }
+        val waiter = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { companion.run(item, "file:/test/video") }
         kotlinx.coroutines.yield()
         owner.cancelAndJoin()
-        assertFails { waiter.await() }
-        assertEquals(0, map(companion, "showLoads").size)
+        assertEquals(com.nuvio.app.features.downloads.CompanionOutcome.NothingFound, waiter.await())
+        assertEquals(2, calls)
+        assertEquals(0, (field(companion, "showLoads").get(companion) as SharedLookup<*, *>).size)
     }
 
     @Test fun failedEpisodeLookupsDoNotRetainOldShowLocks() = runBlocking {
         val companion = EpisodeListCompanion(fetchMeta = { _, _ -> null })
         repeat(500) { companion.run(item().copy(parentMetaId = "show-$it"), "file:/test/video") }
-        assertEquals(0, map(companion, "showLoads").size)
+        assertEquals(0, (field(companion, "showLoads").get(companion) as SharedLookup<*, *>).size)
     }
 
     @Test fun failedChatSendsUseTheSameWindowLimitAsReceivedMessages() {
@@ -123,7 +128,8 @@ class MemoryLifecycleTest {
             val cache = map(instance, name)
             try {
                 repeat(2048) { cache["test-$it"] = "value" }
-                assertTrue(cache.size <= 128, "${instance.javaClass.simpleName}.$name retained ${cache.size} values")
+                assertEquals(128, (cache as BoundedCache<*, *>).capacity)
+                assertEquals(128, cache.size, "${instance.javaClass.simpleName}.$name retained results")
             } finally { cache.clear() }
         }
     }

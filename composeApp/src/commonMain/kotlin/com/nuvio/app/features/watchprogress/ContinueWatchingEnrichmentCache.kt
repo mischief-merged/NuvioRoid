@@ -180,7 +180,7 @@ internal object ContinueWatchingEnrichmentCache {
         source: WatchProgressSource,
     ): CachedEnrichmentPayload? = synchronized(cacheLock) {
         val scope = CacheScope(profileId = profileId, source = source)
-        if (cachedPayloads.containsKey(scope)) return@synchronized cachedPayloads[scope]
+        cachedPayloads.lookup(scope)?.let { return@synchronized it.value }
         removeLegacyPayloadOnce(profileId)
         val raw = ContinueWatchingEnrichmentStorage.loadPayload(
             continueWatchingEnrichmentStorageKey(profileId = profileId, source = source),

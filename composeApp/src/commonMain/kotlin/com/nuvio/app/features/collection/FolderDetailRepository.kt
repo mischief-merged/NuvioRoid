@@ -432,7 +432,7 @@ object FolderDetailRepository {
             val hasLoadMore = sourceTabs.any { it.isLoadingMore }
             val errorMessage = sourceTabs.firstOrNull { it.error != null }?.error
             updatedTabs[allTabIndex] = updatedTabs[allTabIndex].copy(
-                items = merged,
+                items = retainBrowseWindow(merged),
                 isLoading = hasInitialLoads,
                 isLoadingMore = hasLoadMore,
                 error = errorMessage.takeIf { merged.isEmpty() },

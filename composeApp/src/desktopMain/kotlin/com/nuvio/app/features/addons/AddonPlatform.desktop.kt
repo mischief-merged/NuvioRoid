@@ -3,7 +3,6 @@ package com.nuvio.app.features.addons
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.network.DesktopIPv4FirstDns
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -46,13 +45,14 @@ internal actual object AddonStorage {
 
 internal val desktopHttpClient = OkHttpClient.Builder()
     .dns(DesktopIPv4FirstDns())
-    .callTimeout(60, TimeUnit.SECONDS)
     .connectTimeout(60, TimeUnit.SECONDS)
     .readTimeout(60, TimeUnit.SECONDS)
     .writeTimeout(60, TimeUnit.SECONDS)
     .followRedirects(true)
     .followSslRedirects(true)
     .build()
+
+internal val desktopTextClient = desktopHttpClient.newBuilder().callTimeout(60, TimeUnit.SECONDS).build()
 
 private const val truncationSuffix = "\n...[truncated]"
 
@@ -109,9 +109,9 @@ actual suspend fun httpRequestRaw(
     bodyBytes: ByteArray?,
 ): RawHttpResponse = withContext(Dispatchers.IO) {
     val client = if (followRedirects) {
-        desktopHttpClient
+        desktopTextClient
     } else {
-        desktopHttpClient.newBuilder()
+        desktopTextClient.newBuilder()
             .followRedirects(false)
             .followSslRedirects(false)
             .build()
@@ -143,13 +143,15 @@ private suspend fun executeTextRequest(
     body: String = "",
 ): String = withContext(Dispatchers.IO) {
     val request = buildDesktopRequest(method, url, headers, body)
-    desktopHttpClient.newCall(request).execute().use { response ->
-        val payload = readResponseBody(response.body)
+    desktopTextClient.newCall(request).execute().use { response ->
+        val payload = try { readResponseBody(response.body) } catch (error: ResponseTooLarge) {
+            throw IllegalStateException(getString(Res.string.network_response_too_large), error)
+        }
         if (!response.isSuccessful) {
-            error(runBlocking { getString(Res.string.network_request_failed_http, response.code) })
+            error(getString(Res.string.network_request_failed_http, response.code))
         }
         if (payload.isBlank()) {
-            throw IllegalStateException(runBlocking { getString(Res.string.network_empty_response_body) })
+            throw IllegalStateException(getString(Res.string.network_empty_response_body))
         }
         payload
     }
@@ -241,9 +243,9 @@ private fun readResponseBodyLimited(body: ResponseBody?, maxBytes: Int): Limited
 internal fun readResponseBody(body: ResponseBody?, maxBytes: Int = 16 * 1024 * 1024): String {
     if (body == null) return ""
     require(maxBytes > 0)
-    if (body.contentLength() > maxBytes) throw oversizedResponse()
+    if (body.contentLength() > maxBytes) throw ResponseTooLarge()
     val result = body.byteStream().use { readAtMostBytes(it, maxBytes) }
-    if (result.truncated) throw oversizedResponse()
+    if (result.truncated) throw ResponseTooLarge()
     val bytes = result.bytes
     return runCatching {
         val charset = body.contentType()?.charset(Charsets.UTF_8) ?: Charsets.UTF_8
@@ -253,4 +255,4 @@ internal fun readResponseBody(body: ResponseBody?, maxBytes: Int = 16 * 1024 * 1
     }
 }
 
-private fun oversizedResponse() = IllegalStateException(runBlocking { getString(Res.string.network_response_too_large) })
+internal class ResponseTooLarge : IllegalStateException()

@@ -25,13 +25,13 @@ class MemoryRetentionTest {
         checkMaps("features.player.skip.SimklIdResolver", "idsCache", "episodeCache", "animeSeasonCache")
         checkMaps("features.player.ParentalGuideRepository", "cache")
         checkMaps("features.debrid.DirectDebridPlaybackResolver", "resolvedCache")
-        checkMaps("features.catalog.CatalogRepository", "scrollPositions")
+        checkMaps("features.catalog.CatalogRepository", "scrollPositions", expected = 64)
         checkMaps("features.debrid.DebridStreamMetadata", "tokenRegexCache")
         checkMaps("features.trakt.TraktProgressRepository", "episodeProgressFetchedAtMsByContentId", "episodeProgressLastAttemptAtMsByContentId")
     }
 
     @Test fun localControlsImagesHaveFiniteCapacity() {
-        checkMaps("features.player.desktop.WebviewImages", "images")
+        checkMaps("features.player.desktop.WebviewImages", "images", expected = 64)
     }
 
     @Test fun completedSidecarWritesDoNotRetainFileNamesOrLocks() {
@@ -39,12 +39,13 @@ class MemoryRetentionTest {
         assertEquals(0, map("features.downloads.SidecarLocks", "locks").size)
     }
 
-    private fun checkMaps(className: String, vararg names: String) {
+    private fun checkMaps(className: String, vararg names: String, expected: Int = 128) {
         names.forEach { name ->
             val cache = map(className, name)
             try {
                 repeat(2048) { cache["test-$it"] = "test" }
-                assertTrue(cache.size <= 256, "$className.$name retained ${cache.size} results")
+                assertEquals(expected, (cache as BoundedCache<*, *>).capacity, "$className.$name configured capacity")
+                assertEquals(expected, cache.size, "$className.$name retained results")
             } finally { cache.clear() }
         }
     }

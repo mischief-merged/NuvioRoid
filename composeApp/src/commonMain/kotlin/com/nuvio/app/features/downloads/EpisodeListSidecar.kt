@@ -1,11 +1,12 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.memory.SharedLookup
 import com.nuvio.app.core.memory.BoundedCache
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.details.MetaVideo
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -136,9 +137,8 @@ internal class EpisodeListCompanion(
 ) : DownloadCompanion {
     override val name: String get() = "episode list"
 
-    private val cacheLock = kotlinx.atomicfu.locks.SynchronizedObject()
     private val shows = BoundedCache<String, Pair<Long, MetaDetails>>()
-    private val showLoads = mutableMapOf<String, kotlinx.coroutines.CompletableDeferred<MetaDetails?>>()
+    private val showLoads = SharedLookup<String, MetaDetails?>()
 
     /**
      * The details of a show, loaded once for all its episodes: a show loaded within [ShowCacheMs] is
@@ -146,28 +146,19 @@ internal class EpisodeListCompanion(
      */
     private suspend fun detailsOf(type: String, id: String): MetaDetails? {
         val key = "$type:$id"
-        var owner = false
-        val pending = kotlinx.atomicfu.locks.synchronized(cacheLock) {
-            shows[key]?.takeIf { (at, _) -> nowEpochMs() - at in 0 until ShowCacheMs }?.second?.let { return it }
-            showLoads[key] ?: kotlinx.coroutines.CompletableDeferred<MetaDetails?>().also {
-                showLoads[key] = it
-                owner = true
+        shows[key]?.takeIf { (at, _) -> nowEpochMs() - at in 0 until ShowCacheMs }?.second?.let { return it }
+        return showLoads.get(key) {
+            shows[key]?.takeIf { (at, _) -> nowEpochMs() - at in 0 until ShowCacheMs }?.second?.let { return@get it }
+            try {
+                val loaded = withTimeoutOrNull(LookupTimeoutMs) { fetchMeta(type, id) }
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (loaded != null) shows[key] = nowEpochMs() to loaded
+                loaded
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                null
             }
-        }
-        if (!owner) return pending.await()
-        return try {
-            val loaded = withTimeoutOrNull(LookupTimeoutMs) { fetchMeta(type, id) }
-            if (loaded != null) shows[key] = nowEpochMs() to loaded
-            pending.complete(loaded)
-            loaded
-        } catch (error: CancellationException) {
-            pending.cancel(error)
-            throw error
-        } catch (_: Exception) {
-            pending.complete(null)
-            null
-        } finally {
-            kotlinx.atomicfu.locks.synchronized(cacheLock) { showLoads.remove(key) }
         }
     }
 
