@@ -1432,6 +1432,171 @@ class DesktopDownloadLinkRefreshTest {
         assertEquals(DownloadLocations.AppId, item.supersededPartials.single().locationId)
     }
 
+    @Test
+    fun restart_recovery_accepting_awaiting_check_retires_superseded_partial_and_clears_record() {
+        checkRestartRecoveryRetirement(accept = true)
+    }
+
+    @Test
+    fun restart_recovery_rejecting_awaiting_check_trashes_published_file_and_keeps_superseded_partial() {
+        checkRestartRecoveryRetirement(accept = false)
+    }
+
+    @Test
+    fun restart_retires_superseded_partial_left_on_completed_record() {
+        val payload = ByteArray(200 * 1024) { (it * 7).toByte() }
+        val originalBytes = ByteArray(80 * 1024) { (it * 13).toByte() }
+        val folder = world.appFolder.also { Files.createDirectories(it) }
+        val original = folder.resolve("completed-leftover.mkv.part")
+        Files.write(original, originalBytes)
+        val kept = KeptPartialFile(
+            fileName = original.fileName.toString(),
+            partialFileKey = DownloadMover.identityOf(original)!!,
+            locationId = DownloadLocations.AppId,
+        )
+        val published = folder.resolve("completed-leftover.mkv")
+        Files.write(published, payload)
+        val trashedPaths = CopyOnWriteArrayList<Path>()
+        val retiredLatch = CountDownLatch(1)
+        DownloadsPlatformDownloader.trashPartial = { path ->
+            trashedPaths.add(path)
+            val moved = world.trash.send(path)
+            if (moved) retiredLatch.countDown()
+            moved
+        }
+
+        val item = baseItem("http://127.0.0.1:1/unused", "completed-leftover.mkv").copy(
+            status = DownloadStatus.Completed,
+            localFileUri = published.toFile().toURI().toString(),
+            downloadedBytes = payload.size.toLong(),
+            totalBytes = payload.size.toLong(),
+            supersededPartials = listOf(kept),
+        )
+        var stored = DownloadsCodec.encode(listOf(item), null)
+        DownloadsRepository.backend = object : DownloadsBackend {
+            override fun loadPayload() = stored
+            override fun savePayload(payload: String) { stored = payload }
+            override fun restoreItem(item: DownloadItem) = item
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (Long, Long?) -> Unit,
+                onSuccess: (String, Long?) -> Unit,
+                onFailure: (String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle = error("start should not be called for already-completed item")
+            override fun retireSupersededPartials(item: DownloadItem) =
+                DownloadsPlatformDownloader.retireSupersededPartials(item)
+            override fun removeFile(localFileUri: String?) = false
+            override fun removePartialFile(destinationFileName: String) = false
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String) = localFileUri
+        }
+
+        DownloadsRepository.ensureLoaded()
+        assertTrue(retiredLatch.await(15, TimeUnit.SECONDS), "Leftover superseded partial was not retired on load")
+        val deadline = System.currentTimeMillis() + 5_000L
+        while (System.currentTimeMillis() < deadline &&
+            DownloadsRepository.uiState.value.items.single().supersededPartials.isNotEmpty()
+        ) {
+            Thread.sleep(10)
+        }
+        val finalItem = DownloadsRepository.uiState.value.items.single()
+        val savedItem = DownloadsCodec.decode(stored)!!.items.single()
+        assertFalse(Files.exists(original))
+        assertTrue(original in trashedPaths)
+        assertTrue(finalItem.supersededPartials.isEmpty())
+        assertTrue(savedItem.supersededPartials.isEmpty())
+    }
+
+    private fun checkRestartRecoveryRetirement(accept: Boolean) {
+        val payload = ByteArray(200 * 1024) { (it * 7).toByte() }
+        val originalBytes = ByteArray(80 * 1024) { (it * 13).toByte() }
+        val folder = world.appFolder.also { Files.createDirectories(it) }
+        val original = folder.resolve("recover.mkv.part")
+        Files.write(original, originalBytes)
+        val kept = KeptPartialFile(
+            fileName = original.fileName.toString(),
+            partialFileKey = DownloadMover.identityOf(original)!!,
+            locationId = DownloadLocations.AppId,
+        )
+        val published = folder.resolve("recover.mkv")
+        Files.write(published, payload)
+        val publishedUri = published.toFile().toURI().toString()
+        val publishedKey = DownloadMover.identityOf(published)!!
+        val trashedPaths = CopyOnWriteArrayList<Path>()
+        val retiredLatch = CountDownLatch(1)
+        DownloadsPlatformDownloader.trashPartial = { path ->
+            trashedPaths.add(path)
+            val moved = world.trash.send(path)
+            if (moved) retiredLatch.countDown()
+            moved
+        }
+
+        val item = baseItem("http://127.0.0.1:1/unused", "recover.mkv").copy(
+            status = DownloadStatus.Downloading,
+            localFileUri = publishedUri,
+            downloadedBytes = payload.size.toLong(),
+            totalBytes = payload.size.toLong(),
+            partialFileName = "recover (2).mkv.part",
+            supersededPartials = listOf(kept),
+            awaitingCheck = true,
+            publishedFileKey = publishedKey,
+        )
+        var stored = DownloadsCodec.encode(listOf(item), null)
+        DownloadsRepository.backend = object : DownloadsBackend {
+            override fun loadPayload() = stored
+            override fun savePayload(payload: String) { stored = payload }
+            override fun restoreItem(item: DownloadItem) = item
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (Long, Long?) -> Unit,
+                onSuccess: (String, Long?) -> Unit,
+                onFailure: (String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle = error("start should not be called for awaitingCheck recovery")
+            override fun inspectFile(localFileUri: String) =
+                DownloadedFileFacts(exists = true, sizeBytes = payload.size.toLong(), isVideoContainer = accept)
+            override fun removeJustPublished(localFileUri: String, fileKey: String?) =
+                DownloadsPlatformDownloader.removeJustPublished(localFileUri, fileKey) { path ->
+                    trashedPaths.add(path)
+                    world.trash.send(path)
+                }
+            override fun retireSupersededPartials(item: DownloadItem) =
+                DownloadsPlatformDownloader.retireSupersededPartials(item)
+            override fun removeFile(localFileUri: String?) = false
+            override fun removePartialFile(destinationFileName: String) = false
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String) = localFileUri
+        }
+
+        DownloadsRepository.ensureLoaded()
+        if (accept) {
+            awaitStatus(item.videoId, DownloadStatus.Completed)
+            assertTrue(retiredLatch.await(15, TimeUnit.SECONDS), "Superseded partial was not retired after restart recovery")
+            val deadline = System.currentTimeMillis() + 5_000L
+            while (System.currentTimeMillis() < deadline &&
+                DownloadsRepository.uiState.value.items.single().supersededPartials.isNotEmpty()
+            ) {
+                Thread.sleep(10)
+            }
+            val finalItem = DownloadsRepository.uiState.value.items.single()
+            val savedItem = DownloadsCodec.decode(stored)!!.items.single()
+            assertFalse(Files.exists(original))
+            assertTrue(original in trashedPaths)
+            assertTrue(finalItem.supersededPartials.isEmpty())
+            assertTrue(savedItem.supersededPartials.isEmpty())
+            assertTrue(Files.exists(published))
+        } else {
+            awaitStatus(item.videoId, DownloadStatus.Failed)
+            val finalItem = DownloadsRepository.uiState.value.items.single()
+            val savedItem = DownloadsCodec.decode(stored)!!.items.single()
+            assertFalse(Files.exists(published))
+            assertTrue(published in trashedPaths)
+            assertTrue(Files.exists(original))
+            assertContentEquals(originalBytes, Files.readAllBytes(original))
+            assertEquals(listOf(kept), finalItem.supersededPartials)
+            assertEquals(listOf(kept), savedItem.supersededPartials)
+        }
+    }
+
     private fun awaitStatus(key: String, target: DownloadStatus, matchLogicalKey: Boolean = false) {
         val deadline = System.currentTimeMillis() + 20_000L
         while (System.currentTimeMillis() < deadline) {

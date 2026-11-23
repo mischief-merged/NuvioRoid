@@ -93,6 +93,9 @@ internal expect object DownloadsPlatformDownloader {
     /** Moves this download's partial files to the Trash when they are still the ones it recorded. */
     fun retirePartial(item: DownloadItem): Boolean
 
+    /** Moves superseded partials of an accepted download to the Trash and returns their keys. */
+    fun retireSupersededPartials(item: DownloadItem): Set<String>
+
     fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String?
 
     fun openDownloadsDirectory(): Boolean

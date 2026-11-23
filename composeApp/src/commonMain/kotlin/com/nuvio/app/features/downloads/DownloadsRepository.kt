@@ -925,6 +925,15 @@ object DownloadsRepository {
                 val resumed = _uiState.value.items.filter { it.status == DownloadStatus.Downloading && it.id !in activeTransfers }
                 downloadsResumedAtLoad = downloadsResumedAtLoad + resumed.map { it.id }
                 resumed.forEach(::startDownload)
+                val completedWithKept = _uiState.value.items.filter { it.status == DownloadStatus.Completed && it.supersededPartials.isNotEmpty() }
+                if (completedWithKept.isNotEmpty()) {
+                    val retirementProfileId = loadedProfileId
+                    checkScope.launch {
+                        completedWithKept.forEach { completed ->
+                            retireCompletedSupersededPartials(completed, retirementProfileId)
+                        }
+                    }
+                }
                 // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
                 applyConnectionHold()
                 _catalogReady.value = true
@@ -1134,8 +1143,18 @@ object DownloadsRepository {
             transfer.digestVerified = item.publishedDigestVerified
             transfer.finishing = true
             checkScope.launch {
-                try { finishTransfer(item, transfer, item.localFileUri, item.totalBytes ?: item.downloadedBytes) }
-                finally { finishing.end(transfer) }
+                try {
+                    finishTransfer(
+                        item,
+                        transfer,
+                        item.localFileUri,
+                        item.totalBytes ?: item.downloadedBytes,
+                        retireSupersededOnAccept = true,
+                        transferProfileId = transferProfileId,
+                    )
+                } finally {
+                    finishing.end(transfer)
+                }
             }
             return
         }
@@ -1246,18 +1265,7 @@ object DownloadsRepository {
                     synchronized(stateLock) { transfer.completionAccepted && loadedProfileId == transferProfileId }
                 },
                 onSupersededPartialsRetired = { retiredKeys ->
-                    synchronized(stateLock) {
-                        if (!transfer.completionAccepted || loadedProfileId != transferProfileId) return@synchronized
-                        mutateItem(item.id) { current ->
-                            if (retiredKeys.isEmpty() || current.supersededPartials.isEmpty()) {
-                                current
-                            } else {
-                                current.copy(
-                                    supersededPartials = current.supersededPartials.filterNot { it.partialFileKey in retiredKeys },
-                                )
-                            }
-                        }
-                    }
+                    applyRetiredSupersededPartials(item.id, transferProfileId, retiredKeys, transfer)
                 },
             ),
             { downloadedBytes, totalBytes ->
@@ -1350,7 +1358,14 @@ object DownloadsRepository {
      * The frame look runs outside the state lock, while the transfer still owns the
      * download; the result is applied under the lock, and only if the transfer still owns it.
      */
-    private fun finishTransfer(item: DownloadItem, transfer: ActiveTransfer, localFileUri: String, totalBytes: Long?) {
+    private fun finishTransfer(
+        item: DownloadItem,
+        transfer: ActiveTransfer,
+        localFileUri: String,
+        totalBytes: Long?,
+        retireSupersededOnAccept: Boolean = false,
+        transferProfileId: Int? = loadedProfileId,
+    ) {
         transfer.finishing = true
         try {
             val saved = synchronized(stateLock) {
@@ -1360,7 +1375,7 @@ object DownloadsRepository {
                 else rememberPublished(item.id, transfer, localFileUri, totalBytes)
             }
             if (!saved) return
-            finishCheckedTransfer(item, transfer, localFileUri, totalBytes)
+            finishCheckedTransfer(item, transfer, localFileUri, totalBytes, retireSupersededOnAccept, transferProfileId)
         } catch (_: CancellationException) {
             // The saved final address stays available for the next check after a pause or quit.
         } finally {
@@ -1368,7 +1383,14 @@ object DownloadsRepository {
         }
     }
 
-    private fun finishCheckedTransfer(item: DownloadItem, transfer: ActiveTransfer, localFileUri: String, totalBytes: Long?) {
+    private fun finishCheckedTransfer(
+        item: DownloadItem,
+        transfer: ActiveTransfer,
+        localFileUri: String,
+        totalBytes: Long?,
+        retireSupersededOnAccept: Boolean = false,
+        transferProfileId: Int? = loadedProfileId,
+    ) {
         // A download is finished only when its file is there, has the size the server
         // announced and is a video. Anything else is a failed download without a file.
         val inspection = synchronized(stateLock) {
@@ -1468,7 +1490,49 @@ object DownloadsRepository {
         }
         // File moves and companion writes can wait on the file system, so they never hold the state lock.
         rejected?.let(::trashRejectedFile)
-        completedItem?.let { companions().saveAfterDownload(it, localFileUri) }
+        completedItem?.let { accepted ->
+            companions().saveAfterDownload(accepted, localFileUri)
+            if (retireSupersededOnAccept) {
+                retireCompletedSupersededPartials(accepted, transferProfileId, transfer)
+            }
+        }
+    }
+
+    private fun retireCompletedSupersededPartials(
+        item: DownloadItem,
+        transferProfileId: Int?,
+        transfer: ActiveTransfer? = null,
+    ) {
+        if (item.supersededPartials.isEmpty()) return
+        if (!ItemLocks.tryAcquire(item.id)) return
+        val retiredKeys = try {
+            backend.retireSupersededPartials(item)
+        } finally {
+            ItemLocks.release(item.id)
+        }
+        applyRetiredSupersededPartials(item.id, transferProfileId, retiredKeys, transfer)
+    }
+
+    private fun applyRetiredSupersededPartials(
+        downloadId: String,
+        transferProfileId: Int?,
+        retiredKeys: Set<String>,
+        transfer: ActiveTransfer? = null,
+    ) {
+        if (retiredKeys.isEmpty()) return
+        synchronized(stateLock) {
+            if (loadedProfileId != transferProfileId) return@synchronized
+            if (transfer != null && !transfer.completionAccepted) return@synchronized
+            mutateItem(downloadId) { current ->
+                if (current.status != DownloadStatus.Completed || current.supersededPartials.isEmpty()) {
+                    current
+                } else {
+                    current.copy(
+                        supersededPartials = current.supersededPartials.filterNot { it.partialFileKey in retiredKeys },
+                    )
+                }
+            }
+        }
     }
 
     /** No state lock while waiting for the Trash; keep the failed record if any guard or move refuses. */
@@ -2270,6 +2334,9 @@ internal interface DownloadsBackend {
         if (item.supersededPartials.isEmpty()) removePartialOf(item)
         else removePartialOf(item.copy(supersededPartials = emptyList()))
 
+    /** Moves superseded partials of an accepted download to the Trash and returns their keys. */
+    fun retireSupersededPartials(item: DownloadItem): Set<String> = emptySet()
+
     /** The location a new download goes to. Null where there are no locations. */
     fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? = null
 
@@ -2435,6 +2502,9 @@ private object PlatformDownloadsBackend : DownloadsBackend {
     override fun removeActivePartialOf(item: DownloadItem): Boolean =
         DownloadFolders.controller.removeActivePartialOf(item)
             ?: DownloadsPlatformDownloader.retirePartial(item.copy(supersededPartials = emptyList()))
+
+    override fun retireSupersededPartials(item: DownloadItem): Set<String> =
+        DownloadsPlatformDownloader.retireSupersededPartials(item)
 
     override fun placementFor(items: List<DownloadItem>, parentMetaId: String, isEpisode: Boolean): String? =
         DownloadFolders.controller.placementFor(items, parentMetaId, isEpisode)

@@ -540,6 +540,19 @@ internal actual object DownloadsPlatformDownloader {
         return allOut
     }
 
+    actual fun retireSupersededPartials(item: DownloadItem): Set<String> {
+        if (item.supersededPartials.isEmpty()) return emptySet()
+        val folders = DesktopDownloads.folders
+        val fallbackDir = folders.locations.locationOfRecord(item.locationId, item.localFileUri).path
+        return retireKeptPartials(
+            keptPartials = item.supersededPartials,
+            fallbackDir = fallbackDir,
+            downloadId = item.id,
+            folders = folders,
+            trashPartial = trashPartial ?: folders::moveToTrash,
+        )
+    }
+
     private fun trashOwnedAppPartial(item: DownloadItem, path: Path, expectedKey: String?): Boolean {
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return true
         if (Files.isSymbolicLink(path)) return false
@@ -1300,7 +1313,13 @@ private fun retireKeptPartials(
     val activeProfileId = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
     val retired = mutableSetOf<String>()
     keptPartials.forEach { kept ->
-        val dir = kept.locationId?.let { folders.locations.ownerOf(it, null)?.path } ?: fallbackDir
+        val dir = if (kept.locationId != null) {
+            val location = folders.locations.ownerOf(kept.locationId, null) ?: return@forEach
+            if (folders.locations.availability(location) != FolderAvailability.Available) return@forEach
+            location.path
+        } else {
+            fallbackDir
+        }
         val path = dir.resolve(kept.fileName)
         if (!Files.exists(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
             retired += kept.partialFileKey

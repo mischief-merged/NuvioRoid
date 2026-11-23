@@ -83,6 +83,8 @@ internal actual object DownloadsPlatformDownloader {
 
     actual fun retirePartial(item: DownloadItem): Boolean = removePartialFile(item.fileName)
 
+    actual fun retireSupersededPartials(item: DownloadItem): Set<String> = emptySet()
+
     actual fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? {
         localFileUri
             ?.toLocalFileOrNull()

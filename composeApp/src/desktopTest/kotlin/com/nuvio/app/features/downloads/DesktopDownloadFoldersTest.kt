@@ -528,4 +528,38 @@ class DesktopDownloadFoldersTest {
         assertTrue(fileOf(item).exists())
         assertFalse(folders.setDefault(world.root.resolve("not-there").toString()))
     }
+
+    @Test
+    fun moving_active_partial_off_an_external_folder_retains_the_folder_while_superseded_partials_remain_there() {
+        val first = world.driveLocation("One")
+        val second = world.driveLocation("Two")
+        val superseded = first.path.resolve("A S01E01.mp4.part").also { Files.write(it, ByteArray(1_024) { 1 }) }
+        val active = first.path.resolve("A S01E01 (2).mp4.part").also { Files.write(it, ByteArray(2_048) { 2 }) }
+        val item = episodeItem("A", 1, status = DownloadStatus.Paused, bytes = 2_048L).copy(
+            locationId = first.id,
+            partialFileName = active.fileName.toString(),
+            partialFileKey = DownloadMover.identityOf(active),
+            supersededPartials = listOf(
+                KeptPartialFile(superseded.fileName.toString(), DownloadMover.identityOf(superseded)!!, locationId = null),
+            ),
+        )
+        val hooks = Hooks(listOf(item))
+        val folders = controller(hooks)
+
+        val report = folders.move(setOf(item.id), second.path.toString())
+
+        assertEquals(1, report.moved)
+        assertTrue(second.path.resolve(active.fileName).exists())
+        assertTrue(superseded.exists())
+        assertTrue(first.id in world.locations.all().map { it.id }, "location holding superseded partial was forgotten")
+        val relocated = hooks.items().single()
+        assertEquals(first.id, relocated.supersededPartials.single().locationId)
+
+        // Once the superseded partial is retired and cleared from the record, the next move can forget the empty drive.
+        assertTrue(world.trash.send(superseded))
+        hooks.setList(hooks.profileId(), listOf(relocated.copy(supersededPartials = emptyList())))
+        folders.move(setOf(item.id), world.appFolder.toString())
+
+        assertFalse(first.id in world.locations.all().map { it.id })
+    }
 }

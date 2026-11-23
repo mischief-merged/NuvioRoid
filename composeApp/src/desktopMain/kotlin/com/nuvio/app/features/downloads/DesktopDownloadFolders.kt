@@ -567,6 +567,7 @@ internal class DesktopDownloadFolders(
     internal val records: MoveRecords = object : MoveRecords {
         override fun relocate(item: MoveItem, destinationId: String): RelocateResult =
             hooks.compareAndRelocate(item.profileId, item.itemId, { it.isAsPlanned(item) }) { record ->
+                val keptLocationFallback = record.locationId ?: DownloadLocations.AppId
                 record.copy(
                     locationId = destinationId,
                     localFileUri = if (record.status == DownloadStatus.Completed) item.newUri else record.localFileUri,
@@ -576,6 +577,13 @@ internal class DesktopDownloadFolders(
                         record.partialFileKey
                     } else {
                         item.main?.takeIf { it.kind == MoveKind.Partial }?.let { it.finalKey ?: it.tempKey } ?: record.partialFileKey
+                    },
+                    supersededPartials = if (record.status == DownloadStatus.Completed || record.supersededPartials.isEmpty()) {
+                        record.supersededPartials
+                    } else {
+                        record.supersededPartials.map { kept ->
+                            if (kept.locationId == null) kept.copy(locationId = keptLocationFallback) else kept
+                        }
                     },
                 )
             }
@@ -659,7 +667,14 @@ internal class DesktopDownloadFolders(
             )
             // A location that no record of any profile and no journal names is forgotten, after a move that ended normally.
             val journalled = mover.referencedLocations()
-            val used = hooks.allRecords()?.map { locations.locationOfRecord(it.locationId, it.localFileUri).id }?.toSet()
+            val used = hooks.allRecords()?.flatMapTo(mutableSetOf()) { record ->
+                buildList {
+                    add(locations.locationOfRecord(record.locationId, record.localFileUri).id)
+                    record.supersededPartials.forEach { kept ->
+                        kept.locationId?.let { add(locations.locationOfRecord(it, null).id) }
+                    }
+                }
+            }
             if (report.problem == null && journalled != null && used != null) locations.forgetExcept(used + journalled)
             return report.copy(
                 unreachable = planned.unreachable,
