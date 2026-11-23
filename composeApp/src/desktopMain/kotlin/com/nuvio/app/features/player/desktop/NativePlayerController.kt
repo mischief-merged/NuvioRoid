@@ -7,6 +7,7 @@ import com.nuvio.app.features.player.PlayerControlEpisodeItem
 import com.nuvio.app.features.player.PlayerControlFilterItem
 import com.nuvio.app.features.player.PlayerControlPartyState
 import com.nuvio.app.features.player.PlayerControlSeasonItem
+import com.nuvio.app.features.player.PlayerControlShortcutItem
 import com.nuvio.app.features.player.PlayerControlSourceItem
 import com.nuvio.app.features.player.PlayerControlSubtitleCueItem
 import com.nuvio.app.features.player.PlayerControlSubtitleLanguageItem
@@ -20,6 +21,7 @@ import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.PlayerEngineController
 import com.nuvio.app.features.player.PlayerMediaInfo
 import com.nuvio.app.features.player.mpvMediaInfo
+import com.nuvio.app.features.player.PlayerNowPlayingInfo
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MAX_MS
@@ -64,11 +66,16 @@ internal class NativePlayerController(
     },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
+    private val nativeSeekBy: (Long, Long) -> Unit = NativePlayerBridge::seekBy,
+    private val nativeUpdateControls: (Long, String) -> Unit = NativePlayerBridge::updateControls,
     private val isHostDisplayable: () -> Boolean = { host.isDisplayable },
     private val resolveHostView: () -> Long = { AwtNativeViewResolver.resolveNativeViewPointer(host) },
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
     private val onCreateWaitCompleted: () -> Unit = {},
+    private val hideTimerNowMs: () -> Long = System::currentTimeMillis,
+    private val hideTimerScheduler: DesktopTimerScheduler = SwingDesktopTimerScheduler,
+    private val setHostControlsVisible: (Boolean) -> Unit = host::setControlsVisible,
 ) : PlayerEngineController {
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
@@ -93,6 +100,8 @@ internal class NativePlayerController(
     private var currentNowPlayingTitle: String = ""
     private var currentNowPlayingSubtitle: String = ""
     private var currentArtworkUrl: String = ""
+    private var explicitNowPlayingMetadataSet: Boolean = false
+    private var fallbackHideTimer: DesktopPlayerHideTimer? = null
 
     @Volatile
     private var handle: Long = 0L
@@ -436,7 +445,12 @@ internal class NativePlayerController(
 
     @Synchronized
     fun updateControls(state: PlayerControlsState) {
-        host.setControlsVisible(state.controlsVisible)
+        val cursorVisible = DesktopPlayerHideTimer.computeDesktopCursorVisible(
+            controlsVisible = state.controlsVisible,
+            hasError = state.playbackErrorMessage.isNotBlank(),
+            isLoading = state.isLoading,
+        )
+        setHostControlsVisible(cursorVisible)
         val currentHandle = handle
         val current = currentHandle.takeIf { it != 0L } ?: run {
             controlsState = state
@@ -465,7 +479,7 @@ internal class NativePlayerController(
                 "speed=${stateWithVolume.playbackSpeedLabel} audioLabel=${stateWithVolume.audioLabel} " +
                 "subsLabel=${stateWithVolume.subtitlesLabel} fullscreen=$isFullscreen"
         }
-        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen, ::refreshControlsForImage))
+        nativeUpdateControls(current, stateWithVolume.toControlsJson(isFullscreen, ::refreshControlsForImage))
     }
 
     private fun refreshControlsForImage() {
@@ -508,6 +522,21 @@ internal class NativePlayerController(
             host.requestFocusInWindow()
             NativePlayerBridge.requestFocus(current)
         }
+    }
+
+    override fun updateNowPlayingMetadata(info: PlayerNowPlayingInfo) {
+        explicitNowPlayingMetadataSet = true
+        setNowPlayingMetadata(info.title, info.subtitle, info.artworkUrl)
+    }
+
+    override fun clearNowPlayingInfo() {
+        explicitNowPlayingMetadataSet = false
+        setNowPlayingMetadata("", "", "")
+    }
+
+    fun updatePresenceNowPlayingFallback(title: String?, subtitle: String?, artworkUrl: String?) {
+        if (explicitNowPlayingMetadataSet) return
+        setNowPlayingMetadata(title, subtitle, artworkUrl)
     }
 
     fun setNowPlayingMetadata(title: String?, subtitle: String?, artworkUrl: String?) {
@@ -557,11 +586,45 @@ internal class NativePlayerController(
             log.d { "event received handle=$handle type=$type value=$value" }
         }
         when (type) {
-            "cursorActivity" -> host.noteCursorActivity()
+            "cursorActivity" -> {
+                if (!onEvent(type, value)) {
+                    ensureFallbackHideTimer().onMouseMoved()
+                }
+            }
+            "keepChromeVisible" -> {
+                if (!onEvent(type, value)) {
+                    val timer = ensureFallbackHideTimer()
+                    if (value >= 0.5) {
+                        timer.onInteractionStarted()
+                    } else {
+                        if (timer.currentState().isPointerDown) {
+                            timer.onInteractionEnded()
+                        }
+                        timer.onMouseMoved()
+                    }
+                }
+            }
+            "chromeInteraction" -> {
+                if (!onEvent(type, value)) {
+                    val timer = ensureFallbackHideTimer()
+                    if (value >= 0.5) {
+                        timer.onInteractionStarted()
+                    } else {
+                        timer.onInteractionEnded()
+                    }
+                }
+            }
+            "hideChrome" -> {
+                setHostControlsVisible(false)
+                if (!onEvent(type, value)) {
+                    ensureFallbackHideTimer().onControlsHidden()
+                }
+            }
             "scrubChange" -> {
                 val handled = onScrubChange(value.toLong())
                 log.d { "scrubChange positionMs=${value.toLong()} handled=$handled handle=$handle" }
                 if (!handled) {
+                    ensureFallbackHideTimer().onScrubbingChanged(true)
                     updateLocalProgress(value.toLong())
                 }
             }
@@ -569,6 +632,7 @@ internal class NativePlayerController(
                 val scrubHandled = onScrubFinished(value.toLong())
                 log.d { "scrubFinish positionMs=${value.toLong()} handled=$scrubHandled handle=$handle" }
                 if (!scrubHandled) {
+                    ensureFallbackHideTimer().onScrubbingChanged(false)
                     seekTo(value.toLong())
                 }
             }
@@ -578,9 +642,32 @@ internal class NativePlayerController(
                 if (DesktopPlayerPictureInPicture.isEnabled) {
                     DesktopPlayerPictureInPicture.toggle()
                 } else {
-                    toggleDesktopAppFullscreen(SwingUtilities.getWindowAncestor(host))
+                    val targetWindow = SwingUtilities.getWindowAncestor(host)
+                    if (value >= 0.5) {
+                        exitDesktopAppFullscreen(targetWindow)
+                    } else {
+                        toggleDesktopAppFullscreen(targetWindow)
+                    }
                     onDesktopFullscreenChanged()
                 }
+            }
+            "mediaPlay",
+            "mediaPause" -> {
+                if (onEvent(type, value)) return
+                applyFallbackPlaybackState(play = type == "mediaPlay")
+            }
+            "mediaNext" -> {
+                if (onEvent(type, value)) return
+                fallbackSeekBy(10_000L)
+            }
+            "mediaPrevious" -> {
+                if (onEvent(type, value)) return
+                fallbackSeekBy(-10_000L)
+            }
+            "setPlaybackState",
+            "setPlaybackStateQuiet" -> {
+                if (onEvent(type, value)) return
+                applyFallbackPlaybackState(play = value >= 0.5)
             }
             "dragWindow" -> NativePlayerBridge.beginWindowDrag(handle)
             "volumeChange" -> setFallbackVolume(value.toFloat())
@@ -604,6 +691,34 @@ internal class NativePlayerController(
                 }
             }
         }
+    }
+
+    @Synchronized
+    private fun ensureFallbackHideTimer(): DesktopPlayerHideTimer {
+        fallbackHideTimer?.let { return it }
+        return DesktopPlayerHideTimer(
+            nowMs = hideTimerNowMs,
+            scheduler = hideTimerScheduler,
+        ) { hideState ->
+            val current = handle
+            if (current == 0L || releaseRequested) return@DesktopPlayerHideTimer
+            SwingUtilities.invokeLater {
+                if (!releaseRequested && controlsState.controlsVisible != hideState.controlsVisible) {
+                    updateControls(controlsState.copy(controlsVisible = hideState.controlsVisible))
+                } else if (!releaseRequested) {
+                    setHostControlsVisible(hideState.cursorVisible)
+                }
+            }
+        }.also { fallbackHideTimer = it }
+    }
+
+    private fun applyFallbackPlaybackState(play: Boolean) {
+        val current = handle
+        if (current == 0L) return
+        if (play && NativePlayerBridge.isEnded(current)) {
+            NativePlayerBridge.seekTo(current, 0L)
+        }
+        NativePlayerBridge.setPaused(current, !play)
     }
 
     @Synchronized
@@ -720,7 +835,7 @@ internal class NativePlayerController(
     private fun fallbackSeekBy(offsetMs: Long) {
         val current = handle
         if (current != 0L) {
-            NativePlayerBridge.seekBy(current, offsetMs)
+            nativeSeekBy(current, offsetMs)
         }
     }
 
@@ -870,6 +985,8 @@ internal class NativePlayerController(
     }
 
     fun dispose() {
+        fallbackHideTimer?.dispose()
+        fallbackHideTimer = null
         host.resetCursorVisibility()
         val accepted = synchronized(lifecycleLock) {
             if (releaseRequested) {
@@ -892,6 +1009,8 @@ internal class NativePlayerController(
     }
 
     private fun invalidateForRelease() {
+        fallbackHideTimer?.dispose()
+        fallbackHideTimer = null
         cancelPendingAttachment()
         host.onCursorActivity = null
         onAction = { false }
@@ -1012,7 +1131,7 @@ internal class NativePlayerController(
 
     override fun seekBy(offsetMs: Long) {
         log.d { "seekBy offsetMs=$offsetMs handle=$handle" }
-        handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekBy(it, offsetMs) }
+        handle.takeIf { it != 0L }?.let { nativeSeekBy(it, offsetMs) }
     }
 
     override fun retry() {
@@ -1631,6 +1750,8 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         append(',')
         appendJsonField("isInPip", DesktopPlayerPictureInPicture.isEnabled)
         append(',')
+        appendJsonField("isLocked", isLocked)
+        append(',')
         appendJsonField("controlsVisible", controlsVisible)
         append(',')
         appendJsonArrayField("parentalWarnings", parentalWarnings) { appendParentalWarningJson(it) }
@@ -1801,6 +1922,22 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRea
         appendJsonField("autoSyncedLabel", autoSyncedLabel)
         append(',')
         appendJsonField("streamInfoLabel", streamInfoLabel)
+        append(',')
+        appendJsonField("shortcutsLabel", shortcutsLabel)
+        append(',')
+        appendJsonField("shortcutsGroupPlaybackLabel", shortcutsGroupPlaybackLabel)
+        append(',')
+        appendJsonField("shortcutsGroupNavigationLabel", shortcutsGroupNavigationLabel)
+        append(',')
+        val resolvedShortcutItems = shortcutsItems.ifEmpty {
+            defaultDesktopPlayerShortcuts().toControlShortcutItems()
+        }
+        appendJsonArrayField("shortcutsItems", resolvedShortcutItems) { shortcut ->
+            append("{\"keys\":").append(shortcut.keys.toJsonString())
+            append(",\"label\":").append(shortcut.label.toJsonString())
+            append(",\"group\":").append(shortcut.group.toJsonString())
+            append('}')
+        }
         append(',')
         appendJsonArrayField("streamInfoSections", streamInfoSections) { section ->
             append("{\"title\":").append(section.title.toJsonString())

@@ -1545,8 +1545,9 @@ object DownloadsRepository {
         return synchronized(stateLock) {
             val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return false
             if (item.status != DownloadStatus.Completed) return false
-            // A move has the item: its file is in the middle of changing places, which is not a file that is lost.
-            if (!ItemLocks.tryAcquire(downloadId)) return true
+            // A move has the item. Its file is in the middle of changing places, so this check cannot
+            // say the file is lost, and it also cannot say the file is playable.
+            if (!ItemLocks.tryAcquire(downloadId)) return false
             try {
                 val checked = item.withoutLostFile()
                 if (checked.status == DownloadStatus.Completed) return true

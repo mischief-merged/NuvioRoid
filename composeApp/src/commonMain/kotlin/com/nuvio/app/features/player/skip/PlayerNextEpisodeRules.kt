@@ -9,6 +9,29 @@ object PlayerNextEpisodeRules {
         videos: List<MetaVideo>,
         currentSeason: Int?,
         currentEpisode: Int?,
+    ): MetaVideo? = resolveAdjacentEpisode(
+        videos = videos,
+        currentSeason = currentSeason,
+        currentEpisode = currentEpisode,
+        offset = 1,
+    )
+
+    fun resolvePreviousEpisode(
+        videos: List<MetaVideo>,
+        currentSeason: Int?,
+        currentEpisode: Int?,
+    ): MetaVideo? = resolveAdjacentEpisode(
+        videos = videos,
+        currentSeason = currentSeason,
+        currentEpisode = currentEpisode,
+        offset = -1,
+    )
+
+    private fun resolveAdjacentEpisode(
+        videos: List<MetaVideo>,
+        currentSeason: Int?,
+        currentEpisode: Int?,
+        offset: Int,
     ): MetaVideo? {
         if (currentSeason == null || currentEpisode == null) return null
         val sortedEpisodes = videos
@@ -22,7 +45,7 @@ object PlayerNextEpisodeRules {
             it.season == currentSeason && it.episode == currentEpisode
         }
         if (currentIndex < 0) return null
-        return sortedEpisodes.getOrNull(currentIndex + 1)
+        return sortedEpisodes.getOrNull(currentIndex + offset)
     }
 
     fun shouldShowNextEpisodeCard(
@@ -187,3 +210,45 @@ object PlayerNextEpisodeRules {
 internal expect fun currentDateComponents(): DateComponents
 
 data class DateComponents(val year: Int, val month: Int, val day: Int)
+
+internal enum class MediaTrackCommand {
+    NEXT,
+    PREVIOUS,
+}
+
+internal enum class MediaTrackResolution {
+    SWITCH_NEXT_EPISODE,
+    SWITCH_PREVIOUS_EPISODE,
+    IGNORE_WHILE_SWITCHING,
+    SEEK_FORWARD,
+    SEEK_BACKWARD,
+}
+
+/**
+ * Resolves hardware/Control Center Next/Previous media commands to episode
+ * switching when watching a series with an adjacent playable episode, falling
+ * back to ±10 s seek for movies or series boundaries.
+ */
+internal fun resolveMediaTrackCommand(
+    command: MediaTrackCommand,
+    isSeries: Boolean,
+    hasPlayableNextEpisode: Boolean,
+    hasPlayablePreviousEpisode: Boolean,
+    isEpisodeSwitchInProgress: Boolean,
+): MediaTrackResolution {
+    if (isSeries && isEpisodeSwitchInProgress) {
+        return MediaTrackResolution.IGNORE_WHILE_SWITCHING
+    }
+    return when (command) {
+        MediaTrackCommand.NEXT -> if (isSeries && hasPlayableNextEpisode) {
+            MediaTrackResolution.SWITCH_NEXT_EPISODE
+        } else {
+            MediaTrackResolution.SEEK_FORWARD
+        }
+        MediaTrackCommand.PREVIOUS -> if (isSeries && hasPlayablePreviousEpisode) {
+            MediaTrackResolution.SWITCH_PREVIOUS_EPISODE
+        } else {
+            MediaTrackResolution.SEEK_BACKWARD
+        }
+    }
+}

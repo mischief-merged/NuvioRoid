@@ -257,9 +257,9 @@ class DownloadLocationsRepositoryTest {
         try {
             assertEquals(DownloadDeleteResult.Moving, DownloadsRepository.deleteDownload(item.id))
             assertEquals(AutoDownloadRemovalResult.Busy, DownloadsRepository.removeWatchedAutoDownload(item.id, rule))
-            // A file in the middle of changing places is not a lost file.
+            // A file in the middle of changing places is not a lost file, and a busy check is not a pass.
             java.nio.file.Files.delete(java.nio.file.Paths.get(java.net.URI(item.localFileUri!!)))
-            assertTrue(DownloadsRepository.verifyCompletedDownload(item.id))
+            assertFalse(DownloadsRepository.verifyCompletedDownload(item.id))
             DownloadsRepository.cancelDownload(item.id)
         } finally {
             ItemLocks.release(item.id)

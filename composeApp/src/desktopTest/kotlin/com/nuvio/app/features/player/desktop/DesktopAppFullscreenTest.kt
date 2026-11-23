@@ -61,4 +61,36 @@ class DesktopAppFullscreenTest {
             updates,
         )
     }
+
+    @Test
+    fun `exitDesktopAppFullscreen only toggles when currently fullscreen`() {
+        var fullscreen = false
+        var toggleCalls = 0
+        val unregister = registerDesktopAppFullscreenToggle(
+            handler = {
+                toggleCalls += 1
+                fullscreen = !fullscreen
+            },
+            isFullscreen = { fullscreen },
+        )
+        try {
+            val initialChanges = desktopFullscreenChanges.value
+            exitDesktopAppFullscreen()
+            assertEquals(0, toggleCalls)
+            assertEquals(false, fullscreen)
+
+            fullscreen = true
+            notifyDesktopAppFullscreenChanged()
+            assertEquals(initialChanges + 1, desktopFullscreenChanges.value)
+
+            // Wait for Swing invokeLater if needed, or verify synchronously on EDT.
+            javax.swing.SwingUtilities.invokeAndWait {
+                exitDesktopAppFullscreen()
+            }
+            assertEquals(1, toggleCalls)
+            assertEquals(false, fullscreen)
+        } finally {
+            unregister()
+        }
+    }
 }

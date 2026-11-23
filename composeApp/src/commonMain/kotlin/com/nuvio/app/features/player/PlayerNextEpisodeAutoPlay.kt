@@ -21,10 +21,14 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.watching.domain.isShortPlaceholderDuration
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
@@ -61,12 +65,20 @@ internal fun PlayerScreenRuntime.isAtNextEpisodeThreshold(): Boolean {
 }
 
 internal fun PlayerScreenRuntime.cancelNextEpisodeAutoPlay() {
-    nextEpisodeAutoPlayJob?.cancel()
-    nextEpisodeAutoPlayJob = null
-    nextEpisodeAutoPlayAutomatic = false
-    nextEpisodeAutoPlaySearching = false
-    nextEpisodeAutoPlaySourceName = null
-    nextEpisodeAutoPlayCountdown = null
+    val (autoPlay, pending) = synchronized(episodeSwitchLock) {
+        val autoPlay = nextEpisodeAutoPlayJob
+        val pending = downloadedEpisodeSwitch
+        nextEpisodeAutoPlayJob = null
+        downloadedEpisodeSwitch = null
+        nextEpisodeAutoPlayAutomatic = false
+        nextEpisodeAutoPlaySearching = false
+        nextEpisodeAutoPlaySourceName = null
+        nextEpisodeAutoPlayCountdown = null
+        nextEpisodeAutoPlayTarget = null
+        autoPlay to pending
+    }
+    autoPlay?.cancel()
+    if (pending != null && pending.job !== autoPlay) pending.job.cancel()
 }
 
 internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
@@ -86,29 +98,31 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
     onSourceNameChanged: (String?) -> Unit,
     onCountdownChanged: (Int?) -> Unit,
     onNextEpisodeCardVisibleChanged: (Boolean) -> Unit,
+    isOffline: () -> Boolean = ::isNetworkOffline,
+    findDownloadedEpisode: (MetaVideo) -> DownloadItem? = { video ->
+        DownloadsRepository.findPlayableDownload(parentMetaId, video.season, video.episode, video.id)
+    },
+    verifyDownloadedEpisode: suspend (DownloadItem) -> Boolean = { item ->
+        DownloadsRepository.verifyCompletedDownload(item.id)
+    },
+    onDownloadVerificationJob: (Job) -> Unit = {},
+    onOfflineDownloadDeclined: () -> Unit = {},
 ): Job? {
     val nextVideoId = nextEpisodeInfo?.videoId ?: return null
     val nextVideo = allEpisodes.firstOrNull { video -> video.id == nextVideoId } ?: return null
     if (nextEpisodeInfo.hasAired != true) return null
 
-    val downloadedNextEpisode = DownloadsRepository.findPlayableDownload(
-        parentMetaId = parentMetaId,
-        seasonNumber = nextVideo.season,
-        episodeNumber = nextVideo.episode,
-        videoId = nextVideo.id,
-    )
-    if (downloadedNextEpisode != null) {
-        onDownloadedEpisodeSelected(downloadedNextEpisode, nextVideo)
-        return null
-    }
-
-    // Offline: the auto-play fan-out is a network search, so skip it entirely.
-    if (isNetworkOffline()) return null
+    val hasDownload = findDownloadedEpisode(nextVideo) != null
+    // Offline with nothing saved: there is no network search to start, and no file to check.
+    if (!hasDownload && isOffline()) return null
 
     previousJob?.cancel()
-    onSearchingChanged(true)
-    onSourceNameChanged(null)
-    onCountdownChanged(null)
+    // A saved file is checked before it is chosen. Searching starts only once that file is ruled out.
+    if (!hasDownload) {
+        onSearchingChanged(true)
+        onSourceNameChanged(null)
+        onCountdownChanged(null)
+    }
 
     val type = contentType ?: parentMetaType
     val shouldAutoSelectInManualMode =
@@ -151,9 +165,29 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
         null
     }
 
-    return launch {
+    val job = launch(start = CoroutineStart.LAZY) {
+        if (hasDownload) {
+            val candidate = findDownloadedEpisode(nextVideo)
+            val verified = if (candidate != null && withContext(Dispatchers.IO) { verifyDownloadedEpisode(candidate) }) {
+                candidate
+            } else {
+                null
+            }
+            if (verified != null) {
+                onDownloadedEpisodeSelected(verified, nextVideo)
+                return@launch
+            }
+            if (isOffline()) {
+                if (isActive) onOfflineDownloadDeclined()
+                return@launch
+            }
+            onSearchingChanged(true)
+            onSourceNameChanged(null)
+            onCountdownChanged(null)
+        }
+
         // Connectivity may have dropped between the request and the actual search.
-        if (isNetworkOffline()) {
+        if (isOffline()) {
             onSearchingChanged(false)
             return@launch
         }
@@ -346,6 +380,9 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
             onNextEpisodeCardVisibleChanged(false)
         }
     }
+    if (hasDownload) onDownloadVerificationJob(job)
+    job.start()
+    return job
 }
 
 internal fun isNextEpisodeBingeGroupOnly(settings: PlayerSettingsUiState): Boolean {

@@ -348,6 +348,16 @@ data class PlayerControlsState(
     val sleepTimerRemainingLabel: String = "",
     val sleepTimerFading: Boolean = false,
     val sleepTimerActive: Boolean = false,
+    val shortcutsLabel: String = "Keyboard shortcuts",
+    val shortcutsGroupPlaybackLabel: String = "Playback",
+    val shortcutsGroupNavigationLabel: String = "Navigation",
+    val shortcutsItems: List<PlayerControlShortcutItem> = emptyList(),
+)
+
+data class PlayerControlShortcutItem(
+    val keys: String = "",
+    val label: String = "",
+    val group: String = "playback",
 )
 
 data class PlayerControlFilterItem(
