@@ -860,7 +860,7 @@ class NativePlayerControllerTeardownTest {
 
         val second = NativePlayerController(
             host = NativePlayerHost(),
-            nativeCreate = { _, source, _, _, _, _, _, _, _ ->
+            nativeCreate = { _, source, _, _, _, _, _, _, _, _ ->
                 events += "create-$source"
                 secondCreated.countDown()
                 202L
@@ -912,7 +912,7 @@ class NativePlayerControllerTeardownTest {
 
         val first = NativePlayerController(
             host = NativePlayerHost(),
-            nativeCreate = { _, _, _, _, _, _, _, _, _ ->
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ ->
                 events += "create-1-start"
                 firstCreateStarted.countDown()
                 allowFirstCreate.await()
@@ -926,7 +926,7 @@ class NativePlayerControllerTeardownTest {
         )
         val second = NativePlayerController(
             host = NativePlayerHost(),
-            nativeCreate = { _, _, _, _, _, _, _, _, _ ->
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ ->
                 events += "create-2"
                 secondCreated.countDown()
                 222L
@@ -1056,6 +1056,7 @@ class NativePlayerControllerTeardownTest {
                 controlsPageUrl: String,
                 decoderPriority: Int,
                 nvidiaRtxSuperResolutionEnabled: Boolean,
+                nvidiaRtxHdrEnabled: Boolean,
                 eventSink: NativePlayerEventSink,
                 inMiniPlayer: Boolean,
                 remoteCommandsEnabled: Boolean,
