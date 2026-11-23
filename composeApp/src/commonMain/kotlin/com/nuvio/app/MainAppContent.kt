@@ -153,6 +153,7 @@ import com.nuvio.app.features.player.PlayerLaunchStore
 import com.nuvio.app.features.player.PlayerSessionController
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.SubtitleLanguageOption
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.player.completeExternalPlayback
 import com.nuvio.app.features.player.launchPreparedExternalPlayback
 import com.nuvio.app.features.player.prepareExternalPlayerLaunch
@@ -992,7 +993,13 @@ internal fun MainAppContent(
             }
         }
 
-        fun launchLocalPlayer(playerLaunch: PlayerLaunch) {
+        suspend fun launchLocalPlayer(savedLaunch: PlayerLaunch) {
+            // The saved subtitle files are checked and the preferred one picked before playback starts
+            // inside the active preparation job so cancel and new selections still apply.
+            val playerLaunch = prepareLocalPlayerLaunch(
+                savedLaunch = savedLaunch,
+                settings = playerSettingsUiState,
+            )
             if (externalPlayerSupported && playerSettingsUiState.externalPlayerEnabled) {
                 playerSessionController.launchExternalOrAskToReplace(
                     launch = playerLaunch,
@@ -1074,13 +1081,24 @@ internal fun MainAppContent(
             resumePositionMs: Long?,
             resumeProgressFraction: Float?,
             startFromBeginning: Boolean,
-        ): Boolean =
-            when (
-                val resolved = CloudLibraryRepository.resolvePlayback(
-                    item = item,
-                    file = file,
-                )
-            ) {
+        ): Boolean {
+            val cloudVideoId = item.playbackVideoId(file)
+            val (resolved, preparedSubtitles) = SubtitleStartupCoordinator.prepareStreamInParallelWithSource(
+                request = com.nuvio.app.features.player.StartupSubtitleRequest(
+                    type = CloudLibraryContentType,
+                    videoId = cloudVideoId,
+                    parentMetaId = item.stableKey,
+                    settings = playerSettingsUiState,
+                    filename = file.name,
+                ),
+                resolveSource = {
+                    CloudLibraryRepository.resolvePlayback(
+                        item = item,
+                        file = file,
+                    )
+                },
+            )
+            return when (resolved) {
                 is CloudLibraryPlaybackResult.Success -> {
                     val playbackTitle = resolved.filename
                         ?.takeIf { it.isNotBlank() }
@@ -1089,6 +1107,8 @@ internal fun MainAppContent(
                         profileId = activePlaybackProfileId,
                         title = playbackTitle,
                         sourceUrl = resolved.url,
+                        externalSubtitles = preparedSubtitles.subtitles,
+                        startupSubtitleSelection = preparedSubtitles.selection,
                         streamTitle = playbackTitle,
                         streamSubtitle = item.name.takeIf { it != playbackTitle },
                         providerName = item.providerName,
@@ -1112,6 +1132,7 @@ internal fun MainAppContent(
 
                 else -> false
             }
+        }
 
         suspend fun launchCloudLibraryFile(
             item: CloudLibraryItem,
@@ -1198,6 +1219,7 @@ internal fun MainAppContent(
                     episodeNumber = episodeNumber,
                 )
             ) {
+                playbackPreparation.cancel()
                 return
             }
             val targetResumePositionMs = if (startFromBeginning) 0L else (resumePositionMs ?: 0L)
@@ -1495,6 +1517,7 @@ internal fun MainAppContent(
         val openContinueWatching: (ContinueWatchingItem, Boolean, Boolean) -> Unit = { item, manualSelection, startFromBeginning ->
             resumePromptItem = null
             if (item.isCloudLibraryContinueWatchingItem()) {
+                playbackPreparation.cancel()
                 coroutineScope.launch {
                     when (
                         val lookup = CloudLibraryRepository.findPlaybackTargetForProgressResult(

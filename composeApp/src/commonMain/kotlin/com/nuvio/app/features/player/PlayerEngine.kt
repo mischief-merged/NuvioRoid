@@ -32,6 +32,7 @@ interface PlayerEngineController {
     fun setSubtitleUri(url: String)
     fun clearExternalSubtitle()
     fun clearExternalSubtitleAndSelect(trackIndex: Int)
+    fun setOnExternalSubtitleLoadFailed(listener: ((String) -> Unit)?) {}
     fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean = false) {}
     fun applySubtitlePreferences(
         preferredLanguage: String,
@@ -482,6 +483,8 @@ internal fun sanitizePlaybackResponseHeaders(headers: Map<String, String>?): Map
     }
     return sanitized
 }
+
+internal val LocalStartupSubtitlePlan = androidx.compose.runtime.staticCompositionLocalOf<StartupSubtitleSelection?> { null }
 
 @Composable
 expect fun PlatformPlayerSurface(

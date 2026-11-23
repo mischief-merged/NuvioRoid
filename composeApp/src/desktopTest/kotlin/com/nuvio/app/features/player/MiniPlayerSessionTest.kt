@@ -660,6 +660,11 @@ class MiniPlayerSessionTest {
             )
         }
         compose.waitForIdle()
+        // The episode changes once its subtitles are ready, so run the player's work and wait for the switch.
+        compose.waitUntil(5_000L) {
+            testDispatcher.scheduler.advanceUntilIdle()
+            harness.runtime.activeEpisodeNumber == 2
+        }
 
         compose.runOnIdle {
             harness.runtime.playerController = harness.controller
@@ -2455,6 +2460,10 @@ class MiniPlayerSessionTest {
             )
         }
         compose.waitForIdle()
+        compose.waitUntil(5_000L) {
+            testDispatcher.scheduler.advanceUntilIdle()
+            harness.runtime.activeEpisodeNumber == 2
+        }
 
         val afterMinimizedSwitch = runBlocking {
             withTimeout(5_000L) {

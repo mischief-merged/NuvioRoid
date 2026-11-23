@@ -157,6 +157,8 @@ private fun NativePlayerSurface(
     val hostFirstFullSizePaintComplete = remember { mutableStateOf(nativeHooks.forceHostReady) }
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestExternalSubtitles = rememberUpdatedState(externalSubtitles)
+    val startupSubtitleSelection = LocalStartupSubtitlePlan.current
+    val latestStartupSelection = rememberUpdatedState(startupSubtitleSelection)
     val latestPlayerControlsState = rememberUpdatedState(playerControlsState)
     val autoSyncScope = rememberCoroutineScope()
     // Kept across sources so its message count, part of the overlay's notification token, only grows.
@@ -296,12 +298,30 @@ private fun NativePlayerSurface(
             decoderPriority = decoderPriority,
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
             nvidiaRtxHdrEnabled = nvidiaRtxHdrEnabled,
+            externalSubtitles = latestExternalSubtitles.value,
+            startupSubtitleSelection = latestStartupSelection.value,
             onError = { message -> latestOnError.value(message) },
         )
         initialPositionRequestKey?.let { key ->
             latestOnInitialPositionHandled.value(key, initialPositionMs > 0L)
         }
         onControllerReady(readyController)
+    }
+
+    LaunchedEffect(
+        controller,
+        sourceAvailable,
+        hostFirstFullSizePaintComplete.value,
+        sourceUrl,
+        externalSubtitles,
+        startupSubtitleSelection,
+    ) {
+        if (!sourceAvailable || !hostFirstFullSizePaintComplete.value) return@LaunchedEffect
+        controller.applyStartupSubtitlesIfNeeded(
+            sourceUrl = sourceUrl,
+            externalSubtitles = externalSubtitles,
+            startupSubtitleSelection = startupSubtitleSelection,
+        )
     }
 
     LaunchedEffect(controller, sourceAvailable, playWhenReady) {

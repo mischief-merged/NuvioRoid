@@ -203,6 +203,15 @@ static NSString *NuvioPlaybackNetwork(void) {
 - (void)setAudioLanguages:(NSString *)languages;
 - (void)selectSubtitleTrackId:(int)trackId;
 - (void)addSubtitleUrl:(NSString *)url;
+- (void)addSubtitleTrack:(NSString *)url
+                   title:(NSString *)title
+                language:(NSString *)language
+                  select:(BOOL)select;
+- (void)configureStartupSubtitlesWithUrls:(NSArray<NSString *> *)urls
+                                   titles:(NSArray<NSString *> *)titles
+                                languages:(NSArray<NSString *> *)languages
+                            selectedIndex:(int)selectedIndex
+                        disableAutoSelect:(BOOL)disableAutoSelect;
 - (void)removeExternalSubtitles;
 - (void)removeExternalSubtitlesAndSelect:(int)trackId;
 - (void)setSubtitleDelayMs:(int)delayMs;
@@ -1210,6 +1219,12 @@ static __weak MpvWebPlayer *gRemoteCommandOwner = nil;
     // Drains mpv's event queue (property observations, async replies, log lines).
     dispatch_queue_t _mpvDrainQueue;
     std::atomic_bool _mpvDrainStopped;
+    std::atomic_bool _shuttingDown;
+    std::mutex _startupSubtitleLock;
+    BOOL _fileLoaded;
+    BOOL _startupSubtitlesApplied;
+    NSArray<NSDictionary *> *_pendingStartupSubtitles;
+    BOOL _disableAutoSubtitleSelection;
     // True once mpv reports current-ao == avfoundation. That AO buffers deeply
     // inside AVSampleBufferAudioRenderer, so softvol changes lag; its own
     // renderer volume (ao-volume) applies instantly.
@@ -1314,6 +1329,11 @@ static char kPlayerUiQueueKey;
     _mpvDrainQueue = dispatch_queue_create("com.nuvio.desktop.mpv-drain", DISPATCH_QUEUE_SERIAL);
     _mpvDrainStopped.store(false);
     _certificateFailureSeen.store(false);
+    _shuttingDown.store(false);
+    _fileLoaded = NO;
+    _startupSubtitlesApplied = NO;
+    _pendingStartupSubtitles = nil;
+    _disableAutoSubtitleSelection = NO;
     _aoIsAvfoundation.store(false);
     _requestedVolumePercent.store(100.0);
     _javaVm = javaVm;
@@ -2395,6 +2415,7 @@ static char kPlayerUiQueueKey;
 }
 
 - (void)shutdown {
+    _shuttingDown.store(true);
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self cancelSyncTimer];
     _activeSyncTimerInterval.store(0.0);
@@ -2412,10 +2433,10 @@ static char kPlayerUiQueueKey;
     [self deactivateRemoteCommands];
     _controlsWebReady = NO;
     _pendingControlsJson = nil;
+    [self stopMpvEventDrain];
     if (_mpvEventQueue) {
         dispatch_sync(_mpvEventQueue, ^{});
     }
-    [self stopMpvEventDrain];
     [_trustBanner removeFromSuperview]; _trustBanner = nil;
     [_videoView destroyMpvRenderContext];
     if (_mpv) {
@@ -2595,6 +2616,29 @@ static constexpr uint64_t kObserveAoUserdata = 2;
                 }
                 break;
             }
+            case MPV_EVENT_FILE_LOADED: {
+                NSArray<NSDictionary *> *items = nil;
+                BOOL disableAuto = NO;
+                BOOL shouldApply = NO;
+                {
+                    std::lock_guard<std::mutex> guard(_startupSubtitleLock);
+                    _fileLoaded = YES;
+                    if (!_startupSubtitlesApplied && (_pendingStartupSubtitles != nil || _disableAutoSubtitleSelection)) {
+                        items = _pendingStartupSubtitles;
+                        disableAuto = _disableAutoSubtitleSelection;
+                        _startupSubtitlesApplied = YES;
+                        shouldApply = YES;
+                    }
+                }
+                if (shouldApply) {
+                    [self enqueueMpvBlock:^(mpv_handle *loadedMpv) {
+                        [self applyStartupSubtitlesOnMpv:loadedMpv items:items disableAutoSelect:disableAuto];
+                    }];
+                } else {
+                    [self triggerSyncControlsAsync];
+                }
+                break;
+            }
             case MPV_EVENT_PROPERTY_CHANGE: {
                 if (event->reply_userdata == kObserveAoUserdata) {
                     mpv_event_property *prop = (mpv_event_property *)event->data;
@@ -2651,6 +2695,12 @@ static constexpr uint64_t kObserveAoUserdata = 2;
     _allowUnverified = YES;
     _certificateFailureSeen = NO;
     [self showTrustBanner];
+    {
+        // The reload drops the subtitle tracks added at startup, so the next file-loaded event adds them again.
+        std::lock_guard<std::mutex> guard(_startupSubtitleLock);
+        _fileLoaded = NO;
+        _startupSubtitlesApplied = NO;
+    }
     char start[64];
     snprintf(start, sizeof(start), "start=%.3f", fmax(_initialStartSeconds, _cachedPositionSeconds.load()));
     const char *load[] = {"loadfile", _playbackSource.UTF8String, "replace", "-1", start, nullptr};
@@ -2898,6 +2948,118 @@ static constexpr uint64_t kObserveAoUserdata = 2;
     return [self tracksJsonForType:@"sub"];
 }
 
+- (void)enqueueMpvBlock:(void (^)(mpv_handle *mpv))block {
+    if (!block || _shuttingDown.load()) return;
+    dispatch_queue_t queue = _mpvEventQueue;
+    if (!queue) return;
+    dispatch_async(queue, ^{
+        @autoreleasepool {
+            mpv_handle *mpv = self->_mpv;
+            if (!mpv || self->_shuttingDown.load()) return;
+            block(mpv);
+        }
+    });
+}
+
+- (void)triggerSyncControlsAsync {
+    if (_shuttingDown.load()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self->_shuttingDown.load()) {
+            [self syncControls];
+        }
+    });
+}
+
+- (void)addSubtitleTrackOnMpv:(mpv_handle *)mpv
+                          url:(NSString *)url
+                        title:(NSString *)title
+                     language:(NSString *)language
+                       select:(BOOL)select {
+    if (!mpv || url.length == 0) return;
+    std::string urlStr = url.UTF8String ?: "";
+    if (urlStr.empty()) return;
+    std::string flagStr = select ? "select" : "cached";
+    std::string titleStr = (title ?: @"").UTF8String ?: "";
+    std::string langStr = (language ?: @"").UTF8String ?: "";
+    std::vector<const char *> args = {"sub-add", urlStr.c_str(), flagStr.c_str()};
+    if (!titleStr.empty() || !langStr.empty()) {
+        args.push_back(titleStr.c_str());
+    }
+    if (!langStr.empty()) {
+        args.push_back(langStr.c_str());
+    }
+    args.push_back(nullptr);
+    mpv_command(mpv, args.data());
+}
+
+- (void)applyStartupSubtitlesOnMpv:(mpv_handle *)mpv
+                             items:(NSArray<NSDictionary *> *)items
+                 disableAutoSelect:(BOOL)disableAutoSelect {
+    if (!mpv) return;
+    BOOL selectedAny = NO;
+    for (NSDictionary *item in items) {
+        BOOL select = [item[@"select"] boolValue];
+        if (!select) {
+            [self addSubtitleTrackOnMpv:mpv
+                                    url:item[@"url"]
+                                  title:item[@"title"]
+                               language:item[@"language"]
+                                 select:NO];
+        }
+    }
+    for (NSDictionary *item in items) {
+        BOOL select = [item[@"select"] boolValue];
+        if (select) {
+            selectedAny = YES;
+            [self addSubtitleTrackOnMpv:mpv
+                                    url:item[@"url"]
+                                  title:item[@"title"]
+                               language:item[@"language"]
+                                 select:YES];
+        }
+    }
+    if (!selectedAny && disableAutoSelect) {
+        mpv_set_property_string(mpv, "sid", "no");
+    }
+    [self triggerSyncControlsAsync];
+    [self sendPlayerEvent:@"tracksChanged" value:0.0];
+}
+
+- (void)configureStartupSubtitlesWithUrls:(NSArray<NSString *> *)urls
+                                   titles:(NSArray<NSString *> *)titles
+                                languages:(NSArray<NSString *> *)languages
+                            selectedIndex:(int)selectedIndex
+                        disableAutoSelect:(BOOL)disableAutoSelect {
+    NSMutableArray<NSDictionary *> *items = [NSMutableArray arrayWithCapacity:urls.count];
+    for (NSUInteger i = 0; i < urls.count; i++) {
+        NSString *url = urls[i];
+        if (url.length == 0) continue;
+        NSString *title = i < titles.count ? (titles[i] ?: @"") : @"";
+        NSString *lang = i < languages.count ? (languages[i] ?: @"") : @"";
+        [items addObject:@{
+            @"url": url,
+            @"title": title,
+            @"language": lang,
+            @"select": @(selectedIndex >= 0 && (NSUInteger)selectedIndex == i),
+        }];
+    }
+    BOOL applyNow = NO;
+    {
+        std::lock_guard<std::mutex> guard(_startupSubtitleLock);
+        _pendingStartupSubtitles = [items copy];
+        _disableAutoSubtitleSelection = disableAutoSelect;
+        if (_fileLoaded && !_startupSubtitlesApplied) {
+            _startupSubtitlesApplied = YES;
+            applyNow = YES;
+        }
+    }
+    if (applyNow) {
+        [self enqueueMpvBlock:^(mpv_handle *loadedMpv) {
+            [self applyStartupSubtitlesOnMpv:loadedMpv items:items disableAutoSelect:disableAutoSelect];
+        }];
+    }
+}
+
 - (void)selectAudioTrackId:(int)trackId {
     if (!_mpv) return;
     int64_t id = trackId;
@@ -2914,21 +3076,31 @@ static constexpr uint64_t kObserveAoUserdata = 2;
     if (!_mpv) return;
     if (trackId < 0) {
         [self setStringProperty:"sid" value:@"no"];
-        return;
+    } else {
+        int64_t id = trackId;
+        mpv_set_property(_mpv, "sid", MPV_FORMAT_INT64, &id);
     }
-    int64_t id = trackId;
-    mpv_set_property(_mpv, "sid", MPV_FORMAT_INT64, &id);
+    [self triggerSyncControlsAsync];
 }
 
 - (void)addSubtitleUrl:(NSString *)url {
+    [self addSubtitleTrack:url title:@"" language:@"" select:YES];
+}
+
+- (void)addSubtitleTrack:(NSString *)url
+                   title:(NSString *)title
+                language:(NSString *)language
+                  select:(BOOL)select {
     if (!_mpv || url.length == 0) return;
-    [self command:@[@"sub-add", url, @"select"]];
+    [self addSubtitleTrackOnMpv:_mpv url:url title:title language:language select:select];
+    [self triggerSyncControlsAsync];
 }
 
 - (void)removeExternalSubtitles {
     if (!_mpv) return;
     [self removeExternalSubtitleTracks];
     [self setStringProperty:"sid" value:@"no"];
+    [self triggerSyncControlsAsync];
 }
 
 - (void)removeExternalSubtitlesAndSelect:(int)trackId {
@@ -2938,6 +3110,7 @@ static constexpr uint64_t kObserveAoUserdata = 2;
         [self selectSubtitleTrackId:trackId];
     } else {
         [self setStringProperty:"sid" value:@"no"];
+        [self triggerSyncControlsAsync];
     }
 }
 
@@ -4504,9 +4677,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_selectAudioTrack(
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player selectAudioTrackId:(int)trackId];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4519,9 +4692,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setAudioLanguages(
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
     NSString *value = [NSString stringWithUTF8String:jstringToString(env, languages).c_str()] ?: @"";
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player setAudioLanguages:value];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4533,9 +4706,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_selectSubtitleTrac
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player selectSubtitleTrackId:(int)trackId];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4547,10 +4720,55 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_addSubtitleUrl(
 ) {
     if (handle == 0) return;
     std::string subtitleUrl = jstringToString(env, url);
+    NSString *nsUrl = [NSString stringWithUTF8String:subtitleUrl.c_str()] ?: @"";
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
-        [player addSubtitleUrl:[NSString stringWithUTF8String:subtitleUrl.c_str()]];
-    });
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
+        [player addSubtitleUrl:nsUrl];
+    }];
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_addSubtitleTrack(
+    JNIEnv *env,
+    jobject /* bridge */,
+    jlong handle,
+    jstring url,
+    jstring title,
+    jstring language,
+    jboolean select
+) {
+    if (handle == 0) return;
+    NSString *nsUrl = [NSString stringWithUTF8String:jstringToString(env, url).c_str()] ?: @"";
+    NSString *nsTitle = [NSString stringWithUTF8String:jstringToString(env, title).c_str()] ?: @"";
+    NSString *nsLanguage = [NSString stringWithUTF8String:jstringToString(env, language).c_str()] ?: @"";
+    BOOL shouldSelect = select == JNI_TRUE;
+    MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
+        [player addSubtitleTrack:nsUrl title:nsTitle language:nsLanguage select:shouldSelect];
+    }];
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_configureStartupSubtitles(
+    JNIEnv *env,
+    jobject /* bridge */,
+    jlong handle,
+    jobjectArray urls,
+    jobjectArray titles,
+    jobjectArray languages,
+    jint selectedIndex,
+    jboolean disableAutoSelect
+) {
+    if (handle == 0) return;
+    NSArray<NSString *> *urlList = jstringArrayToNSArray(env, urls);
+    NSArray<NSString *> *titleList = jstringArrayToNSArray(env, titles);
+    NSArray<NSString *> *langList = jstringArrayToNSArray(env, languages);
+    MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
+    [player configureStartupSubtitlesWithUrls:urlList
+                                       titles:titleList
+                                    languages:langList
+                                selectedIndex:(int)selectedIndex
+                            disableAutoSelect:disableAutoSelect == JNI_TRUE];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4561,9 +4779,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_clearExternalSubti
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player removeExternalSubtitles];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4575,9 +4793,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_clearExternalSubti
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player removeExternalSubtitlesAndSelect:(int)trackId];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4589,9 +4807,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setSubtitleVisible
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player setSubtitleVisible:visible == JNI_TRUE];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -4603,9 +4821,9 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setSubtitleDelayMs
 ) {
     if (handle == 0) return;
     MpvWebPlayer *player = (__bridge MpvWebPlayer *)(void *)(intptr_t)handle;
-    runOnMainAsync(^{
+    [player enqueueMpvBlock:^(mpv_handle * /* mpv */) {
         [player setSubtitleDelayMs:(int)delayMs];
-    });
+    }];
 }
 
 extern "C" JNIEXPORT void JNICALL

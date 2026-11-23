@@ -37,6 +37,10 @@ object SubtitleFileCache {
     private val cacheDir: File?
         get() = appContext?.let { File(it.cacheDir, SUBTITLE_CACHE_DIR).also { dir -> dir.mkdirs() } }
 
+    internal fun contextOrNull(): Context? = appContext
+
+    internal fun startupCacheDir(): File? = cacheDir
+
     /**
      * Downloads subtitle files and returns updated [SubtitleInput] list with
      * content:// URIs instead of HTTP URLs.

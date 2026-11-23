@@ -399,6 +399,7 @@ internal fun PlayerDestination(
         sourceHeaders = launch.sourceHeaders,
         sourceResponseHeaders = launch.sourceResponseHeaders,
         externalSubtitles = launch.externalSubtitles,
+        startupSubtitleSelection = launch.startupSubtitleSelection,
         streamType = launch.streamType,
         logo = launch.logo,
         poster = launch.poster,

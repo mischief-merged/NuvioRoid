@@ -33,12 +33,19 @@ import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.downloads.DownloadItem
 import com.nuvio.app.features.downloads.DownloadSubtitles
 import com.nuvio.app.features.downloads.DownloadsRepository
+import com.nuvio.app.features.player.PlayerLaunch
+import com.nuvio.app.features.player.PlayerSettingsUiState
+import com.nuvio.app.features.player.PreparedStartupSubtitles
+import com.nuvio.app.features.player.SubtitleStartupCoordinator
 import com.nuvio.app.features.streams.StreamSubtitle
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import nuvio.composeapp.generated.resources.Res
@@ -92,6 +99,37 @@ internal suspend fun verifyDownloadedItemForPlayback(
     )
 }
 
+/**
+ * Validates saved download sidecar subtitles and picks the initial subtitle track before
+ * playback starts, aborting if the enclosing preparation job was cancelled.
+ */
+internal suspend fun prepareLocalPlayerLaunch(
+    savedLaunch: PlayerLaunch,
+    settings: PlayerSettingsUiState,
+    prepareSubtitles: suspend (
+        localSubtitles: List<StreamSubtitle>,
+        settings: PlayerSettingsUiState,
+        parentMetaId: String,
+    ) -> PreparedStartupSubtitles = { localSubtitles, currentSettings, parentMetaId ->
+        SubtitleStartupCoordinator.prepareDownloadedSubtitles(
+            localSubtitles = localSubtitles,
+            settings = currentSettings,
+            parentMetaId = parentMetaId,
+        )
+    },
+): PlayerLaunch {
+    val preparedSubtitles = prepareSubtitles(
+        savedLaunch.externalSubtitles,
+        settings,
+        savedLaunch.parentMetaId,
+    )
+    currentCoroutineContext().ensureActive()
+    return savedLaunch.copy(
+        externalSubtitles = preparedSubtitles.subtitles,
+        startupSubtitleSelection = preparedSubtitles.selection,
+    )
+}
+
 internal class PlaybackPreparationController(
     private val scope: CoroutineScope,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -113,13 +151,26 @@ internal class PlaybackPreparationController(
         verifyDownloadedItemForPlayback(item = item, ioDispatcher = ioDispatcher)
     },
 ) {
+    private sealed interface PreparationTarget {
+        data class DownloadPreference(
+            val parentMetaId: String,
+            val seasonNumber: Int?,
+            val episodeNumber: Int?,
+            val videoId: String,
+        ) : PreparationTarget
+
+        data class DownloadedItem(val itemId: String) : PreparationTarget
+    }
+
     var isPreparing by mutableStateOf(false)
         private set
     private var activeJob: Job? = null
+    private var activeTarget: PreparationTarget? = null
 
     fun cancel() {
         activeJob?.cancel()
         activeJob = null
+        activeTarget = null
         isPreparing = false
     }
 
@@ -131,13 +182,21 @@ internal class PlaybackPreparationController(
         episodeNumber: Int?,
         videoId: String,
         onStreamFallback: () -> Unit,
-        onLocalPlaybackReady: (VerifiedLocalPlayback) -> Unit,
+        onLocalPlaybackReady: suspend (VerifiedLocalPlayback) -> Unit,
     ) {
         if (manualSelection || !downloadsEnabled) {
+            cancel()
             onStreamFallback()
             return
         }
+        val target = PreparationTarget.DownloadPreference(
+            parentMetaId = parentMetaId,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            videoId = videoId,
+        )
         launchAsync(
+            target = target,
             resolve = { resolveLocalPlayback(parentMetaId, seasonNumber, episodeNumber, videoId) },
             onReady = { resolved ->
                 if (resolved != null) onLocalPlaybackReady(resolved) else onStreamFallback()
@@ -148,13 +207,16 @@ internal class PlaybackPreparationController(
     fun openDownloadedItem(
         item: DownloadItem,
         onUnavailable: () -> Unit,
-        onLocalPlaybackReady: (VerifiedLocalPlayback) -> Unit,
+        onLocalPlaybackReady: suspend (VerifiedLocalPlayback) -> Unit,
     ) {
         if (item.isPlaceholder) {
+            cancel()
             onUnavailable()
             return
         }
+        val target = PreparationTarget.DownloadedItem(itemId = item.id)
         launchAsync(
+            target = target,
             resolve = { verifyDownloadItem(item) },
             onReady = { resolved ->
                 if (resolved != null) onLocalPlaybackReady(resolved) else onUnavailable()
@@ -163,21 +225,27 @@ internal class PlaybackPreparationController(
     }
 
     private fun launchAsync(
+        target: PreparationTarget,
         resolve: suspend () -> VerifiedLocalPlayback?,
-        onReady: (VerifiedLocalPlayback?) -> Unit,
+        onReady: suspend (VerifiedLocalPlayback?) -> Unit,
     ) {
-        if (activeJob?.isActive == true) return
+        if (activeJob?.isActive == true) {
+            if (activeTarget == target) return
+            activeJob?.cancel()
+            activeJob = null
+            activeTarget = null
+        }
         isPreparing = true
+        activeTarget = target
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val resolved = resolve()
-                if (activeJob !== coroutineContext[Job]) return@launch
-                activeJob = null
-                isPreparing = false
+                if (!coroutineContext.isActive || activeJob !== coroutineContext[Job]) return@launch
                 onReady(resolved)
             } finally {
                 if (activeJob === coroutineContext[Job]) {
                     activeJob = null
+                    activeTarget = null
                     isPreparing = false
                 }
             }

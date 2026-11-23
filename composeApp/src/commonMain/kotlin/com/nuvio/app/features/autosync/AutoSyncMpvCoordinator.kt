@@ -214,6 +214,9 @@ internal open class AutoSyncMpvEngineController(
         listener: ((subtitleUrl: String, delayMs: Int) -> Unit)?,
     ) = coordinator.setAppliedListener(listener)
 
+    override fun setOnExternalSubtitleLoadFailed(listener: ((String) -> Unit)?) =
+        base.setOnExternalSubtitleLoadFailed(listener)
+
     override fun setSubtitleUri(url: String) {
         coordinator.cancel()
         base.setSubtitleUri(url)

@@ -321,6 +321,18 @@ internal fun CoroutineScope.launchPlayerNextEpisodeAutoPlay(
                 first = stream,
                 maxSources = if (settings.streamAutoPlayFallbackActive) settings.streamAutoPlayFallbackMaxSources else 0,
                 resolve = { candidate ->
+                    SubtitleStartupCoordinator.prefetchForStream(
+                        StartupSubtitleRequest(
+                            type = type,
+                            videoId = nextVideo.id,
+                            parentMetaId = parentMetaId,
+                            settings = settings,
+                            streamExternalSubtitles = candidate.externalSubtitles,
+                            videoHash = candidate.behaviorHints.videoHash,
+                            videoSizeBytes = candidate.behaviorHints.videoSize,
+                            filename = candidate.behaviorHints.filename,
+                        ),
+                    )
                     when (
                         val result = DirectDebridPlaybackResolver.resolveToPlayableStream(
                             candidate,

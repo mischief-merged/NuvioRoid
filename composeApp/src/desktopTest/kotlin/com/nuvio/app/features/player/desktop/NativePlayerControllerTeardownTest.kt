@@ -30,7 +30,7 @@ class NativePlayerControllerTeardownTest {
             nativeCreate = failNativeCreate,
             nativeDispose = { handle -> events += "disposed-$handle" },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation {
             events += "released"
@@ -459,7 +459,7 @@ class NativePlayerControllerTeardownTest {
                 error("host resolution must be rejected")
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.dispose()
         assertTrue(disposeStarted.await(2, TimeUnit.SECONDS))
@@ -493,7 +493,7 @@ class NativePlayerControllerTeardownTest {
                 error("dispose failed")
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.dispose()
         assertTrue(disposeAttempted.await(2, TimeUnit.SECONDS))
@@ -517,7 +517,7 @@ class NativePlayerControllerTeardownTest {
             nativeCreate = failNativeCreate,
             nativeDispose = { error("dispose failed") },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation(
             onReleased = { completions.incrementAndGet() },
@@ -552,7 +552,7 @@ class NativePlayerControllerTeardownTest {
                 allowDispose.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation { released.countDown() }
 
@@ -579,7 +579,7 @@ class NativePlayerControllerTeardownTest {
             },
             releaseTimeoutMs = 50L,
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
 
         controller.releaseBeforeNavigation(
             onReleased = { completed.incrementAndGet() },
@@ -648,7 +648,7 @@ class NativePlayerControllerTeardownTest {
                 unblock.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
         repeat(2) {
             controller.releaseBeforeNavigation {
                 assertTrue(SwingUtilities.isEventDispatchThread())
@@ -696,7 +696,7 @@ class NativePlayerControllerTeardownTest {
                 allowDispose.await()
             },
         )
-        controller.setNativeHandleForTest(42L)
+        controller.assignNativeHandleForTest(42L)
         val create = thread(isDaemon = true, name = "test-native-create") {
             createStarted.countDown()
             allowCreate.await()
@@ -856,7 +856,7 @@ class NativePlayerControllerTeardownTest {
             },
             lifecycleCoordinator = coordinator,
         )
-        first.setNativeHandleForTest(101L)
+        first.assignNativeHandleForTest(101L)
 
         val second = NativePlayerController(
             host = NativePlayerHost(),
@@ -988,7 +988,7 @@ class NativePlayerControllerTeardownTest {
                 nativeDispose = { disposedLatch.countDown() },
                 lifecycleCoordinator = coordinator,
             )
-            controller.setNativeHandleForTest(301L)
+            controller.assignNativeHandleForTest(301L)
             val released = CountDownLatch(1)
             controller.releaseBeforeNavigation { released.countDown() }
             assertTrue(released.await(2, TimeUnit.SECONDS))
@@ -1003,7 +1003,7 @@ class NativePlayerControllerTeardownTest {
                 nativeDispose = { done.countDown() },
                 lifecycleCoordinator = coordinator,
             )
-            controller.setNativeHandleForTest(302L)
+            controller.assignNativeHandleForTest(302L)
             controller.dispose()
             assertTrue(done.await(2, TimeUnit.SECONDS))
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
@@ -1185,13 +1185,6 @@ private fun NativePlayerController.startTrackedDisposeForTest(value: Long) {
     javaClass.getDeclaredMethod("startTrackedDisposeLocked", Long::class.javaPrimitiveType).also { method ->
         method.isAccessible = true
         method.invoke(this, value)
-    }
-}
-
-private fun NativePlayerController.setNativeHandleForTest(value: Long) {
-    javaClass.getDeclaredField("handle").also { field ->
-        field.isAccessible = true
-        field.setLong(this, value)
     }
 }
 

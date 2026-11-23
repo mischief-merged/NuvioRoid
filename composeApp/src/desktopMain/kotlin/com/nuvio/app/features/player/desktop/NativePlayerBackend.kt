@@ -192,6 +192,27 @@ internal interface NativePlayerBackend {
     fun addSubtitleUrl(handle: Long, url: String)
     fun clearExternalSubtitles(handle: Long)
     fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int)
+
+    /** Adds one subtitle file with its name and language. Older native libraries only take the address. */
+    fun addSubtitleTrack(handle: Long, url: String, title: String, language: String, select: Boolean) =
+        addSubtitleUrl(handle, url)
+
+    /** Adds the startup subtitle files and picks one, or turns automatic selection off. */
+    fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    ) {
+        if (selectedIndex in urls.indices) {
+            addSubtitleUrl(handle, urls[selectedIndex])
+        } else if (disableAutoSelect) {
+            selectSubtitleTrack(handle, -1)
+        }
+    }
+
     fun setSubtitleVisible(handle: Long, visible: Boolean)
     fun setSubtitleDelayMs(handle: Long, delayMs: Int)
     fun applySubtitleStyle(
@@ -417,6 +438,33 @@ internal object RealNativePlayerBackend : NativePlayerBackend {
     override fun clearExternalSubtitles(handle: Long) = NativePlayerBridge.clearExternalSubtitles(handle)
     override fun clearExternalSubtitlesAndSelect(handle: Long, trackId: Int) =
         NativePlayerBridge.clearExternalSubtitlesAndSelect(handle, trackId)
+
+    override fun addSubtitleTrack(handle: Long, url: String, title: String, language: String, select: Boolean) {
+        try {
+            NativePlayerBridge.addSubtitleTrack(handle, url, title, language, select)
+        } catch (_: UnsatisfiedLinkError) {
+            NativePlayerBridge.addSubtitleUrl(handle, url)
+        }
+    }
+
+    override fun configureStartupSubtitles(
+        handle: Long,
+        urls: Array<String>,
+        titles: Array<String>,
+        languages: Array<String>,
+        selectedIndex: Int,
+        disableAutoSelect: Boolean,
+    ) {
+        try {
+            NativePlayerBridge.configureStartupSubtitles(handle, urls, titles, languages, selectedIndex, disableAutoSelect)
+        } catch (_: UnsatisfiedLinkError) {
+            if (selectedIndex in urls.indices) {
+                NativePlayerBridge.addSubtitleUrl(handle, urls[selectedIndex])
+            } else if (disableAutoSelect) {
+                NativePlayerBridge.selectSubtitleTrack(handle, -1)
+            }
+        }
+    }
 
     override fun setSubtitleVisible(handle: Long, visible: Boolean) =
         NativePlayerBridge.setSubtitleVisible(handle, visible)
