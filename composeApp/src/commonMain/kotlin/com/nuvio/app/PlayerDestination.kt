@@ -71,8 +71,10 @@ internal fun BoxScope.PlayerSessionHost(
             ActivePlayerSessionRegistry.unbindController(controller)
         }
     }
-    val session = controller.activeSession ?: return
-    key(session.launchId) {
+    val session = controller.activeSession
+    // The replacement dialog stays mounted when the in-app session is already gone.
+    // An external launch can still be preparing, and a newer title has to be able to ask.
+    if (session != null) key(session.launchId) {
         val launch = session.launch
         val guard = remember { PlayerBackReleaseGuard() }
         val exitTarget = remember { PlayerExitTargetHolder() }

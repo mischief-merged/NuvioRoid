@@ -1022,6 +1022,99 @@ class ReplacePlaybackPromptTest {
     }
 
     @Test
+    fun player_session_host_shows_the_replacement_prompt_while_external_preparation_waits() {
+        val controller = PlayerSessionController(onExitPictureInPicture = {})
+        val navigator = NuvioNavigator(NavBackStack<NavKey>(TabsRoute))
+        val backend = CountingNativePlayerBackend()
+        val opened = mutableListOf<String>()
+        val first = sampleLaunch(
+            title = "Severance",
+            videoId = firstVideoId,
+            parentMetaId = "tt1111111",
+            sourceUrl = "https://example.com/severance-external.mp4",
+        )
+        val second = sampleLaunch(
+            title = "The Bear",
+            videoId = secondVideoId,
+            parentMetaId = "tt2222222",
+            sourceUrl = "https://example.com/the-bear-external.mp4",
+        )
+        var resumeFirst: (() -> Unit)? = null
+        var resumeSecond: (() -> Unit)? = null
+        val launchScope = CoroutineScope(Dispatchers.Unconfined)
+        var secondJob: Job? = null
+        val firstJob = launchScope.launch {
+            launchPreparedExternalPlayback(
+                sessions = controller,
+                launch = first,
+                prepare = {
+                    suspendCancellableCoroutine { cont ->
+                        resumeFirst = { if (cont.isActive) cont.resume(Unit) }
+                    }
+                },
+                open = {
+                    opened += first.sourceUrl
+                    true
+                },
+            )
+        }
+
+        try {
+            assertNotNull(resumeFirst)
+            assertFalse(controller.hasActiveSession)
+            assertEquals(first.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+            mountPlayerSessionHost(controller, navigator, backend)
+
+            compose.runOnIdle {
+                controller.launchExternalOrAskToReplace(
+                    launch = second,
+                    allowSameTargetReopen = false,
+                ) {
+                    secondJob = launchScope.launch {
+                        launchPreparedExternalPlayback(
+                            sessions = controller,
+                            launch = second,
+                            prepare = {
+                                suspendCancellableCoroutine { cont ->
+                                    resumeSecond = { if (cont.isActive) cont.resume(Unit) }
+                                }
+                            },
+                            open = {
+                                opened += second.sourceUrl
+                                true
+                            },
+                        )
+                    }
+                }
+            }
+            compose.waitForIdle()
+            assertNotNull(controller.pendingReplacement)
+            compose.onNodeWithText(text(Res.string.player_replace_playback_title)).assertIsDisplayed()
+            compose.onNodeWithText(
+                "Severance (S1 E1) is currently playing. Start The Bear (S1 E1) instead?",
+            ).assertIsDisplayed()
+
+            compose.onNodeWithText(text(Res.string.player_replace_playback_confirm)).performClick()
+            compose.waitForIdle()
+            assertNotNull(resumeSecond)
+            assertEquals(second.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+
+            resumeFirst.invoke()
+            runBlocking { firstJob.join() }
+            assertFalse(opened.contains(first.sourceUrl))
+            assertEquals(second.sourceUrl, controller.pendingExternalPlayback?.sourceUrl)
+        } finally {
+            resumeFirst?.invoke()
+            resumeSecond?.invoke()
+            runBlocking {
+                firstJob.join()
+                secondJob?.join()
+            }
+            launchScope.cancel()
+        }
+    }
+
+    @Test
     fun close_active_session_trailing_lambda_runs_when_idle_or_closed_and_never_on_close_failure() {
         val controller = PlayerSessionController(onExitPictureInPicture = {})
         var continuations = 0
