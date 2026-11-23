@@ -11,4 +11,6 @@ internal expect object SeasonDownloadDefaultsStorage {
     /** The last season, movie-set and movie runs, shown on the Downloads screen until dismissed. */
     fun loadBatchRunsPayload(profileId: Int): String?
     fun saveBatchRunsPayload(profileId: Int, payload: String)
+    fun loadTripQueue(profileId: Int): String?
+    fun saveTripQueue(profileId: Int, payload: String)
 }

@@ -111,6 +111,8 @@ data class DownloadItem(
     val preferredAudioLanguage: String? = null,
     /** The automatic-download rule that queued this item. Null for a download the user started. */
     val autoDownloadRuleKey: String? = null,
+    /** Queued by a trip fill; kept for storage accounting across restarts. */
+    val tripFill: Boolean = false,
     /** The limit that paused this automatic download. Cleared when it is resumed. */
     val autoDownloadStop: AutoDownloadStop? = null,
     /** Why this source failed. Also set on a finished file rejected by a batch; null when no failure was recorded. */

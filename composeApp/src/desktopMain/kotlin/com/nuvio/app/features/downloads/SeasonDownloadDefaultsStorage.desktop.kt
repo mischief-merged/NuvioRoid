@@ -26,4 +26,11 @@ internal actual object SeasonDownloadDefaultsStorage {
     actual fun saveBatchRunsPayload(profileId: Int, payload: String) {
         store.putString(ProfileScopedKey.of("batch_runs", profileId), payload)
     }
+    actual fun loadTripQueue(profileId: Int): String? =
+        store.getString(ProfileScopedKey.of("trip_queue", profileId))
+
+    actual fun saveTripQueue(profileId: Int, payload: String) {
+        store.putString(ProfileScopedKey.of("trip_queue", profileId), payload)
+        check(store.sync())
+    }
 }

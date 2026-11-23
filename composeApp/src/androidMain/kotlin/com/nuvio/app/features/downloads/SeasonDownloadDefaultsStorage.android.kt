@@ -45,4 +45,10 @@ internal actual object SeasonDownloadDefaultsStorage {
             ?.putString(ProfileScopedKey.of(batchRunsKey, profileId), payload)
             ?.apply()
     }
+    actual fun loadTripQueue(profileId: Int): String? =
+        preferences?.getString(ProfileScopedKey.of("trip_queue", profileId), null)
+
+    actual fun saveTripQueue(profileId: Int, payload: String) {
+        check(preferences?.edit()?.putString(ProfileScopedKey.of("trip_queue", profileId), payload)?.commit() == true)
+    }
 }

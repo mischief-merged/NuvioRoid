@@ -187,7 +187,7 @@ private fun DownloadItem.isNotTheVideo(runtimeMinutes: Int?): Boolean =
  * copy or one that is on its way, is not in the set: the marked file is kept beside it, as a problem
  * for the user to deal with, and does not make the rule fetch again.
  */
-private fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, episodes: List<SeasonBatchEpisode>): Set<String> {
+internal fun List<DownloadItem>.placeholderEpisodeKeys(parentMetaId: String, episodes: List<SeasonBatchEpisode>): Set<String> {
     val parent = parentMetaId.trim()
     val runtimes = episodes.associate { it.autoDownloadKey to it.runtimeMinutes }
     val ofShow = mapNotNull { item ->

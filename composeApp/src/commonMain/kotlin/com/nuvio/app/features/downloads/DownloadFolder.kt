@@ -75,6 +75,8 @@ internal data class DownloadLocationInfo(
     val usedBytes: Long = totalBytes,
     /** The location is away, so [usedBytes] is what was known when it was last there. */
     val usedIsLastKnown: Boolean = false,
+    /** Locations on the same volume share their free-space budget. */
+    val volumeKey: String = id,
 )
 
 internal data class DownloadFolderState(
@@ -287,6 +289,9 @@ internal interface DownloadFolderController {
      * any profile uses it. Nothing is moved, copied or deleted.
      */
     fun adoptFile(item: DownloadItem, path: String): Boolean = false
+
+    /** Whether a folder move is currently running. */
+    val isMoveRunning: Boolean get() = false
 
     /** Scans every available storage location for completed downloads whose records are missing. */
     fun scanDownloadsOnDisk(
