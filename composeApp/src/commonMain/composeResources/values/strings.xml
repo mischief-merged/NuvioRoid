@@ -3451,6 +3451,8 @@
     <string name="downloads_trip_ready_fetch_extras">Fetch missing subtitles and skip times</string>
     <string name="downloads_trip_ready_fetch_extras_done">Checked for missing subtitles and skip times.</string>
     <string name="downloads_trip_ready_fetch_extras_offline">Connect to the internet to fetch missing subtitles and skip times.</string>
+    <string name="downloads_trip_ready_fetch_extras_unavailable">Some subtitles or skip times could not be checked. Try again later.</string>
+    <string name="downloads_trip_ready_fetch_extras_nothing">No subtitles or skip times were checked.</string>
     <string name="downloads_trip_ready_offline_heading">Playable offline now</string>
     <string name="downloads_trip_ready_offline_subtitle">Verified files that are not flagged</string>
     <string name="downloads_trip_ready_offline_empty">No verified offline downloads ready yet.</string>
@@ -3536,7 +3538,7 @@
     <string name="downloads_trip_fill_hold_notice">%1$s Queued downloads will wait automatically until you're back on a regular connection.</string>
     <string name="downloads_trip_fill_skipped_drive">%1$s skipped: its downloads folder is on an unplugged drive</string>
     <string name="downloads_trip_fill_skipped_meta">%1$s skipped: couldn't load episodes</string>
-    <string name="downloads_trip_fill_skipped_no_source">%1$s skipped: no source matched your preferences</string>
+    <string name="downloads_trip_fill_skipped_no_source">%1$s skipped: couldn't find a usable source. Check your add-ons and preferences, then try again.</string>
     <string name="downloads_trip_fill_cached">Cached</string>
     <string name="downloads_trip_fill_not_cached">Not cached yet</string>
     <string name="downloads_trip_fill_estimated">~%1$s</string>

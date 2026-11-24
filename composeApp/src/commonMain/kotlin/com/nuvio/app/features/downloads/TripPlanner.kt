@@ -687,7 +687,7 @@ internal suspend fun buildAppTripFillPlan(
     val freeBytes = shows.mapNotNull { DownloadsRepository.tripDestination(it.parentMetaId).freeBytes }.minOrNull()
     val qualityDefaults = SeasonDownloadDefaultsRepository.load(profileId)
     val holdReason = LimitedConnections.hold.holdReasonFor(automatic = false)
-    val offline = NetworkStatusRepository.uiState.value.isOfflineLike
+    val offline = !NetworkStatusRepository.uiState.value.hasInternet
 
     return planTripFill(
         targetHours = targetHours,
@@ -1116,7 +1116,7 @@ internal object TripFillHost {
             DownloadsRepository.loadedProfile()?.takeIf { it == ProfileRepository.activeProfileId }
         },
         loadPendingPlan: (Int) -> TripFillPlan? = queue::pending,
-        awaitOnline: suspend () -> Unit = { NetworkStatusRepository.uiState.first { !it.isOfflineLike } },
+        awaitOnline: suspend () -> Unit = { NetworkStatusRepository.uiState.first { it.hasInternet } },
         activeRunner: TripFillRunner = runner,
     ) {
         synchronized(hostLock) {

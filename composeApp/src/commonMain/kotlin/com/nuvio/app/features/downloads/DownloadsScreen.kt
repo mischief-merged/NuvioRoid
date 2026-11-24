@@ -273,7 +273,7 @@ internal fun DownloadsScreenContent(
     val clock = remember(
         now,
         runtimeMinutes,
-        network.isOfflineLike,
+        network.hasInternet,
         extras,
         holdState.reason,
         removalByDownload,
@@ -285,7 +285,7 @@ internal fun DownloadsScreenContent(
         RowClock(
             nowEpochMs = now,
             runtimeMinutes = runtimeMinutes,
-            offline = network.isOfflineLike,
+            offline = !network.hasInternet,
             extras = extras,
             limitedBy = holdState.reason,
             removals = removalByDownload,
@@ -337,7 +337,8 @@ internal fun DownloadsScreenContent(
             locationIdOf = if (folders.supported) folders::locationIdOf else { item -> item.locationId.orEmpty() },
             addressRequired = folders.supported,
             holdState = holdState,
-            offline = network.isOfflineLike,
+            offline = !network.hasInternet,
+            canFetchCompanions = network.isOnline,
             nowEpochMs = now.value,
             rechecks = rechecks,
             tripDeps = tripDeps,
