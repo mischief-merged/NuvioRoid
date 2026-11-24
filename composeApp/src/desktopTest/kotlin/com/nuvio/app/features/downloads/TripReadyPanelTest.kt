@@ -457,6 +457,117 @@ class TripReadyPanelTest {
         }
     }
 
+    @Test
+    fun `stopping trip queueing while two downloads are receiving shows two in progress and done summary`() {
+        val showCandidate = TripShowCandidate(
+            parentMetaType = "series",
+            parentMetaId = "show:trip",
+            title = "Andor",
+            fromContinueWatching = true,
+        )
+        val cachedStream = StreamItem(
+            name = "Andor.1080p",
+            title = "Andor.1080p",
+            url = "https://ex/ep.mkv",
+            addonName = "Addon",
+            addonId = "addon:test",
+            behaviorHints = StreamBehaviorHints(videoSize = 900_000_000L, filename = "ep.mkv"),
+            debridCacheStatus = StreamDebridCacheStatus(
+                providerId = "rd",
+                providerName = "RD",
+                state = StreamDebridCacheState.CACHED,
+                cachedSize = 900_000_000L,
+            ),
+        )
+        val plannedEpisodes = (1..4).map { number ->
+            TripPlannedEpisode(
+                show = showCandidate,
+                episode = SeasonBatchEpisode("show:trip:1:$number", 1, number, "Episode $number", null, runtimeMinutes = 45),
+                effectiveRuntimeMinutes = 45,
+                runtimeEstimated = false,
+                rankedStreams = listOf(cachedStream.copy(url = "https://ex/ep$number.mkv")),
+                selectedStream = cachedStream.copy(url = "https://ex/ep$number.mkv"),
+                isCached = true,
+                estimatedBytes = 900_000_000L,
+                sizeEstimated = false,
+            )
+        }
+        DownloadsRepository.ensureLoaded()
+        val profileId = DownloadsRepository.loadedProfile()
+        val runner = TripFillRunner(
+            scope = runnerScope,
+            downloads = DownloadsRepository.uiState,
+            prepareStream = { s, _ -> s },
+            enqueue = { _, _, _ -> DownloadEnqueueResult.MissingUrl },
+            enqueueOwned = DownloadsRepository::enqueueTripEpisode,
+            resume = DownloadsRepository::resumeTripEpisode,
+            currentProfileId = { profileId },
+            maxConcurrent = 2,
+        )
+        val deps = TripReadyDeps(
+            collectShows = { listOf(showCandidate) },
+            buildPlan = { hours, _ ->
+                TripFillPlan(
+                    requestedHours = hours,
+                    plannedEpisodes = plannedEpisodes,
+                    totalPlannedMinutes = 180,
+                    totalEstimatedBytes = 3_600_000_000L,
+                    qualityDefaults = SeasonDownloadDefaults(),
+                    storageLimitBytes = null,
+                    remainingStorageLimitBytes = null,
+                    freeDiskBytes = 40_000_000_000L,
+                    connectionHoldReason = null,
+                    stoppedReason = TripPlanStopReason.TargetReached,
+                    profileId = profileId,
+                )
+            },
+            runner = runner,
+            loadDiskInfo = { _, _ -> emptyMap() },
+            durationMsOf = { _, _ -> null },
+            bytesPerSecondOf = { _, _ -> null },
+            fetchMissingCompanions = null,
+        )
+
+        val preview8HrText = runBlocking { getString(Res.string.downloads_trip_fill_plan_button, DefaultTripFillHours) }
+        val startDownloadingText = runBlocking { getString(Res.string.downloads_trip_fill_start) }
+
+        compose.setContent {
+            NuvioTheme {
+                TripReadyPanel(
+                    onBack = {},
+                    onOpenDownload = {},
+                    onOpenShow = { _, _ -> },
+                    downloadsStateFlow = DownloadsRepository.uiState,
+                    folders = NoDownloadFolders,
+                    rechecks = null,
+                    connectionHold = ConnectionHold(),
+                    tripDeps = deps,
+                )
+            }
+        }
+
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(preview8HrText))
+        compose.onNodeWithText(preview8HrText).performClick()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            compose.onAllNodesWithText(startDownloadingText).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(startDownloadingText))
+        compose.onNodeWithText(startDownloadingText).performClick()
+
+        // Wait for two downloads to be enqueued and actively receiving, and verify progress reflects 2 of 4.
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            DownloadsRepository.uiState.value.items.count { it.tripFill && it.status == DownloadStatus.Downloading } == 2 &&
+                compose.onAllNodesWithText("Queueing 2 of 4:", substring = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Stop queueing").assertIsDisplayed().performClick()
+
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            compose.onAllNodesWithText("Queued 2 of 4 planned episodes.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Queueing stopped early.").assertIsDisplayed()
+        assertEquals(2, DownloadsRepository.uiState.value.items.count { it.tripFill })
+    }
+
     private class FakeFolderController(
         initialState: DownloadFolderState,
     ) : DownloadFolderController by NoDownloadFolders {

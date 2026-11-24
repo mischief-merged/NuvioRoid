@@ -1126,4 +1126,362 @@ class TripPlannerTest {
             scope.cancel()
         }
     }
+
+    @Test
+    fun `stop after active trip downloads start receiving reports exact enqueued count through repository`() = runBlocking {
+        val previousBackend = DownloadsRepository.backend
+        val progressCallbacks = MutableStateFlow<List<(Long, Long?) -> Unit>>(emptyList())
+        val backend = object : DownloadsBackend {
+            var payload: String? = null
+            override fun loadPayload(): String? = payload
+            override fun savePayload(payload: String) {
+                this.payload = payload
+            }
+            override fun restoreItem(item: DownloadItem): DownloadItem = item
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
+                onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
+                onFailure: (message: String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle {
+                progressCallbacks.update { it + onProgress }
+                return object : DownloadsTaskHandle {
+                    override fun cancel() = Unit
+                }
+            }
+            override fun removeFile(localFileUri: String?): Boolean = true
+            override fun removePartialFile(destinationFileName: String): Boolean = true
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            DownloadsRepository.backend = backend
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+            val profileId = DownloadsRepository.loadedProfile()
+            val plan = reviewPlan(episodes = 14).copy(profileId = profileId)
+
+            val runner = TripFillRunner(
+                scope = scope,
+                downloads = DownloadsRepository.uiState,
+                prepareStream = { s, _ -> s },
+                enqueue = { _, _, _ -> DownloadEnqueueResult.MissingUrl },
+                enqueueOwned = DownloadsRepository::enqueueTripEpisode,
+                resume = DownloadsRepository::resumeTripEpisode,
+                currentProfileId = { profileId },
+                maxConcurrent = 2,
+            )
+
+            assertTrue(runner.start(plan))
+            val callbacks = kotlinx.coroutines.withTimeout(30_000) {
+                progressCallbacks.first { it.size == 2 }
+            }
+            // Simulate both enqueued transfers actively receiving bytes.
+            callbacks.forEach { cb -> cb(50_000_000L, 1_500_000_000L) }
+            kotlinx.coroutines.withTimeout(30_000) {
+                DownloadsRepository.uiState.first { state ->
+                    state.items.count { it.tripFill && it.status == DownloadStatus.Downloading && it.downloadedBytes > 0L } == 2
+                }
+            }
+
+            runner.stop()
+            val finished = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { !it.isRunning && it.doneSummary != null }
+            }
+            val summary = finished.doneSummary!!
+            assertTrue(summary.stoppedEarly)
+            assertEquals(14, summary.totalPlanned)
+            assertEquals(2, summary.queuedCount)
+            assertEquals(0, summary.failedCount)
+
+            val tripItems = DownloadsRepository.uiState.value.items.filter { it.tripFill }
+            assertEquals(2, tripItems.size)
+            assertEquals(2, tripItems.map { it.logicalContentKey }.distinct().size)
+            assertTrue(tripItems.all { it.status == DownloadStatus.Downloading })
+        } finally {
+            scope.cancel()
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = previousBackend
+        }
+    }
+
+    @Test
+    fun `stop before any episode is enqueued reports zero queued`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val enteredPrepare = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val neverCompletes = kotlinx.coroutines.CompletableDeferred<Unit>()
+        try {
+            val downloads = MutableStateFlow(DownloadsUiState())
+            var enqueueCalls = 0
+            val runner = TripFillRunner(
+                scope = scope,
+                downloads = downloads,
+                prepareStream = { s, _ ->
+                    enteredPrepare.complete(Unit)
+                    neverCompletes.await()
+                    s
+                },
+                enqueue = { _, _, _ ->
+                    enqueueCalls++
+                    DownloadEnqueueResult.Started
+                },
+                maxConcurrent = 2,
+            )
+
+            assertTrue(runner.start(reviewPlan(episodes = 4)))
+            kotlinx.coroutines.withTimeout(30_000) { enteredPrepare.await() }
+            runner.stop()
+            val done = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { !it.isRunning && it.doneSummary != null }.doneSummary!!
+            }
+            assertTrue(done.stoppedEarly)
+            assertEquals(4, done.totalPlanned)
+            assertEquals(0, done.queuedCount)
+            assertEquals(0, enqueueCalls)
+            assertTrue(downloads.value.items.isEmpty())
+        } finally {
+            neverCompletes.cancel()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `full completion after active downloads reports total without double counting`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val downloads = MutableStateFlow(DownloadsUiState())
+            val plan = reviewPlan(episodes = 4)
+            val runner = TripFillRunner(
+                scope = scope,
+                downloads = downloads,
+                prepareStream = { s, _ -> s },
+                enqueue = { show, episode, _ ->
+                    val id = "dl-${episode.episodeNumber}"
+                    downloads.update { state ->
+                        state.copy(items = state.items + dl(id, show.parentMetaId, 1, episode.episodeNumber, DownloadStatus.Downloading))
+                    }
+                    DownloadEnqueueResult.Started
+                },
+                maxConcurrent = 2,
+            )
+
+            assertTrue(runner.start(plan))
+            // First two enter Downloading -> complete them so the next two start.
+            kotlinx.coroutines.withTimeout(30_000) {
+                downloads.first { state -> state.items.count { it.status == DownloadStatus.Downloading } == 2 }
+            }
+            downloads.update { state ->
+                state.copy(items = state.items.map { it.copy(status = DownloadStatus.Completed, localFileUri = "file:///dl/${it.id}.mkv", downloadedBytes = 500_000_000L) })
+            }
+            // Next two enter Downloading -> complete them too.
+            kotlinx.coroutines.withTimeout(30_000) {
+                downloads.first { state -> state.items.size == 4 && state.items.count { it.status == DownloadStatus.Downloading } == 2 }
+            }
+            downloads.update { state ->
+                state.copy(items = state.items.map { it.copy(status = DownloadStatus.Completed, localFileUri = "file:///dl/${it.id}.mkv", downloadedBytes = 500_000_000L) })
+            }
+
+            val done = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { !it.isRunning && it.doneSummary != null }.doneSummary!!
+            }
+            assertFalse(done.stoppedEarly)
+            assertEquals(4, done.totalPlanned)
+            assertEquals(4, done.queuedCount)
+            assertEquals(0, done.failedCount)
+            assertEquals(4, downloads.value.items.size)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `stop mid-step during failover and preparation does not double count or orphan records`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val extraPrepareGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val extraEnteredPrepare = kotlinx.coroutines.CompletableDeferred<Unit>()
+        try {
+            val downloads = MutableStateFlow(DownloadsUiState())
+            val show = TripShowCandidate("series", "show-1", "Show")
+            val primary = stream("Show.1080p.primary", "https://ex/primary", true, 800_000_000L)
+            val backup = stream("Show.1080p.backup", "https://ex/backup", true, 800_000_000L)
+            val planned = (1..4).map { number ->
+                TripPlannedEpisode(
+                    show = show,
+                    episode = ep("ep-$number", 1, number, 45),
+                    effectiveRuntimeMinutes = 45,
+                    runtimeEstimated = false,
+                    rankedStreams = listOf(primary, backup),
+                    selectedStream = primary,
+                    isCached = true,
+                    estimatedBytes = 800_000_000L,
+                    sizeEstimated = false,
+                )
+            }
+            val plan = TripFillPlan(
+                requestedHours = 4,
+                plannedEpisodes = planned,
+                totalPlannedMinutes = 180,
+                totalEstimatedBytes = 3_200_000_000L,
+                qualityDefaults = SeasonDownloadDefaults(),
+                storageLimitBytes = null,
+                remainingStorageLimitBytes = null,
+                freeDiskBytes = 50_000_000_000L,
+                connectionHoldReason = null,
+                stoppedReason = TripPlanStopReason.TargetReached,
+            )
+
+            val startedEpisodes = mutableListOf<Int>()
+            val runner = TripFillRunner(
+                scope = scope,
+                downloads = downloads,
+                prepareStream = { s, ep ->
+                    val slotOrder = synchronized(startedEpisodes) {
+                        val existing = startedEpisodes.indexOf(ep.episodeNumber)
+                        if (existing >= 0) existing else {
+                            startedEpisodes += ep.episodeNumber
+                            startedEpisodes.lastIndex
+                        }
+                    }
+                    if (slotOrder >= 2) {
+                        extraEnteredPrepare.complete(Unit)
+                        extraPrepareGate.await()
+                    }
+                    s
+                },
+                enqueue = { s, ep, chosen ->
+                    val slotOrder = synchronized(startedEpisodes) { startedEpisodes.indexOf(ep.episodeNumber) }
+                    val suffix = if (chosen.url == primary.url) "primary" else "backup"
+                    val id = "dl-${ep.episodeNumber}-$suffix"
+                    val status = if (slotOrder == 0) DownloadStatus.Completed else DownloadStatus.Downloading
+                    downloads.update { state ->
+                        val cleaned = state.items.filterNot { it.episodeNumber == ep.episodeNumber && it.status == DownloadStatus.Failed }
+                        state.copy(items = cleaned + dl(id, s.parentMetaId, 1, ep.episodeNumber, status))
+                    }
+                    DownloadEnqueueResult.Started
+                },
+                maxConcurrent = 1,
+            )
+
+            assertTrue(runner.start(plan))
+            // First dispatched episode completes; second starts primary as Downloading.
+            val secondPrimary = kotlinx.coroutines.withTimeout(30_000) {
+                downloads.first { state ->
+                    state.items.count { it.status == DownloadStatus.Completed } == 1 &&
+                        state.items.any { it.status == DownloadStatus.Downloading && it.id.endsWith("-primary") }
+                }.items.first { it.status == DownloadStatus.Downloading }
+            }
+            val firstCompletedId = downloads.value.items.first { it.status == DownloadStatus.Completed }.id
+            // Fail the second episode's primary with 0 bytes -> runner fails over to its backup (Downloading).
+            downloads.update { state ->
+                state.copy(items = state.items.map { if (it.id == secondPrimary.id) it.copy(status = DownloadStatus.Failed, downloadedBytes = 0L) else it })
+            }
+            val expectedBackupId = "dl-${secondPrimary.episodeNumber}-backup"
+            kotlinx.coroutines.withTimeout(30_000) {
+                downloads.first { state -> state.items.any { it.id == expectedBackupId } }
+            }
+            // Stop while the backup is actively Downloading (after 1st completed and 2nd failed over).
+            val runningBeforeStop = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { it.isRunning && it.queuedEpisodes == 2 }
+            }
+            assertEquals(2, runningBeforeStop.queuedEpisodes)
+
+            runner.stop()
+            val done = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { !it.isRunning && it.doneSummary != null }.doneSummary!!
+            }
+            assertTrue(done.stoppedEarly)
+            assertEquals(2, done.queuedCount)
+            assertEquals(0, done.failedCount)
+            assertEquals(setOf(firstCompletedId, expectedBackupId), downloads.value.items.map { it.id }.toSet())
+            assertFalse(extraEnteredPrepare.isCompleted)
+        } finally {
+            extraPrepareGate.cancel()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `stop while preparing backup after primary failed does not count failed episode as queued`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val backupPrepareEntered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val backupPrepareGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        try {
+            val downloads = MutableStateFlow(DownloadsUiState())
+            val show = TripShowCandidate("series", "show-1", "Show")
+            val primary = stream("Show.1080p.primary", "https://ex/primary", true, 800_000_000L)
+            val backup = stream("Show.1080p.backup", "https://ex/backup", true, 800_000_000L)
+            val planned = (1..3).map { number ->
+                TripPlannedEpisode(
+                    show = show,
+                    episode = ep("ep-$number", 1, number, 45),
+                    effectiveRuntimeMinutes = 45,
+                    runtimeEstimated = false,
+                    rankedStreams = listOf(primary, backup),
+                    selectedStream = primary,
+                    isCached = true,
+                    estimatedBytes = 800_000_000L,
+                    sizeEstimated = false,
+                )
+            }
+            val plan = TripFillPlan(
+                requestedHours = 4,
+                plannedEpisodes = planned,
+                totalPlannedMinutes = 135,
+                totalEstimatedBytes = 2_400_000_000L,
+                qualityDefaults = SeasonDownloadDefaults(),
+                storageLimitBytes = null,
+                remainingStorageLimitBytes = null,
+                freeDiskBytes = 50_000_000L * 1000L,
+                connectionHoldReason = null,
+                stoppedReason = TripPlanStopReason.TargetReached,
+            )
+
+            var backupEnqueued = false
+            val runner = TripFillRunner(
+                scope = scope,
+                downloads = downloads,
+                prepareStream = { s, _ ->
+                    if (s.url == backup.url) {
+                        backupPrepareEntered.complete(Unit)
+                        backupPrepareGate.await()
+                    }
+                    s
+                },
+                enqueue = { s, ep, chosen ->
+                    if (chosen.url == backup.url) backupEnqueued = true
+                    val id = "dl-${ep.episodeNumber}-${if (chosen.url == primary.url) "primary" else "backup"}"
+                    downloads.update { state ->
+                        state.copy(items = state.items + dl(id, s.parentMetaId, 1, ep.episodeNumber, DownloadStatus.Downloading))
+                    }
+                    DownloadEnqueueResult.Started
+                },
+                maxConcurrent = 2,
+            )
+
+            assertTrue(runner.start(plan))
+            val activeTwo = kotlinx.coroutines.withTimeout(30_000) {
+                downloads.first { state ->
+                    state.items.count { it.status == DownloadStatus.Downloading } == 2
+                }.items
+            }
+            val failedTarget = activeTwo.last()
+            // Fail one active episode's primary with 0 bytes so it moves to prepareStream for its backup while the other stays Downloading.
+            downloads.update { state ->
+                state.copy(items = state.items.map { if (it.id == failedTarget.id) it.copy(status = DownloadStatus.Failed, downloadedBytes = 0L) else it })
+            }
+            kotlinx.coroutines.withTimeout(30_000) { backupPrepareEntered.await() }
+
+            runner.stop()
+            val done = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { !it.isRunning && it.doneSummary != null }.doneSummary!!
+            }
+            assertTrue(done.stoppedEarly)
+            assertEquals(1, done.queuedCount)
+            assertFalse(backupEnqueued)
+        } finally {
+            backupPrepareGate.cancel()
+            scope.cancel()
+        }
+    }
 }
