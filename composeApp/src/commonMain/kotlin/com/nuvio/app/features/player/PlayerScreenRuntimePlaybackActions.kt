@@ -179,6 +179,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         frozenForQuit = false
         endedPlaybackStopCommitted = false
         closedWatchProgressFlushed = false
+        resetMatchingClearEpoch()
         playbackSnapshotEpoch = PlaybackClearEpochs.currentEpoch()
         pendingSeekScrobbleRestart = false
         awaitingPausedSeekSnapshot = false
@@ -189,6 +190,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
     if (lastResetVideoIdentity != videoIdentity) {
         lastResetVideoIdentity = videoIdentity
         endedPlaybackStopCommitted = false
+        resetMatchingClearEpoch()
         playbackSnapshotEpoch = PlaybackClearEpochs.currentEpoch()
         hasRequestedScrobbleStartForCurrentItem = false
         scrobbleStartRequestGeneration = 0L
@@ -553,10 +555,16 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
     )
 }
 
+internal fun PlayerScreenRuntime.isClearedSinceLastPlaybackActivity(
+    session: WatchProgressPlaybackSession = playbackSession,
+): Boolean =
+    latestMatchingClearEpoch > playbackSnapshotEpoch ||
+        PlaybackClearEpochs.wasClearedAfter(session = session, afterEpoch = playbackSnapshotEpoch)
+
 internal fun PlayerScreenRuntime.refreshPlaybackActivityAfterClearIfNeeded() {
     val latestEpoch = PlaybackClearEpochs.currentEpoch()
-    if (latestEpoch <= playbackSnapshotEpoch) return
-    if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) {
+    if (latestEpoch <= playbackSnapshotEpoch && latestMatchingClearEpoch <= playbackSnapshotEpoch) return
+    if (isClearedSinceLastPlaybackActivity()) {
         hasSentCompletionScrobbleForCurrentItem = false
     }
     playbackSnapshotEpoch = latestEpoch
@@ -574,7 +582,7 @@ private fun PlayerScreenRuntime.commitWatchProgress(
     val action = scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)
     val session = playbackSession
     val snapshot = playbackSnapshot
-    if (PlaybackClearEpochs.wasClearedAfter(session = session, afterEpoch = playbackSnapshotEpoch)) {
+    if (isClearedSinceLastPlaybackActivity(session)) {
         if (action == TrackingScrobbleAction.STOP) {
             if (snapshot.isEnded && syncRemote) {
                 endedPlaybackStopCommitted = true
@@ -668,7 +676,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (frozenForQuit) return@launch
-        if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) return@launch
+        if (isClearedSinceLastPlaybackActivity()) return@launch
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
         val expectedTargetMs = lastSeekTargetMs ?: pendingSeekTarget?.first
         val reachedTarget = expectedTargetMs?.let { targetMs ->
@@ -732,7 +740,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
 
 internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     if (frozenForQuit) return
-    if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) return
+    if (isClearedSinceLastPlaybackActivity()) return
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now

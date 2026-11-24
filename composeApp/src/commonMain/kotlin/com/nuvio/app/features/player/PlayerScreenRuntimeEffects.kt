@@ -560,6 +560,24 @@ internal fun PlayerScreenRuntime.BindPlayerQuitAndDisposeEffects() {
         val effectSourceUrl = activeSourceUrl
         val effectSourceAudioUrl = activeSourceAudioUrl
         frozenForQuit = false
+        val unregisterClearObserver = com.nuvio.app.features.watchprogress.PlaybackClearEpochs.registerObserver { record ->
+            val currentSession = playbackSession
+            if (
+                currentSession.videoId == effectVideoId &&
+                activeSourceUrl == effectSourceUrl &&
+                activeSourceAudioUrl == effectSourceAudioUrl &&
+                com.nuvio.app.features.watchprogress.PlaybackClearEpochs.matchesSession(record, currentSession)
+            ) {
+                recordMatchingClearEpoch(record.epoch)
+            }
+        }
+        val missedClearEpoch = com.nuvio.app.features.watchprogress.PlaybackClearEpochs.latestMatchingEpoch(
+            session = playbackSession,
+            afterEpoch = playbackSnapshotEpoch,
+        )
+        if (missedClearEpoch > playbackSnapshotEpoch) {
+            recordMatchingClearEpoch(missedClearEpoch)
+        }
         val unregisterFlushHook = WatchProgressRepository.registerActivePlayerFlushHook(
             onQuitAborted = {
                 Snapshot.withMutableSnapshot {
@@ -584,14 +602,18 @@ internal fun PlayerScreenRuntime.BindPlayerQuitAndDisposeEffects() {
         )
         onDispose {
             unregisterFlushHook()
-            if (
-                !frozenForQuit &&
-                !closedWatchProgressFlushed &&
-                playbackSession.videoId == effectVideoId &&
-                activeSourceUrl == effectSourceUrl &&
-                activeSourceAudioUrl == effectSourceAudioUrl
-            ) {
-                flushWatchProgress()
+            try {
+                if (
+                    !frozenForQuit &&
+                    !closedWatchProgressFlushed &&
+                    playbackSession.videoId == effectVideoId &&
+                    activeSourceUrl == effectSourceUrl &&
+                    activeSourceAudioUrl == effectSourceAudioUrl
+                ) {
+                    flushWatchProgress()
+                }
+            } finally {
+                unregisterClearObserver()
             }
         }
     }

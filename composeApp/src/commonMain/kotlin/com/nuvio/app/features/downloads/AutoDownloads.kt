@@ -15,9 +15,13 @@ import com.nuvio.app.features.watchprogress.CurrentDateProvider
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.isDesktop
 import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -143,6 +147,8 @@ internal fun MetaDetails.releasedBatchEpisodes(todayIsoDate: String): List<Seaso
 internal object AutoDownloads : AutoDownloadController {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val started = atomic(false)
+    private val actionJobsLock = SynchronizedObject()
+    private val activeActionJobs = LinkedHashSet<Job>()
 
     private val store = AutoDownloadStore(PlatformAutoDownloadPayloads) { ProfileRepository.activeProfileId }
 
@@ -301,7 +307,7 @@ internal object AutoDownloads : AutoDownloadController {
     }
 
     override fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) {
-        scope.launch {
+        launchTrackedAction {
             if (!runCatching { store.setDeleteAfterWatchingMode(profileId, mode) }.getOrDefault(false)) {
                 NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
             }
@@ -309,15 +315,15 @@ internal object AutoDownloads : AutoDownloadController {
     }
 
     override fun undoKeepDownload(profileId: Int, downloadId: String) {
-        scope.launch { runCatching { deleteAfterWatching.undoKeep(profileId, downloadId) } }
+        launchTrackedAction { runCatching { deleteAfterWatching.undoKeep(profileId, downloadId) } }
     }
 
     override fun keepDownload(profileId: Int, downloadId: String) {
-        scope.launch { runCatching { deleteAfterWatching.keep(profileId, downloadId) } }
+        launchTrackedAction { runCatching { deleteAfterWatching.keep(profileId, downloadId) } }
     }
 
     override fun deleteDownloadNow(profileId: Int, downloadId: String) {
-        scope.launch {
+        launchTrackedAction {
             val outcome = runCatching { deleteAfterWatching.deleteNow(profileId, downloadId) }.getOrNull()
             val message = when (outcome) {
                 AutoDownloadRemovalOutcome.Removed -> Res.string.downloads_auto_deleted_toast
@@ -371,15 +377,17 @@ internal object AutoDownloads : AutoDownloadController {
         // The profile and cancel epoch when playback ended, so a later unwatch or profile switch wins.
         val profileId = ProfileRepository.activeProfileId
         val completionEpoch = store.currentCancelEpoch()
-        scope.launch {
-            val item = DownloadsRepository.findCompletedDownloadByLocalFile(localFileUri) ?: return@launch
+        launchTrackedAction {
+            val item = DownloadsRepository.findCompletedDownloadByLocalFile(localFileUri) ?: return@launchTrackedAction
             val scheduled = runCatching {
                 deleteAfterWatching.onLocalPlaybackCompleted(profileId, item, completionEpoch)
             }.getOrDefault(false)
             if (scheduled) runCatching { announceScheduledDeletion(profileId, item) }
             // The watched state is saved by the player after it reports the end of playback.
-            delay(PlaybackCheckDelayMs)
-            checkSafely(autoDownloadRuleKey(item.parentMetaType, item.parentMetaId))
+            scope.launch {
+                delay(PlaybackCheckDelayMs)
+                checkSafely(autoDownloadRuleKey(item.parentMetaType, item.parentMetaId))
+            }
         }
     }
 
@@ -425,7 +433,7 @@ internal object AutoDownloads : AutoDownloadController {
                 onlyNonEpisode = onlyNonEpisode,
             )
             if (cancelled) {
-                scope.launch {
+                launchTrackedAction {
                     runCatching {
                         store.currentRules()
                             .filter { it.parentMetaId.trim() in normalizedParents }
@@ -455,6 +463,38 @@ internal object AutoDownloads : AutoDownloadController {
 
     fun onBatchFinished(request: SeasonBatchRequest, summary: SeasonBatchSummary) {
         engine.onBatchFinished(request, summary)
+    }
+
+    /** Waits until every queued completion, Keep, Undo Keep, or deletion action has settled. */
+    internal suspend fun awaitIdle() {
+        while (true) {
+            val snapshot = synchronized(actionJobsLock) { activeActionJobs.toList() }
+            if (snapshot.isEmpty()) return
+            snapshot.forEach { it.join() }
+        }
+    }
+
+    private fun launchTrackedAction(block: suspend CoroutineScope.() -> Unit): Job {
+        lateinit var job: Job
+        synchronized(actionJobsLock) {
+            job = scope.launch(start = CoroutineStart.LAZY) {
+                try {
+                    block()
+                } finally {
+                    synchronized(actionJobsLock) {
+                        activeActionJobs.remove(job)
+                    }
+                }
+            }
+            activeActionJobs.add(job)
+        }
+        job.invokeOnCompletion {
+            synchronized(actionJobsLock) {
+                activeActionJobs.remove(job)
+            }
+        }
+        job.start()
+        return job
     }
 
     private suspend fun checkSafely(ruleKey: String? = null, ignoreWaiting: Boolean = false) {

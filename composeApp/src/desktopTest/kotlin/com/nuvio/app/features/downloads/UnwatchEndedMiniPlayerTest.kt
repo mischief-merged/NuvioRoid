@@ -39,6 +39,7 @@ import com.nuvio.app.features.player.PlayerSessionController
 import com.nuvio.app.features.player.PlayerSettingsUiState
 import com.nuvio.app.features.player.PreparedStartupSubtitles
 import com.nuvio.app.features.player.SubtitleTrack
+import com.nuvio.app.features.player.playbackSession
 import com.nuvio.app.features.player.requestMinimize
 import com.nuvio.app.features.player.stopPlaybackAndFlushForQuit
 import com.nuvio.app.features.player.updatePlaybackSnapshot
@@ -64,11 +65,13 @@ import com.nuvio.app.features.watched.WatchedItem
 import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watched.WatchedStorage
 import com.nuvio.app.features.watching.application.WatchingActions
+import com.nuvio.app.features.watchprogress.PlaybackClearEpochs
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import com.nuvio.app.features.watchprogress.WatchProgressStorage
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.writeBytes
@@ -84,7 +87,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelChildren
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -152,7 +154,7 @@ class UnwatchEndedMiniPlayerTest {
         val progressProvider: TrackingProgressProvider?,
     )
 
-    private val recordedScrobbles = mutableListOf<RecordedScrobble>()
+    private val recordedScrobbles = CopyOnWriteArrayList<RecordedScrobble>()
 
     private inner class TestDownloadsBackend : DownloadsBackend {
         var payload: String? = null
@@ -278,6 +280,7 @@ class UnwatchEndedMiniPlayerTest {
 
     @After
     fun tearDown() {
+        runBlocking { AutoDownloads.awaitIdle() }
         cancelAutoDownloadsPendingJobs()
         setAutoDownloadsStarted(previousAutoStarted)
         ActivePlayerSessionRegistry.setActive(false)
@@ -330,11 +333,10 @@ class UnwatchEndedMiniPlayerTest {
         val item = downloadedItem(episodeNumber = 1)
         val harness = mountMiniPlayerSession(localFileUri = file.toUri().toString(), episodeNumber = 1)
 
-        // Play to natural end in the mini player.
+        // Play to natural end in the mini player; await both removal scheduling and toast delivery.
         deliverNaturalEnd(harness)
-        awaitCondition("removal scheduled after natural finish") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
+        assertTrue(NuvioToastController.currentToast.value?.message?.contains("Pantheon") == true)
         assertTrue(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertTrue(WatchProgressRepository.isEpisodeLocallyFinished(showId, 1, 1))
 
@@ -345,7 +347,7 @@ class UnwatchEndedMiniPlayerTest {
             episode = episodes[0],
             isCurrentlyWatched = true,
         )
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
 
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertNull(WatchProgressRepository.progressForVideo(videoId = episodes[0].id, parentMetaId = showId, seasonNumber = 1, episodeNumber = 1))
@@ -355,8 +357,7 @@ class UnwatchEndedMiniPlayerTest {
         // Close the ended mini player.
         val toastBeforeClose = NuvioToastController.currentToast.value?.id
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(harness.sessionController.hasActiveSession)
         assertFalse(
@@ -391,22 +392,19 @@ class UnwatchEndedMiniPlayerTest {
         val harness = mountMiniPlayerSession(localFileUri = file.toUri().toString(), episodeNumber = 1)
 
         deliverNaturalEnd(harness)
-        awaitCondition("removal scheduled after natural finish") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
         val originalDue = AutoDownloads.removals.value.single().dueAtEpochMs
 
         // Choose Keep while the ended mini player is still open.
         AutoDownloads.keepDownload(profileId, item.id)
-        awaitCondition("Keep clears active removal and records kept download") {
-            item.id in AutoDownloads.keptDownloadIds.value && AutoDownloads.removals.value.isEmpty()
-        }
+        awaitAutoDownloadsIdle()
+        assertTrue(item.id in AutoDownloads.keptDownloadIds.value)
+        assertEquals(emptyList(), AutoDownloads.removals.value)
 
         // Close the ended mini player: Keep must still win and leave no active schedule.
         val toastBeforeClose = NuvioToastController.currentToast.value?.id
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(harness.sessionController.hasActiveSession)
         assertEquals(emptyList(), AutoDownloads.removals.value)
@@ -415,9 +413,8 @@ class UnwatchEndedMiniPlayerTest {
 
         // Undoing Keep still restores the original pre-close due time.
         AutoDownloads.undoKeepDownload(profileId, item.id)
-        awaitCondition("Undo Keep restores original schedule") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        awaitAutoDownloadsIdle()
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
         assertEquals(originalDue, AutoDownloads.removals.value.single().dueAtEpochMs)
     }
 
@@ -434,9 +431,7 @@ class UnwatchEndedMiniPlayerTest {
 
         // First natural finish.
         deliverNaturalEnd(harness)
-        awaitCondition("first finish schedules removal") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
         assertEquals(1, completionScrobbles().size)
 
         // Mark as unwatched while the ended mini player remains open.
@@ -445,7 +440,7 @@ class UnwatchEndedMiniPlayerTest {
             episode = episodes[0],
             isCurrentlyWatched = true,
         )
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertEquals(emptyList(), AutoDownloads.removals.value)
 
@@ -464,9 +459,7 @@ class UnwatchEndedMiniPlayerTest {
         }
         compose.waitForIdle()
         deliverNaturalEnd(harness)
-        awaitCondition("new natural finish after unwatch schedules removal again") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
         assertTrue(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertEquals(
             2,
@@ -482,8 +475,7 @@ class UnwatchEndedMiniPlayerTest {
             isCurrentlyWatched = true,
         )
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
         assertFalse(harness.sessionController.hasActiveSession)
         assertEquals(emptyList(), AutoDownloads.removals.value)
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
@@ -492,13 +484,10 @@ class UnwatchEndedMiniPlayerTest {
         // Reopen in a fresh session and play to natural end, then close.
         openSessionOnExistingContent(harness, localFileUri = file.toUri().toString(), episodeNumber = 1, launchId = 202L)
         deliverNaturalEnd(harness)
-        awaitCondition("fresh session natural finish schedules removal") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
         val thirdDue = AutoDownloads.removals.value.single().dueAtEpochMs
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
         assertEquals(listOf(AutoDownloadRemoval(item.id, null, thirdDue)), AutoDownloads.removals.value)
 
         // When the 24-hour hold expires, removal uses Trash only (never permanent deletion).
@@ -531,20 +520,17 @@ class UnwatchEndedMiniPlayerTest {
         val harness = mountMiniPlayerSession(localFileUri = file.toUri().toString(), episodeNumber = 1)
 
         deliverNaturalEnd(harness)
-        awaitCondition("removal scheduled and toast shown after natural finish") {
-            AutoDownloads.removals.value.any { it.downloadId == item.id } &&
-                NuvioToastController.currentToast.value?.message?.contains("Pantheon") == true
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
+        assertTrue(NuvioToastController.currentToast.value?.message?.contains("Pantheon") == true)
         val dueAfterFinish = AutoDownloads.removals.value.single().dueAtEpochMs
         val toastAfterFinish = NuvioToastController.currentToast.value?.id
         assertNotNull(toastAfterFinish)
         assertEquals(1, completionScrobbles().size)
 
-        // Advance wall clock before closing so any duplicate scheduleRemoval would shift dueAtEpochMs.
-        Thread.sleep(30)
+        // Wait for the millisecond clock to tick so any duplicate scheduleRemoval would shift dueAtEpochMs.
+        advanceDownloadsClockTick()
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(harness.sessionController.hasActiveSession)
         assertEquals(
@@ -600,7 +586,7 @@ class UnwatchEndedMiniPlayerTest {
             episode = episodes[0],
             isCurrentlyWatched = true,
         )
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertEquals(emptyList(), AutoDownloads.removals.value)
 
@@ -610,12 +596,87 @@ class UnwatchEndedMiniPlayerTest {
             harness.runtime.frozenForQuit = false
         }
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertNull(WatchProgressRepository.progressForVideo(videoId = episodes[0].id, parentMetaId = showId, seasonNumber = 1, episodeNumber = 1))
         assertEquals(emptyList(), AutoDownloads.removals.value)
+    }
+
+    @Test
+    fun paused_past_watched_threshold_survives_clear_history_eviction_before_close_or_quit() {
+        autoDownloadsStore().setDeleteAfterWatchingMode(profileId, DeleteAfterWatchingMode.AllDownloads)
+        val file = completeDownloadedEpisode(episodeNumber = 1)
+        val item = downloadedItem(episodeNumber = 1)
+        val harness = mountMiniPlayerSession(localFileUri = file.toUri().toString(), episodeNumber = 1)
+        assertEquals(1, PlaybackClearEpochs.activeObserverCount())
+
+        // Play to 95% and pause so the episode is marked watched while paused.
+        compose.runOnIdle {
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = true,
+                    isEnded = false,
+                    positionMs = 2_280_000L,
+                    durationMs = 2_400_000L,
+                ),
+            )
+        }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            harness.runtime.shouldPlay = false
+            harness.runtime.updatePlaybackSnapshot(
+                PlayerPlaybackSnapshot(
+                    isLoading = false,
+                    isPlaying = false,
+                    isEnded = false,
+                    positionMs = 2_280_000L,
+                    durationMs = 2_400_000L,
+                ),
+            )
+        }
+        compose.waitForIdle()
+        assertTrue(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+
+        // Explicitly unwatch episode 1 while paused, then evict the bounded clear history completely.
+        WatchingActions.toggleEpisodeWatched(
+            meta = showMeta,
+            episode = episodes[0],
+            isCurrentlyWatched = true,
+        )
+        awaitAutoDownloadsIdle()
+        repeat(PlaybackClearEpochs.MaxRecentClears + 32) { index ->
+            WatchProgressRepository.clearProgress(
+                videoId = "tt8880000:1:${index + 1}",
+                parentMetaId = "tt8880000",
+            )
+        }
+        awaitAutoDownloadsIdle()
+        assertFalse(
+            PlaybackClearEpochs.wasClearedAfter(harness.runtime.playbackSession, afterEpoch = 0L),
+            "Expected bounded history entry for episode 1 to be evicted by subsequent clears",
+        )
+
+        // Even after bounded history eviction, neither quit nor close may restore watched state or schedule removal.
+        compose.runOnIdle {
+            harness.runtime.stopPlaybackAndFlushForQuit()
+            harness.runtime.frozenForQuit = false
+        }
+        compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
+        awaitAutoDownloadsIdle()
+
+        assertFalse(harness.sessionController.hasActiveSession)
+        assertEquals(0, PlaybackClearEpochs.activeObserverCount())
+        assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
+        assertNull(WatchProgressRepository.progressForVideo(videoId = episodes[0].id, parentMetaId = showId, seasonNumber = 1, episodeNumber = 1))
+        assertEquals(emptyList(), AutoDownloads.removals.value)
+
+        // Reopening and finishing genuinely still schedules removal as normal.
+        openSessionOnExistingContent(harness, localFileUri = file.toUri().toString(), episodeNumber = 1, launchId = 303L)
+        deliverNaturalEnd(harness)
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item.id })
+        assertTrue(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
     }
 
     @Test
@@ -627,9 +688,7 @@ class UnwatchEndedMiniPlayerTest {
         val harness = mountMiniPlayerSession(localFileUri = file1.toUri().toString(), episodeNumber = 1)
 
         deliverNaturalEnd(harness)
-        awaitCondition("removal scheduled for episode 1") {
-            AutoDownloads.removals.value.any { it.downloadId == item1.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == item1.id })
 
         // Unwatch episode 1 while ended mini player stays open.
         WatchingActions.toggleEpisodeWatched(
@@ -637,7 +696,7 @@ class UnwatchEndedMiniPlayerTest {
             episode = episodes[0],
             isCurrentlyWatched = true,
         )
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertEquals(emptyList(), AutoDownloads.removals.value)
 
@@ -647,8 +706,7 @@ class UnwatchEndedMiniPlayerTest {
             harness.runtime.frozenForQuit = false
         }
         compose.onNodeWithContentDescription(text(Res.string.player_next_episode)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(WatchedRepository.isWatched(id = showId, type = "series", season = 1, episode = 1))
         assertEquals(emptyList(), AutoDownloads.removals.value)
@@ -700,9 +758,7 @@ class UnwatchEndedMiniPlayerTest {
         val harness = mountMiniPlayerSessionForLaunch(movieLaunch, movieMeta)
 
         deliverNaturalEnd(harness)
-        awaitCondition("movie removal scheduled after natural finish") {
-            AutoDownloads.removals.value.any { it.downloadId == movieItem.id }
-        }
+        assertTrue(AutoDownloads.removals.value.any { it.downloadId == movieItem.id })
         assertTrue(WatchedRepository.isWatched(id = movieId, type = "movie"))
 
         runBlocking {
@@ -715,13 +771,12 @@ class UnwatchEndedMiniPlayerTest {
                 ),
             )
         }
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
         assertFalse(WatchedRepository.isWatched(id = movieId, type = "movie"))
         assertEquals(emptyList(), AutoDownloads.removals.value)
 
         compose.onNodeWithContentDescription(text(Res.string.compose_player_close)).performClick()
-        compose.waitForIdle()
-        settleAsyncAutoDownloads()
+        awaitAutoDownloadsIdle()
 
         assertFalse(harness.sessionController.hasActiveSession)
         assertFalse(WatchedRepository.isWatched(id = movieId, type = "movie"))
@@ -963,7 +1018,7 @@ class UnwatchEndedMiniPlayerTest {
                 ),
             )
         }
-        compose.waitForIdle()
+        awaitAutoDownloadsIdle()
     }
 
     private fun completionScrobbles(): List<RecordedScrobble> =
@@ -971,20 +1026,17 @@ class UnwatchEndedMiniPlayerTest {
 
     private fun text(resource: StringResource): String = runBlocking { getString(resource) }
 
-    private fun awaitCondition(description: String, timeoutMs: Long = 5_000L, predicate: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            compose.waitForIdle()
-            if (predicate()) return
-            Thread.sleep(15)
-        }
+    private fun awaitAutoDownloadsIdle() {
         compose.waitForIdle()
-        assertTrue(predicate(), "Timed out waiting for: $description")
+        runBlocking { AutoDownloads.awaitIdle() }
+        compose.waitForIdle()
     }
 
-    private fun settleAsyncAutoDownloads() {
-        Thread.sleep(150)
-        compose.waitForIdle()
+    private fun advanceDownloadsClockTick() {
+        val start = DownloadsClock.nowEpochMs()
+        while (DownloadsClock.nowEpochMs() <= start) {
+            Thread.yield()
+        }
     }
 
     private fun installIsolatedTrackerPorts(

@@ -246,6 +246,9 @@ internal fun PlayerScreenRuntime.skipInterval(interval: SkipInterval) {
     val rawMs = interval.internalSkipAction(skipIntervals, durationMs)?.targetMs ?: return
     val requestedMs = if (durationMs > 0L) rawMs.coerceAtMost(durationMs - 1) else rawMs
     val seekMs = if (isPartyControlLocked) ownSeekTarget(requestedMs) ?: return else requestedMs
+    if (!playbackSnapshot.isEnded || seekMs < playbackSnapshot.positionMs) {
+        refreshPlaybackActivityAfterClearIfNeeded()
+    }
     seekWithNote(playerController, seekMs)
     scheduleProgressSyncAfterSeek()
     publishPartyPlayback(positionMs = seekMs)
@@ -481,6 +484,9 @@ internal fun PlayerScreenRuntime.rememberSurfaceGestureCallbacks(): PlayerSurfac
                 ownSeekTarget(requestedPositionMs) ?: return@rememberUpdatedState
             } else {
                 requestedPositionMs
+            }
+            if (!playbackSnapshot.isEnded || targetPositionMs < playbackSnapshot.positionMs) {
+                refreshPlaybackActivityAfterClearIfNeeded()
             }
             lastManualSkipSeekPositions = playbackSnapshot.positionMs to targetPositionMs
             seekWithNote(playerController, targetPositionMs)
