@@ -2107,6 +2107,12 @@ object WatchProgressRepository {
         }
     }
 
+    internal fun normalizedParentContentId(parentContentId: String, videoId: String?): String? =
+        activeProgressProvider()
+            ?.normalizeParentContentId(parentContentId, videoId)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+
     private fun seedParentIdsFor(
         parentMetaId: String,
         videoId: String?,
@@ -2294,6 +2300,13 @@ object WatchProgressRepository {
                 seasonNumber = entry.seasonNumber,
                 episodeNumber = entry.episodeNumber,
             ) + episodeParents
+            PlaybackClearEpochs.recordClear(
+                profileId = currentProfileId,
+                parentMetaIds = parents,
+                seasonNumber = entry.seasonNumber,
+                episodeNumber = entry.episodeNumber,
+                videoId = entry.videoId,
+            )
             AutoDownloads.cancelPendingRemovals(
                 parentMetaIds = parents,
                 seasonNumber = entry.seasonNumber,
@@ -2314,6 +2327,13 @@ object WatchProgressRepository {
                 parseEpisodeFromPlaybackVideoId(videoId, parentMetaId = null)?.first?.let(::add)
                 addAll(episodeParents)
             }
+            PlaybackClearEpochs.recordClear(
+                profileId = currentProfileId,
+                parentMetaIds = parents,
+                seasonNumber = parsed?.second,
+                episodeNumber = parsed?.third,
+                videoId = videoId,
+            )
             AutoDownloads.cancelPendingRemovals(
                 parentMetaIds = parents,
                 seasonNumber = parsed?.second,
@@ -2322,6 +2342,12 @@ object WatchProgressRepository {
             )
         }
         aliasParentsByEpisode.forEach { (seasonEpisode, parents) ->
+            PlaybackClearEpochs.recordClear(
+                profileId = currentProfileId,
+                parentMetaIds = parents,
+                seasonNumber = seasonEpisode.first,
+                episodeNumber = seasonEpisode.second,
+            )
             AutoDownloads.cancelPendingRemovals(
                 parentMetaIds = parents,
                 seasonNumber = seasonEpisode.first,
@@ -2336,6 +2362,12 @@ object WatchProgressRepository {
         episodeNumber: Int?,
         clearedAliases: Set<LocallyFinishedEpisodeAlias>,
     ) {
+        PlaybackClearEpochs.recordClear(
+            profileId = currentProfileId,
+            parentMetaIds = parentMetaIds,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+        )
         AutoDownloads.cancelPendingRemovals(
             parentMetaIds = parentMetaIds,
             seasonNumber = seasonNumber,
@@ -2348,6 +2380,12 @@ object WatchProgressRepository {
             )
             .forEach { (seasonEpisode, parents) ->
                 if (seasonEpisode.first != seasonNumber || seasonEpisode.second != episodeNumber) {
+                    PlaybackClearEpochs.recordClear(
+                        profileId = currentProfileId,
+                        parentMetaIds = parents,
+                        seasonNumber = seasonEpisode.first,
+                        episodeNumber = seasonEpisode.second,
+                    )
                     AutoDownloads.cancelPendingRemovals(
                         parentMetaIds = parents,
                         seasonNumber = seasonEpisode.first,

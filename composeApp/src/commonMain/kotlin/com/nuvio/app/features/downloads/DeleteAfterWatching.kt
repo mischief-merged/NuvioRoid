@@ -46,11 +46,19 @@ internal class DeleteAfterWatching(
     private val holdMs: Long = DefaultHoldMs,
 ) {
     /** True when a removal was scheduled for [item]. */
-    fun onLocalPlaybackCompleted(profileId: Int, item: DownloadItem): Boolean {
+    fun onLocalPlaybackCompleted(
+        profileId: Int,
+        item: DownloadItem,
+        afterCancelEpoch: Long? = null,
+    ): Boolean {
         val ruleKey = item.autoDownloadRuleKey
         if (item.status != DownloadStatus.Completed || item.isPlaceholder) return false
         if (!store.allowsRemoval(profileId, ruleKey)) return false
-        return store.scheduleRemoval(profileId, AutoDownloadRemoval(item.id, ruleKey, nowEpochMs() + holdMs))
+        return store.scheduleRemoval(
+            profileId = profileId,
+            removal = AutoDownloadRemoval(item.id, ruleKey, nowEpochMs() + holdMs),
+            afterCancelEpoch = afterCancelEpoch,
+        )
     }
 
     fun keep(profileId: Int, downloadId: String) {
