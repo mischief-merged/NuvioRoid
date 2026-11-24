@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.features.player.SubtitleRequestExtras
 import com.nuvio.app.features.player.looksLikePlaceholder
 import com.nuvio.app.features.player.addonSubtitleRequests
@@ -1845,6 +1846,8 @@ object DownloadsRepository {
                 },
                 onSwitchedToNewPartial = { newPartialFileName, kept ->
                     ifCurrent(item.id, transfer) {
+                        val now = DownloadsClock.nowEpochMs()
+                        rateTracker.recordStart(item.id, 0L, now)
                         mutateItem(item.id) { current ->
                             if (current.status != DownloadStatus.Downloading) {
                                 current
@@ -1863,7 +1866,7 @@ object DownloadsRepository {
                                     sourceLastModified = null,
                                     supersededPartials = nextSuperseded,
                                     pendingLinkVerification = false,
-                                    updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                                    updatedAtEpochMs = now,
                                 )
                             }
                         }
@@ -1881,18 +1884,24 @@ object DownloadsRepository {
                     val currentItem = _uiState.value.items.firstOrNull { it.id == item.id } ?: item
                     if (failIfAnnouncedAsPlaceholder(currentItem, totalBytes)) return@ifCurrent
                     val now = DownloadsClock.nowEpochMs()
-                    rateTracker.recordProgress(item.id, downloadedBytes, now)
+                    val normalizedBytes = downloadedBytes.coerceAtLeast(0L)
+                    rateTracker.recordProgress(item.id, normalizedBytes, now)
+                    var receivedNewBytes = false
                     mutateItem(item.id, progressOnly = true) { current ->
                         if (current.status != DownloadStatus.Downloading) {
                             current
                         } else {
+                            if (normalizedBytes > current.downloadedBytes) receivedNewBytes = true
                             current.copy(
-                                downloadedBytes = downloadedBytes.coerceAtLeast(0L),
+                                downloadedBytes = normalizedBytes,
                                 totalBytes = totalBytes?.takeIf { it > 0L },
                                 updatedAtEpochMs = now,
                                 errorMessage = null,
                             )
                         }
+                    }
+                    if (receivedNewBytes) {
+                        NetworkStatusRepository.onTrafficObserved(currentItem.sourceUrl)
                     }
                 }
             },
@@ -2547,6 +2556,9 @@ object DownloadsRepository {
 
     internal fun transferBytesPerSecond(downloadId: String, nowEpochMs: Long = DownloadsClock.nowEpochMs()): Long? =
         rateTracker.bytesPerSecond(downloadId, nowEpochMs)
+
+    internal fun hasRecentTransferBytes(downloadId: String, nowEpochMs: Long = DownloadsClock.nowEpochMs()): Boolean =
+        rateTracker.hasRecentProgress(downloadId, nowEpochMs)
 
     internal fun autoDownloadStorageLimitBytes(): Long? = autoDownloadLimits.storageLimitBytes()
 

@@ -121,8 +121,13 @@ internal fun guardedHttpClient(
         .dns(policy.dns)
         .socketFactory(policy.sockets)
         .addInterceptor { chain ->
-            checkScheme(chain.request().url)
-            chain.proceed(chain.request())
+            val request = chain.request()
+            checkScheme(request.url)
+            chain.proceed(request).also { response ->
+                if (response.code in 100..599) {
+                    NetworkStatusRepository.onTrafficObserved(request.url.toString())
+                }
+            }
         }
         .addNetworkInterceptor { chain ->
             // Runs for every redirect and pooled connection, before any request bytes are sent.

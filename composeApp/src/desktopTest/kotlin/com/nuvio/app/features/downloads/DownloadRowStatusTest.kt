@@ -29,8 +29,8 @@ class DownloadRowStatusTest {
         verifiedBy = verifiedBy, framesCheck = frames,
     )
 
-    private fun phase(item: DownloadItem, offline: Boolean = false, at: Long = now) =
-        downloadRowStatus(item, at, offline).phase
+    private fun phase(item: DownloadItem, offline: Boolean = false, at: Long = now, receivedRecently: Boolean = false) =
+        downloadRowStatus(item, at, offline, receivedBytesRecently = receivedRecently).phase
 
     @Test
     fun a_transfer_that_receives_data_is_downloading() {
@@ -54,6 +54,32 @@ class DownloadRowStatusTest {
     fun without_internet_the_wait_is_named_before_the_silence() {
         val silent = item(DownloadStatus.Downloading, updatedAt = 0)
         assertEquals(DownloadPhase.WaitingForNetwork, phase(silent, offline = true))
+    }
+
+    @Test
+    fun a_transfer_that_received_bytes_recently_is_downloading_even_while_marked_offline() {
+        val active = item(DownloadStatus.Downloading, downloaded = 125_000_000L, total = 1_400_000_000L, updatedAt = now)
+        val tracker = DownloadRateTracker()
+        tracker.recordStart(active.id, 100_000_000L, now - 6_000L)
+        assertFalse(tracker.hasRecentProgress(active.id, now))
+        tracker.recordProgress(active.id, 125_000_000L, now - 5_000L)
+        assertTrue(tracker.hasRecentProgress(active.id, now))
+
+        assertEquals(DownloadPhase.Downloading, phase(active, offline = true, receivedRecently = tracker.hasRecentProgress(active.id, now)))
+        assertEquals(
+            128L,
+            estimateDownloadEtaSeconds(active, bytesPerSecond = 10_000_000L, nowEpochMs = now, offline = true, receivedBytesRecently = true),
+        )
+
+        val afterSilence = now + DownloadStalledAfterMs
+        assertFalse(tracker.hasRecentProgress(active.id, afterSilence))
+        assertEquals(
+            DownloadPhase.WaitingForNetwork,
+            phase(active, offline = true, at = afterSilence, receivedRecently = tracker.hasRecentProgress(active.id, afterSilence)),
+        )
+        assertNull(
+            estimateDownloadEtaSeconds(active, bytesPerSecond = 10_000_000L, nowEpochMs = afterSilence, offline = true, receivedBytesRecently = false),
+        )
     }
 
     @Test
