@@ -1231,6 +1231,8 @@ class TripPlannerTest {
 
             assertTrue(runner.start(reviewPlan(episodes = 4)))
             kotlinx.coroutines.withTimeout(30_000) { enteredPrepare.await() }
+            assertEquals(0, runner.state.value.queuedEpisodes)
+            assertEquals(0, runner.state.value.processedEpisodes)
             runner.stop()
             val done = kotlinx.coroutines.withTimeout(30_000) {
                 runner.state.first { !it.isRunning && it.doneSummary != null }.doneSummary!!
@@ -1471,6 +1473,11 @@ class TripPlannerTest {
                 state.copy(items = state.items.map { if (it.id == failedTarget.id) it.copy(status = DownloadStatus.Failed, downloadedBytes = 0L) else it })
             }
             kotlinx.coroutines.withTimeout(30_000) { backupPrepareEntered.await() }
+            val runningDuringBackupPrepare = kotlinx.coroutines.withTimeout(30_000) {
+                runner.state.first { it.isRunning && it.queuedEpisodes == 1 && it.processedEpisodes == 1 }
+            }
+            assertEquals(1, runningDuringBackupPrepare.queuedEpisodes)
+            assertEquals(1, runningDuringBackupPrepare.processedEpisodes)
 
             runner.stop()
             val done = kotlinx.coroutines.withTimeout(30_000) {

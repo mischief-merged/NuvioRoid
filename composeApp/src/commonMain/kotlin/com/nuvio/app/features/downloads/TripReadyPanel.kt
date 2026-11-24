@@ -790,16 +790,12 @@ private fun TripFillCard(
                     } else {
                         0f
                     }
-                    val currentEpisode = if (runState.startedEpisodes > 0) {
-                        runState.startedEpisodes
-                    } else {
-                        runState.processedEpisodes + 1
-                    }.coerceIn(1, runState.totalEpisodes.coerceAtLeast(1))
+                    val queuedCount = runState.queuedEpisodes.coerceIn(0, runState.totalEpisodes)
                     LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                     Text(
                         text = stringResource(
                             Res.string.downloads_trip_fill_running,
-                            currentEpisode,
+                            queuedCount,
                             runState.totalEpisodes,
                             runState.currentLabel.orEmpty(),
                         ),

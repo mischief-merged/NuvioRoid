@@ -149,7 +149,6 @@ internal data class TripFillRunState(
     val failedEpisodes: Int = 0,
     val currentLabel: String? = null,
     val doneSummary: TripFillDoneSummary? = null,
-    val startedEpisodes: Int = 0,
 )
 
 /**
@@ -812,7 +811,6 @@ internal class TripFillRunner(
     }
 
     private data class RunCounts(
-        val started: Int,
         val processed: Int,
         val queued: Int,
         val waitingOnHold: Int,
@@ -827,15 +825,11 @@ internal class TripFillRunner(
     }
 
     private fun computeCounts(states: Array<EpisodeProgress>): RunCounts {
-        var started = 0
         var processed = 0
         var queued = 0
         var waitingOnHold = 0
         var failed = 0
         for (state in states) {
-            if (state != EpisodeProgress.Pending && state != EpisodeProgress.Stopped) {
-                started++
-            }
             when (state) {
                 EpisodeProgress.Pending, EpisodeProgress.Preparing, EpisodeProgress.Stopped -> Unit
                 EpisodeProgress.Enqueued, EpisodeProgress.Queued -> {
@@ -856,7 +850,7 @@ internal class TripFillRunner(
                 }
             }
         }
-        return RunCounts(started, processed, queued, waitingOnHold, failed)
+        return RunCounts(processed, queued, waitingOnHold, failed)
     }
 
     private fun updateEpisode(
@@ -883,7 +877,6 @@ internal class TripFillRunner(
             waitingOnHoldEpisodes = counts.waitingOnHold,
             failedEpisodes = counts.failed,
             currentLabel = run.currentLabel,
-            startedEpisodes = counts.started,
         )
     }
 
@@ -977,7 +970,6 @@ internal class TripFillRunner(
                                 failedCount = counts.failed,
                                 stoppedEarly = cancelled || run.stopped,
                             ),
-                            startedEpisodes = counts.started,
                         )
                     }
                 }
@@ -1013,13 +1005,9 @@ internal class TripFillRunner(
             currentCoroutineContext().ensureActive()
             resume(existing, profileId)
             if (!profileMatches(profileId)) return EpisodeOutcome.Stopped
-            val resumed = downloads.value.items.firstOrNull { it.id == existing.id }
-            return when {
-                resumed == null -> EpisodeOutcome.Skipped
-                resumed.status == DownloadStatus.Paused && resumed.pausedByConnection -> EpisodeOutcome.WaitingOnHold
-                resumed.status != DownloadStatus.Failed -> EpisodeOutcome.Queued
-                else -> EpisodeOutcome.Failed
-            }
+            return if (downloads.value.items.any { it.id == existing.id && it.status != DownloadStatus.Failed }) {
+                EpisodeOutcome.Queued
+            } else EpisodeOutcome.Failed
         }
         if (hasActiveOrCompleted(downloads.value, planned, minBytes)) {
             return EpisodeOutcome.AlreadyPresent
