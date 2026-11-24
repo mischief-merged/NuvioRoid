@@ -22,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.action_back
@@ -454,6 +455,297 @@ class TripReadyPanelTest {
         compose.onNodeWithText(preview8HrText).performClick()
         compose.waitUntil(timeoutMillis = 3_000L) {
             compose.onAllNodesWithText(downloadAnywayText).fetchSemanticsNodes().size == 2
+        }
+    }
+
+    @Test
+    fun `stopping trip queueing while two downloads are receiving shows two in progress and done summary`() {
+        val showCandidate = TripShowCandidate(
+            parentMetaType = "series",
+            parentMetaId = "show:trip",
+            title = "Andor",
+            fromContinueWatching = true,
+        )
+        val cachedStream = StreamItem(
+            name = "Andor.1080p",
+            title = "Andor.1080p",
+            url = "https://ex/ep.mkv",
+            addonName = "Addon",
+            addonId = "addon:test",
+            behaviorHints = StreamBehaviorHints(videoSize = 900_000_000L, filename = "ep.mkv"),
+            debridCacheStatus = StreamDebridCacheStatus(
+                providerId = "rd",
+                providerName = "RD",
+                state = StreamDebridCacheState.CACHED,
+                cachedSize = 900_000_000L,
+            ),
+        )
+        val plannedEpisodes = (1..4).map { number ->
+            TripPlannedEpisode(
+                show = showCandidate,
+                episode = SeasonBatchEpisode("show:trip:1:$number", 1, number, "Episode $number", null, runtimeMinutes = 45),
+                effectiveRuntimeMinutes = 45,
+                runtimeEstimated = false,
+                rankedStreams = listOf(cachedStream.copy(url = "https://ex/ep$number.mkv")),
+                selectedStream = cachedStream.copy(url = "https://ex/ep$number.mkv"),
+                isCached = true,
+                estimatedBytes = 900_000_000L,
+                sizeEstimated = false,
+            )
+        }
+        DownloadsRepository.ensureLoaded()
+        val profileId = DownloadsRepository.loadedProfile()
+        val runner = TripFillRunner(
+            scope = runnerScope,
+            downloads = DownloadsRepository.uiState,
+            prepareStream = { s, _ -> s },
+            enqueue = { _, _, _ -> DownloadEnqueueResult.MissingUrl },
+            enqueueOwned = DownloadsRepository::enqueueTripEpisode,
+            resume = DownloadsRepository::resumeTripEpisode,
+            currentProfileId = { profileId },
+            maxConcurrent = 2,
+        )
+        val deps = TripReadyDeps(
+            collectShows = { listOf(showCandidate) },
+            buildPlan = { hours, _ ->
+                TripFillPlan(
+                    requestedHours = hours,
+                    plannedEpisodes = plannedEpisodes,
+                    totalPlannedMinutes = 180,
+                    totalEstimatedBytes = 3_600_000_000L,
+                    qualityDefaults = SeasonDownloadDefaults(),
+                    storageLimitBytes = null,
+                    remainingStorageLimitBytes = null,
+                    freeDiskBytes = 40_000_000_000L,
+                    connectionHoldReason = null,
+                    stoppedReason = TripPlanStopReason.TargetReached,
+                    profileId = profileId,
+                )
+            },
+            runner = runner,
+            loadDiskInfo = { _, _ -> emptyMap() },
+            durationMsOf = { _, _ -> null },
+            bytesPerSecondOf = { _, _ -> null },
+            fetchMissingCompanions = null,
+        )
+
+        val preview8HrText = runBlocking { getString(Res.string.downloads_trip_fill_plan_button, DefaultTripFillHours) }
+        val startDownloadingText = runBlocking { getString(Res.string.downloads_trip_fill_start) }
+
+        compose.setContent {
+            NuvioTheme {
+                TripReadyPanel(
+                    onBack = {},
+                    onOpenDownload = {},
+                    onOpenShow = { _, _ -> },
+                    downloadsStateFlow = DownloadsRepository.uiState,
+                    folders = NoDownloadFolders,
+                    rechecks = null,
+                    connectionHold = ConnectionHold(),
+                    tripDeps = deps,
+                )
+            }
+        }
+
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(preview8HrText))
+        compose.onNodeWithText(preview8HrText).performClick()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            compose.onAllNodesWithText(startDownloadingText).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(startDownloadingText))
+        compose.onNodeWithText(startDownloadingText).performClick()
+
+        // Wait for two downloads to be enqueued and actively receiving, and verify progress reflects 2 of 4.
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            DownloadsRepository.uiState.value.items.count { it.tripFill && it.status == DownloadStatus.Downloading } == 2 &&
+                compose.onAllNodesWithText("Queued 2 of 4:", substring = true).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Stop queueing").assertIsDisplayed().performClick()
+
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            compose.onAllNodesWithText("Queued 2 of 4 planned episodes.").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Queueing stopped early.").assertIsDisplayed()
+        assertEquals(2, DownloadsRepository.uiState.value.items.count { it.tripFill })
+    }
+
+    @Test
+    fun `running progress label matches enqueued count during initial preparation and failover backup`() {
+        val showCandidate = TripShowCandidate(
+            parentMetaType = "series",
+            parentMetaId = "show:trip-prep",
+            title = "Andor",
+            fromContinueWatching = true,
+        )
+        val primaryStream = StreamItem(
+            name = "Andor.1080p.primary",
+            title = "Andor.1080p.primary",
+            url = "https://ex/primary.mkv",
+            addonName = "Addon",
+            addonId = "addon:test",
+            behaviorHints = StreamBehaviorHints(videoSize = 900_000_000L, filename = "primary.mkv"),
+            debridCacheStatus = StreamDebridCacheStatus(
+                providerId = "rd",
+                providerName = "RD",
+                state = StreamDebridCacheState.CACHED,
+                cachedSize = 900_000_000L,
+            ),
+        )
+        val backupStream = primaryStream.copy(
+            name = "Andor.1080p.backup",
+            title = "Andor.1080p.backup",
+            url = "https://ex/backup.mkv",
+        )
+        val plannedEpisodes = (1..4).map { number ->
+            val primary = primaryStream.copy(url = "https://ex/ep$number-primary.mkv")
+            val backup = backupStream.copy(url = "https://ex/ep$number-backup.mkv")
+            TripPlannedEpisode(
+                show = showCandidate,
+                episode = SeasonBatchEpisode("show:trip-prep:1:$number", 1, number, "Episode $number", null, runtimeMinutes = 45),
+                effectiveRuntimeMinutes = 45,
+                runtimeEstimated = false,
+                rankedStreams = listOf(primary, backup),
+                selectedStream = primary,
+                isCached = true,
+                estimatedBytes = 900_000_000L,
+                sizeEstimated = false,
+            )
+        }
+
+        val initialPrepareGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val backupPrepareEntered = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val backupPrepareGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val downloadsFlow = MutableStateFlow(DownloadsUiState())
+        try {
+            val runner = TripFillRunner(
+                scope = runnerScope,
+                downloads = downloadsFlow,
+                prepareStream = { stream, _ ->
+                    if (stream.url.orEmpty().contains("-primary")) {
+                        initialPrepareGate.await()
+                    } else {
+                        backupPrepareEntered.complete(Unit)
+                        backupPrepareGate.await()
+                    }
+                    stream
+                },
+                enqueue = { show, episode, chosen ->
+                    val suffix = if (chosen.url.orEmpty().contains("-primary")) "primary" else "backup"
+                    val item = DownloadItem(
+                        id = "dl-${episode.episodeNumber}-$suffix",
+                        contentType = "series",
+                        parentMetaId = show.parentMetaId,
+                        parentMetaType = show.parentMetaType,
+                        videoId = episode.videoId,
+                        title = show.title,
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber,
+                        streamTitle = chosen.name.orEmpty(),
+                        providerName = "Addon",
+                        sourceUrl = chosen.url.orEmpty(),
+                        fileName = "ep${episode.episodeNumber}-$suffix.mkv",
+                        status = DownloadStatus.Downloading,
+                        downloadedBytes = 0L,
+                        totalBytes = 900_000_000L,
+                        createdAtEpochMs = 1_000L,
+                        updatedAtEpochMs = 2_000L,
+                        tripFill = true,
+                    )
+                    downloadsFlow.update { state -> state.copy(items = state.items + item) }
+                    DownloadEnqueueResult.Started
+                },
+                maxConcurrent = 2,
+            )
+
+            val deps = TripReadyDeps(
+                collectShows = { listOf(showCandidate) },
+                buildPlan = { hours, _ ->
+                    TripFillPlan(
+                        requestedHours = hours,
+                        plannedEpisodes = plannedEpisodes,
+                        totalPlannedMinutes = 180,
+                        totalEstimatedBytes = 3_600_000_000L,
+                        qualityDefaults = SeasonDownloadDefaults(),
+                        storageLimitBytes = null,
+                        remainingStorageLimitBytes = null,
+                        freeDiskBytes = 40_000_000_000L,
+                        connectionHoldReason = null,
+                        stoppedReason = TripPlanStopReason.TargetReached,
+                    )
+                },
+                runner = runner,
+                loadDiskInfo = { _, _ -> emptyMap() },
+                durationMsOf = { _, _ -> null },
+                bytesPerSecondOf = { _, _ -> null },
+                fetchMissingCompanions = null,
+            )
+
+            val preview8HrText = runBlocking { getString(Res.string.downloads_trip_fill_plan_button, DefaultTripFillHours) }
+            val startDownloadingText = runBlocking { getString(Res.string.downloads_trip_fill_start) }
+
+            compose.setContent {
+                NuvioTheme {
+                    TripReadyPanel(
+                        onBack = {},
+                        onOpenDownload = {},
+                        onOpenShow = { _, _ -> },
+                        downloadsStateFlow = downloadsFlow,
+                        folders = NoDownloadFolders,
+                        rechecks = null,
+                        connectionHold = ConnectionHold(),
+                        tripDeps = deps,
+                    )
+                }
+            }
+
+            compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(preview8HrText))
+            compose.onNodeWithText(preview8HrText).performClick()
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                compose.onAllNodesWithText(startDownloadingText).fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(startDownloadingText))
+            compose.onNodeWithText(startDownloadingText).performClick()
+
+            // While both workers are resolving sources before any enqueue, label stays at 0 of 4.
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                compose.onAllNodesWithText("Queued 0 of 4: Andor", substring = true).fetchSemanticsNodes().isNotEmpty()
+            }
+            assertEquals(0, compose.onAllNodesWithText("Queued 1 of 4:", substring = true).fetchSemanticsNodes().size)
+            assertEquals(0, compose.onAllNodesWithText("Queued 2 of 4:", substring = true).fetchSemanticsNodes().size)
+
+            // Release initial preparation -> two downloads become active and label shows 2 of 4.
+            initialPrepareGate.complete(Unit)
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                downloadsFlow.value.items.count { it.status == DownloadStatus.Downloading } == 2 &&
+                    compose.onAllNodesWithText("Queued 2 of 4:", substring = true).fetchSemanticsNodes().isNotEmpty()
+            }
+
+            // Fail one active episode with 0 bytes so it enters backup preparation while the other stays active.
+            val failedTarget = downloadsFlow.value.items.last()
+            downloadsFlow.update { state ->
+                state.copy(
+                    items = state.items.map {
+                        if (it.id == failedTarget.id) it.copy(status = DownloadStatus.Failed, downloadedBytes = 0L) else it
+                    },
+                )
+            }
+            runBlocking { kotlinx.coroutines.withTimeout(5_000L) { backupPrepareEntered.await() } }
+
+            // With one active download and one preparing its backup, label shows 1 of 4 (not 2 of 4).
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                compose.onAllNodesWithText("Queued 1 of 4:", substring = true).fetchSemanticsNodes().isNotEmpty()
+            }
+            assertEquals(0, compose.onAllNodesWithText("Queued 2 of 4:", substring = true).fetchSemanticsNodes().size)
+
+            // Stopping in this preparation/failover window reports 1 of 4, matching the running label.
+            compose.onNodeWithText("Stop queueing").assertIsDisplayed().performClick()
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                compose.onAllNodesWithText("Queued 1 of 4 planned episodes.").fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithText("Queueing stopped early.").assertIsDisplayed()
+        } finally {
+            initialPrepareGate.cancel()
+            backupPrepareGate.cancel()
         }
     }
 

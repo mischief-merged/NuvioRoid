@@ -3546,7 +3546,7 @@
     <string name="downloads_trip_fill_start">Start downloading</string>
     <string name="downloads_trip_fill_start_waiting">Queue to wait</string>
     <string name="downloads_trip_fill_cancel_plan">Clear plan</string>
-    <string name="downloads_trip_fill_running">Queueing %1$d of %2$d: %3$s</string>
+    <string name="downloads_trip_fill_running">Queued %1$d of %2$d: %3$s</string>
     <string name="downloads_trip_fill_stop_queueing">Stop queueing</string>
     <string name="downloads_trip_fill_done_queued">Queued %1$d of %2$d planned episodes.</string>
     <string name="downloads_trip_fill_done_waiting">Queued %1$d episodes to wait for your connection.</string>

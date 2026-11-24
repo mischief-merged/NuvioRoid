@@ -44,6 +44,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- Stopping trip queueing now counts the downloads that had already started, and the progress label shows how many are queued (#145) ([#146](https://github.com/mischief-merged/NuvioRoid/pull/146)).
 - Marking a finished download as unwatched, or tapping Keep, now stays in effect when you close the player, so it is no longer scheduled for removal again (#139, #141) ([#143](https://github.com/mischief-merged/NuvioRoid/pull/143)).
 - Trip planning and download status no longer say you are offline when only the account server is unreachable (#140). ([#142](https://github.com/mischief-merged/NuvioRoid/pull/142)).
 - The download folder setting tests no longer read saved downloads on the test machine, so they pass the same way in any order ([#138](https://github.com/mischief-merged/NuvioRoid/pull/138)).

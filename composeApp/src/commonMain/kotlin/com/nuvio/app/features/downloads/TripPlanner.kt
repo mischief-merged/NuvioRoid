@@ -759,7 +759,7 @@ internal class TripFillRunner(
     private val lock = SynchronizedObject()
     private val slots = Semaphore(maxConcurrent.coerceAtLeast(1))
     private var activeJob: Job? = null
-    private var stopped = false
+    private var activeRun: RunContext? = null
     private var runProfileId: Int? = null
 
     private val _state = MutableStateFlow(TripFillRunState())
@@ -770,37 +770,117 @@ internal class TripFillRunner(
         synchronized(lock) {
             if (activeJob?.isActive == true) return false
             if (runCatching { persistPlan(plan) }.isFailure) return false
+            val run = RunContext(plan.plannedEpisodes.size)
             runProfileId = plan.profileId
-            stopped = false
+            activeRun = run
             _state.value = TripFillRunState(
                 isRunning = true,
                 totalEpisodes = plan.plannedEpisodes.size,
             )
-            activeJob = scope.launch { runPlan(plan) }
+            activeJob = scope.launch { runPlan(plan, run) }
         }
         return true
     }
 
     fun stop(clearPending: Boolean = true): Job? {
-        if (clearPending) runCatching { clearPlan(runProfileId) }
-        val job = synchronized(lock) {
-            stopped = true
-            activeJob
+        val (job, profileId) = synchronized(lock) {
+            activeRun?.stopped = true
+            activeJob to runProfileId
         }
+        if (clearPending) runCatching { clearPlan(profileId) }
         job?.cancel()
         return job
     }
 
     fun clearDone() {
-        if (_state.value.isRunning) return
-        _state.value = TripFillRunState()
+        synchronized(lock) {
+            if (_state.value.isRunning) return
+            _state.value = TripFillRunState()
+        }
     }
 
-    private suspend fun runPlan(plan: TripFillPlan) {
+    private enum class EpisodeProgress {
+        Pending,
+        Preparing,
+        Enqueued,
+        Queued,
+        WaitingOnHold,
+        Skipped,
+        Failed,
+        Stopped,
+    }
+
+    private data class RunCounts(
+        val processed: Int,
+        val queued: Int,
+        val waitingOnHold: Int,
+        val failed: Int,
+    )
+
+    private class RunContext(totalEpisodes: Int) {
+        var stopped: Boolean = false
+        var finished: Boolean = false
+        val episodeStates: Array<EpisodeProgress> = Array(totalEpisodes) { EpisodeProgress.Pending }
+        var currentLabel: String? = null
+    }
+
+    private fun computeCounts(states: Array<EpisodeProgress>): RunCounts {
+        var processed = 0
         var queued = 0
         var waitingOnHold = 0
         var failed = 0
-        var processed = 0
+        for (state in states) {
+            when (state) {
+                EpisodeProgress.Pending, EpisodeProgress.Preparing, EpisodeProgress.Stopped -> Unit
+                EpisodeProgress.Enqueued, EpisodeProgress.Queued -> {
+                    processed++
+                    queued++
+                }
+                EpisodeProgress.WaitingOnHold -> {
+                    processed++
+                    queued++
+                    waitingOnHold++
+                }
+                EpisodeProgress.Skipped -> {
+                    processed++
+                }
+                EpisodeProgress.Failed -> {
+                    processed++
+                    failed++
+                }
+            }
+        }
+        return RunCounts(processed, queued, waitingOnHold, failed)
+    }
+
+    private fun updateEpisode(
+        run: RunContext,
+        index: Int,
+        progress: EpisodeProgress,
+        label: String? = null,
+    ) {
+        synchronized(lock) {
+            run.episodeStates[index] = progress
+            if (label != null) run.currentLabel = label
+            publishRunningLocked(run)
+        }
+    }
+
+    private fun publishRunningLocked(run: RunContext) {
+        if (activeRun !== run || run.finished) return
+        val counts = computeCounts(run.episodeStates)
+        _state.value = TripFillRunState(
+            isRunning = true,
+            totalEpisodes = run.episodeStates.size,
+            processedEpisodes = counts.processed,
+            queuedEpisodes = counts.queued,
+            waitingOnHoldEpisodes = counts.waitingOnHold,
+            failedEpisodes = counts.failed,
+            currentLabel = run.currentLabel,
+        )
+    }
+
+    private suspend fun runPlan(plan: TripFillPlan, run: RunContext) {
         var cancelled = false
         val budgetLock = SynchronizedObject()
         val reservedBytesByKey = mutableMapOf<String, Long>()
@@ -809,16 +889,23 @@ internal class TripFillRunner(
 
         try {
             coroutineScope {
-                for (planned in plan.plannedEpisodes) {
+                plan.plannedEpisodes.forEachIndexed { index, planned ->
                     launch {
                         val key = logicalKeyOf(planned)
                         slots.acquire()
                         try {
-                            if (synchronized(lock) { stopped }) return@launch
+                            if (synchronized(lock) { run.stopped }) return@launch
                             val label = "${planned.show.title} S${planned.episode.seasonNumber.toString().padStart(2, '0')}E${planned.episode.episodeNumber.toString().padStart(2, '0')}"
-                            _state.update { it.copy(currentLabel = label) }
+                            synchronized(lock) {
+                                if (run.stopped) return@launch
+                                run.episodeStates[index] = EpisodeProgress.Preparing
+                                run.currentLabel = label
+                                publishRunningLocked(run)
+                            }
 
                             val outcome = processPlannedEpisode(
+                                run = run,
+                                index = index,
                                 planned = planned,
                                 qualityDefaults = plan.qualityDefaults,
                                 profileId = plan.profileId,
@@ -828,26 +915,23 @@ internal class TripFillRunner(
                                 queuedEstimatedBytesByKey = queuedEstimatedBytesByKey,
                             )
                             synchronized(lock) {
-                                processed++
-                                when (outcome) {
-                                    EpisodeOutcome.Queued -> queued++
-                                    EpisodeOutcome.WaitingOnHold -> {
-                                        queued++
-                                        waitingOnHold++
+                                val nextProgress = when (outcome) {
+                                    EpisodeOutcome.Queued,
+                                    EpisodeOutcome.AlreadyPresent -> EpisodeProgress.Queued
+                                    EpisodeOutcome.WaitingOnHold -> EpisodeProgress.WaitingOnHold
+                                    EpisodeOutcome.Skipped -> EpisodeProgress.Skipped
+                                    EpisodeOutcome.Failed -> EpisodeProgress.Failed
+                                    EpisodeOutcome.Stopped -> {
+                                        run.stopped = true
+                                        if (run.episodeStates[index] == EpisodeProgress.Enqueued) {
+                                            EpisodeProgress.Enqueued
+                                        } else {
+                                            EpisodeProgress.Stopped
+                                        }
                                     }
-                                    EpisodeOutcome.AlreadyPresent -> queued++
-                                    EpisodeOutcome.Skipped -> Unit
-                                    EpisodeOutcome.Failed -> failed++
-                                    EpisodeOutcome.Stopped -> stopped = true
                                 }
-                                _state.update {
-                                    it.copy(
-                                        processedEpisodes = processed,
-                                        queuedEpisodes = queued,
-                                        waitingOnHoldEpisodes = waitingOnHold,
-                                        failedEpisodes = failed,
-                                    )
-                                }
+                                run.episodeStates[index] = nextProgress
+                                publishRunningLocked(run)
                             }
                         } finally {
                             synchronized(budgetLock) {
@@ -863,28 +947,32 @@ internal class TripFillRunner(
             cancelled = true
         } finally {
             withContext(NonCancellable) {
-                if (!cancelled && !synchronized(lock) { stopped } && profileMatches(plan.profileId)) {
+                val wasStopped = synchronized(lock) { run.stopped }
+                if (!cancelled && !wasStopped && profileMatches(plan.profileId)) {
                     runCatching { clearPlan(plan.profileId) }
                 }
-                val (finalProcessed, finalQueued, finalHold, finalFailed, wasStopped) = synchronized(lock) {
-                    listOf(processed, queued, waitingOnHold, failed, if (stopped) 1 else 0)
+                synchronized(lock) {
+                    run.finished = true
+                    val counts = computeCounts(run.episodeStates)
+                    if (activeRun === run) {
+                        _state.value = TripFillRunState(
+                            isRunning = false,
+                            totalEpisodes = plan.plannedEpisodes.size,
+                            processedEpisodes = counts.processed,
+                            queuedEpisodes = counts.queued,
+                            waitingOnHoldEpisodes = counts.waitingOnHold,
+                            failedEpisodes = counts.failed,
+                            currentLabel = null,
+                            doneSummary = TripFillDoneSummary(
+                                totalPlanned = plan.plannedEpisodes.size,
+                                queuedCount = counts.queued,
+                                waitingOnHoldCount = counts.waitingOnHold,
+                                failedCount = counts.failed,
+                                stoppedEarly = cancelled || run.stopped,
+                            ),
+                        )
+                    }
                 }
-                _state.value = TripFillRunState(
-                    isRunning = false,
-                    totalEpisodes = plan.plannedEpisodes.size,
-                    processedEpisodes = finalProcessed,
-                    queuedEpisodes = finalQueued,
-                    waitingOnHoldEpisodes = finalHold,
-                    failedEpisodes = finalFailed,
-                    currentLabel = null,
-                    doneSummary = TripFillDoneSummary(
-                        totalPlanned = plan.plannedEpisodes.size,
-                        queuedCount = finalQueued,
-                        waitingOnHoldCount = finalHold,
-                        failedCount = finalFailed,
-                        stoppedEarly = cancelled || wasStopped != 0,
-                    ),
-                )
             }
         }
     }
@@ -899,6 +987,8 @@ internal class TripFillRunner(
     }
 
     private suspend fun processPlannedEpisode(
+        run: RunContext,
+        index: Int,
         planned: TripPlannedEpisode,
         qualityDefaults: SeasonDownloadDefaults,
         profileId: Int?,
@@ -911,6 +1001,8 @@ internal class TripFillRunner(
         val minBytes = minPlausibleVideoBytes(planned.effectiveRuntimeMinutes)
         val existing = findItem(downloads.value.items, planned)
         if (existing?.hasTripPartial == true) {
+            if (synchronized(lock) { run.stopped }) return EpisodeOutcome.Stopped
+            currentCoroutineContext().ensureActive()
             resume(existing, profileId)
             if (!profileMatches(profileId)) return EpisodeOutcome.Stopped
             return if (downloads.value.items.any { it.id == existing.id && it.status != DownloadStatus.Failed }) {
@@ -934,7 +1026,7 @@ internal class TripFillRunner(
             }
         }.take(SeasonBatchDownloader.MaxSourcesPerEpisode)
         for (candidate in candidates) {
-            if (synchronized(lock) { stopped }) return EpisodeOutcome.Stopped
+            if (synchronized(lock) { run.stopped }) return EpisodeOutcome.Stopped
             currentCoroutineContext().ensureActive()
 
             val prepared = try {
@@ -945,6 +1037,8 @@ internal class TripFillRunner(
                 null
             } ?: continue
 
+            if (synchronized(lock) { run.stopped }) return EpisodeOutcome.Stopped
+            currentCoroutineContext().ensureActive()
             if (!profileMatches(profileId)) return EpisodeOutcome.Stopped
             val intervening = findItem(downloads.value.items, planned)
             if (intervening != null && intervening.id !in ownedIds &&
@@ -977,6 +1071,8 @@ internal class TripFillRunner(
             }
             if (!fitsBudget) return EpisodeOutcome.Stopped
 
+            if (synchronized(lock) { run.stopped }) return EpisodeOutcome.Stopped
+            currentCoroutineContext().ensureActive()
             if (!profileMatches(profileId)) return EpisodeOutcome.Stopped
             val ownedId = try {
                 if (enqueueOwned != null) {
@@ -1007,15 +1103,25 @@ internal class TripFillRunner(
                 reservedDestinationByKey.remove(key)
             }
 
-            // A row that pauses or is replaced releases its slot for the rest of the plan.
-            val item = downloads
-                .first { state ->
-                    val current = state.items.firstOrNull { it.id == ownedId }
-                    !profileMatches(profileId) || current == null ||
-                        current.status != DownloadStatus.Downloading ||
-                        (current.totalBytes != null && current.totalBytes in 1 until minBytes)
-                }
-                .let { state -> state.items.firstOrNull { it.id == ownedId } }
+            // Count the episode as queued as soon as its download is active, before waiting for a slot.
+            val initialItem = downloads.value.items.firstOrNull { it.id == ownedId }
+            val item = if (
+                initialItem != null &&
+                initialItem.status == DownloadStatus.Downloading &&
+                !(initialItem.totalBytes != null && initialItem.totalBytes in 1 until minBytes)
+            ) {
+                updateEpisode(run, index, EpisodeProgress.Enqueued)
+                downloads
+                    .first { state ->
+                        val current = state.items.firstOrNull { it.id == ownedId }
+                        !profileMatches(profileId) || current == null ||
+                            current.status != DownloadStatus.Downloading ||
+                            (current.totalBytes != null && current.totalBytes in 1 until minBytes)
+                    }
+                    .let { state -> state.items.firstOrNull { it.id == ownedId } }
+            } else {
+                initialItem
+            }
 
             if (!profileMatches(profileId)) return EpisodeOutcome.Stopped
             when {
@@ -1027,17 +1133,17 @@ internal class TripFillRunner(
                 item.status == DownloadStatus.Downloading && item.totalBytes != null && item.totalBytes in 1 until minBytes ->
                     return EpisodeOutcome.Failed
                 item.isPlaceholder ->
-                    Unit
+                    updateEpisode(run, index, EpisodeProgress.Preparing)
                 item.status == DownloadStatus.Completed && item.finishedSizeBytes < minBytes ->
-                    Unit
+                    updateEpisode(run, index, EpisodeProgress.Preparing)
                 item.status == DownloadStatus.Completed && isPlaceholderOnDisk(item, planned.effectiveRuntimeMinutes, minBytes) ->
-                    Unit
+                    updateEpisode(run, index, EpisodeProgress.Preparing)
                 item.status == DownloadStatus.Completed && lacksChosenAudio(item, qualityDefaults.audioLanguage) ->
-                    Unit
+                    updateEpisode(run, index, EpisodeProgress.Preparing)
                 item.status == DownloadStatus.Completed ->
                     return EpisodeOutcome.Queued
                 item.hasTripPartial -> return EpisodeOutcome.Failed
-                else -> Unit // A source that wrote nothing may be tried from another source.
+                else -> updateEpisode(run, index, EpisodeProgress.Preparing) // A source that wrote nothing may be tried from another source.
             }
         }
         return EpisodeOutcome.Failed
