@@ -265,6 +265,7 @@ internal fun TripReadyPanel(
         addressRequired = folders.supported,
         holdState = holdState,
         offline = !network.hasInternet,
+        canFetchCompanions = network.isOnline,
         nowEpochMs = now,
         rechecks = rechecks,
         tripDeps = tripDeps,
@@ -323,6 +324,7 @@ internal fun rememberTripReadyController(
     addressRequired: Boolean,
     holdState: ConnectionHoldState,
     offline: Boolean,
+    canFetchCompanions: Boolean,
     nowEpochMs: Long,
     rechecks: DownloadRechecks?,
     tripDeps: TripReadyDeps,
@@ -370,6 +372,8 @@ internal fun rememberTripReadyController(
 
     val fetchDoneText = stringResource(Res.string.downloads_trip_ready_fetch_extras_done)
     val fetchOfflineText = stringResource(Res.string.downloads_trip_ready_fetch_extras_offline)
+    val fetchUnavailableText = stringResource(Res.string.downloads_trip_ready_fetch_extras_unavailable)
+    val fetchNothingText = stringResource(Res.string.downloads_trip_ready_fetch_extras_nothing)
     val checkClearText = stringResource(Res.string.downloads_check_all_clear)
     val checkNothingText = stringResource(Res.string.downloads_check_all_nothing)
 
@@ -387,14 +391,19 @@ internal fun rememberTripReadyController(
     val runFetchCompanions: (suspend () -> Unit)? = tripDeps.fetchMissingCompanions?.let { fetcher ->
         {
             if (!isFetchingCompanions) {
-                if (offline) {
-                    NuvioToastController.show(fetchOfflineText)
+                if (!canFetchCompanions) {
+                    NuvioToastController.show(if (offline) fetchOfflineText else fetchUnavailableText)
                 } else {
                     isFetchingCompanions = true
                     try {
-                        fetcher(uiState.items)
+                        val result = fetcher(uiState.items)
                         companionRefreshNonce++
-                        NuvioToastController.show(fetchDoneText)
+                        val message = when {
+                            result.stoppedEarly || result.failed > 0 || result.unavailable > 0 -> fetchUnavailableText
+                            result.looked == 0 -> fetchNothingText
+                            else -> fetchDoneText
+                        }
+                        NuvioToastController.show(message)
                     } finally {
                         isFetchingCompanions = false
                     }

@@ -338,6 +338,7 @@ internal fun DownloadsScreenContent(
             addressRequired = folders.supported,
             holdState = holdState,
             offline = !network.hasInternet,
+            canFetchCompanions = network.isOnline,
             nowEpochMs = now.value,
             rechecks = rechecks,
             tripDeps = tripDeps,

@@ -3451,6 +3451,8 @@
     <string name="downloads_trip_ready_fetch_extras">Fetch missing subtitles and skip times</string>
     <string name="downloads_trip_ready_fetch_extras_done">Checked for missing subtitles and skip times.</string>
     <string name="downloads_trip_ready_fetch_extras_offline">Connect to the internet to fetch missing subtitles and skip times.</string>
+    <string name="downloads_trip_ready_fetch_extras_unavailable">Some subtitles or skip times could not be checked. Try again later.</string>
+    <string name="downloads_trip_ready_fetch_extras_nothing">No subtitles or skip times were checked.</string>
     <string name="downloads_trip_ready_offline_heading">Playable offline now</string>
     <string name="downloads_trip_ready_offline_subtitle">Verified files that are not flagged</string>
     <string name="downloads_trip_ready_offline_empty">No verified offline downloads ready yet.</string>

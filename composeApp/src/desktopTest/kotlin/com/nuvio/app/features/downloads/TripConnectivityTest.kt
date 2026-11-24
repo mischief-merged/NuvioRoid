@@ -13,10 +13,12 @@ import com.nuvio.app.core.network.NetworkCondition
 import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.addons.AddonManifest
 import com.nuvio.app.features.addons.AddonRepository
 import com.nuvio.app.features.addons.AddonResource
 import com.nuvio.app.features.addons.ManagedAddon
+import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CoroutineScope
@@ -61,6 +63,7 @@ class TripConnectivityTest : TrustedLocalServerTest() {
     @BeforeTest
     fun setUp() {
         NetworkStatusRepository.resetForTest()
+        NuvioToastController.dismiss()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = MemoryBackend()
@@ -79,7 +82,16 @@ class TripConnectivityTest : TrustedLocalServerTest() {
             exchange.sendResponseHeaders(if (failStreams) 503 else 200, bytes.size.toLong())
             exchange.responseBody.use { it.write(bytes) }
         }
+        server.createContext("/ready") { exchange ->
+            val bytes = "ready".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
         server.start()
+        // Initialize the HTTP client before measuring a lookup with the planner's timeout.
+        runBlocking {
+            withTimeout(30_000) { assertEquals("ready", httpGetText("http://127.0.0.1:${server.address.port}/ready")) }
+        }
         val url = "http://127.0.0.1:${server.address.port}/manifest.json"
         AddonRepository.setAddonsForTest(listOf(ManagedAddon(
             manifestUrl = url,
@@ -96,6 +108,7 @@ class TripConnectivityTest : TrustedLocalServerTest() {
     @AfterTest
     fun tearDown() {
         scope.cancel()
+        NuvioToastController.dismiss()
         server.stop(0)
         MetaDetailsRepository.removeCachedMetaForTest("series", show.parentMetaId)
         AddonRepository.setAddonsForTest(previousAddons)
@@ -279,6 +292,143 @@ class TripConnectivityTest : TrustedLocalServerTest() {
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("/s • About", substring = true))
         compose.onNodeWithText("/s • About", substring = true).assertIsDisplayed()
         assertTrue(compose.onAllNodesWithText("Waiting for the internet", substring = true).fetchSemanticsNodes().isEmpty())
+    }
+
+    @Test
+    fun standalone_companions_use_the_backfill_connection_gate() {
+        assertCompanionConnectionGate(embedded = false)
+    }
+
+    @Test
+    fun embedded_companions_use_the_backfill_connection_gate() {
+        assertCompanionConnectionGate(embedded = true)
+    }
+
+    private fun assertCompanionConnectionGate(embedded: Boolean) {
+        val probe = showCompanionFetch(embedded)
+        for (condition in listOf(NetworkCondition.ServersUnreachable, NetworkCondition.NoInternet,
+            NetworkCondition.Unknown, NetworkCondition.Checking, NetworkCondition.Online)) {
+            compose.runOnIdle {
+                NuvioToastController.dismiss()
+                NetworkStatusRepository.setConditionForTest(condition)
+            }
+            clickCompanionFetch()
+            val expected = if (condition == NetworkCondition.Online) 1 else 0
+            assertEquals(expected, probe.fetches.get(), condition.name)
+            assertEquals(expected, probe.requests.get(), condition.name)
+            if (condition == NetworkCondition.Online) {
+                assertEquals(1, probe.result.value?.looked)
+                assertEquals("Checked for missing subtitles and skip times.", NuvioToastController.currentToast.value?.message)
+            } else {
+                assertFalse(NuvioToastController.currentToast.value?.message == "Checked for missing subtitles and skip times.")
+            }
+        }
+    }
+
+    @Test
+    fun companions_stopped_before_backfill_do_not_claim_a_finished_check() {
+        val probe = showCompanionFetch(embedded = false, beforeBackfill = {
+            NetworkStatusRepository.setConditionForTest(NetworkCondition.ServersUnreachable)
+        })
+        clickCompanionFetch()
+        assertEquals(1, probe.fetches.get())
+        assertEquals(0, probe.requests.get())
+        assertEquals(0, probe.result.value?.looked)
+        assertEquals(true, probe.result.value?.stoppedEarly)
+        assertFalse(NuvioToastController.currentToast.value?.message == "Checked for missing subtitles and skip times.")
+    }
+
+    @Test
+    fun companions_failed_http_lookup_does_not_claim_a_finished_check() {
+        val probe = showCompanionFetch(embedded = true, failRequest = true)
+        clickCompanionFetch()
+        assertEquals(1, probe.fetches.get())
+        assertEquals(1, probe.requests.get())
+        assertEquals(1, probe.result.value?.failed)
+        assertFalse(NuvioToastController.currentToast.value?.message == "Checked for missing subtitles and skip times.")
+    }
+
+    @Test
+    fun companions_with_no_due_work_do_not_claim_a_finished_check() {
+        val probe = showCompanionFetch(embedded = false, due = false)
+        clickCompanionFetch()
+        assertEquals(1, probe.fetches.get())
+        assertEquals(0, probe.requests.get())
+        assertEquals(0, probe.result.value?.looked)
+        assertFalse(NuvioToastController.currentToast.value?.message == "Checked for missing subtitles and skip times.")
+    }
+
+    private data class CompanionFetchProbe(
+        val fetches: AtomicInteger = AtomicInteger(),
+        val requests: AtomicInteger = AtomicInteger(),
+        val result: MutableStateFlow<CompanionBackfillSummary?> = MutableStateFlow(null),
+    )
+
+    private fun showCompanionFetch(
+        embedded: Boolean,
+        failRequest: Boolean = false,
+        due: Boolean = true,
+        beforeBackfill: () -> Unit = {},
+    ): CompanionFetchProbe {
+        val probe = CompanionFetchProbe()
+        server.createContext("/companions") { exchange ->
+            probe.requests.incrementAndGet()
+            val bytes = "nothing found".toByteArray()
+            exchange.sendResponseHeaders(if (failRequest) 503 else 200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        val companion = object : DownloadCompanion {
+            override val name = "test companions"
+            override fun isDue(item: DownloadItem, localVideoUri: String) = due
+            override suspend fun run(item: DownloadItem, localVideoUri: String): CompanionOutcome {
+                httpGetText("http://127.0.0.1:${server.address.port}/companions")
+                return CompanionOutcome.NothingFound
+            }
+        }
+        val backfill = DownloadCompanions(listOf(companion), scope = scope)
+        val completed = testDownload(2, DownloadStatus.Completed, localFileUri = "file:///fixture/episode.mkv")
+        val items = listOf(completed)
+        val deps = rowDeps().copy(
+            loadDiskInfo = { _, _ -> mapOf(completed.id to TripItemDiskInfo()) },
+            fetchMissingCompanions = { downloads ->
+                probe.fetches.incrementAndGet()
+                beforeBackfill()
+                backfill.backfill(downloads) { it.localFileUri }.also { probe.result.value = it }
+            },
+        )
+        (DownloadsRepository.backend as MemoryBackend).payload = DownloadsCodec.encode(items, null)
+        NetworkStatusRepository.setConditionForTest(NetworkCondition.Online)
+        compose.setContent {
+            NuvioTheme {
+                if (embedded) {
+                    DownloadsScreenContent(
+                        onBack = {}, onOpenDownload = {}, showAutoDownloads = false,
+                        folders = NoDownloadFolders, connectionHold = ConnectionHold(),
+                        nowEpochMs = { now }, tripDeps = deps, runtimeMinutes = { null },
+                    )
+                } else {
+                    TripReadyPanel(
+                        onBack = {}, onOpenDownload = {}, onOpenShow = { _, _ -> },
+                        downloadsStateFlow = MutableStateFlow(DownloadsUiState(items)),
+                        folders = NoDownloadFolders, rechecks = null, connectionHold = ConnectionHold(),
+                        nowEpochMs = { now }, tripDeps = deps,
+                    )
+                }
+            }
+        }
+        if (embedded) compose.onNodeWithText("Trip ready").performClick()
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Needs attention"))
+        compose.waitUntil(30_000) {
+            compose.onAllNodesWithText("Fetch missing subtitles and skip times").fetchSemanticsNodes().isNotEmpty()
+        }
+        return probe
+    }
+
+    private fun clickCompanionFetch() {
+        val label = "Fetch missing subtitles and skip times"
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText(label))
+        compose.onNodeWithText(label).performClick()
+        compose.waitUntil(30_000) { NuvioToastController.currentToast.value != null }
     }
 
     private fun rowDeps() = TripReadyDeps(
