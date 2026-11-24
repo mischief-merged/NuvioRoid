@@ -1146,4 +1146,59 @@ class DeleteAfterWatchingTest {
         assertFalse(store.isKept(1, item(2).id))
         assertEquals(emptyList(), store.removals(1))
     }
+
+    @Test
+    fun an_in_flight_completion_from_before_unwatch_or_keep_is_refused_while_a_new_finish_schedules() {
+        optIn()
+        store.setDeleteAfterWatchingMode(1, DeleteAfterWatchingMode.AllDownloads)
+
+        // Completion captured before unwatch, even when no removal was stored yet at the moment of unwatch.
+        val epochBeforeUnwatch = store.currentCancelEpoch()
+        assertFalse(feature.cancelForContent(1, parentMetaId = "tt1", seasonNumber = 1, episodeNumber = 1))
+        assertFalse(
+            feature.onLocalPlaybackCompleted(1, item(1), afterCancelEpoch = epochBeforeUnwatch),
+            "A completion signal captured before Mark as unwatched must not schedule removal afterwards",
+        )
+        assertEquals(emptyList(), store.removals(1))
+
+        // Unwatching episode 1 does not block an in-flight completion for sibling episode 2.
+        assertTrue(feature.onLocalPlaybackCompleted(1, item(2), afterCancelEpoch = epochBeforeUnwatch))
+        assertEquals(listOf(item(2).id), store.removals(1).map { it.downloadId })
+
+        // A genuinely new natural finish on episode 1 captured after the unwatch schedules normally.
+        val epochAfterUnwatch = store.currentCancelEpoch()
+        assertTrue(feature.onLocalPlaybackCompleted(1, item(1), afterCancelEpoch = epochAfterUnwatch))
+        assertEquals(setOf(item(1).id, item(2).id), store.removals(1).mapTo(mutableSetOf()) { it.downloadId })
+
+        // A pending Keep in flight before lock acquisition also blocks a racing schedule attempt.
+        val keepSignalled = CountDownLatch(1)
+        val allowKeepToFinish = CountDownLatch(1)
+        val racingStore = AutoDownloadStore(
+            payloads = payloads,
+            nowEpochMs = { now },
+            afterSignallingKeep = {
+                keepSignalled.countDown()
+                assertTrue(allowKeepToFinish.await(5, TimeUnit.SECONDS))
+            },
+            activeProfileId = { activeProfile },
+        )
+        val racingFeature = DeleteAfterWatching(
+            store = racingStore,
+            downloads = { items },
+            isWatchedToTheEnd = { it.id !in notWatchedToTheEnd },
+            isInPlayer = { false },
+            hasLaterEpisode = { _, _ -> true },
+            removeDownload = { _, _, _ -> AutoDownloadRemovalResult.Removed },
+            nowEpochMs = { now },
+        )
+        val keepWorker = thread(isDaemon = true) {
+            racingFeature.keep(1, item(3).id)
+        }
+        assertTrue(keepSignalled.await(5, TimeUnit.SECONDS))
+        assertFalse(racingFeature.onLocalPlaybackCompleted(1, item(3), afterCancelEpoch = racingStore.currentCancelEpoch()))
+        allowKeepToFinish.countDown()
+        keepWorker.join(5_000)
+        assertTrue(racingStore.isKept(1, item(3).id))
+        assertEquals(emptyList(), racingStore.removals(1).filter { it.downloadId == item(3).id })
+    }
 }

@@ -25,6 +25,7 @@ import com.nuvio.app.features.watching.sync.WatchedDeltaEvent
 import com.nuvio.app.features.watching.sync.WatchedSyncAdapter
 import com.nuvio.app.features.watchprogress.ContinueWatchingPreferencesRepository
 import com.nuvio.app.features.watchprogress.LocallyFinishedEpisodeAlias
+import com.nuvio.app.features.watchprogress.PlaybackClearEpochs
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
@@ -1045,6 +1046,13 @@ object WatchedRepository {
                         valueTransform = { it.parentMetaId },
                     )
                     .forEach { (seasonEpisode, parentMetaIds) ->
+                        PlaybackClearEpochs.recordClear(
+                            profileId = currentProfileId,
+                            parentMetaIds = parentMetaIds,
+                            seasonNumber = seasonEpisode.first,
+                            episodeNumber = seasonEpisode.second,
+                            videoId = item.videoId,
+                        )
                         AutoDownloads.cancelPendingRemovals(
                             parentMetaIds = parentMetaIds,
                             seasonNumber = seasonEpisode.first,
@@ -1053,6 +1061,12 @@ object WatchedRepository {
                         )
                     }
             } else if (!item.type.isSeriesLikeWatchingContentType()) {
+                PlaybackClearEpochs.recordClear(
+                    profileId = currentProfileId,
+                    parentMetaIds = listOf(item.id),
+                    videoId = item.videoId,
+                    onlyNonEpisode = true,
+                )
                 AutoDownloads.cancelPendingRemovals(
                     parentMetaId = item.id,
                     videoId = item.videoId,
@@ -1077,6 +1091,12 @@ object WatchedRepository {
                     valueTransform = { it.parentMetaId },
                 )
                 .forEach { (seasonEpisode, parentMetaIds) ->
+                    PlaybackClearEpochs.recordClear(
+                        profileId = currentProfileId,
+                        parentMetaIds = parentMetaIds,
+                        seasonNumber = seasonEpisode.first,
+                        episodeNumber = seasonEpisode.second,
+                    )
                     AutoDownloads.cancelPendingRemovals(
                         parentMetaIds = parentMetaIds,
                         seasonNumber = seasonEpisode.first,

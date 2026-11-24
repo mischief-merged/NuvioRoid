@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -85,6 +86,8 @@ internal class AutoDownloadStore(
     private val pendingKeeps = mutableMapOf<Pair<Int, String>, Int>()
     private val activeRemovalSnapshots = mutableMapOf<Pair<Int, String>, Int>()
     private val acceptedKeepEpochs = mutableMapOf<Pair<Int, String>, Long>()
+    private val cancelEpoch = atomic(0L)
+    private val cancelledRemovalEpochs = LinkedHashMap<Pair<Int, String>, Long>()
     // Every field is written, also one that has its default value, so that a rule keeps what it
     // was saved with when a default changes later.
     private val json = Json {
@@ -228,9 +231,25 @@ internal class AutoDownloadStore(
         ensureLoaded() == profileId && downloadId in state.keptDownloadIds
     }
 
-    /** Schedules [removal], replacing an earlier one of the same download. Refused for a kept download. */
-    fun scheduleRemoval(profileId: Int, removal: AutoDownloadRemoval): Boolean = synchronized(lock) {
-        if (ensureLoaded() != profileId || removal.downloadId in state.keptDownloadIds || !state.allowsRemoval(removal.ruleKey)) return false
+    fun currentCancelEpoch(): Long = cancelEpoch.value
+
+    /** Schedules [removal], replacing an earlier one of the same download. Refused for a kept or newly unwatched download. */
+    fun scheduleRemoval(
+        profileId: Int,
+        removal: AutoDownloadRemoval,
+        afterCancelEpoch: Long? = null,
+    ): Boolean = synchronized(lock) {
+        val key = profileId to removal.downloadId
+        if (
+            ensureLoaded() != profileId ||
+            hasPendingKeep(profileId, removal.downloadId) ||
+            removal.downloadId in state.keptDownloadIds ||
+            !state.allowsRemoval(removal.ruleKey) ||
+            (afterCancelEpoch != null && (cancelledRemovalEpochs[key] ?: 0L) > afterCancelEpoch)
+        ) {
+            return false
+        }
+        cancelledRemovalEpochs.remove(key)
         save(profileId, state.copy(removals = state.removals.filterNot { it.downloadId == removal.downloadId } + removal))
         true
     }
@@ -257,6 +276,18 @@ internal class AutoDownloadStore(
     /** Cancels any scheduled or kept-aside removal for [downloadIds]. */
     fun cancelRemovals(profileId: Int, downloadIds: Set<String>): Boolean = WatchedRemovalGuard.change {
         if (downloadIds.isEmpty() || ensureLoaded() != profileId) return@change false
+        val epoch = cancelEpoch.incrementAndGet()
+        downloadIds.forEach { id ->
+            val key = profileId to id
+            cancelledRemovalEpochs.remove(key)
+            cancelledRemovalEpochs[key] = epoch
+        }
+        while (cancelledRemovalEpochs.size > MaxTrackedCancelledRemovals) {
+            val iterator = cancelledRemovalEpochs.entries.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next()
+            iterator.remove()
+        }
         val nextRemovals = state.removals.filterNot { it.downloadId in downloadIds }
         val nextKeptRemovals = state.keptRemovals.filterNot { it.downloadId in downloadIds }
         if (nextRemovals.size == state.removals.size && nextKeptRemovals.size == state.keptRemovals.size) {
@@ -487,6 +518,7 @@ internal class AutoDownloadStore(
         const val DefaultStorageLimitGb = 50
         const val RecentlyDeletedMs = 7L * 24 * 60 * 60 * 1000
         const val MaxRecentlyDeleted = 20
+        private const val MaxTrackedCancelledRemovals = 256
         val storageLimitOptionsGb: List<Int?> = listOf(null, 10, 25, 50, 100, 250)
     }
 }

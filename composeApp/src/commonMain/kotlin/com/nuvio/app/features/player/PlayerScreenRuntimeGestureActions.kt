@@ -233,6 +233,9 @@ internal fun PlayerScreenRuntime.finishTimelineSeek(positionMs: Long) {
         return
     }
     finishTimelineScrub(targetMs)
+    if (!playbackSnapshot.isEnded || targetMs < playbackSnapshot.positionMs) {
+        refreshPlaybackActivityAfterClearIfNeeded()
+    }
     seekWithNote(playerController, targetMs)
     scheduleProgressSyncAfterSeek()
     publishPartyPlayback(positionMs = targetMs)
@@ -243,6 +246,9 @@ internal fun PlayerScreenRuntime.skipInterval(interval: SkipInterval) {
     val rawMs = interval.internalSkipAction(skipIntervals, durationMs)?.targetMs ?: return
     val requestedMs = if (durationMs > 0L) rawMs.coerceAtMost(durationMs - 1) else rawMs
     val seekMs = if (isPartyControlLocked) ownSeekTarget(requestedMs) ?: return else requestedMs
+    if (!playbackSnapshot.isEnded || seekMs < playbackSnapshot.positionMs) {
+        refreshPlaybackActivityAfterClearIfNeeded()
+    }
     seekWithNote(playerController, seekMs)
     scheduleProgressSyncAfterSeek()
     publishPartyPlayback(positionMs = seekMs)
@@ -274,6 +280,9 @@ internal fun PlayerScreenRuntime.seekBy(offsetMs: Long, revealControls: Boolean 
     val requestedMs = (fromMs + offsetMs).coerceAtLeast(0L)
         .let { if (playbackSnapshot.durationMs > 0L) it.coerceAtMost(playbackSnapshot.durationMs) else it }
     val targetMs = if (isPartyControlLocked) ownSeekTarget(requestedMs) ?: return else requestedMs
+    if (!playbackSnapshot.isEnded || offsetMs < 0L) {
+        refreshPlaybackActivityAfterClearIfNeeded()
+    }
     lastManualSkipSeekPositions = fromMs to targetMs
     pendingSeekTarget = targetMs to TimeSource.Monotonic.markNow()
     if (isPartySynced) seekWithNote(playerController, targetMs) else seekByWithNote(playerController, offsetMs)
@@ -337,6 +346,9 @@ private fun PlayerScreenRuntime.handleDoubleTapSeek(
         }
     }
     val targetPositionMs = if (isPartyControlLocked) ownSeekTarget(requestedPositionMs) ?: return else requestedPositionMs
+    if (!playbackSnapshot.isEnded || direction == PlayerSeekDirection.Backward) {
+        refreshPlaybackActivityAfterClearIfNeeded()
+    }
     accumulatedSeekState = nextState
     lastManualSkipSeekPositions = currentPositionMs to targetPositionMs
     if (sendToController) {
@@ -472,6 +484,9 @@ internal fun PlayerScreenRuntime.rememberSurfaceGestureCallbacks(): PlayerSurfac
                 ownSeekTarget(requestedPositionMs) ?: return@rememberUpdatedState
             } else {
                 requestedPositionMs
+            }
+            if (!playbackSnapshot.isEnded || targetPositionMs < playbackSnapshot.positionMs) {
+                refreshPlaybackActivityAfterClearIfNeeded()
             }
             lastManualSkipSeekPositions = playbackSnapshot.positionMs to targetPositionMs
             seekWithNote(playerController, targetPositionMs)
