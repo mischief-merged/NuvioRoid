@@ -368,11 +368,14 @@ internal object AutoDownloads : AutoDownloadController {
      */
     fun onLocalPlaybackCompleted(localFileUri: String) {
         if (!started.value) return
-        // The profile that watched it. Nothing is scheduled when another one is active by then.
+        // The profile and cancel epoch when playback ended, so a later unwatch or profile switch wins.
         val profileId = ProfileRepository.activeProfileId
+        val completionEpoch = store.currentCancelEpoch()
         scope.launch {
             val item = DownloadsRepository.findCompletedDownloadByLocalFile(localFileUri) ?: return@launch
-            val scheduled = runCatching { deleteAfterWatching.onLocalPlaybackCompleted(profileId, item) }.getOrDefault(false)
+            val scheduled = runCatching {
+                deleteAfterWatching.onLocalPlaybackCompleted(profileId, item, completionEpoch)
+            }.getOrDefault(false)
             if (scheduled) runCatching { announceScheduledDeletion(profileId, item) }
             // The watched state is saved by the player after it reports the end of playback.
             delay(PlaybackCheckDelayMs)
@@ -437,6 +440,7 @@ internal object AutoDownloads : AutoDownloadController {
     private suspend fun announceScheduledDeletion(profileId: Int, item: DownloadItem) {
         val due = store.removals(profileId).firstOrNull { it.downloadId == item.id } ?: return
         val message = scheduledDeletionMessage(item, removalHoursLeft(due.dueAtEpochMs, DownloadsClock.nowEpochMs()))
+        if (store.removals(profileId).none { it.downloadId == item.id }) return
         NuvioToastController.show(
             message = message,
             durationMillis = ScheduledDeletionToastMs,

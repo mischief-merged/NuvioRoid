@@ -1236,6 +1236,8 @@ internal fun PlayerScreenRuntime.requestClose(
     afterClosed: (() -> Unit)? = null,
 ) {
     cancelSourceFailoverOnExit()
+    seekProgressSyncJob?.cancel()
+    seekProgressSyncJob = null
     flushWatchProgress()
     val exitingController = playerLifecycleController
     args.onBack { afterRelease, releaseFailed ->
@@ -1256,6 +1258,7 @@ internal fun PlayerScreenRuntime.requestClose(
                     if (playerController === exitingController) {
                         playerController = null
                     }
+                    closedWatchProgressFlushed = true
                     afterRelease()
                     afterClosed?.invoke()
                 },

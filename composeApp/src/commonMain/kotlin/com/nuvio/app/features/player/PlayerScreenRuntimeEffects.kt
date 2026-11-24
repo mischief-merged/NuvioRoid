@@ -586,6 +586,7 @@ internal fun PlayerScreenRuntime.BindPlayerQuitAndDisposeEffects() {
             unregisterFlushHook()
             if (
                 !frozenForQuit &&
+                !closedWatchProgressFlushed &&
                 playbackSession.videoId == effectVideoId &&
                 activeSourceUrl == effectSourceUrl &&
                 activeSourceAudioUrl == effectSourceAudioUrl

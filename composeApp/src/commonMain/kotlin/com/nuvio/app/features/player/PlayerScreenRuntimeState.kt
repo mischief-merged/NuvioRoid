@@ -24,6 +24,7 @@ import com.nuvio.app.features.player.skip.SkipInterval
 import com.nuvio.app.features.streams.StreamsUiState
 import com.nuvio.app.features.tracking.TrackingMediaReference
 import com.nuvio.app.features.watched.WatchedUiState
+import com.nuvio.app.features.watchprogress.PlaybackClearEpochs
 import com.nuvio.app.features.watchprogress.WatchProgressUiState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -230,7 +231,20 @@ internal class PlayerScreenRuntime(
     var shouldPlay by mutableStateOf(true)
     var resizeMode by mutableStateOf(playerSettingsUiState.resizeMode.supportedOnCurrentPlatform())
     var layoutSize by mutableStateOf(IntSize.Zero)
-    var playbackSnapshot by mutableStateOf(PlayerPlaybackSnapshot())
+    private var _playbackSnapshot by mutableStateOf(PlayerPlaybackSnapshot())
+    var playbackSnapshot: PlayerPlaybackSnapshot
+        get() = _playbackSnapshot
+        set(value) {
+            val wasEnded = _playbackSnapshot.isEnded
+            _playbackSnapshot = value
+            if (!value.isEnded) {
+                endedPlaybackStopCommitted = false
+            }
+            if ((value.isPlaying && !value.isLoading) || (!wasEnded && value.isEnded && shouldPlay)) {
+                refreshPlaybackActivityAfterClearIfNeeded()
+                closedWatchProgressFlushed = false
+            }
+        }
     var playbackSnapshotKey by mutableStateOf<PlaybackKey?>(null)
     var playerController by mutableStateOf<PlayerEngineController?>(null)
     var playerLifecycleController by mutableStateOf<PlayerEngineController?>(null)
@@ -257,6 +271,9 @@ internal class PlayerScreenRuntime(
     var lastProgressPersistEpochMs by mutableStateOf(0L)
     var previousIsPlaying by mutableStateOf(false)
     var frozenForQuit by mutableStateOf(false)
+    var endedPlaybackStopCommitted: Boolean = false
+    var closedWatchProgressFlushed: Boolean = false
+    var playbackSnapshotEpoch: Long = PlaybackClearEpochs.currentEpoch()
     var hasRequestedScrobbleStartForCurrentItem by mutableStateOf(false)
     var scrobbleStartRequestGeneration by mutableStateOf(0L)
     var pendingSeekScrobbleRestart by mutableStateOf(false)

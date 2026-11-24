@@ -14,6 +14,7 @@ import com.nuvio.app.isDesktop
 import com.nuvio.app.features.tracking.TrackingScrobbleCoordinator
 import com.nuvio.app.features.tracking.TrackingScrobbleEvent
 import com.nuvio.app.features.tracking.buildTrackingMediaReference
+import com.nuvio.app.features.watchprogress.PlaybackClearEpochs
 import com.nuvio.app.features.watchprogress.WatchProgressClock
 import com.nuvio.app.features.watchprogress.WatchProgressPlaybackSession
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
@@ -176,6 +177,9 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
         frozenForQuit = false
+        endedPlaybackStopCommitted = false
+        closedWatchProgressFlushed = false
+        playbackSnapshotEpoch = PlaybackClearEpochs.currentEpoch()
         pendingSeekScrobbleRestart = false
         awaitingPausedSeekSnapshot = false
         resetTrackSelectionState()
@@ -184,6 +188,8 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
     val videoIdentity = "$identity:$activeVideoId:$activeSeasonNumber:$activeEpisodeNumber"
     if (lastResetVideoIdentity != videoIdentity) {
         lastResetVideoIdentity = videoIdentity
+        endedPlaybackStopCommitted = false
+        playbackSnapshotEpoch = PlaybackClearEpochs.currentEpoch()
         hasRequestedScrobbleStartForCurrentItem = false
         scrobbleStartRequestGeneration = 0L
         pendingSeekScrobbleRestart = false
@@ -547,6 +553,15 @@ internal fun PlayerScreenRuntime.flushWatchProgress(
     )
 }
 
+internal fun PlayerScreenRuntime.refreshPlaybackActivityAfterClearIfNeeded() {
+    val latestEpoch = PlaybackClearEpochs.currentEpoch()
+    if (latestEpoch <= playbackSnapshotEpoch) return
+    if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) {
+        hasSentCompletionScrobbleForCurrentItem = false
+    }
+    playbackSnapshotEpoch = latestEpoch
+}
+
 /**
  * The save shared by pause, stop, and quit. A sleep hold turns a stop into a pause, keeps the
  * episode unfinished, and does not schedule removal of a downloaded file.
@@ -557,9 +572,38 @@ private fun PlayerScreenRuntime.commitWatchProgress(
     syncRemote: Boolean,
 ) {
     val action = scrobbleActionForProgressSave(scrobbleAction, holdIncomplete)
+    val session = playbackSession
+    val snapshot = playbackSnapshot
+    if (PlaybackClearEpochs.wasClearedAfter(session = session, afterEpoch = playbackSnapshotEpoch)) {
+        if (action == TrackingScrobbleAction.STOP) {
+            if (snapshot.isEnded && syncRemote) {
+                endedPlaybackStopCommitted = true
+            }
+            if (hasRequestedScrobbleStartForCurrentItem && currentPlaybackProgressPercent(snapshot) < 80f) {
+                emitTrackingScrobbleStop(currentPlaybackProgressPercent(snapshot))
+            } else {
+                currentTrackingMedia = null
+                hasRequestedScrobbleStartForCurrentItem = false
+                pendingSeekScrobbleRestart = false
+                scrobbleStartRequestGeneration += 1L
+            }
+        }
+        emitAddonPlayerProgressEvent(
+            scrobbleAction = scrobbleAction,
+            holdIncomplete = holdIncomplete,
+        )
+        return
+    }
+    if (action == TrackingScrobbleAction.STOP && snapshot.isEnded && endedPlaybackStopCommitted) {
+        emitAddonPlayerProgressEvent(
+            scrobbleAction = scrobbleAction,
+            holdIncomplete = holdIncomplete,
+        )
+        return
+    }
     WatchProgressRepository.flushPlaybackProgress(
-        session = playbackSession,
-        snapshot = playbackSnapshot,
+        session = session,
+        snapshot = snapshot,
         syncRemote = syncRemote,
         holdIncomplete = holdIncomplete,
     )
@@ -568,6 +612,9 @@ private fun PlayerScreenRuntime.commitWatchProgress(
         TrackingScrobbleAction.STOP -> {
             emitStopScrobbleForCurrentProgress()
             reportLocalPlaybackCompleted()
+            if (snapshot.isEnded && syncRemote) {
+                endedPlaybackStopCommitted = true
+            }
         }
         TrackingScrobbleAction.START -> Unit
     }
@@ -621,6 +668,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
     seekProgressSyncJob = scope.launch {
         delay(PlayerSeekProgressSyncDebounceMs)
         if (frozenForQuit) return@launch
+        if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) return@launch
         if (isShortPlaceholderDuration(playbackSnapshot.durationMs)) return@launch
         val expectedTargetMs = lastSeekTargetMs ?: pendingSeekTarget?.first
         val reachedTarget = expectedTargetMs?.let { targetMs ->
@@ -684,6 +732,7 @@ internal fun PlayerScreenRuntime.scheduleProgressSyncAfterSeek() {
 
 internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     if (frozenForQuit) return
+    if (PlaybackClearEpochs.wasClearedAfter(playbackSession, playbackSnapshotEpoch)) return
     val now = WatchProgressClock.nowEpochMs()
     if (now - lastProgressPersistEpochMs < PlaybackProgressPersistIntervalMs) return
     lastProgressPersistEpochMs = now
