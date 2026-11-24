@@ -17,19 +17,29 @@ import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.streams.StreamItem
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Rule
 import java.io.File
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -41,7 +51,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-@OptIn(ExperimentalTestApi::class)
+@OptIn(ExperimentalTestApi::class, ExperimentalCoroutinesApi::class)
 class OfflineRecoveryStatusTest {
     @get:Rule
     val compose = createComposeRule()
@@ -436,45 +446,248 @@ class OfflineRecoveryStatusTest {
     }
 
     @Test
-    fun offline_recovery_probes_are_bounded_without_probe_storm() = runBlocking {
-        configureLocalNetworkProbes(retryBaseMs = 140L, retryMaxMs = 420L, minIntervalMs = 150L)
-        allowPublicProbe.set(false)
-        allowAccountServer.set(false)
-        val backend = ControllableBackend()
-        DownloadsRepository.backend = backend
-        DownloadsRepository.ensureLoaded()
-        DownloadsRepository.enqueueFromStream(
-            contentType = "movie",
-            videoId = "tt-storm",
-            parentMetaId = "tt-storm",
-            parentMetaType = "movie",
-            title = "Bounded Probe Movie",
-            logo = null,
-            poster = null,
-            background = null,
-            seasonNumber = null,
-            episodeNumber = null,
-            episodeTitle = null,
-            episodeThumbnail = null,
-            stream = StreamItem(url = "https://media.example/storm.mkv", addonName = "Test", addonId = "test"),
-        )
-
-        publicProbeHits.set(0)
-        NetworkStatusRepository.ensureStarted()
-        assertTrue(awaitCondition { it == NetworkCondition.NoInternet })
-
-        val pingUrl = "http://127.0.0.1:${server.address.port}/ping"
-        repeat(30) { step ->
-            backend.onProgress?.invoke(((step + 1) * 65_536).toLong(), 10_000_000L)
-            if (step % 5 == 0) {
-                runCatching { httpGetText(pingUrl) }
+    fun offline_recovery_probes_are_bounded_without_probe_storm() = runTest {
+        val repositoryScope = CoroutineScope(StandardTestDispatcher(testScheduler) + SupervisorJob())
+        try {
+            var internetUp = false
+            var publicHits = 0
+            NetworkStatusRepository.coroutineScope = repositoryScope
+            NetworkStatusRepository.nowMs = { testScheduler.currentTime }
+            NetworkStatusRepository.publicProbeUrls = listOf("https://probe.example/generate_204")
+            NetworkStatusRepository.serverProbeUrls = { listOf("https://account.example/rest/v1" to emptyMap()) }
+            NetworkStatusRepository.probeReachableOverride = { url, _ ->
+                if (url.contains("generate_204")) {
+                    publicHits++
+                    internetUp
+                } else {
+                    false
+                }
             }
-            delay(20L)
-        }
 
-        val hits = publicProbeHits.get()
-        assertTrue(hits >= 2, "Expected offline recovery to re-probe at least once after initial NoInternet, got $hits")
-        assertTrue(hits <= 8, "Expected bounded probe rate without storm across 30 rapid events in ~600ms, got $hits")
+            val backend = ControllableBackend()
+            DownloadsRepository.backend = backend
+            DownloadsRepository.ensureLoaded()
+            DownloadsRepository.enqueueFromStream(
+                contentType = "movie",
+                videoId = "tt-storm",
+                parentMetaId = "tt-storm",
+                parentMetaType = "movie",
+                title = "Bounded Probe Movie",
+                logo = null,
+                poster = null,
+                background = null,
+                seasonNumber = null,
+                episodeNumber = null,
+                episodeTitle = null,
+                episodeThumbnail = null,
+                stream = StreamItem(url = "https://media.example/storm.mkv", addonName = "Test", addonId = "test"),
+            )
+
+            NetworkStatusRepository.ensureStarted()
+            runCurrent()
+            assertEquals(NetworkCondition.NoInternet, NetworkStatusRepository.uiState.value.condition)
+            assertEquals(1, publicHits, "Initial startup should issue a single public probe")
+
+            // 30 rapid download chunks + HTTP traffic signals within the first 4,500ms (< 5,000ms cooldown):
+            // must coalesce without issuing any extra probe early.
+            var nextChunk = 1L
+            repeat(30) { step ->
+                backend.onProgress?.invoke(nextChunk++ * 65_536L, 100_000_000L)
+                if (step % 5 == 0) {
+                    NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+                }
+                advanceTimeBy(150L)
+                runCurrent()
+            }
+            assertEquals(1, publicHits, "Traffic burst inside 5s cooldown must not fire extra probes")
+
+            advanceTimeBy(500L)
+            runCurrent()
+            assertEquals(2, publicHits, "Exactly one coalesced probe should fire at the 5s mark")
+
+            // Because the traffic-triggered probe still failed public reachability, the next gap backs off to 10s.
+            repeat(30) {
+                backend.onProgress?.invoke(nextChunk++ * 65_536L, 100_000_000L)
+                NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+                advanceTimeBy(300L)
+                runCurrent()
+            }
+            assertEquals(2, publicHits, "Traffic burst inside 10s backed-off window must not fire early")
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(3, publicHits, "Second traffic-triggered probe should fire after 10s backoff")
+
+            // Third failed traffic window backs off to 20s, and fourth caps at 30s.
+            NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+            advanceTimeBy(19_999L)
+            runCurrent()
+            assertEquals(3, publicHits)
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals(4, publicHits)
+
+            NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+            advanceTimeBy(29_999L)
+            runCurrent()
+            assertEquals(4, publicHits)
+            advanceTimeBy(1L)
+            runCurrent()
+            assertEquals(5, publicHits)
+
+            // Once public connectivity recovers, periodic/traffic polling stops completely.
+            internetUp = true
+            NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertEquals(6, publicHits)
+            assertEquals(NetworkCondition.ServersUnreachable, NetworkStatusRepository.uiState.value.condition)
+            assertTrue(NetworkStatusRepository.uiState.value.hasInternet)
+
+            repeat(10) {
+                backend.onProgress?.invoke(nextChunk++ * 65_536L, 100_000_000L)
+                NetworkStatusRepository.onTrafficObserved("https://addon.example/catalog.json")
+                advanceTimeBy(30_000L)
+                runCurrent()
+            }
+            assertEquals(6, publicHits, "No background offline probes should run once internet reachability recovers")
+        } finally {
+            repositoryScope.cancel()
+            NetworkStatusRepository.resetForTest()
+        }
+    }
+
+    @Test
+    fun guarded_http_client_response_wakes_offline_recovery_without_self_probe_loop() = runBlocking {
+        configureLocalNetworkProbes(retryBaseMs = 60_000L, retryMaxMs = 60_000L, minIntervalMs = 50L)
+        allowPublicProbe.set(false)
+        allowAccountServer.set(true)
+        publicProbeHits.set(0)
+
+        NetworkStatusRepository.ensureStarted()
+        assertTrue(awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.NoInternet })
+        assertEquals(1, publicProbeHits.get())
+
+        val readyAfter = NetworkStatusRepository.nowMs() + 60L
+        while (NetworkStatusRepository.nowMs() < readyAfter) {
+            delay(10L)
+        }
+        allowPublicProbe.set(true)
+        val pingUrl = "http://127.0.0.1:${server.address.port}/ping"
+        assertTrue(httpGetText(pingUrl).contains("ok"))
+
+        assertTrue(
+            awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online },
+            "Expected guardedHttpClient response to wake offline recovery without waiting for 60s timer",
+        )
+        delay(120L)
+        assertEquals(2, publicProbeHits.get(), "Own probe responses must not trigger extra self-probes")
+    }
+
+    @Test
+    fun completed_probe_does_not_clear_concurrent_probe_in_flight_flag_or_overlap_probes() = runBlocking {
+        val executor = Executors.newCachedThreadPool()
+        val supervisor = SupervisorJob()
+        val customScope = CoroutineScope(supervisor + executor.asCoroutineDispatcher())
+        try {
+            NetworkStatusRepository.coroutineScope = customScope
+            NetworkStatusRepository.offlineRetryBaseDelayMs = 60_000L
+            NetworkStatusRepository.offlineRetryMaxDelayMs = 60_000L
+            NetworkStatusRepository.publicProbeUrls = listOf("https://probe.example/generate_204")
+            NetworkStatusRepository.serverProbeUrls = { listOf("https://account.example/rest/v1" to emptyMap()) }
+
+            val probeNumber = AtomicInteger(0)
+            val inFlight = AtomicInteger(0)
+            val maxConcurrent = AtomicInteger(0)
+            val probe1Completed = CountDownLatch(1)
+            val probe2Entered = CountDownLatch(1)
+            val allowProbe2ToFinish = CountDownLatch(1)
+            val probe3Completed = CountDownLatch(1)
+
+            NetworkStatusRepository.probeReachableOverride = { url, _ ->
+                if (!url.contains("generate_204")) {
+                    true
+                } else {
+                    val active = inFlight.incrementAndGet()
+                    maxConcurrent.accumulateAndGet(active, ::maxOf)
+                    try {
+                        when (probeNumber.incrementAndGet()) {
+                            1 -> {
+                                currentCoroutineContext()[Job]!!.invokeOnCompletion { probe1Completed.countDown() }
+                                false
+                            }
+                            2 -> {
+                                probe2Entered.countDown()
+                                assertTrue(allowProbe2ToFinish.await(5, TimeUnit.SECONDS))
+                                false
+                            }
+                            else -> {
+                                probe3Completed.countDown()
+                                true
+                            }
+                        }
+                    } finally {
+                        inFlight.decrementAndGet()
+                    }
+                }
+            }
+
+            // Right after Probe 1 releases its in-flight ownership and before Probe 1's finally block runs,
+            // start Probe 2 and wait until Probe 2 is actively in flight so Probe 1's finally runs concurrently with Probe 2.
+            val interceptedFirstExit = AtomicBoolean(false)
+            NetworkStatusRepository.onAfterProbeReleaseForTest = {
+                if (interceptedFirstExit.compareAndSet(false, true)) {
+                    NetworkStatusRepository.requestRefresh(force = true)
+                    assertTrue(probe2Entered.await(5, TimeUnit.SECONDS))
+                }
+            }
+
+            NetworkStatusRepository.ensureStarted()
+            assertTrue(probe2Entered.await(5, TimeUnit.SECONDS))
+            assertTrue(probe1Completed.await(5, TimeUnit.SECONDS), "Probe 1 coroutine (including finally) must finish")
+
+            // Requesting Probe 3 now must synchronously queue behind Probe 2 rather than launching an overlapping job.
+            NetworkStatusRepository.requestRefresh(force = true)
+            assertEquals(1, maxConcurrent.get(), "Probe 1 finally must not clear Probe 2 in-flight ownership")
+            assertEquals(2, probeNumber.get(), "Probe 3 must wait until Probe 2 completes")
+
+            allowProbe2ToFinish.countDown()
+            assertTrue(probe3Completed.await(5, TimeUnit.SECONDS))
+            assertTrue(awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online })
+            assertEquals(1, maxConcurrent.get(), "Probes must never overlap")
+
+            // Verify both unexpected runtime exceptions and mid-probe cancellations release ownership in finally.
+            for (throwableFactory in listOf(
+                { IllegalStateException("simulated mid-probe failure") },
+                { CancellationException("simulated mid-probe cancellation") },
+            )) {
+                NetworkStatusRepository.resetForTest()
+                NetworkStatusRepository.coroutineScope = customScope
+                NetworkStatusRepository.offlineRetryBaseDelayMs = 60_000L
+                NetworkStatusRepository.offlineRetryMaxDelayMs = 60_000L
+                NetworkStatusRepository.publicProbeUrls = listOf("https://probe.example/generate_204")
+                NetworkStatusRepository.serverProbeUrls = { listOf("https://account.example/rest/v1" to emptyMap()) }
+                val abortedProbeCompleted = CountDownLatch(1)
+                val abortFirst = AtomicBoolean(true)
+                NetworkStatusRepository.probeReachableOverride = { _, _ ->
+                    if (abortFirst.compareAndSet(true, false)) {
+                        currentCoroutineContext()[Job]!!.invokeOnCompletion { abortedProbeCompleted.countDown() }
+                        throw throwableFactory()
+                    }
+                    true
+                }
+                NetworkStatusRepository.ensureStarted()
+                assertTrue(abortedProbeCompleted.await(5, TimeUnit.SECONDS))
+                NetworkStatusRepository.requestRefresh(force = true)
+                assertTrue(
+                    awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online },
+                    "Aborted probe must release ownership in finally so subsequent refreshes recover",
+                )
+            }
+        } finally {
+            customScope.cancel()
+            executor.shutdownNow()
+            NetworkStatusRepository.resetForTest()
+        }
     }
 
     @Test
@@ -492,9 +705,12 @@ class OfflineRecoveryStatusTest {
         allowPublicProbe.set(false)
         allowAccountServer.set(true)
         NetworkStatusRepository.ensureStarted()
-        assertTrue(awaitCondition { it == NetworkCondition.NoInternet })
+        assertTrue(awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.NoInternet })
 
-        delay(80L)
+        val readyAfter = NetworkStatusRepository.nowMs() + 60L
+        while (NetworkStatusRepository.nowMs() < readyAfter) {
+            delay(10L)
+        }
         allowPublicProbe.set(true)
         val hold = ConnectionHold()
         val recheck = WakeNetworkRecheck(
@@ -505,7 +721,7 @@ class OfflineRecoveryStatusTest {
         recheck.report(pathReport(satisfied = true, expensive = false, constrained = false, interfaces = "en0", gateways = "192.168.1.1"))
 
         assertTrue(
-            awaitCondition(timeoutMs = 1_500L) { it == NetworkCondition.Online },
+            awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online },
             "Expected satisfied path report to trigger immediate recovery from NoInternet",
         )
     }

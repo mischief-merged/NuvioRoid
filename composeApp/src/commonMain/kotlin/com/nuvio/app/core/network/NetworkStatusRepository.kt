@@ -2,6 +2,7 @@ package com.nuvio.app.core.network
 
 import androidx.compose.runtime.Composable
 import com.nuvio.app.features.addons.httpRequestRaw
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,21 +75,28 @@ object NetworkStatusRepository {
     private val DEFAULT_PUBLIC_PROBE_URLS = listOf(PUBLIC_PROBE_PRIMARY, PUBLIC_PROBE_FALLBACK)
 
     private val monotonicMark = TimeSource.Monotonic.markNow()
+    private val defaultScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    internal var coroutineScope: CoroutineScope = defaultScope
     internal var publicProbeUrls: List<String> = DEFAULT_PUBLIC_PROBE_URLS
     internal var serverProbeUrls: (() -> List<Pair<String, Map<String, String>>>)? = null
+    internal var probeReachableOverride: (suspend (url: String, headers: Map<String, String>) -> Boolean)? = null
+    internal var onAfterProbeReleaseForTest: (() -> Unit)? = null
     internal var offlineRetryBaseDelayMs: Long = DEFAULT_OFFLINE_RETRY_BASE_DELAY_MS
     internal var offlineRetryMaxDelayMs: Long = DEFAULT_OFFLINE_RETRY_MAX_DELAY_MS
     internal var minRecoveryProbeIntervalMs: Long = DEFAULT_MIN_RECOVERY_PROBE_INTERVAL_MS
     internal var nowMs: () -> Long = { monotonicMark.elapsedNow().inWholeMilliseconds }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val _uiState = MutableStateFlow(NetworkStatusUiState())
     val uiState: StateFlow<NetworkStatusUiState> = _uiState.asStateFlow()
 
     private var started = false
     private var pinnedForTest = false
-    private var probeInFlight = false
+    private var nextToken = 0L
+    private var activeProbeToken = 0L
+    private var foregroundRefreshToken = 0L
+    private var offlineRetryToken = 0L
+    private var recoveryCooldownToken = 0L
     private var pendingProbeAfterCurrent = false
     private var pendingProbeConfirmFailures = false
     private var pendingProbeFromTraffic = false
@@ -104,6 +112,30 @@ object NetworkStatusRepository {
     private var probeGeneration = 0
     private val probeLock = Any()
 
+    private fun nextOwnerTokenLocked(): Long {
+        val next = ++nextToken
+        return if (next != 0L) next else ++nextToken
+    }
+
+    private fun cancelRecoveryTimersLocked() {
+        offlineRetryToken = 0L
+        offlineRetryJob?.cancel()
+        offlineRetryJob = null
+        recoveryCooldownToken = 0L
+        recoveryCooldownJob?.cancel()
+        recoveryCooldownJob = null
+    }
+
+    private fun cancelAllJobsLocked() {
+        activeProbeToken = 0L
+        probeJob?.cancel()
+        probeJob = null
+        foregroundRefreshToken = 0L
+        foregroundRefreshJob?.cancel()
+        foregroundRefreshJob = null
+        cancelRecoveryTimersLocked()
+    }
+
     fun ensureStarted() {
         synchronized(probeLock) {
             if (started || pinnedForTest) return
@@ -113,24 +145,23 @@ object NetworkStatusRepository {
     }
 
     fun requestForegroundRefresh() {
-        val generation = synchronized(probeLock) {
+        synchronized(probeLock) {
             if (pinnedForTest) return
             started = true
+            val generation = probeGeneration
+            val token = nextOwnerTokenLocked()
+            foregroundRefreshToken = token
             foregroundRefreshJob?.cancel()
-            probeGeneration
-        }
-        val job = scope.launch {
-            delay(FOREGROUND_REFRESH_DELAY_MS)
-            synchronized(probeLock) {
-                if (generation != probeGeneration || pinnedForTest) return@launch
-                startOrQueueProbeLocked(force = true, confirmFailures = true)
-            }
-        }
-        synchronized(probeLock) {
-            if (generation == probeGeneration && !pinnedForTest) {
-                foregroundRefreshJob = job
-            } else {
-                job.cancel()
+            foregroundRefreshJob = coroutineScope.launch {
+                delay(FOREGROUND_REFRESH_DELAY_MS)
+                synchronized(probeLock) {
+                    if (generation != probeGeneration || foregroundRefreshToken != token || pinnedForTest) {
+                        return@launch
+                    }
+                    foregroundRefreshToken = 0L
+                    foregroundRefreshJob = null
+                    startOrQueueProbeLocked(force = true, confirmFailures = true)
+                }
             }
         }
     }
@@ -151,7 +182,7 @@ object NetworkStatusRepository {
         synchronized(probeLock) {
             if (!started || pinnedForTest || _uiState.value.condition != NetworkCondition.NoInternet) return
             if (url != null && isOwnProbeUrlLocked(url)) return
-            if (probeInFlight) {
+            if (activeProbeToken != 0L) {
                 trafficObservedWhileProbing = true
                 return
             }
@@ -164,16 +195,20 @@ object NetworkStatusRepository {
             }
             if (elapsed >= minGap) {
                 startOrQueueProbeLocked(force = true, confirmFailures = false, fromTraffic = true)
-            } else if (recoveryCooldownJob?.isActive != true) {
+            } else if (recoveryCooldownToken == 0L) {
                 val remaining = minGap - elapsed
                 val generation = probeGeneration
-                offlineRetryJob?.cancel()
-                offlineRetryJob = null
-                recoveryCooldownJob = scope.launch {
+                val token = nextOwnerTokenLocked()
+                cancelRecoveryTimersLocked()
+                recoveryCooldownToken = token
+                recoveryCooldownJob = coroutineScope.launch {
                     delay(remaining)
                     synchronized(probeLock) {
+                        if (generation != probeGeneration || recoveryCooldownToken != token || !started || pinnedForTest) {
+                            return@launch
+                        }
+                        recoveryCooldownToken = 0L
                         recoveryCooldownJob = null
-                        if (generation != probeGeneration || !started || pinnedForTest) return@launch
                         if (_uiState.value.condition != NetworkCondition.NoInternet) return@launch
                         startOrQueueProbeLocked(force = true, confirmFailures = false, fromTraffic = true)
                     }
@@ -214,7 +249,7 @@ object NetworkStatusRepository {
         confirmFailures: Boolean,
         fromTraffic: Boolean = false,
     ) {
-        if (probeInFlight) {
+        if (activeProbeToken != 0L) {
             if (force) {
                 pendingProbeAfterCurrent = true
                 pendingProbeConfirmFailures = pendingProbeConfirmFailures || confirmFailures
@@ -224,18 +259,16 @@ object NetworkStatusRepository {
         }
 
         val generation = probeGeneration
-        probeInFlight = true
-        offlineRetryJob?.cancel()
-        offlineRetryJob = null
-        recoveryCooldownJob?.cancel()
-        recoveryCooldownJob = null
-        probeJob = scope.launch {
+        val ownerToken = nextOwnerTokenLocked()
+        activeProbeToken = ownerToken
+        cancelRecoveryTimersLocked()
+        probeJob = coroutineScope.launch {
             var nextConfirmFailures = confirmFailures
             var nextFromTraffic = fromTraffic
             try {
                 while (true) {
                     val (runConfirmFailures, runFromTraffic) = synchronized(probeLock) {
-                        if (generation != probeGeneration || pinnedForTest) return@launch
+                        if (generation != probeGeneration || activeProbeToken != ownerToken || pinnedForTest) return@launch
                         val confirm = nextConfirmFailures || pendingProbeConfirmFailures
                         val triggeredByTraffic = nextFromTraffic || pendingProbeFromTraffic
                         nextConfirmFailures = false
@@ -250,23 +283,48 @@ object NetworkStatusRepository {
                         confirmFailures = runConfirmFailures,
                         fromTraffic = runFromTraffic,
                         generation = generation,
+                        ownerToken = ownerToken,
                     )
                     val continueImmediately = synchronized(probeLock) {
-                        if (generation != probeGeneration || pinnedForTest) return@launch
+                        if (generation != probeGeneration || activeProbeToken != ownerToken || pinnedForTest) return@launch
                         if (pendingProbeAfterCurrent) {
                             true
                         } else {
-                            probeInFlight = false
+                            activeProbeToken = 0L
+                            probeJob = null
                             scheduleOfflineRecoveryIfNeededLocked(generation)
                             false
                         }
                     }
                     if (!continueImmediately) break
                 }
+                onAfterProbeReleaseForTest?.invoke()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                // Fall through to finally so an unexpected probe failure neither crashes
+                // an uncaught exception handler nor leaves activeProbeToken wedged.
             } finally {
                 synchronized(probeLock) {
-                    if (generation == probeGeneration) {
-                        probeInFlight = false
+                    if (activeProbeToken == ownerToken) {
+                        activeProbeToken = 0L
+                        probeJob = null
+                        if (generation == probeGeneration && started && !pinnedForTest) {
+                            if (pendingProbeAfterCurrent) {
+                                val confirm = pendingProbeConfirmFailures
+                                val triggeredByTraffic = pendingProbeFromTraffic
+                                pendingProbeAfterCurrent = false
+                                pendingProbeConfirmFailures = false
+                                pendingProbeFromTraffic = false
+                                startOrQueueProbeLocked(
+                                    force = true,
+                                    confirmFailures = confirm,
+                                    fromTraffic = triggeredByTraffic,
+                                )
+                            } else {
+                                scheduleOfflineRecoveryIfNeededLocked(generation)
+                            }
+                        }
                     }
                 }
             }
@@ -276,10 +334,7 @@ object NetworkStatusRepository {
     private fun scheduleOfflineRecoveryIfNeededLocked(generation: Int) {
         if (!started || pinnedForTest || generation != probeGeneration) return
         if (_uiState.value.condition != NetworkCondition.NoInternet) {
-            offlineRetryJob?.cancel()
-            offlineRetryJob = null
-            recoveryCooldownJob?.cancel()
-            recoveryCooldownJob = null
+            cancelRecoveryTimersLocked()
             return
         }
         val fromTraffic = trafficObservedWhileProbing
@@ -289,21 +344,29 @@ object NetworkStatusRepository {
         } else {
             offlineRetryDelayMs(offlineRetryAttempt)
         }
-        offlineRetryJob?.cancel()
-        offlineRetryJob = scope.launch {
+        val token = nextOwnerTokenLocked()
+        cancelRecoveryTimersLocked()
+        offlineRetryToken = token
+        offlineRetryJob = coroutineScope.launch {
             delay(waitMs)
             synchronized(probeLock) {
+                if (generation != probeGeneration || offlineRetryToken != token || !started || pinnedForTest) return@launch
+                offlineRetryToken = 0L
                 offlineRetryJob = null
-                if (generation != probeGeneration || !started || pinnedForTest) return@launch
                 if (_uiState.value.condition != NetworkCondition.NoInternet) return@launch
                 startOrQueueProbeLocked(force = true, confirmFailures = false, fromTraffic = fromTraffic)
             }
         }
     }
 
-    private suspend fun runProbe(confirmFailures: Boolean, fromTraffic: Boolean, generation: Int) {
+    private suspend fun runProbe(
+        confirmFailures: Boolean,
+        fromTraffic: Boolean,
+        generation: Int,
+        ownerToken: Long,
+    ) {
         val previousCondition = synchronized(probeLock) {
-            if (generation != probeGeneration || pinnedForTest) return
+            if (generation != probeGeneration || activeProbeToken != ownerToken || pinnedForTest) return
             val current = _uiState.value.condition
             if (current == NetworkCondition.Unknown) {
                 _uiState.value = NetworkStatusUiState(condition = NetworkCondition.Checking)
@@ -318,11 +381,14 @@ object NetworkStatusRepository {
             nextCondition.isOfflineLike()
         ) {
             delay(FOREGROUND_FAILURE_CONFIRM_DELAY_MS)
+            synchronized(probeLock) {
+                if (generation != probeGeneration || activeProbeToken != ownerToken || pinnedForTest) return
+            }
             nextCondition = probeCondition()
         }
 
         synchronized(probeLock) {
-            if (generation != probeGeneration || pinnedForTest) return
+            if (generation != probeGeneration || activeProbeToken != ownerToken || pinnedForTest) return
             lastProbeCompletedAtMs = nowMs()
             _uiState.value = NetworkStatusUiState(condition = nextCondition)
             if (nextCondition == NetworkCondition.NoInternet) {
@@ -335,10 +401,7 @@ object NetworkStatusRepository {
             } else {
                 offlineRetryAttempt = 0
                 trafficProbeAttempt = 0
-                offlineRetryJob?.cancel()
-                offlineRetryJob = null
-                recoveryCooldownJob?.cancel()
-                recoveryCooldownJob = null
+                cancelRecoveryTimersLocked()
             }
         }
     }
@@ -349,7 +412,7 @@ object NetworkStatusRepository {
             url to mapOf("apikey" to ServerConfigurationRepository.active.value.publishableKey)
         }
         synchronized(probeLock) {
-            activeProbeUrls = (publicUrls + serverTargets.map { it.first }).mapTo(mutableSetOf()) { it.trim() }
+            activeProbeUrls = (publicUrls + serverTargets.map { it.first }).mapTo(mutableSetOf(), ::normalizeProbeUrl)
         }
         val internetReachable = publicUrls.any { url -> probeReachable(url) }
         if (!internetReachable) {
@@ -379,21 +442,13 @@ object NetworkStatusRepository {
         synchronized(probeLock) {
             probeGeneration++
             pinnedForTest = true
-            probeInFlight = false
             pendingProbeAfterCurrent = false
             pendingProbeConfirmFailures = false
             pendingProbeFromTraffic = false
             trafficObservedWhileProbing = false
             offlineRetryAttempt = 0
             trafficProbeAttempt = 0
-            foregroundRefreshJob?.cancel()
-            foregroundRefreshJob = null
-            probeJob?.cancel()
-            probeJob = null
-            offlineRetryJob?.cancel()
-            offlineRetryJob = null
-            recoveryCooldownJob?.cancel()
-            recoveryCooldownJob = null
+            cancelAllJobsLocked()
             _uiState.value = NetworkStatusUiState(condition = condition)
         }
     }
@@ -403,7 +458,6 @@ object NetworkStatusRepository {
             probeGeneration++
             started = false
             pinnedForTest = false
-            probeInFlight = false
             pendingProbeAfterCurrent = false
             pendingProbeConfirmFailures = false
             pendingProbeFromTraffic = false
@@ -412,16 +466,12 @@ object NetworkStatusRepository {
             trafficProbeAttempt = 0
             lastProbeCompletedAtMs = Long.MIN_VALUE
             activeProbeUrls = emptySet()
-            foregroundRefreshJob?.cancel()
-            foregroundRefreshJob = null
-            probeJob?.cancel()
-            probeJob = null
-            offlineRetryJob?.cancel()
-            offlineRetryJob = null
-            recoveryCooldownJob?.cancel()
-            recoveryCooldownJob = null
+            cancelAllJobsLocked()
+            coroutineScope = defaultScope
             publicProbeUrls = DEFAULT_PUBLIC_PROBE_URLS
             serverProbeUrls = null
+            probeReachableOverride = null
+            onAfterProbeReleaseForTest = null
             offlineRetryBaseDelayMs = DEFAULT_OFFLINE_RETRY_BASE_DELAY_MS
             offlineRetryMaxDelayMs = DEFAULT_OFFLINE_RETRY_MAX_DELAY_MS
             minRecoveryProbeIntervalMs = DEFAULT_MIN_RECOVERY_PROBE_INTERVAL_MS
@@ -430,15 +480,17 @@ object NetworkStatusRepository {
         }
     }
 
+    private fun normalizeProbeUrl(url: String): String = url.trim().trimEnd('/')
+
     private fun isOwnProbeUrlLocked(url: String): Boolean {
-        val trimmed = url.trim()
-        return trimmed in activeProbeUrls || publicProbeUrls.any { it.trim() == trimmed }
+        val normalized = normalizeProbeUrl(url)
+        return normalized in activeProbeUrls || publicProbeUrls.any { normalizeProbeUrl(it) == normalized }
     }
 
     private suspend fun probePublicInternet(): Boolean {
         val urls = publicProbeUrls
         synchronized(probeLock) {
-            activeProbeUrls = activeProbeUrls + urls.map { it.trim() }
+            activeProbeUrls = activeProbeUrls + urls.map(::normalizeProbeUrl)
         }
         return urls.any { url -> probeReachable(url) }
     }
@@ -447,6 +499,10 @@ object NetworkStatusRepository {
         url: String,
         headers: Map<String, String> = emptyMap(),
     ): Boolean {
+        val override = probeReachableOverride
+        if (override != null) {
+            return override(url, headers)
+        }
         val response = withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
             runCatching {
                 httpRequestRaw(
