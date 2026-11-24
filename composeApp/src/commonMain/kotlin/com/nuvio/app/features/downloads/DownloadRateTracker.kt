@@ -16,9 +16,11 @@ internal class DownloadRateTracker(
 
     private val lock = SynchronizedObject()
     private val samplesById = mutableMapOf<String, ArrayDeque<Sample>>()
+    private val lastReceivedAtById = mutableMapOf<String, Long>()
 
     fun recordStart(downloadId: String, initialDownloadedBytes: Long, nowEpochMs: Long) {
         synchronized(lock) {
+            lastReceivedAtById.remove(downloadId)
             val deque = ArrayDeque<Sample>()
             deque.addLast(Sample(nowEpochMs, initialDownloadedBytes.coerceAtLeast(0L)))
             samplesById[downloadId] = deque
@@ -33,6 +35,11 @@ internal class DownloadRateTracker(
             if (last == null) {
                 deque.addLast(Sample(nowEpochMs, bytes))
                 return
+            }
+            if (bytes > last.bytes) {
+                lastReceivedAtById[downloadId] = nowEpochMs
+            } else if (bytes < last.bytes) {
+                lastReceivedAtById.remove(downloadId)
             }
             if (nowEpochMs < last.timestampMs) return
             if (bytes < last.bytes) {
@@ -59,14 +66,22 @@ internal class DownloadRateTracker(
     fun clear(downloadId: String) {
         synchronized(lock) {
             samplesById.remove(downloadId)
+            lastReceivedAtById.remove(downloadId)
         }
     }
 
     fun hasSamples(downloadId: String): Boolean = synchronized(lock) { downloadId in samplesById }
 
+    fun hasRecentProgress(downloadId: String, nowEpochMs: Long): Boolean = synchronized(lock) {
+        val receivedAt = lastReceivedAtById[downloadId] ?: return@synchronized false
+        val ageMs = nowEpochMs - receivedAt
+        ageMs in -stallTimeoutMs..stallTimeoutMs
+    }
+
     fun clearAll() {
         synchronized(lock) {
             samplesById.clear()
+            lastReceivedAtById.clear()
         }
     }
 
@@ -98,8 +113,9 @@ internal fun estimateDownloadEtaSeconds(
     bytesPerSecond: Long?,
     nowEpochMs: Long,
     offline: Boolean,
+    receivedBytesRecently: Boolean = false,
 ): Long? {
-    if (item.status != DownloadStatus.Downloading || offline) return null
+    if (item.status != DownloadStatus.Downloading || (offline && !receivedBytesRecently)) return null
     val total = item.totalBytes?.takeIf { it > 0L } ?: return null
     val downloaded = item.downloadedBytes.coerceAtLeast(0L)
     if (downloaded >= total) return 0L

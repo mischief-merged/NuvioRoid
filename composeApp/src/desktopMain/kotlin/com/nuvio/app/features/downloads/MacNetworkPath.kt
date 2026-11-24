@@ -1,6 +1,7 @@
 package com.nuvio.app.features.downloads
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.network.NetworkStatusRepository
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
@@ -126,6 +127,7 @@ internal fun pathReport(
 /** Serializes sleep and fresh reports; a check begun before another sleep cannot release its hold. */
 internal class WakeNetworkRecheck(
     private val hold: ConnectionHold,
+    private val onSatisfiedPath: () -> Unit = {},
     private val checkQuality: suspend () -> Unit,
 ) {
     private val lock = Any()
@@ -152,9 +154,15 @@ internal class WakeNetworkRecheck(
             if (report !is NetworkPathReport.Known || report.networkKey.isBlank()) return
             checkQuality()
         }
-        synchronized(lock) {
-            if (!sleeping && token == generation) hold.report(report, notifyInBackground = true)
+        val notifySatisfied = synchronized(lock) {
+            if (!sleeping && token == generation) {
+                hold.report(report, notifyInBackground = true)
+                report is NetworkPathReport.Known && report.networkKey.isNotBlank()
+            } else {
+                false
+            }
         }
+        if (notifySatisfied) onSatisfiedPath()
     }
 }
 
@@ -185,7 +193,11 @@ internal class NetworkPathMonitorSession(
 internal object DesktopLimitedConnections {
     fun install() {
         val hold = LimitedConnections.hold
-        val recheck = WakeNetworkRecheck(hold, DesktopPoliteDownloads::recheckAfterWake)
+        val recheck = WakeNetworkRecheck(
+            hold = hold,
+            onSatisfiedPath = NetworkStatusRepository::onNetworkPathAvailable,
+            checkQuality = DesktopPoliteDownloads::recheckAfterWake,
+        )
         lateinit var session: NetworkPathMonitorSession
         fun startMonitor() {
             Thread { session.restart() }.apply {

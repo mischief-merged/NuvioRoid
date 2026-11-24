@@ -193,6 +193,8 @@ internal fun downloadRowStatus(
     runtimeMinutes: ((DownloadItem) -> Int?)? = null,
     /** Why the connection is limited now, or null. Says why a download that waits for a better connection waits. */
     limitedBy: LimitedConnectionReason? = null,
+    /** Whether new transfer bytes arrived recently in the current session, overriding a stale offline flag. */
+    receivedBytesRecently: Boolean = false,
 ): DownloadRowStatus {
     val isAuto = item.autoDownloadRuleKey != null
     if (moving) return DownloadRowStatus(DownloadPhase.Moving, isAuto = isAuto)
@@ -221,6 +223,7 @@ internal fun downloadRowStatus(
             val silentFor = nowEpochMs - item.updatedAtEpochMs
             val phase = when {
                 allBytesIn -> DownloadPhase.CheckingFile
+                receivedBytesRecently -> DownloadPhase.Downloading
                 offline -> DownloadPhase.WaitingForNetwork
                 silentFor > DownloadStalledAfterMs -> DownloadPhase.Reconnecting
                 else -> DownloadPhase.Downloading

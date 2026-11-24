@@ -1194,9 +1194,11 @@ private fun DownloadRow(
     val reachable = availability == FolderAvailability.Available
     val isMoving = extras != null && item.id in extras.folderState.movingIds
     val now = if (item.status == DownloadStatus.Downloading || scheduledDeletionDueAtEpochMs != null) clock.nowEpochMs.value else 0L
+    val receivedBytesRecently = item.status == DownloadStatus.Downloading && DownloadsRepository.hasRecentTransferBytes(item.id, now)
     val rowStatus = downloadRowStatus(
         item, now, clock.offline, availability, isMoving,
         addressRequired = extras != null, runtimeMinutes = clock.runtimeMinutes, limitedBy = clock.limitedBy,
+        receivedBytesRecently = receivedBytesRecently,
     )
     val searchState = clock.searches?.let { sourceSearchRowState(item, it) }
     val skipTimesNote by produceState<DownloadCompanionsNote?>(null, item.localFileUri, item.status) {
