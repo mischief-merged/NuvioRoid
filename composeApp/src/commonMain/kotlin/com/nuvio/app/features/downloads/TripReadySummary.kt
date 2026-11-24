@@ -143,6 +143,7 @@ internal fun buildTripReadySummary(
     diskInfoByDownloadId: Map<String, TripItemDiskInfo> = emptyMap(),
     durationMsOf: (DownloadItem) -> Long? = { null },
     bytesPerSecondOf: (DownloadItem) -> Long? = { null },
+    hasRecentBytesOf: (DownloadItem) -> Boolean = { false },
 ): TripReadySummary {
     val locationAvailabilityByItem = items.associate { item ->
         val location = folderState.location(locationIdOf(item))
@@ -211,6 +212,7 @@ internal fun buildTripReadySummary(
         .map { item ->
             val (_, availability) = locationAvailabilityByItem.getValue(item.id)
             val moving = item.id in folderState.movingIds
+            val receivedRecently = hasRecentBytesOf(item)
             val rowStatus = downloadRowStatus(
                 item = item,
                 nowEpochMs = nowEpochMs,
@@ -219,10 +221,11 @@ internal fun buildTripReadySummary(
                 moving = moving,
                 addressRequired = addressRequired,
                 limitedBy = limitedBy,
+                receivedBytesRecently = receivedRecently,
             )
             val bps = if (rowStatus.phase == DownloadPhase.Downloading) bytesPerSecondOf(item) else null
             val eta = if (rowStatus.phase == DownloadPhase.Downloading) {
-                estimateDownloadEtaSeconds(item, bps, nowEpochMs, offline)
+                estimateDownloadEtaSeconds(item, bps, nowEpochMs, offline, receivedBytesRecently = receivedRecently)
             } else {
                 null
             }

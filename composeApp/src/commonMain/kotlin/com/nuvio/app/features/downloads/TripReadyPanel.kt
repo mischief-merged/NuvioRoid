@@ -88,6 +88,9 @@ internal data class TripReadyDeps(
     val bytesPerSecondOf: (DownloadItem, Long) -> Long? = { item, nowMs ->
         DownloadsRepository.transferBytesPerSecond(item.id, nowMs)
     },
+    val hasRecentBytesOf: (DownloadItem, Long) -> Boolean = { item, nowMs ->
+        DownloadsRepository.hasRecentTransferBytes(item.id, nowMs)
+    },
     val fetchMissingCompanions: (suspend (List<DownloadItem>) -> CompanionBackfillSummary)? = { items ->
         DownloadCompanions.app.backfill(items, DownloadsRepository::playableLocalFileUri)
     },
@@ -362,6 +365,7 @@ internal fun rememberTripReadyController(
             diskInfoByDownloadId = diskInfoById,
             durationMsOf = { item -> tripDeps.durationMsOf(item, diskInfoById) },
             bytesPerSecondOf = { item -> tripDeps.bytesPerSecondOf(item, nowEpochMs) },
+            hasRecentBytesOf = { item -> tripDeps.hasRecentBytesOf(item, nowEpochMs) },
         )
     }
 
@@ -790,11 +794,12 @@ private fun TripFillCard(
                     } else {
                         0f
                     }
+                    val queuedCount = runState.queuedEpisodes.coerceIn(0, runState.totalEpisodes)
                     LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                     Text(
                         text = stringResource(
                             Res.string.downloads_trip_fill_running,
-                            (runState.processedEpisodes + 1).coerceAtMost(runState.totalEpisodes.coerceAtLeast(1)),
+                            queuedCount,
                             runState.totalEpisodes,
                             runState.currentLabel.orEmpty(),
                         ),
