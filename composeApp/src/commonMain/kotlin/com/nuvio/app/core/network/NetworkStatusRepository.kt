@@ -81,7 +81,7 @@ object NetworkStatusRepository {
     internal var publicProbeUrls: List<String> = DEFAULT_PUBLIC_PROBE_URLS
     internal var serverProbeUrls: (() -> List<Pair<String, Map<String, String>>>)? = null
     internal var probeReachableOverride: (suspend (url: String, headers: Map<String, String>) -> Boolean)? = null
-    internal var onAfterProbeReleaseForTest: (() -> Unit)? = null
+    internal var onAfterProbeReleaseForTest: (suspend () -> Unit)? = null
     internal var offlineRetryBaseDelayMs: Long = DEFAULT_OFFLINE_RETRY_BASE_DELAY_MS
     internal var offlineRetryMaxDelayMs: Long = DEFAULT_OFFLINE_RETRY_MAX_DELAY_MS
     internal var minRecoveryProbeIntervalMs: Long = DEFAULT_MIN_RECOVERY_PROBE_INTERVAL_MS

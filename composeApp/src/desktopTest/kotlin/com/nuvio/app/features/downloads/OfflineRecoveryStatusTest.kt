@@ -18,14 +18,12 @@ import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.streams.StreamItem
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -33,13 +31,13 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import org.junit.Rule
 import java.io.File
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -584,76 +582,82 @@ class OfflineRecoveryStatusTest {
     }
 
     @Test
-    fun completed_probe_does_not_clear_concurrent_probe_in_flight_flag_or_overlap_probes() = runBlocking {
-        val executor = Executors.newCachedThreadPool()
+    fun completed_probe_does_not_clear_concurrent_probe_in_flight_flag_or_overlap_probes() = runTest {
         val supervisor = SupervisorJob()
-        val customScope = CoroutineScope(supervisor + executor.asCoroutineDispatcher())
+        val customScope = CoroutineScope(supervisor + StandardTestDispatcher(testScheduler))
         try {
             NetworkStatusRepository.coroutineScope = customScope
+            NetworkStatusRepository.nowMs = { testScheduler.currentTime }
             NetworkStatusRepository.offlineRetryBaseDelayMs = 60_000L
             NetworkStatusRepository.offlineRetryMaxDelayMs = 60_000L
             NetworkStatusRepository.publicProbeUrls = listOf("https://probe.example/generate_204")
             NetworkStatusRepository.serverProbeUrls = { listOf("https://account.example/rest/v1" to emptyMap()) }
 
-            val probeNumber = AtomicInteger(0)
-            val inFlight = AtomicInteger(0)
-            val maxConcurrent = AtomicInteger(0)
-            val probe1Completed = CountDownLatch(1)
-            val probe2Entered = CountDownLatch(1)
-            val allowProbe2ToFinish = CountDownLatch(1)
-            val probe3Completed = CountDownLatch(1)
+            var probeNumber = 0
+            var inFlight = 0
+            var maxConcurrent = 0
+            val startedOrder = mutableListOf<Int>()
+            val completedOrder = mutableListOf<Int>()
+            val finishProbe2 = CompletableDeferred<Boolean>()
 
             NetworkStatusRepository.probeReachableOverride = { url, _ ->
                 if (!url.contains("generate_204")) {
                     true
                 } else {
-                    val active = inFlight.incrementAndGet()
-                    maxConcurrent.accumulateAndGet(active, ::maxOf)
+                    val id = ++probeNumber
+                    startedOrder += id
+                    inFlight++
+                    maxConcurrent = maxOf(maxConcurrent, inFlight)
                     try {
-                        when (probeNumber.incrementAndGet()) {
-                            1 -> {
-                                currentCoroutineContext()[Job]!!.invokeOnCompletion { probe1Completed.countDown() }
-                                false
-                            }
-                            2 -> {
-                                probe2Entered.countDown()
-                                assertTrue(allowProbe2ToFinish.await(5, TimeUnit.SECONDS))
-                                false
-                            }
-                            else -> {
-                                probe3Completed.countDown()
-                                true
-                            }
+                        when (id) {
+                            1 -> false
+                            2 -> finishProbe2.await()
+                            else -> true
                         }
                     } finally {
-                        inFlight.decrementAndGet()
+                        inFlight--
+                        completedOrder += id
                     }
                 }
             }
 
-            // Right after Probe 1 releases its in-flight ownership and before Probe 1's finally block runs,
-            // start Probe 2 and wait until Probe 2 is actively in flight so Probe 1's finally runs concurrently with Probe 2.
-            val interceptedFirstExit = AtomicBoolean(false)
+            // Right after Probe 1 releases its in-flight ownership in the loop and before Probe 1's finally runs,
+            // start Probe 2 and yield so Probe 2 is already blocked in flight when Probe 1 executes its finally block.
+            var interceptedFirstExit = false
             NetworkStatusRepository.onAfterProbeReleaseForTest = {
-                if (interceptedFirstExit.compareAndSet(false, true)) {
+                if (!interceptedFirstExit) {
+                    interceptedFirstExit = true
                     NetworkStatusRepository.requestRefresh(force = true)
-                    assertTrue(probe2Entered.await(5, TimeUnit.SECONDS))
+                    yield()
                 }
             }
 
             NetworkStatusRepository.ensureStarted()
-            assertTrue(probe2Entered.await(5, TimeUnit.SECONDS))
-            assertTrue(probe1Completed.await(5, TimeUnit.SECONDS), "Probe 1 coroutine (including finally) must finish")
+            runCurrent()
 
-            // Requesting Probe 3 now must synchronously queue behind Probe 2 rather than launching an overlapping job.
+            assertEquals(listOf(1, 2), startedOrder)
+            assertEquals(listOf(1), completedOrder)
+            assertEquals(1, inFlight)
+            assertEquals(1, supervisor.children.count { it.isActive }, "Only Probe 2 job should be active")
+
+            // Requesting Probe 3 while Probe 2 remains blocked must queue behind Probe 2 without scheduling a third job.
             NetworkStatusRepository.requestRefresh(force = true)
-            assertEquals(1, maxConcurrent.get(), "Probe 1 finally must not clear Probe 2 in-flight ownership")
-            assertEquals(2, probeNumber.get(), "Probe 3 must wait until Probe 2 completes")
+            assertEquals(
+                1,
+                supervisor.children.count { it.isActive },
+                "Probe 1 finally must not clear Probe 2 ownership or schedule a third probe job while Probe 2 is blocked",
+            )
+            runCurrent()
+            assertEquals(1, maxConcurrent, "Probe 3 must not overlap with blocked Probe 2")
+            assertEquals(listOf(1, 2), startedOrder, "Probe 3 must not start before Probe 2 completes")
+            assertEquals(listOf(1), completedOrder)
 
-            allowProbe2ToFinish.countDown()
-            assertTrue(probe3Completed.await(5, TimeUnit.SECONDS))
-            assertTrue(awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online })
-            assertEquals(1, maxConcurrent.get(), "Probes must never overlap")
+            finishProbe2.complete(false)
+            runCurrent()
+            assertEquals(1, maxConcurrent, "Probes must never overlap")
+            assertEquals(listOf(1, 2, 3), startedOrder)
+            assertEquals(listOf(1, 2, 3), completedOrder)
+            assertEquals(NetworkCondition.Online, NetworkStatusRepository.uiState.value.condition)
 
             // Verify both unexpected runtime exceptions and mid-probe cancellations release ownership in finally.
             for (throwableFactory in listOf(
@@ -662,30 +666,33 @@ class OfflineRecoveryStatusTest {
             )) {
                 NetworkStatusRepository.resetForTest()
                 NetworkStatusRepository.coroutineScope = customScope
+                NetworkStatusRepository.nowMs = { testScheduler.currentTime }
                 NetworkStatusRepository.offlineRetryBaseDelayMs = 60_000L
                 NetworkStatusRepository.offlineRetryMaxDelayMs = 60_000L
                 NetworkStatusRepository.publicProbeUrls = listOf("https://probe.example/generate_204")
                 NetworkStatusRepository.serverProbeUrls = { listOf("https://account.example/rest/v1" to emptyMap()) }
-                val abortedProbeCompleted = CountDownLatch(1)
-                val abortFirst = AtomicBoolean(true)
+                var abortFirst = true
                 NetworkStatusRepository.probeReachableOverride = { _, _ ->
-                    if (abortFirst.compareAndSet(true, false)) {
-                        currentCoroutineContext()[Job]!!.invokeOnCompletion { abortedProbeCompleted.countDown() }
+                    if (abortFirst) {
+                        abortFirst = false
                         throw throwableFactory()
                     }
                     true
                 }
                 NetworkStatusRepository.ensureStarted()
-                assertTrue(abortedProbeCompleted.await(5, TimeUnit.SECONDS))
+                runCurrent()
+                assertEquals(0, supervisor.children.count { it.isActive })
+
                 NetworkStatusRepository.requestRefresh(force = true)
-                assertTrue(
-                    awaitCondition(timeoutMs = 5_000L) { it == NetworkCondition.Online },
+                runCurrent()
+                assertEquals(
+                    NetworkCondition.Online,
+                    NetworkStatusRepository.uiState.value.condition,
                     "Aborted probe must release ownership in finally so subsequent refreshes recover",
                 )
             }
         } finally {
             customScope.cancel()
-            executor.shutdownNow()
             NetworkStatusRepository.resetForTest()
         }
     }
