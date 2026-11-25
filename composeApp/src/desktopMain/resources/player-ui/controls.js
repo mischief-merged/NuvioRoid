@@ -2596,6 +2596,10 @@ const resolveStoredModalFocusElement = (modalEl, focusable = getModalFocusableEl
   if (activeModalFocusKey) {
     const byKey = focusable.find(el => el.dataset.navKey === activeModalFocusKey);
     if (byKey) return byKey;
+    // Source rows arrive on the next frame. The header's temporary index is not the saved row.
+    if (activeModal === "sources" && activeModalFocusKey.startsWith("src:") && sourceVirtualRenderRaf) {
+      return null;
+    }
   }
   if (activeModalFocusIndex >= 0) {
     return focusable[Math.min(activeModalFocusIndex, focusable.length - 1)] || null;
@@ -4739,6 +4743,12 @@ document.addEventListener("keydown", event => {
     } else {
       openPlayerModal("shortcuts");
     }
+    return;
+  }
+
+  if (activeModal === "sources" && (event.code === "ArrowUp" || event.code === "ArrowDown")) {
+    event.preventDefault();
+    handleNativeModalNavigation(event.code === "ArrowDown" ? "down" : "up");
     return;
   }
 

@@ -66,6 +66,34 @@ class DesktopDownloadsTrashTest {
     private fun Path.uri() = toUri().toString()
 
     @Test
+    fun archive_message_wait_matches_when_files_can_move_to_trash() {
+        val strings = listOf(
+            File("src/commonMain/composeResources/values/strings.xml"),
+            File("composeApp/src/commonMain/composeResources/values/strings.xml"),
+        ).first { it.isFile }.readText()
+        val message = requireNotNull(
+            Regex("<string name=\"downloads_delete_message_held\">([^<]+)</string>").find(strings),
+        ).groupValues[1]
+        val days = requireNotNull(Regex("for (\\d+) days").find(message)).groupValues[1].toLong()
+        assertEquals(HeldFileDays.toLong(), days)
+        assertTrue(message.contains("then moves to the Trash when available"))
+
+        val video = video()
+        assertTrue(withoutSystemTrash().moveAway(video.uri()))
+        val archived = holding.resolve("$now-episode.mkv")
+        val trash = withSystemTrash()
+
+        assertEquals(0, trash.purgeHeldFiles(now + days * day - 1))
+        assertTrue(trashedBySystem.isEmpty())
+        assertEquals("video", archived.readText())
+        assertEquals(0, withoutSystemTrash().purgeHeldFiles(now + days * day))
+        assertEquals("video", archived.readText())
+        assertEquals(1, trash.purgeHeldFiles(now + days * day))
+        assertEquals(listOf(archived.toFile()), trashedBySystem)
+        assertEquals("video", systemTrashDir.resolve("1-${archived.fileName}").readText())
+    }
+
+    @Test
     fun cancellation_after_subtitles_move_restores_the_video_and_subtitles() {
         val video = video()
         val subtitles = subtitlesOf(video)
