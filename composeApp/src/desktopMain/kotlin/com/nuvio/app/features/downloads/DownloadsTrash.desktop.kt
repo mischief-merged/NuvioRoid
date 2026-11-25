@@ -70,9 +70,10 @@ internal class DesktopDownloadsTrash(
     val usesSystemTrash: Boolean get() = systemTrash != null
 
     fun moveAway(localFileUri: String): Boolean = synchronized(this) {
-        val file = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return false
-        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) return true
-        val root = roots().firstOrNull { file.isRegularFileInside(it) } ?: return false
+        val requested = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return false
+        if (!Files.exists(requested, LinkOption.NOFOLLOW_LINKS)) return true
+        val (root, file) = locate(requested, directChild = true) ?: return false
+        if (!file.isRegularFileInside(root)) return false
         val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
 
         val trash = systemTrash
@@ -96,11 +97,12 @@ internal class DesktopDownloadsTrash(
     fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult = synchronized(this) {
         val trash = systemTrash ?: return AutoDownloadRemovalResult.NotMoved
         if (!stillWanted()) return AutoDownloadRemovalResult.Changed
-        val file = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return AutoDownloadRemovalResult.NotMoved
-        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
+        val requested = runCatching { Paths.get(URI(localFileUri)) }.getOrNull() ?: return AutoDownloadRemovalResult.NotMoved
+        if (!Files.exists(requested, LinkOption.NOFOLLOW_LINKS)) {
             return if (stillWanted()) AutoDownloadRemovalResult.Removed else AutoDownloadRemovalResult.Changed
         }
-        val root = roots().firstOrNull { file.isRegularFileInside(it) } ?: return AutoDownloadRemovalResult.NotMoved
+        val (root, file) = locate(requested, directChild = true) ?: return AutoDownloadRemovalResult.NotMoved
+        if (!file.isRegularFileInside(root)) return AutoDownloadRemovalResult.NotMoved
         val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
         val sources = listOfNotNull(file, subtitles)
         val recovery = runCatching { Files.createTempDirectory(root, ".watched-removal-") }.getOrNull()
@@ -170,12 +172,8 @@ internal class DesktopDownloadsTrash(
      * downloads folder. A link is refused and never followed. Nothing is deleted. True when it is out.
      */
     fun moveToTrash(path: Path): Boolean = synchronized(this) {
-        // Refuse a linked parent too, even when it points back inside a registered folder.
-        if (path.hasLinkedComponent() ||
-            !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
-        ) return false
-        val real = runCatching { path.parent.toRealPath().resolve(path.fileName) }.getOrNull() ?: return false
-        val root = roots().firstOrNull { real.startsWith(it) && real != it } ?: return false
+        val (root, real) = locate(path) ?: return false
+        if (!Files.exists(real, LinkOption.NOFOLLOW_LINKS)) return false
         if (real.startsWith(root.resolve(HoldingFolderName))) return false
         val key = DownloadMover.identityOf(real) ?: return false
         val trash = systemTrash
@@ -183,7 +181,7 @@ internal class DesktopDownloadsTrash(
             !Files.exists(real, LinkOption.NOFOLLOW_LINKS)
         ) return true
         // Trash can be supported but unavailable now. Hold only the same file we offered it.
-        if (!Files.exists(real, LinkOption.NOFOLLOW_LINKS) || real.hasLinkedComponent() ||
+        if (!Files.exists(real, LinkOption.NOFOLLOW_LINKS) || real.hasLinkedComponentBelow(root) ||
             DownloadMover.identityOf(real) != key
         ) return false
         return runCatching { hold(root, real) }.isSuccess
@@ -200,14 +198,36 @@ internal class DesktopDownloadsTrash(
     fun purgeHeldFiles(nowEpochMs: Long): Int = synchronized(this) {
         // Held videos and partials are never permanently deleted; aged entries move to Trash when available.
         if (systemTrash == null) return 0
-        roots().sumOf { purgeHeldFilesIn(it, nowEpochMs) }
+        roots().map { it.real }.distinct().sumOf { purgeHeldFilesIn(it, nowEpochMs) }
     }
 
-    private fun roots(): List<Path> =
+    private data class Root(val configured: Path, val real: Path)
+    private data class LocatedPath(val root: Path, val file: Path)
+
+    private fun roots(): List<Root> =
         (listOf(runCatching { downloadsDir() }.getOrNull()) + runCatching { otherDirs() }.getOrDefault(emptyList()))
             .filterNotNull()
-            .mapNotNull { runCatching { it.toRealPath() }.getOrNull() }
+            .mapNotNull { path -> runCatching {
+                val configured = path.toAbsolutePath().normalize()
+                Root(configured, configured.toRealPath())
+            }.getOrNull() }
             .distinct()
+
+    /** The configured folder and its real address are trusted; links below either are refused. */
+    private fun locate(path: Path, directChild: Boolean = false): LocatedPath? {
+        val supplied = path.toAbsolutePath()
+        val absolute = supplied.normalize()
+        return roots().firstNotNullOfOrNull { root ->
+            val anchor = listOf(root.configured, root.real).firstOrNull {
+                supplied.startsWith(it) && absolute.startsWith(it) && absolute != it
+            } ?: return@firstNotNullOfOrNull null
+            if (supplied.hasLinkedComponentBelow(anchor)) return@firstNotNullOfOrNull null
+            val real = root.real.resolve(anchor.relativize(absolute))
+            if ((directChild && real.parent != root.real) || real.hasLinkedComponentBelow(root.real)) return@firstNotNullOfOrNull null
+            if (runCatching { supplied.parent.toRealPath() != real.parent }.getOrDefault(true)) return@firstNotNullOfOrNull null
+            LocatedPath(root.real, real)
+        }
+    }
 
     private fun purgeHeldFilesIn(root: Path, nowEpochMs: Long): Int {
         // Never permanently delete archived user files: without a working system Trash they stay
@@ -274,16 +294,19 @@ internal class DesktopDownloadsTrash(
         Files.write(index, entries.map { (heldAt, name) -> "$heldAt\t$name" })
     }
 
-    private fun Path.hasLinkedComponent(): Boolean =
-        generateSequence(toAbsolutePath()) { it.parent }.any { Files.isSymbolicLink(it) }
+    private fun Path.hasLinkedComponentBelow(root: Path): Boolean {
+        val absolute = toAbsolutePath()
+        if (!absolute.startsWith(root) || absolute == root) return true
+        return generateSequence(absolute) { it.parent }.takeWhile { it != root }.any { Files.isSymbolicLink(it) }
+    }
 
     private fun Path.isRegularFileInside(root: Path): Boolean =
-        !hasLinkedComponent() &&
+        !hasLinkedComponentBelow(root) &&
             Files.isRegularFile(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 
     private fun Path.isDirectoryInside(root: Path): Boolean =
-        !hasLinkedComponent() &&
+        !hasLinkedComponentBelow(root) &&
             Files.isDirectory(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 
