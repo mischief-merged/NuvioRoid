@@ -24,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -59,6 +60,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.min
 import coil3.compose.AsyncImage
+import com.nuvio.app.controller.ControllerFocusEngine
+import com.nuvio.app.controller.ControllerFocusZone
+import com.nuvio.app.controller.ControllerManager
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
+import com.nuvio.app.controller.controllerFocusable
 import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
@@ -252,10 +258,31 @@ fun NuvioPosterZoomActionOverlay(
         }
     }
 
+    val modalOverlayToken = remember { Any() }
+    DisposableEffect(modalOverlayToken) {
+        ControllerFocusEngine.pushModalOverlay(
+            token = modalOverlayToken,
+            onBack = {
+                scope.launch { close() }
+                true
+            },
+        )
+        onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
+    }
+
+    // When the preview is opened with the controller/keyboard, select its first action so A
+    // works immediately instead of leaving the ring behind on the poster.
+    LaunchedEffect(Unit) {
+        if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
+        delay(140)
+        ControllerFocusEngine.requestFocus("poster_action_0", triggerScroll = false)
+    }
+
     PlatformBackHandler(enabled = true) {
         close()
     }
 
+    CompositionLocalProvider(LocalControllerModalOverlayToken provides modalOverlayToken) {
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -377,6 +404,7 @@ fun NuvioPosterZoomActionOverlay(
                     }
                     PosterZoomMenuRow(
                         action = action,
+                        index = index,
                         enabled = phase == PosterZoomPhase.Open,
                         onSelected = { select(action) },
                         modifier = Modifier.graphicsLayer {
@@ -511,11 +539,13 @@ fun NuvioPosterZoomActionOverlay(
             }
         }
     }
+    }
 }
 
 @Composable
 private fun PosterZoomMenuRow(
     action: PosterZoomOverlayAction,
+    index: Int,
     enabled: Boolean,
     onSelected: () -> Unit,
     modifier: Modifier = Modifier,
@@ -526,6 +556,13 @@ private fun PosterZoomMenuRow(
         modifier = modifier
             .fillMaxWidth()
             .clickable(enabled = enabled, onClick = onSelected)
+            .controllerFocusable(
+                id = "poster_action_$index",
+                zone = ControllerFocusZone.Overlay,
+                groupKey = "poster_actions",
+                selectLabel = action.label,
+                onSelect = onSelected,
+            )
             .padding(horizontal = NuvioTokens.Space.s18, vertical = NuvioTokens.Space.s16),
         horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
         verticalAlignment = Alignment.CenterVertically,

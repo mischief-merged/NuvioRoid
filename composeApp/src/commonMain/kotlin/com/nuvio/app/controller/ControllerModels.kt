@@ -170,6 +170,7 @@ object ControllerManager {
         // Guard against synthetic AWT mouse move events fired immediately during layout/cursor changes
         val elapsed = System.currentTimeMillis() - lastControllerInputEpochMs
         if (elapsed < 180L) return
+        ControllerFocusEngine.resumeSpatialFocus()
         if (_isControllerActive.value) {
             _isControllerActive.value = false
         }
@@ -179,6 +180,7 @@ object ControllerManager {
     }
 
     fun forceDeactivateController() {
+        ControllerFocusEngine.resumeSpatialFocus()
         if (_isControllerActive.value) {
             _isControllerActive.value = false
         }
@@ -242,10 +244,26 @@ object ControllerManager {
         // Deferred routes and screens without controllerFocusable nodes (e.g. details) leave the
         // engine without a focused node. Returning false lets Compose's native Enter handling
         // activate the focused button instead of the engine swallowing the key.
-        if (ControllerFocusEngine.deferNavigationToCompose) return false
+        // Modal overlays with spatial Overlay rows (e.g. bottom sheet action rows) still activate
+        // their focused Overlay node even when the route underneath defers to Compose.
+        if (ControllerFocusEngine.isYieldedToCompose) return false
+        if (ControllerFocusEngine.deferNavigationToCompose && !ControllerFocusEngine.isModalOverlayActive) return false
         if (ControllerFocusEngine.focusedNodeId.value == null) return false
         notifyNavigationInput()
         return ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.A))
+    }
+
+    /**
+     * Runs a keyboard equivalent of a gamepad shortcut (Y/LB/RB/Menu/X) through the same global
+     * handler stack the controller uses. Unlike [dispatchEvent] this does not switch the UI into
+     * controller mode, so Xbox hints stay hidden for keyboard users.
+     */
+    fun dispatchKeyboardShortcut(button: XboxButton): Boolean {
+        val handled = ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(button))
+        if (handled) {
+            notifyNavigationInput()
+        }
+        return handled
     }
 }
 
