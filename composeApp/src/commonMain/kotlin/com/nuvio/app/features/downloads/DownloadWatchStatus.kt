@@ -36,10 +36,13 @@ internal fun DownloadItem.watchStatus(
         )
     }
     val completedProgressAt = entry?.takeIf { it.isEffectivelyCompleted }?.lastUpdatedEpochMs?.takeIf { it > 0L }
-    val markedAt = historyWatchedAt(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
-    val watched = entry?.isEffectivelyCompleted == true ||
-        markedAt != null ||
-        isHistoryWatched(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
+    val historyWatched = isHistoryWatched(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
+    val watched = entry?.isEffectivelyCompleted == true || historyWatched
+    val markedAt = if (historyWatched) {
+        historyWatchedAt(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
+    } else {
+        null
+    }
     val watchedAt = if (!watched) null else listOfNotNull(completedProgressAt, markedAt).maxOrNull()
     return DownloadWatchStatus(
         isWatched = watched,

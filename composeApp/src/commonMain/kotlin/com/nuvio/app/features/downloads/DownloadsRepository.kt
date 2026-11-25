@@ -3115,16 +3115,24 @@ object DownloadsRepository {
 
     /**
      * Restores a watched download moved to the Trash back to its original location and list entry.
-     * File I/O runs outside [stateLock], under [SidecarLocks] and [ItemLocks].
+     * File I/O runs outside [stateLock], under [SidecarLocks] and [ItemLocks]. When saving the
+     * restored list entry fails or the active profile changed while restoring the file, the restored
+     * file is returned to the Trash so it is never left unindexed or blocking a later Undo.
      */
     internal fun restoreTrashedDownload(
         profileId: Int,
         item: DownloadItem,
         trashed: TrashedWatchedFile,
-    ): UndoTrashResult {
+    ): UndoTrashResult = restoreTrashedDownloadWithOutcome(profileId, item, trashed).result
+
+    internal fun restoreTrashedDownloadWithOutcome(
+        profileId: Int,
+        item: DownloadItem,
+        trashed: TrashedWatchedFile,
+    ): UndoRestoreOutcome {
         ensureLoaded()
         return SidecarLocks.withLock(trashed.originalFileUri) {
-            if (!ItemLocks.tryAcquire(item.id)) return@withLock UndoTrashResult.NotRestored
+            if (!ItemLocks.tryAcquire(item.id)) return@withLock UndoRestoreOutcome(UndoTrashResult.NotRestored)
             try {
                 val precheck = synchronized(stateLock) {
                     if (loadedProfileId != profileId ||
@@ -3133,33 +3141,59 @@ object DownloadsRepository {
                         return@synchronized UndoTrashResult.NotRestored
                     }
                     if (!backend.isConnected(item)) return@synchronized UndoTrashResult.NotReachable
-                    if (_uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed }) {
+                    val targetItem = item.copy(localFileUri = trashed.originalFileUri)
+                    if (_uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed } &&
+                        backend.locate(targetItem) is FileLookup.Found
+                    ) {
                         return@synchronized UndoTrashResult.Restored
                     }
                     null
                 }
-                if (precheck != null) return@withLock precheck
+                if (precheck != null) return@withLock UndoRestoreOutcome(precheck)
 
                 val moveResult = backend.restoreTrashedFile(trashed)
-                if (moveResult != UndoTrashResult.Restored) return@withLock moveResult
+                if (moveResult != UndoTrashResult.Restored) return@withLock UndoRestoreOutcome(moveResult)
 
-                synchronized(stateLock) {
-                    if (loadedProfileId != profileId) return@synchronized UndoTrashResult.NotRestored
+                val saved = synchronized(stateLock) {
+                    if (loadedProfileId != profileId ||
+                        com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != profileId
+                    ) {
+                        return@synchronized false
+                    }
                     val restored = item.copy(
                         status = DownloadStatus.Completed,
                         localFileUri = trashed.originalFileUri,
                         updatedAtEpochMs = DownloadsClock.nowEpochMs(),
                     )
                     backend.withListLock {
-                        if (_uiState.value.items.none { it.id == restored.id }) {
-                            publish(listOf(restored) + _uiState.value.items)
+                        val previousItems = _uiState.value.items
+                        if (previousItems.none { it.id == restored.id }) {
+                            publish(listOf(restored) + previousItems)
                         } else {
-                            publish(_uiState.value.items.map { if (it.id == restored.id) restored else it })
+                            publish(previousItems.map { if (it.id == restored.id) restored else it })
                         }
-                        persist(durably = true)
+                        if (persist(durably = true)) {
+                            true
+                        } else {
+                            publish(previousItems)
+                            persist()
+                            false
+                        }
                     }
-                    UndoTrashResult.Restored
                 }
+                if (saved) return@withLock UndoRestoreOutcome(UndoTrashResult.Restored)
+
+                // List save failed or profile changed after moving the file back: put the file back in the Trash.
+                val rollback = runCatching {
+                    backend.trashWatchedFileWithUndo(
+                        localFileUri = trashed.originalFileUri,
+                        allowHoldingWhenNoSystemTrash = trashed.heldInArchive,
+                    ) { true }
+                }.getOrNull()
+                UndoRestoreOutcome(
+                    result = UndoTrashResult.NotRestored,
+                    updatedTrashed = rollback?.trashed?.takeIf { rollback.result == AutoDownloadRemovalResult.Removed },
+                )
             } finally {
                 ItemLocks.release(item.id)
             }

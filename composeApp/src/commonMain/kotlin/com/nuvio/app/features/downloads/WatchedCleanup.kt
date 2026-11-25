@@ -153,13 +153,13 @@ internal fun undoDeletedWatchedDownload(
     profileId: Int,
     entry: AutoDownloadDeleted,
     store: AutoDownloadStore,
-    restoreDownload: (profileId: Int, item: DownloadItem, trashed: TrashedWatchedFile) -> UndoTrashResult =
-        DownloadsRepository::restoreTrashedDownload,
+    restoreDownload: (profileId: Int, item: DownloadItem, trashed: TrashedWatchedFile) -> UndoRestoreOutcome =
+        DownloadsRepository::restoreTrashedDownloadWithOutcome,
 ): UndoTrashResult {
     val item = entry.restorableItem ?: return UndoTrashResult.NotRestored
     val trashed = entry.trashed?.takeIf { it.canRestore } ?: return UndoTrashResult.NotRestored
-    val result = restoreDownload(profileId, item, trashed)
-    when (result) {
+    val outcome = restoreDownload(profileId, item, trashed)
+    when (outcome.result) {
         UndoTrashResult.Restored -> {
             store.keep(profileId, item.id)
             store.removeDeletedEntry(profileId, entry)
@@ -167,9 +167,13 @@ internal fun undoDeletedWatchedDownload(
         UndoTrashResult.FileGone -> {
             store.clearDeletedUndo(profileId, entry)
         }
-        UndoTrashResult.TargetTaken, UndoTrashResult.NotReachable, UndoTrashResult.NotRestored -> Unit
+        UndoTrashResult.TargetTaken, UndoTrashResult.NotReachable, UndoTrashResult.NotRestored -> {
+            outcome.updatedTrashed?.let { updated ->
+                store.updateDeletedUndo(profileId, entry, updated)
+            }
+        }
     }
-    return result
+    return outcome.result
 }
 
 @Composable
@@ -184,8 +188,10 @@ internal fun WatchedCleanupDialog(
     val visible = remember(candidates, filter, nowEpochMs) {
         candidates.matchingFilter(filter, nowEpochMs)
     }
-    var selectedIds by remember(filter, candidates.map { it.item.id }) {
-        mutableStateOf<Set<String>>(visible.mapTo(linkedSetOf()) { it.item.id })
+    // Initialized once when the dialog opens so explicit user unchecks stay unchecked across list or filter updates,
+    // and newly completed downloads arriving while the dialog is open do not silently select themselves.
+    var selectedIds by remember {
+        mutableStateOf<Set<String>>(candidates.mapTo(linkedSetOf()) { it.item.id })
     }
     val visibleIds: Set<String> = remember(visible) { visible.mapTo(linkedSetOf()) { it.item.id } }
     val activeSelected = remember(selectedIds, visibleIds) { selectedIds.intersect(visibleIds) }
@@ -236,7 +242,7 @@ internal fun WatchedCleanupDialog(
                         val allChosen = activeSelected.size == visible.size
                         TextButton(
                             onClick = {
-                                selectedIds = if (allChosen) emptySet() else visibleIds
+                                selectedIds = if (allChosen) selectedIds - visibleIds else selectedIds + visibleIds
                             },
                         ) {
                             Text(
@@ -267,7 +273,7 @@ internal fun WatchedCleanupDialog(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .toggleable(value = checked, role = Role.Checkbox) {
-                                        selectedIds = if (checked) activeSelected - entry.item.id else activeSelected + entry.item.id
+                                        selectedIds = if (checked) selectedIds - entry.item.id else selectedIds + entry.item.id
                                     }
                                     .semantics { contentDescription = selectLabel }
                                     .padding(vertical = 4.dp),

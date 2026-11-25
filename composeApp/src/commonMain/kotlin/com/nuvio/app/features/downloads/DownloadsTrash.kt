@@ -29,6 +29,11 @@ internal data class WatchedTrashOutcome(
     val trashed: TrashedWatchedFile? = null,
 )
 
+internal data class UndoRestoreOutcome(
+    val result: UndoTrashResult,
+    val updatedTrashed: TrashedWatchedFile? = null,
+)
+
 /** Takes the file of a download out of the downloads folder without deleting it. */
 internal expect object DownloadsTrash {
     /**

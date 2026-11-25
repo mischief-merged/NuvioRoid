@@ -199,6 +199,45 @@ internal class AutoDownloadStore(
         true
     }
 
+    /**
+     * Updates the Trash pointer on [entry] when a failed Undo rolled the file back to Trash under a
+     * new Trash address, even if the active profile changed while the rollback ran.
+     */
+    fun updateDeletedUndo(
+        profileId: Int,
+        entry: AutoDownloadDeleted,
+        trashed: TrashedWatchedFile,
+    ): Boolean = synchronized(lock) {
+        if (ensureLoaded() == profileId) {
+            var changed = false
+            val updated = state.recentlyDeleted.map { current ->
+                if (current == entry) {
+                    changed = true
+                    current.copy(trashed = trashed)
+                } else {
+                    current
+                }
+            }
+            if (!changed) return false
+            save(profileId, state.copy(recentlyDeleted = updated))
+            return true
+        }
+        val raw = runCatching { payloads.load(profileId) }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
+        val decoded = runCatching { json.decodeFromString<StoredAutoDownloads>(raw) }.getOrNull() ?: return false
+        var changed = false
+        val updatedEntries = decoded.recentlyDeleted.map { current ->
+            if (current == entry) {
+                changed = true
+                current.copy(trashed = trashed)
+            } else {
+                current
+            }
+        }
+        if (!changed) return false
+        val updated = decoded.copy(recentlyDeleted = updatedEntries).normalized()
+        runCatching { payloads.save(profileId, json.encodeToString(updated)) }.isSuccess
+    }
+
     /** Drops any scheduled removal for [downloadId] after manual clean-up or make-room moved it. */
     fun dropRemovalById(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false

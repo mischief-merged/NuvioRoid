@@ -1,5 +1,8 @@
 package com.nuvio.app.features.downloads
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
@@ -9,6 +12,8 @@ import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
@@ -16,11 +21,16 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.details.MetaDetails
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
+import com.nuvio.app.features.tracking.WatchProgressSource
+import com.nuvio.app.features.watched.WatchedItem
+import com.nuvio.app.features.watched.WatchedRepository
+import com.nuvio.app.features.watched.WatchedStorage
 import com.nuvio.app.features.watchprogress.WatchProgressEntry
 import com.nuvio.app.features.watchprogress.WatchProgressUiState
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -69,14 +79,32 @@ class WatchedCleanupModelAndUndoTest {
     private var totalLimitBytes: Long? = null
 
     private inner class TrashBackedBackend : DownloadsBackend {
-        var payload: String? = null
+        val payloadsByProfile = mutableMapOf<Int, String?>()
+        var payload: String?
+            get() = payloadsByProfile[ProfileRepository.activeProfileId]
+            set(value) {
+                payloadsByProfile[ProfileRepository.activeProfileId] = value
+            }
         val disconnectedLocations = mutableSetOf<String>()
+        var failSave = false
+        var failDurableSync = false
+        var onAfterRestoreMove: (() -> Unit)? = null
 
         override fun loadPayload(): String? = payload
 
+        override fun loadPayload(profileId: Int): String? = payloadsByProfile[profileId]
+
         override fun savePayload(payload: String) {
+            if (failSave) throw java.io.IOException("Simulated save failure")
             this.payload = payload
         }
+
+        override fun savePayload(profileId: Int, payload: String) {
+            if (failSave) throw java.io.IOException("Simulated save failure")
+            payloadsByProfile[profileId] = payload
+        }
+
+        override fun syncPayload(): Boolean = !failDurableSync
 
         override fun restoreItem(item: DownloadItem): DownloadItem = item
 
@@ -98,7 +126,9 @@ class WatchedCleanupModelAndUndoTest {
         ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash, stillWanted)
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
-            trash.restoreFromTrash(trashed)
+            trash.restoreFromTrash(trashed).also { result ->
+                if (result == UndoTrashResult.Restored) onAfterRestoreMove?.invoke()
+            }
 
         override fun start(
             request: DownloadPlatformRequest,
@@ -118,6 +148,12 @@ class WatchedCleanupModelAndUndoTest {
         override fun removePartialFile(destinationFileName: String): Boolean = true
 
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+
+        override fun locate(item: DownloadItem): FileLookup {
+            val uri = item.localFileUri ?: return FileLookup.Missing
+            val path = runCatching { Path.of(java.net.URI(uri)) }.getOrNull() ?: return FileLookup.Missing
+            return if (path.exists()) FileLookup.Found(uri, item.locationId) else FileLookup.Missing
+        }
     }
 
     private val backend = TrashBackedBackend()
@@ -145,6 +181,11 @@ class WatchedCleanupModelAndUndoTest {
         )
         startedIds.clear()
         totalLimitBytes = null
+        backend.payloadsByProfile.clear()
+        backend.disconnectedLocations.clear()
+        backend.failSave = false
+        backend.failDurableSync = false
+        backend.onAfterRestoreMove = null
 
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
@@ -382,6 +423,170 @@ class WatchedCleanupModelAndUndoTest {
         assertFalse(store.recentlyDeleted.value.single().canUndo)
         assertNull(DownloadsRepository.uiState.value.items.firstOrNull { it.id == "m-1" })
     }
+
+    @Test
+    fun active_provider_without_stored_map_does_not_fall_back_to_local_watched_timestamps() {
+        val profile = ProfileRepository.activeProfileId
+        val watchedStore = DesktopStorage.store("nuvio_watched")
+        val previousPayload = WatchedStorage.loadPayload(profile)
+        try {
+            WatchedRepository.clearLocalState()
+            watchedStore.remove("watched_$profile")
+            WatchedRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+            WatchedRepository.markWatchedLocally(
+                listOf(WatchedItem(id = "m-local", type = "movie", name = "Local Film", markedAtEpochMs = now - 20 * dayMs)),
+            )
+
+            val filmFile = downloadsDir.resolve("m-local.mkv").also { it.writeText("local-bytes") }
+            val film = movie("m-local", "Local Film", 900L, uri = filmFile.toUri().toString())
+                .copy(fileName = "m-local.mkv")
+
+            assertTrue(WatchedRepository.isWatched("m-local", "movie"))
+            assertNotNull(WatchedRepository.watchedAtEpochMs("m-local", "movie"))
+            assertTrue(film.watchStatus(WatchProgressUiState()).isWatched)
+
+            // Switch to Trakt when Trakt has no stored map in providerItems: local nuvioItems must NOT bleed in.
+            WatchedRepository.activateSource(WatchProgressSource.TRAKT)
+            assertFalse(WatchedRepository.isWatched("m-local", "movie"))
+            assertNull(WatchedRepository.watchedAtEpochMs("m-local", "movie"))
+            val statusUnderProvider = film.watchStatus(WatchProgressUiState())
+            assertFalse(statusUnderProvider.isWatched)
+            assertNull(statusUnderProvider.watchedAtEpochMs)
+
+            // Also verify DownloadWatchStatus directly when historyWatchedAt would return a timestamp while isHistoryWatched is false.
+            val mismatchedStatus = film.watchStatus(
+                progressState = WatchProgressUiState(),
+                isHistoryWatched = { _, _, _, _ -> false },
+                historyWatchedAt = { _, _, _, _ -> now - 10 * dayMs },
+            )
+            assertFalse(mismatchedStatus.isWatched)
+            assertNull(mismatchedStatus.watchedAtEpochMs)
+
+            assertTrue(
+                cleanableWatchedDownloads(
+                    items = listOf(film),
+                    watchStatusOf = { it.watchStatus(WatchProgressUiState()) },
+                    keptDownloadIds = emptySet(),
+                    movingIds = emptySet(),
+                    isReachable = { true },
+                    isPlaying = { false },
+                ).isEmpty(),
+            )
+
+            val store = AutoDownloadStore(MemoryAutoDownloadPayloads(), nowEpochMs = { now }) { profile }
+            assertTrue(store.setMakeRoomAutomatically(profile, true))
+            totalLimitBytes = 500L
+            backend.payload = DownloadsCodec.encode(listOf(film), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            val makeRoom = MakeRoomAutomatically(
+                store = store,
+                downloads = { DownloadsRepository.uiState.value.items },
+                allDownloadBytes = DownloadsRepository::allDownloadBytes,
+                autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+                totalStorageLimitBytes = { totalLimitBytes },
+                autoStorageLimitBytes = { null },
+                watchStatusOf = { it.watchStatus(WatchProgressUiState()) },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            )
+            assertEquals(0, makeRoom.runOnce(profile))
+            assertTrue(filmFile.exists(), "title unwatched in active provider must never be trashed")
+        } finally {
+            WatchedRepository.clearLocalState()
+            WatchedRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+            if (previousPayload == null) {
+                watchedStore.remove("watched_$profile")
+            } else {
+                WatchedStorage.savePayload(profile, previousPayload)
+            }
+        }
+    }
+
+    @Test
+    fun undo_rolls_file_back_to_trash_on_save_failure_or_profile_switch_and_succeeds_on_retry() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val otherProfile = originalProfile + 17
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+
+        try {
+            val filmFile = downloadsDir.resolve("film.mkv").also { it.writeText("transactional-bytes") }
+            val subsDir = downloadsDir.resolve("film.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("transactional-subs") }
+            val film = movie("m-tx", "Transactional Film", 700L, uri = filmFile.toUri().toString())
+                .copy(fileName = "film.mkv")
+            backend.payload = DownloadsCodec.encode(listOf(film), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                1,
+                executeWatchedCleanup(
+                    profileId = originalProfile,
+                    downloadIds = listOf("m-tx"),
+                    store = store,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { now },
+                ),
+            )
+            assertFalse(filmFile.exists())
+
+            // 1a. savePayload throws IOException: Undo returns NotRestored, puts file back in Trash, and keeps Undo available.
+            backend.failSave = true
+            val firstEntry = store.recentlyDeleted.value.single()
+            assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(originalProfile, firstEntry, store))
+            assertFalse(filmFile.exists(), "failed save must roll the restored file back to Trash")
+            assertFalse(subsDir.exists(), "failed save must roll restored subtitles back to Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.none { it.id == "m-tx" })
+            backend.failSave = false
+
+            // 1b. syncPayload returns false: Undo returns NotRestored, rolls back stored payload + file, and keeps Undo available.
+            backend.failDurableSync = true
+            val afterWriteFailure = store.recentlyDeleted.value.single()
+            assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(originalProfile, afterWriteFailure, store))
+            assertFalse(filmFile.exists(), "failed durable sync must roll the restored file back to Trash")
+            assertFalse(subsDir.exists(), "failed durable sync must roll restored subtitles back to Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.none { it.id == "m-tx" })
+            val afterSaveFailure = store.recentlyDeleted.value.single()
+            assertTrue(afterSaveFailure.canUndo)
+
+            // 2. Profile switches right after physical move out of Trash: Undo rolls file back to Trash and updates profile's Undo entry.
+            backend.failDurableSync = false
+            backend.onAfterRestoreMove = {
+                backend.onAfterRestoreMove = null
+                ProfileRepository.setActiveProfileIdForTest(otherProfile)
+                DownloadsRepository.onProfileChanged()
+            }
+            assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(originalProfile, afterSaveFailure, store))
+            assertFalse(filmFile.exists(), "mid-restore profile switch must roll the restored file back to Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.none { it.id == "m-tx" })
+
+            // 3. Switch back to originalProfile and press Undo again -> succeeds cleanly without TargetTaken!
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+            val afterProfileRollback = store.recentlyDeleted.value.single()
+            assertTrue(afterProfileRollback.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, afterProfileRollback, store))
+            assertEquals("transactional-bytes", filmFile.readText())
+            assertEquals("transactional-subs", subsDir.resolve("en.srt").readText())
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-tx" && it.status == DownloadStatus.Completed })
+
+            // Verify the restored entry was durably saved to the catalog payload as well.
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-tx" && it.status == DownloadStatus.Completed })
+        } finally {
+            backend.onAfterRestoreMove = null
+            backend.failSave = false
+            backend.failDurableSync = false
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+        }
+    }
 }
 
 @OptIn(ExperimentalTestApi::class)
@@ -507,5 +712,63 @@ class WatchedCleanupUiTest {
             .performClick()
 
         assertEquals(listOf(9 to deleted), undone)
+    }
+
+    @Test
+    fun dialog_preserves_excluded_choices_across_candidate_refreshes() {
+        val dayMs = 24L * 60 * 60 * 1_000L
+        val now = 1_800_000_000_000L
+        val ep1 = CleanableWatchedDownload(
+            item = testDownload(1, DownloadStatus.Completed, id = "ep-1").copy(title = "Andor", downloadedBytes = 1_000_000_000L, totalBytes = 1_000_000_000L),
+            sizeBytes = 1_000_000_000L,
+            watchedAtEpochMs = now - 20 * dayMs,
+        )
+        val ep2 = CleanableWatchedDownload(
+            item = testDownload(2, DownloadStatus.Completed, id = "ep-2").copy(title = "Andor", downloadedBytes = 1_500_000_000L, totalBytes = 1_500_000_000L),
+            sizeBytes = 1_500_000_000L,
+            watchedAtEpochMs = now - 10 * dayMs,
+        )
+        val ep3 = CleanableWatchedDownload(
+            item = testDownload(3, DownloadStatus.Completed, id = "ep-3").copy(title = "Andor", downloadedBytes = 2_000_000_000L, totalBytes = 2_000_000_000L),
+            sizeBytes = 2_000_000_000L,
+            watchedAtEpochMs = now - 2 * dayMs,
+        )
+        var candidatesState by mutableStateOf(listOf(ep1, ep2))
+        var confirmed: Set<String>? = null
+
+        compose.setContent {
+            NuvioTheme {
+                WatchedCleanupDialog(
+                    candidates = candidatesState,
+                    nowEpochMs = now,
+                    usesSystemTrash = true,
+                    onConfirm = { confirmed = it },
+                    onDismiss = {},
+                )
+            }
+        }
+
+        // Uncheck S01E01 while S01E02 remains checked.
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E01"))
+            .assertIsOn()
+            .performClick()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E01"))
+            .assertIsOff()
+
+        // Candidate list refreshes: S01E03 arrives while the dialog is open -> S01E01 stays unchecked, S01E02 stays checked, S01E03 arrives unchecked.
+        compose.runOnIdle { candidatesState = listOf(ep1, ep2, ep3) }
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E01")).assertIsOff()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E02")).assertIsOn()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E03")).assertIsOff()
+
+        // Another refresh removes S01E03 -> S01E01 still stays unchecked!
+        compose.runOnIdle { candidatesState = listOf(ep1, ep2) }
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E01")).assertIsOff()
+        compose.onNodeWithContentDescription(text(Res.string.downloads_select_description, "Andor S01E02")).assertIsOn()
+
+        compose.onNode(hasText(text(Res.string.downloads_delete_confirm_trash)) and hasAnyAncestor(isDialog())).performClick()
+        assertEquals(setOf("ep-2"), confirmed)
     }
 }

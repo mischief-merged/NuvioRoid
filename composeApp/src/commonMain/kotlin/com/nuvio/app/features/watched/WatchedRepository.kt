@@ -1135,7 +1135,8 @@ object WatchedRepository {
         val source = activeSource
         val keys = watchedItemKeys(type = type, id = id, season = season, episode = episode)
         return itemsStore.read { nuvioItems, providerItems, _, _ ->
-            val map = source.providerId?.let { providerItems[it] } ?: nuvioItems
+            val providerId = source.providerId
+            val map = if (providerId != null) providerItems[providerId] else nuvioItems
             keys.mapNotNull { key -> map?.get(key)?.normalizedMarkedAt()?.markedAtEpochMs?.takeIf { it > 0L } }.maxOrNull()
         }
     }
