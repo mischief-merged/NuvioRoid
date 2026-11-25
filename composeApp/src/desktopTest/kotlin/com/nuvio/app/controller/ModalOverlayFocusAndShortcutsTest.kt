@@ -2,7 +2,10 @@ package com.nuvio.app.controller
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Text
@@ -15,12 +18,17 @@ import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.AppScreenTab
 import com.nuvio.app.core.ui.ComposePopupFocus
 import com.nuvio.app.core.ui.NuvioBottomSheetActionRow
+import com.nuvio.app.core.ui.NuvioDropdownChip
+import com.nuvio.app.core.ui.NuvioDropdownOption
 import com.nuvio.app.core.ui.NuvioModalBottomSheet
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.features.profiles.SidebarProfileSwitcherStack
 import com.nuvio.app.navigation.DetailRoute
 import com.nuvio.app.navigation.TabsRoute
 import org.junit.After
@@ -256,5 +264,213 @@ class ModalOverlayFocusAndShortcutsTest {
         assertFalse(ControllerManager.dispatchKeyboardShortcut(XboxButton.Menu))
         assertFalse(ControllerFocusEngine.isNavigationZoneExpanded.value)
         assertNull(ControllerFocusEngine.focusedNodeId.value)
+    }
+
+    @Test
+    fun desktop_dropdown_owns_modal_input_and_blocks_shell_shortcuts() {
+        var bumperRightCalls = 0
+        var searchCalls = 0
+        var openNavCalls = 0
+
+        compose.setContent {
+            NuvioTheme {
+                ControllerNavigationHost(
+                    currentRoute = TabsRoute,
+                    selectedTab = AppScreenTab.Library,
+                    onBack = { false },
+                    onBumperRight = {
+                        bumperRightCalls += 1
+                        true
+                    },
+                    onSearch = {
+                        searchCalls += 1
+                        true
+                    },
+                    onOpenNavigation = {
+                        openNavCalls += 1
+                        true
+                    },
+                )
+                NuvioDropdownChip(
+                    title = "Filter",
+                    label = "All Types",
+                    options = listOf(
+                        NuvioDropdownOption("all", "All Types"),
+                        NuvioDropdownOption("movie", "Movies"),
+                    ),
+                    selectedKey = "all",
+                    onSelected = {},
+                )
+            }
+        }
+        compose.waitForIdle()
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+
+        // Open the desktop dropdown menu.
+        compose.onNodeWithText("All Types").performClick()
+        compose.waitForIdle()
+
+        assertTrue(ControllerFocusEngine.isModalOverlayActive)
+        assertFalse(ControllerManager.dispatchKeyboardShortcut(XboxButton.RB))
+        assertFalse(ControllerManager.dispatchKeyboardShortcut(XboxButton.Y))
+        assertFalse(ControllerManager.dispatchKeyboardShortcut(XboxButton.Menu))
+        assertFalse(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.RB)))
+        assertEquals(0, bumperRightCalls)
+        assertEquals(0, searchCalls)
+        assertEquals(0, openNavCalls)
+
+        // Gamepad B closes the dropdown, releasing modal ownership so shell shortcuts work again.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+        assertTrue(ControllerManager.dispatchKeyboardShortcut(XboxButton.RB))
+        assertEquals(1, bumperRightCalls)
+    }
+
+    @Test
+    fun sidebar_profile_switcher_blocks_shell_shortcuts_while_open() {
+        var switcherOpen by mutableStateOf(true)
+        var bumperRightCalls = 0
+
+        compose.setContent {
+            NuvioTheme {
+                ControllerNavigationHost(
+                    currentRoute = TabsRoute,
+                    selectedTab = AppScreenTab.Home,
+                    onBack = { false },
+                    onBumperRight = {
+                        bumperRightCalls += 1
+                        true
+                    },
+                )
+                if (switcherOpen) {
+                    SidebarProfileSwitcherStack(
+                        onProfileSelected = {},
+                        onAddProfileRequested = {},
+                        onDismissRequest = { switcherOpen = false },
+                    )
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        assertTrue(ControllerFocusEngine.isModalOverlayActive)
+        assertFalse(ControllerManager.dispatchKeyboardShortcut(XboxButton.RB))
+        assertFalse(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.RB)))
+        assertEquals(0, bumperRightCalls)
+
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(switcherOpen)
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+        assertTrue(ControllerManager.dispatchKeyboardShortcut(XboxButton.RB))
+        assertEquals(1, bumperRightCalls)
+    }
+
+    @Test
+    fun background_page_does_not_scroll_while_modal_sheet_is_open() {
+        var sheetOpen by mutableStateOf(true)
+
+        compose.setContent {
+            NuvioTheme {
+                val listState = rememberLazyListState()
+                RegisterControllerVerticalScroll(listState)
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.height(300.dp),
+                ) {
+                    items(30) { index ->
+                        Box(modifier = Modifier.height(60.dp)) {
+                            Text("Row $index")
+                        }
+                    }
+                }
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        Button(onClick = {}) { Text("Only control") }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        assertTrue(ControllerFocusEngine.isModalOverlayActive)
+        assertFalse(ControllerFocusEngine.scrollActivePage(down = true))
+        assertFalse(ControllerFocusEngine.handleEvent(ControllerEvent.AnalogScroll(0f, 1f)))
+
+        sheetOpen = false
+        compose.waitForIdle()
+
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+        assertTrue(ControllerFocusEngine.scrollActivePage(down = true))
+    }
+
+    @Test
+    fun explicit_navigation_entry_survives_subsequent_content_registration() {
+        var showLateContent by mutableStateOf(false)
+
+        compose.setContent {
+            NuvioTheme {
+                ControllerNavigationHost(
+                    currentRoute = TabsRoute,
+                    selectedTab = AppScreenTab.Home,
+                    onBack = { false },
+                    onOpenNavigation = {
+                        ControllerFocusEngine.focusNavigationItem("top_nav_home", "sidebar_home")
+                    },
+                )
+                Column {
+                    Box(
+                        modifier = Modifier
+                            .size(80.dp)
+                            .controllerFocusable(
+                                id = "sidebar_home",
+                                zone = ControllerFocusZone.Navigation,
+                                isDefaultFocus = true,
+                                onSelect = {},
+                            ),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(120.dp)
+                            .controllerFocusable(
+                                id = "bg_poster_initial",
+                                zone = ControllerFocusZone.Content,
+                                groupKey = "shelf_1",
+                                onSelect = {},
+                            ),
+                    )
+                    if (showLateContent) {
+                        Box(
+                            modifier = Modifier
+                                .size(120.dp)
+                                .controllerFocusable(
+                                    id = "bg_poster_late",
+                                    zone = ControllerFocusZone.Content,
+                                    groupKey = "shelf_1",
+                                    isDefaultFocus = true,
+                                    onSelect = {},
+                                ),
+                        )
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Explicitly enter navigation rail via Ctrl+B / Menu shortcut.
+        assertTrue(ControllerManager.dispatchKeyboardShortcut(XboxButton.Menu))
+        assertEquals("sidebar_home", ControllerFocusEngine.focusedNodeId.value)
+        assertTrue(ControllerFocusEngine.isNavigationZoneExpanded.value)
+
+        // A late-arriving default content node (e.g. catalog load or window resize) must not steal focus.
+        showLateContent = true
+        compose.waitForIdle()
+
+        assertEquals("sidebar_home", ControllerFocusEngine.focusedNodeId.value)
     }
 }

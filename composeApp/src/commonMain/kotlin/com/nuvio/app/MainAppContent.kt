@@ -1773,12 +1773,10 @@ internal fun MainAppContent(
                             }
                             // The navigation rail can be a sidebar or the floating top bar depending on
                             // the Desktop Navigation setting; try the top bar first, then the sidebar.
-                            val focused = ControllerFocusEngine.requestFocus("top_nav_$tabName", triggerScroll = false) ||
-                                ControllerFocusEngine.requestFocus("sidebar_$tabName", triggerScroll = false)
-                            if (focused) {
-                                ControllerFocusEngine.setNavigationZoneExpanded(true)
-                            }
-                            focused
+                            ControllerFocusEngine.focusNavigationItem(
+                                "top_nav_$tabName",
+                                "sidebar_$tabName",
+                            )
                         } else {
                             false
                         }

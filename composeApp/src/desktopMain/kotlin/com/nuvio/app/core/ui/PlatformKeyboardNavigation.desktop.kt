@@ -216,7 +216,10 @@ actual fun PlatformKeyboardNavigationHost() {
                     val padMoved = activeFocusManager().moveSpatialFocus(event.direction)
                     if (padMoved) {
                         ControllerSoundPlayer.playNavigate()
-                    } else if (event.direction == ControllerDirection.Up || event.direction == ControllerDirection.Down) {
+                    } else if (
+                        !ControllerFocusEngine.isModalOverlayActive &&
+                        (event.direction == ControllerDirection.Up || event.direction == ControllerDirection.Down)
+                    ) {
                         ControllerFocusEngine.scrollActivePage(down = event.direction == ControllerDirection.Down)
                     }
                 }
@@ -327,7 +330,10 @@ actual fun PlatformKeyboardNavigationHost() {
             ControllerManager.notifyNavigationInput()
             if (activeFocusManager().moveSpatialFocus(direction)) {
                 ControllerSoundPlayer.playNavigate()
-            } else if (direction == ControllerDirection.Up || direction == ControllerDirection.Down) {
+            } else if (
+                !ControllerFocusEngine.isModalOverlayActive &&
+                (direction == ControllerDirection.Up || direction == ControllerDirection.Down)
+            ) {
                 ControllerFocusEngine.scrollActivePage(down = direction == ControllerDirection.Down)
             }
             true

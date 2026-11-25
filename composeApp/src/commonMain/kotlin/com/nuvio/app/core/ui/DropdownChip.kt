@@ -25,6 +25,7 @@ import androidx.compose.material3.SheetState
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -155,6 +156,14 @@ fun NuvioDropdownChip(
             }
 
             if (isSheetVisible) {
+                val dropdownOverlayToken = remember { Any() }
+                DisposableEffect(dropdownOverlayToken) {
+                    ControllerFocusEngine.pushModalOverlay(dropdownOverlayToken)
+                    onDispose { ControllerFocusEngine.popModalOverlay(dropdownOverlayToken) }
+                }
+                PlatformBackHandler(enabled = true) {
+                    isSheetVisible = false
+                }
                 // B closes the popup and returns to the chip.
                 RegisterControllerHandler(
                     key = "dropdown_menu",

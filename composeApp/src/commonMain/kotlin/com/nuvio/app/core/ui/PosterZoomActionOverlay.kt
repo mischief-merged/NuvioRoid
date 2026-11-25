@@ -208,14 +208,6 @@ fun NuvioPosterZoomActionOverlay(
         }
     }
 
-    // The preview menu is a spatial overlay (Overlay zone) even when it opens on a Compose-driven
-    // route (details). Let the engine drive it while it is visible, then restore the route mode.
-    DisposableEffect(Unit) {
-        val previous = ControllerFocusEngine.deferNavigationToCompose
-        ControllerFocusEngine.deferNavigationToCompose = false
-        onDispose { ControllerFocusEngine.deferNavigationToCompose = previous }
-    }
-
     DisposableEffect(source) {
         onDispose { source?.land() }
     }

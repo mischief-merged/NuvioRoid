@@ -42,6 +42,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -367,6 +368,12 @@ fun SidebarProfileSwitcherStack(
             onProfileSelected(profile)
             onDismissRequest()
         }
+    }
+
+    val switcherOverlayToken = remember { Any() }
+    DisposableEffect(switcherOverlayToken) {
+        ControllerFocusEngine.pushModalOverlay(switcherOverlayToken)
+        onDispose { ControllerFocusEngine.popModalOverlay(switcherOverlayToken) }
     }
 
     // B closes the PIN step first, then the switcher; without this the app-level back handler
