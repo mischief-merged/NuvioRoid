@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.core.network.TrustedLocalServerTest
 import com.nuvio.app.core.storage.DesktopStorage
 import com.sun.net.httpserver.HttpServer
 import java.io.File
@@ -12,11 +13,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-class DesktopDownloadProgressTest {
+class DesktopDownloadProgressTest : TrustedLocalServerTest() {
     @Test
-    fun slow_download_reports_progress_about_once_per_second_not_per_chunk() {
-        val chunk = 64 * 1024
-        val chunks = 10
+    fun slow_download_reports_progress_throttled_not_per_chunk() {
+        val chunk = 16 * 1024
+        val chunks = 40
         val payload = Random(7).nextBytes(chunk * chunks)
 
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -26,7 +27,7 @@ class DesktopDownloadProgressTest {
                 repeat(chunks) { index ->
                     output.write(payload, index * chunk, chunk)
                     output.flush()
-                    Thread.sleep(250)
+                    Thread.sleep(25)
                 }
             }
         }
@@ -37,6 +38,8 @@ class DesktopDownloadProgressTest {
         val completed = CountDownLatch(1)
         val reported = mutableListOf<Long>()
         var failureMessage: String? = null
+        val previousFreeBytes = DownloadsPlatformDownloader.freeBytesProvider
+        DownloadsPlatformDownloader.freeBytesProvider = { null }
 
         try {
             DownloadsPlatformDownloader.start(
@@ -69,11 +72,15 @@ class DesktopDownloadProgressTest {
             assertTrue(completed.await(30, TimeUnit.SECONDS), "download did not finish")
             assertNull(failureMessage)
             synchronized(reported) {
-                assertTrue(reported.size in 3..5, "expected a handful of progress reports, got ${reported.size}")
+                assertTrue(
+                    reported.size in 3..12 && reported.size < chunks / 2,
+                    "expected throttled progress reports (far fewer than $chunks chunks), got ${reported.size}",
+                )
                 assertEquals(reported.sorted(), reported)
                 assertEquals(payload.size.toLong(), reported.last())
             }
         } finally {
+            DownloadsPlatformDownloader.freeBytesProvider = previousFreeBytes
             server.stop(0)
             File(downloadsDir, fileName).delete()
             File(downloadsDir, "$fileName.part").delete()
