@@ -1,7 +1,7 @@
 package com.nuvio.app.core.build
 
 /** Updated when syncing a new upstream desktop release, not when bumping a fork release. */
-internal const val UPSTREAM_DESKTOP_VERSION = "0.1.38"
+internal const val UPSTREAM_DESKTOP_VERSION = "0.1.39"
 
 /** Decodes major.minor.(patch * 100 + release); unknown formats stay readable as supplied. */
 internal fun decodeForkVersion(packageVersion: String): String {

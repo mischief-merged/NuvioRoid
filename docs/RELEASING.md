@@ -9,7 +9,7 @@ NuvioRoid tracks three coordinated version values for every release:
 1. **User-visible fork version (four parts):** `<upstream-major>.<upstream-minor>.<upstream-patch>.<fork-release>`
    - Used in the app's Settings and About footer and crash-report version metadata, for the git tag (`nuvioroid-<fork-version>`), GitHub release title and notes, [CHANGELOG.md](../CHANGELOG.md), [README.md](../README.md), and the published DMG filename (`NuvioRoid-<fork-version>-macos-arm64.dmg`).
    - On desktop, `AppVersionPolicy.displayVersionName` decodes the package version with `decodeForkVersion()` in `composeApp/src/commonMain/kotlin/com/nuvio/app/core/build/ForkVersion.kt`. For example, `1.1.3801` displays as `1.1.38.1`; the build number comes directly from `VERSION_CODE`. There is no separate fork-release constant to update. Unrecognized inputs (including suffixes, incomplete versions, release zero, non-numeric or overflowing components) display unchanged.
-   - The upstream attribution is separate: `UPSTREAM_DESKTOP_VERSION` in `ForkVersion.kt` records the upstream desktop version (currently `0.1.38`). Update it on an upstream sync. The leading upstream `0` cannot be recovered from the clamped package version. The existing core-version attribution remains derived from `AppVersionConfig.VERSION_NAME`.
+   - The upstream attribution is separate: `UPSTREAM_DESKTOP_VERSION` in `ForkVersion.kt` records the upstream desktop version (currently `0.1.39`). Update it on an upstream sync. The leading upstream `0` cannot be recovered from the clamped package version. The existing core-version attribution remains derived from `AppVersionConfig.VERSION_NAME`.
    - Upstream Nuvio Desktop `0.1.36-alpha` maps to base `1.1.36` because `jpackageCompatibleVersion` clamps a leading `0` to `1` for macOS packaging, so the first fork release is `1.1.36.1`.
 
 2. **Three-part numeric package version (`VERSION_NAME` in `composeApp/Configuration/DesktopVersion.properties`):**
@@ -76,7 +76,7 @@ Before running the release test pass or building the candidate DMG:
 3. Update the download link and version label in [README.md](../README.md) to point to tag `nuvioroid-<fork-version>`.
 4. Commit these changes on `downloads-suite` and merge `downloads-suite` into `nuvioroid`.
 5. On `nuvioroid`, check the attribution before running Step 3:
-   - When syncing upstream, update `UPSTREAM_DESKTOP_VERSION` in `composeApp/src/commonMain/kotlin/com/nuvio/app/core/build/ForkVersion.kt` and commit it. It must match the upstream desktop release without its suffix (currently `0.1.38`). Leave it unchanged for fork-only release bumps.
+   - When syncing upstream, update `UPSTREAM_DESKTOP_VERSION` in `composeApp/src/commonMain/kotlin/com/nuvio/app/core/build/ForkVersion.kt` and commit it. It must match the upstream desktop release without its suffix (currently `0.1.39`). Leave it unchanged for fork-only release bumps.
    - Confirm Settings and About show the decoded `<fork-version>` and `VERSION_CODE` as the build. For `VERSION_NAME=1.1.3801` and `VERSION_CODE=3801`, they must show `Version 1.1.38.1 (build 3801)` and `Based on Nuvio Desktop 0.1.38`, followed by the core version when it applies. No `ForkIdentity.BUILD` or second fork-release number exists.
    - Crash-report release metadata and version tags use the same displayed version and build. `AppVersionPolicy.packageVersionName` preserves the encoded value for existing service fields such as scrobbling; updater comparisons and package metadata also retain the package version.
 
