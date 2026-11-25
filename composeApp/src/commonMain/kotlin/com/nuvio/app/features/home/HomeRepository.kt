@@ -199,7 +199,7 @@ object HomeRepository {
             cachedSections = loadedSections.toMap()
             lastErrorMessage = firstErrorMessage
             activeRequestKey = null
-            loadedRequestKey = requestKey
+            loadedRequestKey = if (loadedSections.isNotEmpty() || firstErrorMessage == null) requestKey else null
             publishCurrentState(
                 isLoading = false,
                 requestKey = requestKey,
