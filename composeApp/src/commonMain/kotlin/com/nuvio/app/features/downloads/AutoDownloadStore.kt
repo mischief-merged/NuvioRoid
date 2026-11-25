@@ -37,6 +37,8 @@ private data class StoredAutoDownloads(
     val storageLimitGb: Int? = AutoDownloadStore.DefaultStorageLimitGb,
     /** Combined limit for hand-started and automatic downloads together. Null means no limit. */
     val totalStorageLimitGb: Int? = null,
+    /** Moves watched downloads to the Trash oldest-watched first when a storage limit needs room. Off by default. */
+    val makeRoomAutomatically: Boolean = false,
     val removals: List<AutoDownloadRemoval> = emptyList(),
     /** Downloads the user chose to keep. They are never removed after watching. */
     val keptDownloadIds: Set<String> = emptySet(),
@@ -116,12 +118,24 @@ internal class AutoDownloadStore(
 
     private val _storageLimitGb = MutableStateFlow<Int?>(DefaultStorageLimitGb)
     private val _totalStorageLimitGb = MutableStateFlow<Int?>(null)
+    private val _makeRoomAutomatically = MutableStateFlow(false)
 
     private val _deleteAfterWatchingMode = MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
     private val _keptDownloadIds = MutableStateFlow<Set<String>>(emptySet())
 
     val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> = _deleteAfterWatchingMode.asStateFlow()
     val keptDownloadIds: StateFlow<Set<String>> = _keptDownloadIds.asStateFlow()
+    val makeRoomAutomatically: StateFlow<Boolean> = _makeRoomAutomatically.asStateFlow()
+
+    fun isMakeRoomEnabled(profileId: Int): Boolean = synchronized(lock) {
+        ensureLoaded() == profileId && state.makeRoomAutomatically
+    }
+
+    fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean): Boolean = WatchedRemovalGuard.change {
+        if (ensureLoaded() != profileId) return@change false
+        save(profileId, state.copy(makeRoomAutomatically = enabled))
+        true
+    }
 
     fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode): Boolean = WatchedRemovalGuard.change {
         if (ensureLoaded() != profileId) return@change false
@@ -541,6 +555,7 @@ internal class AutoDownloadStore(
         _rules.value = updated.rules
         _storageLimitGb.value = updated.storageLimitGb
         _totalStorageLimitGb.value = updated.totalStorageLimitGb
+        _makeRoomAutomatically.value = updated.makeRoomAutomatically
         _removals.value = updated.removals
         _recentlyDeleted.value = updated.recentlyDeleted
     }
@@ -555,6 +570,7 @@ internal class AutoDownloadStore(
             _rules.value = state.rules
             _storageLimitGb.value = state.storageLimitGb
             _totalStorageLimitGb.value = state.totalStorageLimitGb
+            _makeRoomAutomatically.value = state.makeRoomAutomatically
             _removals.value = state.removals
             _recentlyDeleted.value = state.recentlyDeleted
         }

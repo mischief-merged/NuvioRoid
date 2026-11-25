@@ -3598,4 +3598,6 @@
     <string name="settings_free_space_floor_description">Pauses downloads in a location when its drive drops below this free space, and resumes when space returns.</string>
     <string name="settings_free_space_floor_off">Off</string>
     <string name="settings_free_space_floor_value">%1$d GB</string>
+    <string name="settings_make_room_title">Make room automatically</string>
+    <string name="settings_make_room_description">When over a storage limit, moves watched downloads to the Trash, oldest watched first. Never touches unwatched, Keep, playing, or downloading titles.</string>
 </resources>

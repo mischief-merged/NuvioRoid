@@ -256,6 +256,14 @@ internal fun settingsSearchEntries(
             pageLabel = playbackPage,
             section = playbackPage,
         )
+        addRow(
+            page = SettingsPage.Playback,
+            key = "playback-make-room-automatically",
+            title = stringResource(Res.string.settings_make_room_title),
+            description = stringResource(Res.string.settings_make_room_description),
+            pageLabel = playbackPage,
+            section = playbackPage,
+        )
     }
     addPage(
         page = SettingsPage.Advanced,

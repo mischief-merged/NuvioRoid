@@ -73,6 +73,7 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
 private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
 internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
 private val NoTotalStorageLimit = kotlinx.coroutines.flow.MutableStateFlow<Int?>(null)
+private val NoMakeRoomAutomatically = kotlinx.coroutines.flow.MutableStateFlow(false)
 
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
@@ -87,10 +88,14 @@ internal interface AutoDownloadController {
     /** The combined storage limit for all downloads, in gigabytes. Null means no limit. */
     val totalStorageLimitGb: StateFlow<Int?> get() = NoTotalStorageLimit
 
+    /** Whether watched downloads are moved to the Trash automatically when over a storage limit. Off by default. */
+    val makeRoomAutomatically: StateFlow<Boolean> get() = NoMakeRoomAutomatically
+
     val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
     val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
     fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
     fun setTotalStorageLimit(profileId: Int, limitGb: Int?) = Unit
+    fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) = Unit
     fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
 
     /** The watched episodes that are going to be removed. */
@@ -207,10 +212,30 @@ internal object AutoDownloads : AutoDownloadController {
         removeDownloadWithUndo = DownloadsRepository::removeWatchedAutoDownloadWithUndo,
     )
 
+    private val makeRoom = MakeRoomAutomatically(
+        store = store,
+        downloads = { DownloadsRepository.uiState.value.items },
+        allDownloadBytes = DownloadsRepository::allDownloadBytes,
+        autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+        totalStorageLimitBytes = ::totalStorageLimitBytes,
+        autoStorageLimitBytes = ::storageLimitBytes,
+        watchStatusOf = { item ->
+            WatchProgressRepository.ensureLoaded()
+            WatchedRepository.ensureLoaded()
+            item.watchStatus(WatchProgressRepository.uiState.value)
+        },
+        isPlaying = ::isPlaying,
+        isConnected = DownloadsRepository.backend::isConnected,
+        isBusyOrMoving = DownloadsRepository::isBusyOrAway,
+        usesSystemTrash = { DownloadsRepository.usesSystemTrash },
+        hasRuleWaitingForStorage = { engine.statuses.value.values.contains(AutoDownloadStatus.StorageLimitReached) },
+    )
+
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
 
     override val deleteAfterWatchingMode get() = store.deleteAfterWatchingMode
     override val keptDownloadIds get() = store.keptDownloadIds
+    override val makeRoomAutomatically get() = store.makeRoomAutomatically
 
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
@@ -224,7 +249,15 @@ internal object AutoDownloads : AutoDownloadController {
     fun totalStorageLimitBytes(): Long? = store.totalStorageLimitBytes()
 
     /** Called when a download waits on a storage limit. Automatic clean-up hooks in here when enabled. */
-    fun onStorageLimitBlocked() = Unit
+    fun onStorageLimitBlocked() {
+        if (!isAvailable) return
+        val profileId = ProfileRepository.activeProfileId
+        if (!store.isMakeRoomEnabled(profileId)) return
+        launchTrackedAction {
+            val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+            if (moved > 0) checkSafely()
+        }
+    }
 
     fun start() {
         if (!isAvailable || !started.compareAndSet(expect = false, update = true)) return
@@ -237,7 +270,9 @@ internal object AutoDownloads : AutoDownloadController {
                     engine.rulesWithDueRetry().forEach { checkSafely(it) }
                 }
                 runCatching {
-                    deleteAfterWatching.runDue(store.profileId())
+                    val profile = store.profileId()
+                    deleteAfterWatching.runDue(profile)
+                    if (store.isMakeRoomEnabled(profile)) makeRoom.runIfNeeded(profile)
                     DownloadsTrash.purgeHeldFiles(DownloadsClock.nowEpochMs())
                 }
                 delay(PollIntervalMs)
@@ -311,6 +346,7 @@ internal object AutoDownloads : AutoDownloadController {
         launchTrackedAction {
             if (changeAutoDownloadStorageLimit(store, profileId, limitGb)) {
                 DownloadsRepository.onStorageLimitsChanged()
+                if (store.isMakeRoomEnabled(profileId)) runCatching { makeRoom.runIfNeeded(profileId) }
                 checkSafely()
             } else {
                 NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))
@@ -323,9 +359,22 @@ internal object AutoDownloads : AutoDownloadController {
         launchTrackedAction {
             if (changeTotalDownloadStorageLimit(store, profileId, limitGb)) {
                 DownloadsRepository.onStorageLimitsChanged()
+                if (store.isMakeRoomEnabled(profileId)) runCatching { makeRoom.runIfNeeded(profileId) }
                 checkSafely()
             } else {
                 NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))
+            }
+        }
+    }
+
+    override fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) {
+        launchTrackedAction {
+            val saved = runCatching { store.setMakeRoomAutomatically(profileId, enabled) }.getOrDefault(false)
+            if (!saved) {
+                NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
+            } else if (enabled) {
+                val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+                if (moved > 0) checkSafely()
             }
         }
     }
@@ -573,9 +622,22 @@ internal object AutoDownloads : AutoDownloadController {
         return job
     }
 
-    private suspend fun checkSafely(ruleKey: String? = null, ignoreWaiting: Boolean = false) {
+    private suspend fun checkSafely(
+        ruleKey: String? = null,
+        ignoreWaiting: Boolean = false,
+        allowMakeRoomRetry: Boolean = true,
+    ) {
         try {
             engine.runCheck(ruleKey, ignoreWaiting)
+            if (allowMakeRoomRetry) {
+                val profileId = store.profileId()
+                if (store.isMakeRoomEnabled(profileId) && engine.statuses.value.values.contains(AutoDownloadStatus.StorageLimitReached)) {
+                    val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+                    if (moved > 0) {
+                        engine.runCheck(ruleKey, ignoreWaiting)
+                    }
+                }
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {

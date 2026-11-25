@@ -127,6 +127,8 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         SettingsGroupDivider(isTablet = isTablet)
         AutoDownloadStorageLimitSetting(isTablet, profileId = activeProfileId)
         SettingsGroupDivider(isTablet = isTablet)
+        MakeRoomAutomaticallySetting(isTablet, profileId = activeProfileId)
+        SettingsGroupDivider(isTablet = isTablet)
         DeleteAfterWatchingSetting(isTablet, profileId = activeProfileId)
     }
 }

@@ -98,3 +98,22 @@ internal fun AutoDownloadStorageLimitSetting(
         )
     }
 }
+
+@Composable
+internal fun MakeRoomAutomaticallySetting(
+    isTablet: Boolean,
+    controller: AutoDownloadController = AutoDownloads,
+    profileId: Int = ProfileRepository.activeProfileId,
+) {
+    LaunchedEffect(profileId) {
+        if (controller === AutoDownloads) AutoDownloads.onProfileChanged()
+    }
+    val enabled by controller.makeRoomAutomatically.collectAsStateWithLifecycle()
+    SettingsSwitchRow(
+        title = stringResource(Res.string.settings_make_room_title),
+        description = stringResource(Res.string.settings_make_room_description),
+        checked = enabled,
+        isTablet = isTablet,
+        onCheckedChange = { controller.setMakeRoomAutomatically(profileId, it) },
+    )
+}
