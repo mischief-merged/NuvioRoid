@@ -20,4 +20,11 @@ internal actual object LimitedConnectionStorage {
     actual fun savePolite(value: Boolean) {
         store.putString("let_others_first", value.toString())
     }
+
+    actual fun loadFreeSpaceFloorGb(): Int? =
+        store.getString("free_space_floor_gb")?.toIntOrNull()?.takeIf { it > 0 }
+
+    actual fun saveFreeSpaceFloorGb(value: Int?) {
+        store.putString("free_space_floor_gb", value?.toString().orEmpty())
+    }
 }

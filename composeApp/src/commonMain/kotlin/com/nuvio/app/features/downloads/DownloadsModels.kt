@@ -131,6 +131,8 @@ data class DownloadItem(
      * to pause on such connections is on. It goes on by itself, from its partial file, when that ends.
      */
     val pausedByConnection: Boolean = false,
+    /** Waiting because the drive of its download location dropped below the free-space floor. Resumes when space returns. */
+    val pausedByFreeSpace: Boolean = false,
     /**
      * The identity of the partial file this download created, recorded when it was created, so that only
      * that file is ever resumed, cut back or removed; a file of the same name that does not have it is not

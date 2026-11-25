@@ -8,4 +8,6 @@ internal actual object LimitedConnectionStorage {
     actual fun savePauseOnLimited(value: Boolean) = Unit
     actual fun loadPolite(): Boolean? = null
     actual fun savePolite(value: Boolean) = Unit
+    actual fun loadFreeSpaceFloorGb(): Int? = null
+    actual fun saveFreeSpaceFloorGb(value: Int?) = Unit
 }

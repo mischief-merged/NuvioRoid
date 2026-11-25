@@ -919,6 +919,7 @@ private fun LazyListScope.downloadsRootContent(
                 it.status == DownloadStatus.Paused &&
                     !it.pausedByFolder &&
                     !it.pausedByConnection &&
+                    !it.pausedByFreeSpace &&
                     it.autoDownloadStop != AutoDownloadStop.TotalStorageLimit
             }
             SectionTitle(
@@ -1495,8 +1496,8 @@ private fun DownloadRow(
                                 )
                             }
                         }
-                        // One that waits for a better connection or storage limit is offered a pause, which keeps it paused when that ends.
-                        DownloadStatus.Paused -> if (item.pausedByConnection || item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit) {
+                        // One that waits for a better connection, free space, or storage limit is offered a pause, which keeps it paused when that ends.
+                        DownloadStatus.Paused -> if (item.pausedByConnection || item.pausedByFreeSpace || item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit) {
                             IconButton(onClick = onPause) {
                                 Icon(
                                     imageVector = Icons.Rounded.Pause,

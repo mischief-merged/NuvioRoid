@@ -248,6 +248,14 @@ internal fun settingsSearchEntries(
             pageLabel = playbackPage,
             section = playbackPage,
         )
+        addRow(
+            page = SettingsPage.Playback,
+            key = "playback-free-space-floor",
+            title = stringResource(Res.string.settings_free_space_floor_title),
+            description = stringResource(Res.string.settings_free_space_floor_description),
+            pageLabel = playbackPage,
+            section = playbackPage,
+        )
     }
     addPage(
         page = SettingsPage.Advanced,

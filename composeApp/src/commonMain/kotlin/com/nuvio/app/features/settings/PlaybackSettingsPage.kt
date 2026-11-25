@@ -119,6 +119,8 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         SettingsGroupDivider(isTablet = isTablet)
         DownloadFolderSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
+        FreeSpaceFloorSetting(isTablet)
+        SettingsGroupDivider(isTablet = isTablet)
         val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
         val activeProfileId = profileState.activeProfile?.profileIndex ?: ProfileRepository.activeProfileId
         TotalStorageLimitSetting(isTablet, profileId = activeProfileId)

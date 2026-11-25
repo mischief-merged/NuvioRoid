@@ -3592,4 +3592,10 @@
         <item quantity="one">moved to Trash to make room %1$d day ago</item>
         <item quantity="other">moved to Trash to make room %1$d days ago</item>
     </plurals>
+    <string name="downloads_status_waiting_free_space">Waiting: free space low • %1$s</string>
+    <string name="downloads_announce_waiting_free_space">Waiting because free space on the drive is low</string>
+    <string name="settings_free_space_floor_title">Keep free space on drive</string>
+    <string name="settings_free_space_floor_description">Pauses downloads in a location when its drive drops below this free space, and resumes when space returns.</string>
+    <string name="settings_free_space_floor_off">Off</string>
+    <string name="settings_free_space_floor_value">%1$d GB</string>
 </resources>

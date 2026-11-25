@@ -254,8 +254,16 @@ object DownloadsRepository {
             value.listen(::applyConnectionHold)
         }
 
+    // Whether downloads in a location wait because its drive's free space dropped below the floor.
+    internal var freeSpaceHold: FreeSpaceHold = FreeSpaceFloors.hold
+        set(value) {
+            field = value
+            value.listen(::applyFreeSpaceHold)
+        }
+
     init {
         connectionHold.listen(::applyConnectionHold)
+        freeSpaceHold.listen(::applyFreeSpaceHold)
         ItemLocks.setReleaseListener(::onWatchedItemLockReleased)
     }
 
@@ -1013,11 +1021,12 @@ object DownloadsRepository {
         ensureLoaded()
         synchronized(stateLock) {
             val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-            // One that waits for a better connection or storage limit becomes paused by the user: it stays paused when that ends.
-            if (item.status == DownloadStatus.Paused && (item.pausedByConnection || item.autoDownloadStop != null)) {
+            // One that waits for a better connection, free space, or storage limit becomes paused by the user: it stays paused when that ends.
+            if (item.status == DownloadStatus.Paused && (item.pausedByConnection || item.pausedByFreeSpace || item.autoDownloadStop != null)) {
                 mutateItem(downloadId) {
                     it.copy(
                         pausedByConnection = false,
+                        pausedByFreeSpace = false,
                         autoDownloadStop = null,
                         waitingSizeBytes = null,
                         updatedAtEpochMs = DownloadsClock.nowEpochMs(),
@@ -1033,6 +1042,7 @@ object DownloadsRepository {
                     status = DownloadStatus.Paused,
                     pausedByFolder = false,
                     pausedByConnection = false,
+                    pausedByFreeSpace = false,
                     autoDownloadStop = null,
                     waitingSizeBytes = null,
                     updatedAtEpochMs = DownloadsClock.nowEpochMs(),
@@ -1174,6 +1184,7 @@ object DownloadsRepository {
                     it.status == DownloadStatus.Paused &&
                         !it.pausedByFolder &&
                         !it.pausedByConnection &&
+                        !it.pausedByFreeSpace &&
                         it.autoDownloadStop != AutoDownloadStop.TotalStorageLimit
                 }
                 .map { it.id }
@@ -1224,6 +1235,7 @@ object DownloadsRepository {
             localFileUri = item.localFileUri.takeIf { item.awaitingCheck },
             pausedByFolder = false,
             pausedByConnection = false,
+            pausedByFreeSpace = false,
             updatedAtEpochMs = DownloadsClock.nowEpochMs(),
         )
 
@@ -1509,6 +1521,7 @@ object DownloadsRepository {
                 }
                 // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
                 applyConnectionHold()
+                applyFreeSpaceHold()
                 resumeWaitingForStorageLimitLocked()
                 _catalogReady.value = true
                 publishedForScan = true
@@ -1759,6 +1772,45 @@ object DownloadsRepository {
             )
         }
 
+    /**
+     * Applies the per-location free-space floor in memory: pauses running transfers in locations
+     * whose drive dropped below the floor (keeping partial files), and resumes held items when
+     * their connected location's free space recovers above the floor or the floor is turned off.
+     */
+    private fun applyFreeSpaceHold(): Unit = synchronized(stateLock) {
+        if (!hasLoaded) return
+        _uiState.value.items
+            .filter { it.status == DownloadStatus.Downloading && it.isBelowFreeSpaceFloor() }
+            .filter { activeTransfers[it.id]?.finishing != true }
+            .forEach { item ->
+                removeTransfer(item.id)?.cancel()
+                mutateItem(item.id) { it.waitingForFreeSpace() }
+            }
+        _uiState.value.items
+            .filter { it.status == DownloadStatus.Paused && it.pausedByFreeSpace && it.canResumeFromFreeSpaceFloor() }
+            .forEach { resumeDownloadLocked(it.id, keepWaitingSize = true) }
+    }
+
+    private fun DownloadItem.resolvedLocationId(): String = backend.locationIdOf(this)
+
+    private fun DownloadItem.isBelowFreeSpaceFloor(): Boolean =
+        backend.isConnected(this) && freeSpaceHold.isLocationBelowFloor(resolvedLocationId())
+
+    private fun DownloadItem.canResumeFromFreeSpaceFloor(): Boolean =
+        backend.isConnected(this) && !backend.heldByFolder(this) && freeSpaceHold.canResumeLocation(resolvedLocationId())
+
+    private fun DownloadItem.waitingForFreeSpace(): DownloadItem =
+        if (status != DownloadStatus.Downloading) {
+            this
+        } else {
+            copy(
+                status = DownloadStatus.Paused,
+                pausedByFreeSpace = true,
+                errorMessage = null,
+                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+            )
+        }
+
     private fun startDownload(item: DownloadItem, attempt: Int = 1): Unit = synchronized(stateLock) {
         // An unavailable or moving folder is not a missing published file. Its address and bytes stay saved.
         if (item.awaitingCheck && backend.heldByFolder(item)) {
@@ -1773,6 +1825,11 @@ object DownloadsRepository {
         if (!item.awaitingCheck && item.connectionHoldReason() != null) {
             rateTracker.clear(item.id)
             mutateItem(item.id) { it.waitingForConnection() }
+            return
+        }
+        if (!item.awaitingCheck && item.isBelowFreeSpaceFloor()) {
+            rateTracker.clear(item.id)
+            mutateItem(item.id) { it.waitingForFreeSpace() }
             return
         }
         if (!item.awaitingCheck && backend.isConnected(item)) {
@@ -2762,7 +2819,9 @@ object DownloadsRepository {
                             it.autoDownloadStop == AutoDownloadStop.TotalStorageLimit &&
                             !it.pausedByFolder &&
                             !it.pausedByConnection &&
+                            !it.pausedByFreeSpace &&
                             it.connectionHoldReason() == null &&
+                            !it.isBelowFreeSpaceFloor() &&
                             !backend.heldByFolder(it) &&
                             backend.isConnected(it)
                     }
@@ -2804,10 +2863,16 @@ object DownloadsRepository {
         }
     }
 
+    private fun effectiveUserFreeSpaceFloorBytes(): Long =
+        maxOf(
+            (autoDownloadLimits.userFreeSpaceFloorBytes() ?: 0L).coerceAtLeast(0L),
+            (freeSpaceHold.floorBytes ?: 0L).coerceAtLeast(0L),
+        )
+
     private fun transferLimits(item: DownloadItem, transfer: ActiveTransfer): DownloadTransferLimits? {
         val isAutoOrTrip = item.autoDownloadRuleKey != null || item.tripFill
         val limits = autoDownloadLimits
-        val userFloor = (limits.userFreeSpaceFloorBytes() ?: 0L).coerceAtLeast(0L)
+        val userFloor = effectiveUserFreeSpaceFloorBytes()
         if (!isAutoOrTrip && limits.totalStorageLimitBytes() == null && userFloor <= 0L) return null
         transfer.hasTransferLimits = true
         lateinit var guard: DownloadTransferLimits
@@ -2843,13 +2908,16 @@ object DownloadsRepository {
                 ifCurrent(item.id, transfer) {
                     removeTransfer(item.id)
                     val refusedBytes = guard.lastRefusedSizeBytes
+                    val hasUserFloor = effectiveUserFreeSpaceFloorBytes() > 0L
                     mutateItem(item.id) { current ->
                         if (current.status != DownloadStatus.Downloading) return@mutateItem current
                         val isStorageStop = reason == AutoDownloadStop.TotalStorageLimit || reason == AutoDownloadStop.StorageLimit
                         if (isStorageStop) blockedByStorage = true
+                        val stoppedByUserFloor = reason == AutoDownloadStop.LowDiskSpace && (hasUserFloor || !isAutoOrTrip)
                         current.copy(
                             status = DownloadStatus.Paused,
-                            autoDownloadStop = reason,
+                            pausedByFreeSpace = stoppedByUserFloor || current.pausedByFreeSpace,
+                            autoDownloadStop = if (stoppedByUserFloor && !isAutoOrTrip) null else reason,
                             waitingSizeBytes = if (isStorageStop) {
                                 refusedBytes ?: current.waitingSizeBytes ?: current.knownRequiredBytes().takeIf { it > 0L }
                             } else {
@@ -3570,6 +3638,9 @@ internal interface DownloadsBackend {
     /** Whether the location can be used now. */
     fun locationConnected(locationId: String?): Boolean = true
 
+    /** The resolved location identifier of [item]. */
+    fun locationIdOf(item: DownloadItem): String = normalizeFloorLocationId(item.locationId)
+
     /** Removes the partial file of the item, from its own location only. */
     fun removePartialOf(item: DownloadItem): Boolean = removePartialFile(item.fileName)
 
@@ -3757,6 +3828,10 @@ private object PlatformDownloadsBackend : DownloadsBackend {
     override fun isConnected(item: DownloadItem): Boolean = DownloadFolders.controller.isConnected(item)
 
     override fun locationConnected(locationId: String?): Boolean = DownloadFolders.controller.locationConnected(locationId)
+
+    override fun locationIdOf(item: DownloadItem): String =
+        if (DownloadFolders.controller.supported) DownloadFolders.controller.locationIdOf(item)
+        else normalizeFloorLocationId(item.locationId)
 
     override fun removePartialOf(item: DownloadItem): Boolean =
         DownloadFolders.controller.removePartialOf(item) ?: DownloadsPlatformDownloader.retirePartial(item)

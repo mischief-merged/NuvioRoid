@@ -38,6 +38,8 @@ internal object SavedAutoDownloadLimits : AutoDownloadLimits {
     override fun totalStorageLimitBytes(): Long? = AutoDownloads.totalStorageLimitBytes()
 
     override val minFreeBytes: Long get() = MinFreeBytes
+
+    override fun userFreeSpaceFloorBytes(): Long? = FreeSpaceFloors.hold.floorBytes
 }
 
 internal const val BytesPerGigabyte = 1_000_000_000L
