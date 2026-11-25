@@ -44,6 +44,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
 - Downloads that are receiving data no longer say Waiting for the internet after the connection comes back, and the app notices the connection returning on its own (#144) ([#147](https://github.com/mischief-merged/NuvioRoid/pull/147)).
 - Stopping trip queueing now counts the downloads that had already started, and the progress label shows how many are queued (#145) ([#146](https://github.com/mischief-merged/NuvioRoid/pull/146)).
 - Marking a finished download as unwatched, or tapping Keep, now stays in effect when you close the player, so it is no longer scheduled for removal again (#139, #141) ([#143](https://github.com/mischief-merged/NuvioRoid/pull/143)).

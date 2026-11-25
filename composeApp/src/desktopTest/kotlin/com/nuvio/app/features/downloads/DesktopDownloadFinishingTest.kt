@@ -81,7 +81,10 @@ class DesktopDownloadFinishingTest : com.nuvio.app.core.network.TrustedLocalServ
         DownloadsRepository.companions = { DownloadCompanions(emptyList(), isOnline = { false }) }
         DownloadsRepository.connectionHold = ConnectionHold()
         downloadRuntimeLookup = { null }
-        DesktopDownloads.replaceForTest(DesktopDownloadFolders(world.locations, world.validator, world.mover()))
+        DesktopDownloads.replaceForTest(DesktopDownloadFolders(
+            world.locations, world.validator, world.mover(),
+            trashPath = DesktopDownloadsTrash({ world.appFolder }, systemTrash = null)::moveToTrash,
+        ))
     }
 
     @AfterTest
@@ -248,6 +251,7 @@ class DesktopDownloadFinishingTest : com.nuvio.app.core.network.TrustedLocalServ
         var recorded = item()
         val published = publishDurably(
             part, original, flushFolder = { true },
+            retirePartial = DesktopDownloadsTrash({ world.appFolder }, systemTrash = null)::moveToTrash,
             link = { _, _ -> throw UnsupportedOperationException() }, // A volume that needs the copy fallback.
             beforeRemovingPartial = { path ->
                 assertTrue(Files.exists(part))
