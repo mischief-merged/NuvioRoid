@@ -198,6 +198,8 @@ object ControllerFocusEngine {
     private data class ModalOverlayEntry(
         val token: Any,
         val onBack: (() -> Boolean)?,
+        var savedYieldedToCompose: Boolean = false,
+        var savedFocusedNodeId: String? = null,
     )
 
     private val modalOverlayLock = SynchronizedObject()
@@ -208,6 +210,12 @@ object ControllerFocusEngine {
 
     @Volatile
     private var yieldedToCompose: Boolean = false
+
+    @Volatile
+    private var baseRouteYieldedToCompose: Boolean = false
+
+    @Volatile
+    private var baseRouteFocusedNodeId: String? = null
 
     /**
      * True after focus was explicitly handed off to Compose (e.g. via Tab or arrowing past the
@@ -233,6 +241,9 @@ object ControllerFocusEngine {
     private val hasExplicitModalOverlay: Boolean
         get() = topModalOverlay != null
 
+    fun isTopModalOverlay(token: Any): Boolean =
+        topModalOverlay?.token === token
+
     /**
      * True while a modal sheet, dialog, dropdown, switcher, or any visible [ControllerFocusZone.Overlay]
      * popup owns input above the current route.
@@ -251,40 +262,129 @@ object ControllerFocusEngine {
 
     /**
      * Marks a modal overlay (sheet, dialog, dropdown, action menu) as owning input above the active
-     * route. While active, the spatial engine is scoped strictly to [ControllerFocusZone.Overlay]
-     * nodes belonging to the topmost modal, and Back routes to [onBack] before any lower modal.
+     * route. Saves the occluded scope's focus ownership (Compose yield + selected node) so nested
+     * dismissal restores it verbatim. While active, the spatial engine is scoped strictly to
+     * [ControllerFocusZone.Overlay] nodes belonging to the topmost modal, and Back routes to
+     * [onBack] before any lower modal.
      */
     fun pushModalOverlay(token: Any, onBack: (() -> Boolean)? = null) {
-        yieldedToCompose = false
+        val currentFocusedNode = _focusedNodeId.value?.let { nodes[it] }
+        var alreadyOnTop = false
+        var rePromotedEntry: ModalOverlayEntry? = null
         synchronized(modalOverlayLock) {
-            activeModalOverlays.removeAll { it.token === token }
-            activeModalOverlays.add(ModalOverlayEntry(token = token, onBack = onBack))
+            val currentTop = activeModalOverlays.lastOrNull()
+            if (currentTop?.token === token) {
+                activeModalOverlays[activeModalOverlays.lastIndex] = currentTop.copy(onBack = onBack)
+                alreadyOnTop = true
+            } else {
+                if (currentTop != null) {
+                    currentTop.savedYieldedToCompose = yieldedToCompose
+                    currentTop.savedFocusedNodeId = currentFocusedNode
+                        ?.takeIf { it.zone == ControllerFocusZone.Overlay && it.modalOverlayToken === currentTop.token }
+                        ?.id
+                } else {
+                    baseRouteYieldedToCompose = yieldedToCompose
+                    baseRouteFocusedNodeId = currentFocusedNode
+                        ?.takeIf { it.zone != ControllerFocusZone.Overlay }
+                        ?.id
+                }
+                val existingIndex = activeModalOverlays.indexOfFirst { it.token === token }
+                val entry = if (existingIndex >= 0) {
+                    activeModalOverlays.removeAt(existingIndex).copy(onBack = onBack).also {
+                        rePromotedEntry = it
+                    }
+                } else {
+                    ModalOverlayEntry(token = token, onBack = onBack)
+                }
+                activeModalOverlays.add(entry)
+            }
         }
-        val current = _focusedNodeId.value?.let { nodes[it] }
-        if (current != null && (current.zone != ControllerFocusZone.Overlay || current.modalOverlayToken !== token)) {
+        if (alreadyOnTop) return
+
+        val rePromoted = rePromotedEntry
+        if (rePromoted != null) {
+            yieldedToCompose = rePromoted.savedYieldedToCompose
+            _focusedNodeId.value = null
+            _focusedNodeSnapshot.value = null
+            if (!yieldedToCompose && ControllerManager.isNavigationActive.value) {
+                val restored = rePromoted.savedFocusedNodeId
+                    ?.let { nodes[it] }
+                    ?.takeIf(::canSpatiallyFocus)
+                if (restored != null) {
+                    focusNodeInternal(restored, triggerScroll = false)
+                }
+            }
+            return
+        }
+
+        yieldedToCompose = false
+        if (currentFocusedNode != null &&
+            (currentFocusedNode.zone != ControllerFocusZone.Overlay || currentFocusedNode.modalOverlayToken !== token)
+        ) {
             _focusedNodeId.value = null
             _focusedNodeSnapshot.value = null
         }
     }
 
-    /** Releases a previously pushed modal overlay and restores focus to the next modal or content. */
+    /** Releases a previously pushed modal overlay and restores focus ownership to the next modal or route. */
     fun popModalOverlay(token: Any) {
-        yieldedToCompose = false
-        val remainingTop = synchronized(modalOverlayLock) {
-            activeModalOverlays.removeAll { it.token === token }
-            activeModalOverlays.lastOrNull()
+        var wasRemoved = false
+        var wasTop = false
+        var remainingTop: ModalOverlayEntry? = null
+        synchronized(modalOverlayLock) {
+            val index = activeModalOverlays.indexOfLast { it.token === token }
+            if (index >= 0) {
+                wasRemoved = true
+                wasTop = index == activeModalOverlays.lastIndex
+                activeModalOverlays.removeAt(index)
+                remainingTop = activeModalOverlays.lastOrNull()
+            }
         }
+        if (!wasRemoved || !wasTop) return
+
         val current = _focusedNodeId.value?.let { nodes[it] }
         if (current != null && current.modalOverlayToken === token) {
             _focusedNodeId.value = null
             _focusedNodeSnapshot.value = null
         }
-        if (remainingTop != null) {
+
+        val nextTop = remainingTop
+        if (nextTop != null) {
+            yieldedToCompose = nextTop.savedYieldedToCompose
+            if (yieldedToCompose) {
+                _focusedNodeId.value = null
+                _focusedNodeSnapshot.value = null
+                return
+            }
+            val currentAfterClear = _focusedNodeId.value?.let { nodes[it] }
+            if (currentAfterClear != null && !isActiveOverlayNode(currentAfterClear)) {
+                _focusedNodeId.value = null
+                _focusedNodeSnapshot.value = null
+            }
             if (ControllerManager.isNavigationActive.value) {
-                ensureValidFocus()
+                val restored = nextTop.savedFocusedNodeId
+                    ?.let { nodes[it] }
+                    ?.takeIf(::canSpatiallyFocus)
+                if (restored != null) {
+                    focusNodeInternal(restored, triggerScroll = false)
+                } else {
+                    ensureValidFocus()
+                }
             }
             return
         }
+
+        val restoredBaseYielded = baseRouteYieldedToCompose
+        val restoredBaseNodeId = baseRouteFocusedNodeId
+        baseRouteYieldedToCompose = false
+        baseRouteFocusedNodeId = null
+        yieldedToCompose = restoredBaseYielded
+        if (yieldedToCompose) {
+            _focusedNodeId.value = null
+            _focusedNodeSnapshot.value = null
+            return
+        }
+
         val activeAfterPop = _focusedNodeId.value?.let { nodes[it] }
         if (activeAfterPop == null || activeAfterPop.zone == ControllerFocusZone.Overlay) {
             if (activeAfterPop?.zone == ControllerFocusZone.Overlay) {
@@ -292,7 +392,7 @@ object ControllerFocusEngine {
                 _focusedNodeSnapshot.value = null
             }
             if (!deferNavigationToCompose && ControllerManager.isNavigationActive.value) {
-                val restored = lastFocusedByZone[ControllerFocusZone.Content]
+                val restored = (restoredBaseNodeId ?: lastFocusedByZone[ControllerFocusZone.Content])
                     ?.let { nodes[it] }
                     ?.takeIf(::canSpatiallyFocus)
                 if (restored != null) {
@@ -513,7 +613,11 @@ object ControllerFocusEngine {
         val newRouteStr = routeKey?.toString()
         val routeChanged = activeRouteKey != null && activeRouteKey != newRouteStr
         if (routeChanged) {
-            yieldedToCompose = false
+            if (!isModalOverlayActive) {
+                yieldedToCompose = false
+            }
+            baseRouteYieldedToCompose = false
+            baseRouteFocusedNodeId = null
             saveCurrentRouteFocusMemory()
             _routeGeneration.value = _routeGeneration.value + 1
         }

@@ -150,6 +150,7 @@ private fun BottomSheetPopupFocusHost(
     content: @Composable () -> Unit,
 ) {
     val popupFocusManager = LocalFocusManager.current
+    val modalOverlayToken = LocalControllerModalOverlayToken.current
     DisposableEffect(popupFocusManager) {
         ComposePopupFocus.push(popupFocusManager)
         onDispose { ComposePopupFocus.pop(popupFocusManager) }
@@ -157,7 +158,11 @@ private fun BottomSheetPopupFocusHost(
     LaunchedEffect(popupFocusManager) {
         if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
         delay(220)
-        // If the user already tabbed or moved Compose focus inside this sheet, do not steal it back.
+        // If another modal took over above this sheet, or the user already tabbed or moved Compose
+        // focus inside this sheet, do not steal it back.
+        if (modalOverlayToken != null && !ControllerFocusEngine.isTopModalOverlay(modalOverlayToken)) {
+            return@LaunchedEffect
+        }
         if (ControllerFocusEngine.isYieldedToCompose || ComposePopupFocus.hasActiveFocus) return@LaunchedEffect
         // Sheets made of action rows are driven by the spatial engine (white ring + bring-into-view);
         // forms without rows fall back to Compose focus inside this popup.

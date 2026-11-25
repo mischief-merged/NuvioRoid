@@ -23,6 +23,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.AppScreenTab
 import com.nuvio.app.core.ui.ComposePopupFocus
+import com.nuvio.app.core.ui.DesktopEscapeShortcut
 import com.nuvio.app.core.ui.DialogSurface
 import com.nuvio.app.core.ui.NuvioBottomSheetActionRow
 import com.nuvio.app.core.ui.NuvioDropdownChip
@@ -748,11 +749,191 @@ class ModalOverlayFocusAndShortcutsTest {
         assertEquals(sheetFocusManager, ComposePopupFocus.active)
 
         // Now the sheet regains Overlay focus and the next Gamepad B dismisses the sheet.
+        assertEquals("stacked_sheet_adaptive", ControllerFocusEngine.focusedNodeId.value)
         assertTrue(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
         assertEquals("stacked_sheet_adaptive", ControllerFocusEngine.focusedNodeId.value)
         assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
         compose.waitForIdle()
         assertFalse(sheetOpen)
         assertFalse(ControllerFocusEngine.isModalOverlayActive)
+    }
+
+    @Test
+    fun nested_dialog_dismissal_preserves_underlying_sheet_compose_focus_ownership() {
+        var sheetOpen by mutableStateOf(true)
+        var dialogOpen by mutableStateOf(false)
+        var adaptiveClicks = 0
+        var floatingClicks = 0
+
+        compose.setContent {
+            NuvioTheme {
+                PlatformKeyboardNavigationHost()
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        NuvioBottomSheetActionRow(
+                            title = "Adaptive",
+                            focusId = "nested_sheet_adaptive",
+                            onClick = { adaptiveClicks += 1 },
+                        )
+                        NuvioBottomSheetActionRow(
+                            title = "Floating",
+                            focusId = "nested_sheet_floating",
+                            onClick = { floatingClicks += 1 },
+                        )
+                        Button(onClick = {}) { Text("Glow") }
+                        Button(onClick = { sheetOpen = false }) { Text("Done") }
+                    }
+                }
+                if (dialogOpen) {
+                    DialogSurface(
+                        onDismissRequest = { dialogOpen = false },
+                        title = "Quit while downloading?",
+                    ) {
+                        Button(onClick = { dialogOpen = false }) { Text("Keep open") }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Start in spatial navigation on the sheet, then Tab to the Compose controls (Glow / Done).
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
+        assertEquals("nested_sheet_adaptive", ControllerFocusEngine.focusedNodeId.value)
+
+        val tabEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_TAB,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(tabEvent)
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertTrue(ControllerManager.isNavigationActive.value)
+
+        // Open quit confirmation dialog above the sheet, then dismiss it via Gamepad B.
+        dialogOpen = true
+        compose.waitForIdle()
+        assertFalse(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(dialogOpen)
+        assertTrue(sheetOpen)
+
+        // Underlying sheet must keep Compose focus ownership instead of re-selecting a spatial row.
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertFalse(ControllerManager.dispatchKeyboardSelect())
+        val enterEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_ENTER,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(enterEvent)
+        assertEquals(0, adaptiveClicks)
+        assertEquals(0, floatingClicks)
+
+        // Re-open the dialog and dismiss via DesktopEscapeShortcut (Escape path): same guarantee.
+        dialogOpen = true
+        compose.waitForIdle()
+        assertTrue(DesktopEscapeShortcut.dispatchBack())
+        compose.waitForIdle()
+        assertFalse(dialogOpen)
+        assertTrue(sheetOpen)
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertFalse(ControllerManager.dispatchKeyboardSelect())
+        assertEquals(0, adaptiveClicks)
+        assertEquals(0, floatingClicks)
+
+        // Dismissing the sheet restores base route state.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(sheetOpen)
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+        assertFalse(ControllerFocusEngine.isYieldedToCompose)
+    }
+
+    @Test
+    fun nested_dialog_dismissal_restores_underlying_sheet_spatial_row_after_tab_in_dialog() {
+        var sheetOpen by mutableStateOf(true)
+        var dialogOpen by mutableStateOf(false)
+
+        compose.setContent {
+            NuvioTheme {
+                PlatformKeyboardNavigationHost()
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        NuvioBottomSheetActionRow(
+                            title = "Adaptive",
+                            focusId = "restore_sheet_row_1",
+                            onClick = {},
+                        )
+                        NuvioBottomSheetActionRow(
+                            title = "Floating",
+                            focusId = "restore_sheet_row_2",
+                            onClick = {},
+                        )
+                    }
+                }
+                if (dialogOpen) {
+                    DialogSurface(
+                        onDismissRequest = { dialogOpen = false },
+                        title = "Quit while downloading?",
+                    ) {
+                        Button(onClick = { dialogOpen = false }) { Text("Keep open") }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Spatially select the SECOND row in the sheet (not the default first row).
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.requestFocus("restore_sheet_row_2", triggerScroll = false))
+        assertEquals("restore_sheet_row_2", ControllerFocusEngine.focusedNodeId.value)
+
+        // Open dialog on top and press Tab inside the dialog so the dialog yields to Compose.
+        dialogOpen = true
+        compose.waitForIdle()
+        val tabEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_TAB,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(tabEvent)
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+
+        // Dismissing the dialog must restore the sheet's spatial mode and exact previously selected row.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(dialogOpen)
+        assertTrue(sheetOpen)
+        assertFalse(ControllerFocusEngine.isYieldedToCompose)
+        assertEquals("restore_sheet_row_2", ControllerFocusEngine.focusedNodeId.value)
+
+        // Clean up.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(sheetOpen)
     }
 }

@@ -189,6 +189,7 @@ fun NuvioDropdownChip(
                 LaunchedEffect(isSheetVisible, options) {
                     if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
                     delay(120)
+                    if (!ControllerFocusEngine.isTopModalOverlay(dropdownOverlayToken)) return@LaunchedEffect
                     if (ControllerFocusEngine.isYieldedToCompose || ComposePopupFocus.hasActiveFocus) return@LaunchedEffect
                     val selectedIndex = options.indexOfFirst { it.key == selectedKey }.coerceAtLeast(0)
                     ControllerFocusEngine.requestFocus("dropdown_item_$selectedIndex", triggerScroll = false)
