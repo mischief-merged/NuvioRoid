@@ -3557,4 +3557,12 @@
     <string name="available_offline">Available offline</string>
     <string name="home_section_downloaded">Downloaded</string>
     <string name="offline_connect_to_play">Connect to the internet to play this</string>
+    <string name="downloads_total_storage_limit">Storage limit for all downloads</string>
+    <string name="downloads_total_storage_limit_description">Counts downloads you start and auto-downloads together. New downloads wait when it is full.</string>
+    <string name="downloads_storage_all">All downloads: %1$s of %2$s</string>
+    <string name="downloads_storage_all_no_limit">All downloads: No limit</string>
+    <string name="downloads_storage_all_spoken">All downloads use %1$s of %2$s</string>
+    <string name="downloads_storage_change_total_limit">Change total limit</string>
+    <string name="downloads_status_waiting_storage_limit">Waiting: storage limit reached • %1$s</string>
+    <string name="downloads_announce_waiting_storage_limit">Waiting because the storage limit was reached</string>
 </resources>

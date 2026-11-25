@@ -24,6 +24,7 @@ import nuvio.composeapp.generated.resources.downloads_status_waiting_drive
 import nuvio.composeapp.generated.resources.downloads_announce_paused
 import nuvio.composeapp.generated.resources.downloads_announce_paused_low_disk
 import nuvio.composeapp.generated.resources.downloads_announce_paused_storage_limit
+import nuvio.composeapp.generated.resources.downloads_announce_waiting_storage_limit
 import nuvio.composeapp.generated.resources.downloads_announce_reconnecting
 import nuvio.composeapp.generated.resources.downloads_announce_waiting_network
 import nuvio.composeapp.generated.resources.downloads_announce_waiting_connection
@@ -51,6 +52,7 @@ import nuvio.composeapp.generated.resources.downloads_status_failed
 import nuvio.composeapp.generated.resources.downloads_status_paused
 import nuvio.composeapp.generated.resources.downloads_status_paused_low_disk
 import nuvio.composeapp.generated.resources.downloads_status_paused_storage_limit
+import nuvio.composeapp.generated.resources.downloads_status_waiting_storage_limit
 import nuvio.composeapp.generated.resources.downloads_status_reconnecting
 import nuvio.composeapp.generated.resources.downloads_status_waiting_network
 import org.jetbrains.compose.resources.StringResource
@@ -82,6 +84,7 @@ internal enum class DownloadPhase(
 
     Paused(Res.string.downloads_status_paused, showsSize = true, Res.string.downloads_announce_paused),
     PausedStorageLimit(Res.string.downloads_status_paused_storage_limit, showsSize = true, Res.string.downloads_announce_paused_storage_limit),
+    WaitingStorageLimit(Res.string.downloads_status_waiting_storage_limit, showsSize = true, Res.string.downloads_announce_waiting_storage_limit),
     PausedLowDiskSpace(Res.string.downloads_status_paused_low_disk, showsSize = true, Res.string.downloads_announce_paused_low_disk),
     Completed(Res.string.downloads_status_completed, showsSize = true, Res.string.downloads_announce_completed),
 
@@ -233,6 +236,7 @@ internal fun downloadRowStatus(
         DownloadStatus.Paused -> DownloadRowStatus(
             phase = when (item.autoDownloadStop) {
                 AutoDownloadStop.StorageLimit -> DownloadPhase.PausedStorageLimit
+                AutoDownloadStop.TotalStorageLimit -> DownloadPhase.WaitingStorageLimit
                 AutoDownloadStop.LowDiskSpace -> DownloadPhase.PausedLowDiskSpace
                 null -> DownloadPhase.Paused
             },

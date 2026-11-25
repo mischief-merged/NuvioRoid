@@ -44,6 +44,8 @@ internal class AutoDownloadEngine(
     private val nowEpochMs: () -> Long,
     /** The bytes automatic downloads take now. */
     private val autoDownloadBytes: () -> Long = { 0L },
+    /** The bytes all downloads together take now. */
+    private val allDownloadBytes: () -> Long = { 0L },
     private val resumeDownload: (downloadId: String) -> Unit = {},
     /** The location that holds the rule's show is not connected, so nothing is queued for it. */
     private val locationAway: (AutoDownloadRule) -> Boolean = { false },
@@ -296,7 +298,8 @@ internal class AutoDownloadEngine(
         setStatus(
             ruleKey,
             when {
-                AutoDownloadStop.StorageLimit in stops -> AutoDownloadStatus.StorageLimitReached
+                AutoDownloadStop.StorageLimit in stops || AutoDownloadStop.TotalStorageLimit in stops ->
+                    AutoDownloadStatus.StorageLimitReached
                 AutoDownloadStop.LowDiskSpace in stops -> AutoDownloadStatus.LowDiskSpace
                 plan.toDownload.isNotEmpty() && locationAway(rule) -> AutoDownloadStatus.FolderNotConnected
                 plan.toDownload.isNotEmpty() && !batchRunning && storageLimitReached() ->
@@ -310,9 +313,16 @@ internal class AutoDownloadEngine(
         )
     }
 
-    private fun storageLimitReached(): Boolean {
+    private fun storageLimitReached(): Boolean = autoStorageLimitReached() || totalStorageLimitReached()
+
+    private fun autoStorageLimitReached(): Boolean {
         val limit = store.storageLimitBytes() ?: return false
         return autoDownloadBytes() >= limit
+    }
+
+    private fun totalStorageLimitReached(): Boolean {
+        val limit = store.totalStorageLimitBytes() ?: return false
+        return allDownloadBytes() >= limit
     }
 
     /** Resumes the rule's downloads that a limit paused, unless the storage limit is still reached. */
@@ -321,6 +331,7 @@ internal class AutoDownloadEngine(
             .filter { it.autoDownloadRuleKey == ruleKey && it.status == DownloadStatus.Paused && it.autoDownloadStop != null }
             .forEach { item ->
                 if (item.autoDownloadStop == AutoDownloadStop.StorageLimit && storageLimitReached()) return@forEach
+                if (item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit && totalStorageLimitReached()) return@forEach
                 resumeDownload(item.id)
             }
     }

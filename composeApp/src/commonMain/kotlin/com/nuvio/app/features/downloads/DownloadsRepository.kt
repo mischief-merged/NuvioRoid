@@ -230,8 +230,22 @@ object DownloadsRepository {
     private var catalogGeneration = 0L
     private var pendingTripRecovery: PendingTripRecovery? = null
 
-    // What limits automatic downloads. Always the saved setting in the app.
+    // What limits downloads: the automatic-only limit and the combined limit for all downloads.
     internal var autoDownloadLimits: AutoDownloadLimits = SavedAutoDownloadLimits
+
+    /** Called outside [stateLock] when a download waits on a storage limit so automatic clean-up can try making room. */
+    @Volatile
+    internal var onStorageLimitBlocked: () -> Unit = {
+        if (backend === PlatformDownloadsBackend) AutoDownloads.onStorageLimitBlocked()
+    }
+
+    private fun notifyStorageLimitBlocked() {
+        val callback = onStorageLimitBlocked
+        checkScope.launch { runCatching { callback() } }
+    }
+
+    private var resumingWaitingStorage = false
+    private var resumingWaitingDirty = false
 
     // Whether downloads wait because the connection is limited. Always the app's in the app.
     internal var connectionHold: ConnectionHold = LimitedConnections.hold
@@ -391,6 +405,8 @@ object DownloadsRepository {
         quitCancelTimeoutMs = DefaultQuitCancelTimeoutMs
         quitFinishingTimeoutMs = DefaultQuitFinishingTimeoutMs
         hasLoaded = false
+        resumingWaitingStorage = false
+        resumingWaitingDirty = false
         catalogLoadingThread = null
         loadedProfileId = null
         catalogGeneration += 1L
@@ -923,6 +939,7 @@ object DownloadsRepository {
             }
         }
         startDownload(queued)
+        if (replacedExisting) resumeWaitingForStorageLimitLocked()
 
         return if (replacedExisting) {
             DownloadEnqueueResult.Replaced
@@ -996,9 +1013,16 @@ object DownloadsRepository {
         ensureLoaded()
         synchronized(stateLock) {
             val item = _uiState.value.items.firstOrNull { it.id == downloadId } ?: return
-            // One that waits for a better connection becomes paused by the user: it stays paused when that ends.
-            if (item.status == DownloadStatus.Paused && item.pausedByConnection) {
-                mutateItem(downloadId) { it.copy(pausedByConnection = false, updatedAtEpochMs = DownloadsClock.nowEpochMs()) }
+            // One that waits for a better connection or storage limit becomes paused by the user: it stays paused when that ends.
+            if (item.status == DownloadStatus.Paused && (item.pausedByConnection || item.autoDownloadStop != null)) {
+                mutateItem(downloadId) {
+                    it.copy(
+                        pausedByConnection = false,
+                        autoDownloadStop = null,
+                        waitingSizeBytes = null,
+                        updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                    )
+                }
                 return
             }
             if (item.status != DownloadStatus.Downloading) return
@@ -1009,10 +1033,13 @@ object DownloadsRepository {
                     status = DownloadStatus.Paused,
                     pausedByFolder = false,
                     pausedByConnection = false,
+                    autoDownloadStop = null,
+                    waitingSizeBytes = null,
                     updatedAtEpochMs = DownloadsClock.nowEpochMs(),
                     errorMessage = null,
                 )
             }
+            resumeWaitingForStorageLimitLocked()
         }
     }
 
@@ -1143,7 +1170,12 @@ object DownloadsRepository {
         ensureLoaded()
         synchronized(stateLock) {
             _uiState.value.items
-                .filter { it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection }
+                .filter {
+                    it.status == DownloadStatus.Paused &&
+                        !it.pausedByFolder &&
+                        !it.pausedByConnection &&
+                        it.autoDownloadStop != AutoDownloadStop.TotalStorageLimit
+                }
                 .map { it.id }
                 .forEach(::resumeDownloadLocked)
         }
@@ -1179,7 +1211,7 @@ object DownloadsRepository {
     }
 
     /** The caller already holds the state lock. This does not load the list and does not take that lock. */
-    private fun resumeDownloadLocked(downloadId: String) {
+    private fun resumeDownloadLocked(downloadId: String, keepWaitingSize: Boolean = false) {
         val item = _uiState.value.items.firstOrNull { it.id == downloadId }?.let(::normalizeCompletedLocalFileUri) ?: return
         if (item.status != DownloadStatus.Paused && item.status != DownloadStatus.Failed) return
 
@@ -1187,6 +1219,7 @@ object DownloadsRepository {
             status = DownloadStatus.Downloading,
             errorMessage = null,
             autoDownloadStop = null,
+            waitingSizeBytes = item.waitingSizeBytes.takeIf { keepWaitingSize },
             failureKind = null,
             localFileUri = item.localFileUri.takeIf { item.awaitingCheck },
             pausedByFolder = false,
@@ -1238,6 +1271,7 @@ object DownloadsRepository {
         } finally {
             failed.forEach { ItemLocks.release(it.id) }
         }
+        resumeWaitingForStorageLimitLocked()
         failed.size
         }
     }
@@ -1299,6 +1333,7 @@ object DownloadsRepository {
         } finally {
             ItemLocks.release(downloadId)
         }
+        resumeWaitingForStorageLimitLocked()
         }
     }
 
@@ -1319,7 +1354,10 @@ object DownloadsRepository {
             } else {
                 deleteWithLocksHeld(downloadId, null)
             }
-            if (result != null) return result
+            if (result != null) {
+                if (result == DownloadDeleteResult.Removed) resumeWaitingForStorageLimit()
+                return result
+            }
         }
         return DownloadDeleteResult.NotMoved
     }
@@ -1471,6 +1509,7 @@ object DownloadsRepository {
                 }
                 // Downloads that waited for a better connection when the app quit go on when it is no longer limited.
                 applyConnectionHold()
+                resumeWaitingForStorageLimitLocked()
                 _catalogReady.value = true
                 publishedForScan = true
                 PublishedCatalog(profileId, storeProblem, _uiState.value.items, generation)
@@ -1736,6 +1775,27 @@ object DownloadsRepository {
             mutateItem(item.id) { it.waitingForConnection() }
             return
         }
+        if (!item.awaitingCheck && backend.isConnected(item)) {
+            val totalLimit = autoDownloadLimits.totalStorageLimitBytes()
+            if (totalLimit != null) {
+                val used = allDownloadBytes(exceptDownloadId = item.id)
+                val required = item.knownRequiredBytes()
+                if (used >= totalLimit || used + required > totalLimit) {
+                    rateTracker.clear(item.id)
+                    mutateItem(item.id) { current ->
+                        current.copy(
+                            status = DownloadStatus.Paused,
+                            autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                            waitingSizeBytes = required.takeIf { it > 0L } ?: current.waitingSizeBytes,
+                            errorMessage = null,
+                            updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                        )
+                    }
+                    notifyStorageLimitBlocked()
+                    return
+                }
+            }
+        }
         val transfer = ActiveTransfer()
         val finishing = finishingSteps
         val transferProfileId = loadedProfileId
@@ -1772,7 +1832,7 @@ object DownloadsRepository {
             DownloadPlatformRequest(
                 item,
                 onDigestVerified = { transfer.digestVerified = true },
-                limits = autoTransferLimits(item, transfer),
+                limits = transferLimits(item, transfer),
                 onPartialCreated = { key -> ifCurrent(item.id, transfer) { mutateItem(item.id) { it.copy(partialFileKey = key) } } },
                 onFileNameChanged = { name ->
                     ifCurrent(item.id, transfer) {
@@ -1798,12 +1858,14 @@ object DownloadsRepository {
                 },
                 onSourceIdentityObserved = { observedTotalBytes, eTag, lastModified ->
                     ifCurrent(item.id, transfer) {
+                        val positiveObserved = observedTotalBytes?.takeIf { it > 0L }
                         mutateItem(item.id) { current ->
                             if (current.status != DownloadStatus.Downloading) {
                                 current
                             } else {
                                 current.copy(
-                                    totalBytes = observedTotalBytes?.takeIf { it > 0L } ?: current.totalBytes,
+                                    totalBytes = positiveObserved ?: current.totalBytes,
+                                    waitingSizeBytes = if (positiveObserved != null) null else current.waitingSizeBytes,
                                     sourceETag = eTag ?: current.sourceETag,
                                     sourceLastModified = lastModified ?: current.sourceLastModified,
                                     pendingLinkVerification = false,
@@ -1862,6 +1924,7 @@ object DownloadsRepository {
                                     partialFileName = newPartialFileName,
                                     downloadedBytes = 0L,
                                     totalBytes = null,
+                                    waitingSizeBytes = null,
                                     sourceETag = null,
                                     sourceLastModified = null,
                                     supersededPartials = nextSuperseded,
@@ -1880,11 +1943,38 @@ object DownloadsRepository {
                 },
             ),
             { downloadedBytes, totalBytes ->
+                var blockedMidTransfer = false
                 ifCurrent(item.id, transfer) {
                     val currentItem = _uiState.value.items.firstOrNull { it.id == item.id } ?: item
                     if (failIfAnnouncedAsPlaceholder(currentItem, totalBytes)) return@ifCurrent
                     val now = DownloadsClock.nowEpochMs()
                     val normalizedBytes = downloadedBytes.coerceAtLeast(0L)
+                    if (!transfer.hasTransferLimits && backend.isConnected(currentItem)) {
+                        val totalLimit = autoDownloadLimits.totalStorageLimitBytes()
+                        val positiveTotal = totalBytes?.takeIf { it > 0L } ?: currentItem.totalBytes
+                        val size = maxOf(positiveTotal ?: 0L, normalizedBytes)
+                        if (totalLimit != null && allDownloadBytes(exceptDownloadId = item.id) + size > totalLimit) {
+                            removeTransfer(item.id)?.cancel()
+                            blockedMidTransfer = true
+                            mutateItem(item.id) { current ->
+                                if (current.status != DownloadStatus.Downloading) {
+                                    current
+                                } else {
+                                    current.copy(
+                                        status = DownloadStatus.Paused,
+                                        downloadedBytes = normalizedBytes,
+                                        totalBytes = positiveTotal,
+                                        autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                                        waitingSizeBytes = size.takeIf { it > 0L },
+                                        updatedAtEpochMs = now,
+                                        errorMessage = null,
+                                    )
+                                }
+                            }
+                            resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
+                            return@ifCurrent
+                        }
+                    }
                     rateTracker.recordProgress(item.id, normalizedBytes, now)
                     var receivedNewBytes = false
                     mutateItem(item.id, progressOnly = true) { current ->
@@ -1895,6 +1985,7 @@ object DownloadsRepository {
                             current.copy(
                                 downloadedBytes = normalizedBytes,
                                 totalBytes = totalBytes?.takeIf { it > 0L },
+                                waitingSizeBytes = if ((totalBytes ?: 0L) > 0L) null else current.waitingSizeBytes,
                                 updatedAtEpochMs = now,
                                 errorMessage = null,
                             )
@@ -1904,6 +1995,7 @@ object DownloadsRepository {
                         NetworkStatusRepository.onTrafficObserved(currentItem.sourceUrl)
                     }
                 }
+                if (blockedMidTransfer) notifyStorageLimitBlocked()
             },
             { localFileUri, totalBytes ->
                 if (finishing.begin(transfer)) {
@@ -1930,11 +2022,13 @@ object DownloadsRepository {
                                     failed.copy(
                                         status = DownloadStatus.Failed,
                                         failureKind = kind,
+                                        waitingSizeBytes = null,
                                         errorMessage = message.ifBlank { runBlocking { getString(Res.string.download_failed) } },
                                         updatedAtEpochMs = DownloadsClock.nowEpochMs(),
                                     )
                                 }
                             }
+                            resumeWaitingForStorageLimitLocked()
                         }
                     }
                 } finally {
@@ -2147,6 +2241,7 @@ object DownloadsRepository {
                     current.downloadedBytes
                 },
                 totalBytes = totalBytes?.takeIf { it > 0L } ?: current.totalBytes,
+                waitingSizeBytes = null,
                 partialFileName = null,
                 errorMessage = null,
                 updatedAtEpochMs = DownloadsClock.nowEpochMs(),
@@ -2169,12 +2264,14 @@ object DownloadsRepository {
                 )
                 pendingFinishedRecords[item.id] = transfer
                 publish(_uiState.value.items.map { if (it.id == item.id) completedItem else it })
+                resumeWaitingForStorageLimitLocked()
                 desktopSave = true
                 return@ifCurrent
             }
             removeTransfer(item.id)
             completed = true
             mutateItem(item.id) { completedItem }
+            resumeWaitingForStorageLimitLocked()
         }
         // File moves and companion writes can wait on the file system, so they never hold the state lock.
         rejected?.let(::trashRejectedFile)
@@ -2299,10 +2396,11 @@ object DownloadsRepository {
                 if (other.id != current.id) other else current.copy(
                     status = DownloadStatus.Failed, localFileUri = null, awaitingCheck = false,
                     publishedFileKey = null, publishedDigestVerified = false,
-                    pausedByFolder = false, pausedByConnection = false,
+                    pausedByFolder = false, pausedByConnection = false, waitingSizeBytes = null,
                 )
             })
             persist()
+            resumeWaitingForStorageLimitLocked()
         }
     }
 
@@ -2339,9 +2437,11 @@ object DownloadsRepository {
                     .copy(
                         totalBytes = if (current.tripFill && current.downloadedBytes > 0L) current.totalBytes else announcedBytes,
                         downloadedBytes = if (current.tripFill) current.downloadedBytes else 0L,
+                        waitingSizeBytes = null,
                     )
             }
         }
+        resumeWaitingForStorageLimitLocked()
         return true
     }
 
@@ -2562,6 +2662,8 @@ object DownloadsRepository {
 
     internal fun autoDownloadStorageLimitBytes(): Long? = autoDownloadLimits.storageLimitBytes()
 
+    internal fun totalDownloadStorageLimitBytes(): Long? = autoDownloadLimits.totalStorageLimitBytes()
+
     internal fun autoDownloadMinFreeBytes(): Long = autoDownloadLimits.minFreeBytes
 
     /**
@@ -2580,20 +2682,156 @@ object DownloadsRepository {
                 }
             }
 
-    private fun autoTransferLimits(item: DownloadItem, transfer: ActiveTransfer): DownloadTransferLimits? {
-        if (item.autoDownloadRuleKey == null && !item.tripFill) return null
+    /**
+     * The bytes all downloads together take (hand-started and automatic): completed files on disk,
+     * partial bytes of paused or failed items, and reserved sizes of running transfers.
+     */
+    internal fun allDownloadBytes(exceptDownloadId: String? = null): Long =
+        _uiState.value.items
+            // Locations that are away are not counted; nothing waits or is cleaned up because of them.
+            .filter { it.id != exceptDownloadId && backend.isConnected(it) }
+            .sumOf { item ->
+                when {
+                    item.status == DownloadStatus.Completed -> maxOf(item.downloadedBytes, item.totalBytes ?: 0L)
+                    item.status == DownloadStatus.Downloading || (item.tripFill && item.status == DownloadStatus.Paused) ->
+                        maxOf(item.totalBytes ?: item.waitingSizeBytes ?: item.expectedSizeBytes ?: 0L, item.downloadedBytes)
+                    else -> item.downloadedBytes
+                }
+            }
+
+    private fun DownloadItem.knownRequiredBytes(): Long =
+        maxOf(totalBytes ?: waitingSizeBytes ?: expectedSizeBytes ?: 0L, downloadedBytes)
+
+    internal fun onStorageLimitsChanged() {
+        ensureLoaded()
+        var pausedForRoom = false
+        synchronized(stateLock) {
+            val totalLimit = autoDownloadLimits.totalStorageLimitBytes()
+            if (totalLimit != null) {
+                val runningNewestFirst = _uiState.value.items
+                    .filter { it.status == DownloadStatus.Downloading && backend.isConnected(it) && activeTransfers[it.id]?.finishing != true }
+                    .sortedWith(compareByDescending<DownloadItem> { it.createdAtEpochMs }.thenByDescending { it.id })
+                for (running in runningNewestFirst) {
+                    if (allDownloadBytes() <= totalLimit) break
+                    removeTransfer(running.id)?.cancel()
+                    pausedForRoom = true
+                    mutateItem(running.id) { current ->
+                        current.copy(
+                            status = DownloadStatus.Paused,
+                            autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                            waitingSizeBytes = current.knownRequiredBytes().takeIf { it > 0L },
+                            errorMessage = null,
+                            updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                        )
+                    }
+                }
+            }
+            resumeWaitingForStorageLimitLocked()
+            if (!pausedForRoom && totalLimit != null && (
+                    allDownloadBytes() > totalLimit ||
+                        _uiState.value.items.any { it.status == DownloadStatus.Paused && it.autoDownloadStop == AutoDownloadStop.TotalStorageLimit }
+                    )
+            ) {
+                pausedForRoom = true
+            }
+        }
+        if (pausedForRoom) notifyStorageLimitBlocked()
+    }
+
+    internal fun resumeWaitingForStorageLimit() {
+        ensureLoaded()
+        synchronized(stateLock) { resumeWaitingForStorageLimitLocked() }
+    }
+
+    private fun resumeWaitingForStorageLimitLocked(skipDownloadId: String? = null) {
+        if (!hasLoaded) return
+        if (resumingWaitingStorage) {
+            resumingWaitingDirty = true
+            return
+        }
+        resumingWaitingStorage = true
+        val skipped = LinkedHashSet<String>()
+        if (skipDownloadId != null) skipped += skipDownloadId
+        try {
+            do {
+                resumingWaitingDirty = false
+                val candidates = _uiState.value.items
+                    .filter {
+                        it.id !in skipped &&
+                            it.status == DownloadStatus.Paused &&
+                            it.autoDownloadStop == AutoDownloadStop.TotalStorageLimit &&
+                            !it.pausedByFolder &&
+                            !it.pausedByConnection &&
+                            it.connectionHoldReason() == null &&
+                            !backend.heldByFolder(it) &&
+                            backend.isConnected(it)
+                    }
+                    .sortedWith(compareBy<DownloadItem> { it.createdAtEpochMs }.thenBy { it.id })
+                for (candidate in candidates) {
+                    val totalLimit = autoDownloadLimits.totalStorageLimitBytes()
+                    if (totalLimit != null) {
+                        val usedAll = allDownloadBytes(exceptDownloadId = candidate.id)
+                        val required = candidate.knownRequiredBytes()
+                        if (usedAll >= totalLimit || usedAll + required > totalLimit) continue
+                    }
+                    if (candidate.autoDownloadRuleKey != null || candidate.tripFill) {
+                        val autoLimit = autoDownloadLimits.storageLimitBytes()
+                        if (autoLimit != null) {
+                            val usedAuto = autoDownloadBytes(exceptDownloadId = candidate.id)
+                            val requiredAuto = maxOf(
+                                candidate.totalBytes ?: candidate.waitingSizeBytes ?: (candidate.expectedSizeBytes.takeIf { candidate.tripFill }) ?: 0L,
+                                candidate.downloadedBytes,
+                            )
+                            if (usedAuto >= autoLimit || usedAuto + requiredAuto > autoLimit) {
+                                mutateItem(candidate.id) { current ->
+                                    if (current.status == DownloadStatus.Paused && current.autoDownloadStop == AutoDownloadStop.TotalStorageLimit) {
+                                        current.copy(autoDownloadStop = AutoDownloadStop.StorageLimit)
+                                    } else {
+                                        current
+                                    }
+                                }
+                                continue
+                            }
+                        }
+                    }
+                    skipped += candidate.id
+                    resumeDownloadLocked(candidate.id, keepWaitingSize = true)
+                }
+            } while (resumingWaitingDirty)
+        } finally {
+            resumingWaitingStorage = false
+            resumingWaitingDirty = false
+        }
+    }
+
+    private fun transferLimits(item: DownloadItem, transfer: ActiveTransfer): DownloadTransferLimits? {
+        val isAutoOrTrip = item.autoDownloadRuleKey != null || item.tripFill
         val limits = autoDownloadLimits
-        return DownloadTransferLimits(
-            maxTotalBytes = { limits.storageLimitBytes()?.let { it - autoDownloadBytes(exceptDownloadId = item.id) } },
-            minFreeBytes = limits.minFreeBytes,
+        val userFloor = (limits.userFreeSpaceFloorBytes() ?: 0L).coerceAtLeast(0L)
+        if (!isAutoOrTrip && limits.totalStorageLimitBytes() == null && userFloor <= 0L) return null
+        transfer.hasTransferLimits = true
+        lateinit var guard: DownloadTransferLimits
+        guard = DownloadTransferLimits(
+            maxAllDownloadsBytes = {
+                limits.totalStorageLimitBytes()?.let { it - allDownloadBytes(exceptDownloadId = item.id) }
+            },
+            maxTotalBytes = {
+                if (isAutoOrTrip) limits.storageLimitBytes()?.let { it - autoDownloadBytes(exceptDownloadId = item.id) } else null
+            },
+            minFreeBytes = maxOf(if (isAutoOrTrip) limits.minFreeBytes else 0L, userFloor),
             checkAndReserve = { check, announcedBytes ->
                 synchronized(stateLock) {
                     check() ?: run {
                         if (announcedBytes != null && announcedBytes > 0L) {
                             ifCurrent(item.id, transfer) {
                                 mutateItem(item.id) { current ->
-                                    if (current.status == DownloadStatus.Downloading) current.copy(totalBytes = announcedBytes) else current
+                                    if (current.status == DownloadStatus.Downloading) {
+                                        current.copy(totalBytes = announcedBytes, waitingSizeBytes = null)
+                                    } else {
+                                        current
+                                    }
                                 }
+                                resumeWaitingForStorageLimitLocked()
                             }
                         }
                         null
@@ -2601,20 +2839,32 @@ object DownloadsRepository {
                 }
             },
             onStopped = { reason ->
+                var blockedByStorage = false
                 ifCurrent(item.id, transfer) {
                     removeTransfer(item.id)
+                    val refusedBytes = guard.lastRefusedSizeBytes
                     mutateItem(item.id) { current ->
                         if (current.status != DownloadStatus.Downloading) return@mutateItem current
+                        val isStorageStop = reason == AutoDownloadStop.TotalStorageLimit || reason == AutoDownloadStop.StorageLimit
+                        if (isStorageStop) blockedByStorage = true
                         current.copy(
                             status = DownloadStatus.Paused,
                             autoDownloadStop = reason,
+                            waitingSizeBytes = if (isStorageStop) {
+                                refusedBytes ?: current.waitingSizeBytes ?: current.knownRequiredBytes().takeIf { it > 0L }
+                            } else {
+                                null
+                            },
                             errorMessage = null,
                             updatedAtEpochMs = DownloadsClock.nowEpochMs(),
                         )
                     }
+                    resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
                 }
+                if (blockedByStorage) notifyStorageLimitBlocked()
             },
         )
+        return guard
     }
 
     /**
@@ -2639,7 +2889,10 @@ object DownloadsRepository {
             } else {
                 removeAutoWithLocksHeld(downloadId, ruleKey, stillWanted, null)
             }
-            if (result != null) return result
+            if (result != null) {
+                if (result == AutoDownloadRemovalResult.Removed) resumeWaitingForStorageLimit()
+                return result
+            }
         }
         return AutoDownloadRemovalResult.NotMoved
     }
@@ -2993,6 +3246,10 @@ private class ActiveTransfer {
     /** Set by the platform downloader when the body matched a digest the server sent. */
     @Volatile
     var digestVerified = false
+
+    /** True when the transfer received a [DownloadTransferLimits] guard at start. */
+    @Volatile
+    var hasTransferLimits = false
 
     /** Set once the platform downloader reported the file complete: it is being checked and must not be stopped. */
     @Volatile

@@ -68,6 +68,7 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
 
 private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
 internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+private val NoTotalStorageLimit = kotlinx.coroutines.flow.MutableStateFlow<Int?>(null)
 
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
@@ -79,9 +80,13 @@ internal interface AutoDownloadController {
     /** The storage limit for automatic downloads, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?>
 
+    /** The combined storage limit for all downloads, in gigabytes. Null means no limit. */
+    val totalStorageLimitGb: StateFlow<Int?> get() = NoTotalStorageLimit
+
     val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
     val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
     fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
+    fun setTotalStorageLimit(profileId: Int, limitGb: Int?) = Unit
     fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
 
     /** The watched episodes that are going to be removed. */
@@ -166,6 +171,7 @@ internal object AutoDownloads : AutoDownloadController {
         cancelBatch = SeasonBatchDownloads::cancel,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
         autoDownloadBytes = { DownloadsRepository.autoDownloadBytes() },
+        allDownloadBytes = { DownloadsRepository.allDownloadBytes() },
         resumeDownload = DownloadsRepository::resumeDownload,
         locationAway = { rule -> DownloadsRepository.showLocationIsAway(rule.parentMetaId) },
     )
@@ -198,11 +204,16 @@ internal object AutoDownloads : AutoDownloadController {
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
     override val storageLimitGb: StateFlow<Int?> get() = store.storageLimitGb
+    override val totalStorageLimitGb: StateFlow<Int?> get() = store.totalStorageLimitGb
     override val removals: StateFlow<List<AutoDownloadRemoval>> get() = store.removals
     override val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = store.recentlyDeleted
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
 
     fun storageLimitBytes(): Long? = store.storageLimitBytes()
+    fun totalStorageLimitBytes(): Long? = store.totalStorageLimitBytes()
+
+    /** Called when a download waits on a storage limit. Automatic clean-up hooks in here when enabled. */
+    fun onStorageLimitBlocked() = Unit
 
     fun start() {
         if (!isAvailable || !started.compareAndSet(expect = false, update = true)) return
@@ -286,8 +297,21 @@ internal object AutoDownloads : AutoDownloadController {
 
     /** A higher limit may make room for what the old one held back, so the rules are checked. */
     override fun setStorageLimit(profileId: Int, limitGb: Int?) {
-        scope.launch {
+        launchTrackedAction {
             if (changeAutoDownloadStorageLimit(store, profileId, limitGb)) {
+                DownloadsRepository.onStorageLimitsChanged()
+                checkSafely()
+            } else {
+                NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))
+            }
+        }
+    }
+
+    /** Changes the combined storage limit for all downloads and resumes waiting ones when there is room. */
+    override fun setTotalStorageLimit(profileId: Int, limitGb: Int?) {
+        launchTrackedAction {
+            if (changeTotalDownloadStorageLimit(store, profileId, limitGb)) {
+                DownloadsRepository.onStorageLimitsChanged()
                 checkSafely()
             } else {
                 NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))

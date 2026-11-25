@@ -35,6 +35,8 @@ private data class StoredAutoDownloads(
     val rules: List<AutoDownloadRule> = emptyList(),
     /** Null means no limit. */
     val storageLimitGb: Int? = AutoDownloadStore.DefaultStorageLimitGb,
+    /** Combined limit for hand-started and automatic downloads together. Null means no limit. */
+    val totalStorageLimitGb: Int? = null,
     val removals: List<AutoDownloadRemoval> = emptyList(),
     /** Downloads the user chose to keep. They are never removed after watching. */
     val keptDownloadIds: Set<String> = emptySet(),
@@ -99,6 +101,7 @@ internal class AutoDownloadStore(
     private val _rules = MutableStateFlow<List<AutoDownloadRule>>(emptyList())
 
     private val _storageLimitGb = MutableStateFlow<Int?>(DefaultStorageLimitGb)
+    private val _totalStorageLimitGb = MutableStateFlow<Int?>(null)
 
     private val _deleteAfterWatchingMode = MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
     private val _keptDownloadIds = MutableStateFlow<Set<String>>(emptySet())
@@ -399,15 +402,30 @@ internal class AutoDownloadStore(
     /** The storage limit for automatic downloads of that profile, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?> = _storageLimitGb.asStateFlow()
 
+    /** The combined storage limit for all downloads of that profile, in gigabytes. Null means no limit. */
+    val totalStorageLimitGb: StateFlow<Int?> = _totalStorageLimitGb.asStateFlow()
+
     fun storageLimitBytes(): Long? = synchronized(lock) {
         ensureLoaded()
         state.storageLimitGb?.let { it * BytesPerGigabyte }
+    }
+
+    fun totalStorageLimitBytes(): Long? = synchronized(lock) {
+        ensureLoaded()
+        state.totalStorageLimitGb?.let { it * BytesPerGigabyte }
     }
 
     /** False when [profileId] is not the active profile, in which case nothing is changed. */
     fun setStorageLimit(profileId: Int, limitGb: Int?): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false
         save(profileId, state.copy(storageLimitGb = limitGb).normalized())
+        true
+    }
+
+    /** False when [profileId] is not the active profile, in which case nothing is changed. */
+    fun setTotalStorageLimit(profileId: Int, limitGb: Int?): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        save(profileId, state.copy(totalStorageLimitGb = limitGb).normalized())
         true
     }
 
@@ -472,6 +490,7 @@ internal class AutoDownloadStore(
         _keptDownloadIds.value = updated.keptDownloadIds
         _rules.value = updated.rules
         _storageLimitGb.value = updated.storageLimitGb
+        _totalStorageLimitGb.value = updated.totalStorageLimitGb
         _removals.value = updated.removals
         _recentlyDeleted.value = updated.recentlyDeleted
     }
@@ -485,6 +504,7 @@ internal class AutoDownloadStore(
             _keptDownloadIds.value = state.keptDownloadIds
             _rules.value = state.rules
             _storageLimitGb.value = state.storageLimitGb
+            _totalStorageLimitGb.value = state.totalStorageLimitGb
             _removals.value = state.removals
             _recentlyDeleted.value = state.recentlyDeleted
         }
@@ -505,6 +525,7 @@ internal class AutoDownloadStore(
         rules = rules.map(AutoDownloadRule::normalized).distinctBy { it.key },
         recentlyDeleted = recentlyDeleted.takeLast(MaxRecentlyDeleted),
         storageLimitGb = if (storageLimitGb in storageLimitOptionsGb) storageLimitGb else DefaultStorageLimitGb,
+        totalStorageLimitGb = if (totalStorageLimitGb in totalStorageLimitOptionsGb) totalStorageLimitGb else null,
         // Changing the setting or a rule drops removals immediately, including before they are due.
         removals = removals
             .distinctBy { it.downloadId }
@@ -520,5 +541,6 @@ internal class AutoDownloadStore(
         const val MaxRecentlyDeleted = 20
         private const val MaxTrackedCancelledRemovals = 256
         val storageLimitOptionsGb: List<Int?> = listOf(null, 10, 25, 50, 100, 250)
+        val totalStorageLimitOptionsGb: List<Int?> = listOf(null, 10, 25, 50, 100, 250, 500)
     }
 }

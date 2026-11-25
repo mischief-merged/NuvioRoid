@@ -113,8 +113,10 @@ data class DownloadItem(
     val autoDownloadRuleKey: String? = null,
     /** Queued by a trip fill; kept for storage accounting across restarts. */
     val tripFill: Boolean = false,
-    /** The limit that paused this automatic download. Cleared when it is resumed. */
+    /** The limit that paused this download. Cleared when it is resumed or paused by hand. */
     val autoDownloadStop: AutoDownloadStop? = null,
+    /** The size in bytes a download waiting on a storage limit needs before it can fit. */
+    val waitingSizeBytes: Long? = null,
     /** Why this source failed. Also set on a finished file rejected by a batch; null when no failure was recorded. */
     val failureKind: DownloadFailureKind? = null,
     /**

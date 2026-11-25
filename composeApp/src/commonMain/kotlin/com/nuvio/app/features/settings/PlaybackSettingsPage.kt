@@ -120,6 +120,11 @@ private fun DesktopDownloadSettings(isTablet: Boolean) {
         DownloadFolderSetting(isTablet)
         SettingsGroupDivider(isTablet = isTablet)
         val profileState by ProfileRepository.state.collectAsStateWithLifecycle()
-        DeleteAfterWatchingSetting(isTablet, profileId = profileState.activeProfile?.profileIndex ?: ProfileRepository.activeProfileId)
+        val activeProfileId = profileState.activeProfile?.profileIndex ?: ProfileRepository.activeProfileId
+        TotalStorageLimitSetting(isTablet, profileId = activeProfileId)
+        SettingsGroupDivider(isTablet = isTablet)
+        AutoDownloadStorageLimitSetting(isTablet, profileId = activeProfileId)
+        SettingsGroupDivider(isTablet = isTablet)
+        DeleteAfterWatchingSetting(isTablet, profileId = activeProfileId)
     }
 }

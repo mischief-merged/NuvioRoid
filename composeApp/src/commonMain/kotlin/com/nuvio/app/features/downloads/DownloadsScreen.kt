@@ -223,6 +223,7 @@ internal fun DownloadsScreenContent(
     }
     val folderState by folders.state.collectAsStateWithLifecycle()
     val storageLimitGb by (autoDownloads?.storageLimitGb ?: NoStorageLimit).collectAsStateWithLifecycle()
+    val totalStorageLimitGb by (autoDownloads?.totalStorageLimitGb ?: NoStorageLimit).collectAsStateWithLifecycle()
     var selecting by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf(emptySet<String>()) }
     var moveRequest by remember { mutableStateOf<MoveRequest?>(null) }
@@ -300,6 +301,7 @@ internal fun DownloadsScreenContent(
     // lazy list does not survive (an item count that changes between two lookups of one pass).
     val folderStateNow = folderState
     val storageLimitNow = storageLimitGb
+    val totalStorageLimitNow = totalStorageLimitGb
     val selectingNow = selecting
     val selectedNow = selectedIds
 
@@ -550,6 +552,10 @@ internal fun DownloadsScreenContent(
                             { profile, limit -> controller.setStorageLimit(profile, limit) }
                         },
                         profileId = activeProfileId,
+                        totalLimitGb = totalStorageLimitNow,
+                        onChangeTotalStorageLimit = autoDownloads?.let { controller ->
+                            { profile, limit -> controller.setTotalStorageLimit(profile, limit) }
+                        },
                     )
                 }
             }
@@ -858,7 +864,10 @@ private fun LazyListScope.downloadsRootContent(
         item(key = "active-heading") {
             val hasDownloading = activeItems.any { it.status == DownloadStatus.Downloading }
             val hasResumablePaused = activeItems.any {
-                it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection
+                it.status == DownloadStatus.Paused &&
+                    !it.pausedByFolder &&
+                    !it.pausedByConnection &&
+                    it.autoDownloadStop != AutoDownloadStop.TotalStorageLimit
             }
             SectionTitle(
                 title = stringResource(Res.string.downloads_section_active),
@@ -1434,8 +1443,8 @@ private fun DownloadRow(
                                 )
                             }
                         }
-                        // One that waits for a better connection is offered a pause, which keeps it paused when that ends.
-                        DownloadStatus.Paused -> if (item.pausedByConnection) {
+                        // One that waits for a better connection or storage limit is offered a pause, which keeps it paused when that ends.
+                        DownloadStatus.Paused -> if (item.pausedByConnection || item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit) {
                             IconButton(onClick = onPause) {
                                 Icon(
                                     imageVector = Icons.Rounded.Pause,
@@ -1627,6 +1636,8 @@ internal fun statusText(
         formatBytes(item.totalBytes ?: item.downloadedBytes)
     } else if (item.totalBytes != null && item.totalBytes > 0L) {
         "${formatBytes(item.downloadedBytes)} / ${formatBytes(item.totalBytes)}"
+    } else if (item.waitingSizeBytes != null && item.waitingSizeBytes > 0L) {
+        "${formatBytes(item.downloadedBytes)} / ${formatBytes(item.waitingSizeBytes)}"
     } else {
         formatBytes(item.downloadedBytes)
     }
