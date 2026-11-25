@@ -213,6 +213,11 @@ actual fun PlatformKeyboardNavigationHost() {
             when (event) {
                 is ControllerEvent.Navigate -> {
                     ControllerManager.notifyNavigationInput()
+                    // Never fall back to the underlying page's FocusManager while an in-window
+                    // modal overlay without its own popup focus owner is open.
+                    if (ControllerFocusEngine.isModalOverlayActive && ComposePopupFocus.active == null) {
+                        return@collect
+                    }
                     val padMoved = activeFocusManager().moveSpatialFocus(event.direction)
                     if (padMoved) {
                         ControllerFocusEngine.yieldFocusToCompose()
@@ -294,11 +299,15 @@ actual fun PlatformKeyboardNavigationHost() {
             }
 
             if (event.keyCode == KeyEvent.VK_TAB) {
-                // Tab hands focus traversal to Compose; clear spatial selection so Enter activates
-                // the Compose-focused control rather than a stale spatial row.
-                ControllerFocusEngine.yieldFocusToCompose()
-                ControllerManager.notifyNavigationInput()
-                return@KeyEventDispatcher false
+                // Only hand focus traversal to Compose when no modal overlay is open, or when the
+                // active modal popup has registered its own FocusManager in ComposePopupFocus.
+                // Otherwise (an in-window spatial overlay), keep focus confined inside the overlay.
+                if (!ControllerFocusEngine.isModalOverlayActive || ComposePopupFocus.active != null) {
+                    ControllerFocusEngine.yieldFocusToCompose()
+                    ControllerManager.notifyNavigationInput()
+                    return@KeyEventDispatcher false
+                }
+                return@KeyEventDispatcher true
             }
 
             val direction = when (event.keyCode) {
@@ -325,6 +334,12 @@ actual fun PlatformKeyboardNavigationHost() {
 
             // The spatial engine drives instrumented screens (home shelves, catalog grids, sidebar).
             if (ControllerManager.dispatchKeyboardNavigation(direction)) {
+                return@KeyEventDispatcher true
+            }
+
+            // While an in-window modal overlay without its own popup FocusManager is open, keep
+            // edge arrows confined to the overlay instead of moving focus on the page underneath.
+            if (ControllerFocusEngine.isModalOverlayActive && ComposePopupFocus.active == null) {
                 return@KeyEventDispatcher true
             }
 

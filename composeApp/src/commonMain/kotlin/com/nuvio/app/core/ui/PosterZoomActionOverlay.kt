@@ -24,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -62,7 +63,7 @@ import coil3.compose.AsyncImage
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerFocusZone
 import com.nuvio.app.controller.ControllerManager
-import com.nuvio.app.controller.RegisterControllerHandler
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 import com.nuvio.app.controller.controllerFocusable
 import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
@@ -259,19 +260,15 @@ fun NuvioPosterZoomActionOverlay(
 
     val modalOverlayToken = remember { Any() }
     DisposableEffect(modalOverlayToken) {
-        ControllerFocusEngine.pushModalOverlay(modalOverlayToken)
+        ControllerFocusEngine.pushModalOverlay(
+            token = modalOverlayToken,
+            onBack = {
+                scope.launch { close() }
+                true
+            },
+        )
         onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
     }
-
-    // B closes the preview: the engine routes gamepad back through the global handler stack,
-    // so the Compose back handler above alone is not enough.
-    RegisterControllerHandler(
-        key = "poster_zoom_actions",
-        onBack = {
-            scope.launch { close() }
-            true
-        },
-    )
 
     // When the preview is opened with the controller/keyboard, select its first action so A
     // works immediately instead of leaving the ring behind on the poster.
@@ -285,6 +282,7 @@ fun NuvioPosterZoomActionOverlay(
         close()
     }
 
+    CompositionLocalProvider(LocalControllerModalOverlayToken provides modalOverlayToken) {
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -540,6 +538,7 @@ fun NuvioPosterZoomActionOverlay(
                 }
             }
         }
+    }
     }
 }
 

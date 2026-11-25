@@ -26,8 +26,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -41,6 +44,7 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import com.nuvio.app.controller.ControllerFocusEngine
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 
 enum class DialogButtonStyle {
     Primary,
@@ -60,8 +64,18 @@ fun DialogSurface(
 ) {
     val tokens = MaterialTheme.nuvio
     val modalOverlayToken = remember { Any() }
+    val currentDismissOnBackPress by rememberUpdatedState(properties.dismissOnBackPress)
+    val currentOnDismiss by rememberUpdatedState(onDismissRequest)
     DisposableEffect(modalOverlayToken) {
-        ControllerFocusEngine.pushModalOverlay(modalOverlayToken)
+        ControllerFocusEngine.pushModalOverlay(
+            token = modalOverlayToken,
+            onBack = {
+                if (currentDismissOnBackPress) {
+                    currentOnDismiss()
+                }
+                true
+            },
+        )
         onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
     }
     PlatformModalBackHandler(
@@ -78,6 +92,7 @@ fun DialogSurface(
             ComposePopupFocus.push(dialogFocusManager)
             onDispose { ComposePopupFocus.pop(dialogFocusManager) }
         }
+        CompositionLocalProvider(LocalControllerModalOverlayToken provides modalOverlayToken) {
         Surface(
             modifier = modifier
                 .fillMaxWidth()
@@ -108,6 +123,7 @@ fun DialogSurface(
                 }
                 content()
             }
+        }
         }
     }
 }

@@ -42,6 +42,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -49,6 +50,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -87,7 +89,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerFocusZone
 import com.nuvio.app.controller.ControllerManager
-import com.nuvio.app.controller.RegisterControllerHandler
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 import com.nuvio.app.controller.controllerFocusable
 import dev.chrisbanes.haze.hazeEffect
 import com.nuvio.app.core.ui.NuvioDesktopAnimation
@@ -371,24 +373,22 @@ fun SidebarProfileSwitcherStack(
     }
 
     val switcherOverlayToken = remember { Any() }
+    val currentOnDismiss by rememberUpdatedState(onDismissRequest)
+    val currentPinProfile by rememberUpdatedState(pinProfile)
     DisposableEffect(switcherOverlayToken) {
-        ControllerFocusEngine.pushModalOverlay(switcherOverlayToken)
+        ControllerFocusEngine.pushModalOverlay(
+            token = switcherOverlayToken,
+            onBack = {
+                if (currentPinProfile != null) {
+                    pinProfile = null
+                } else {
+                    currentOnDismiss()
+                }
+                true
+            },
+        )
         onDispose { ControllerFocusEngine.popModalOverlay(switcherOverlayToken) }
     }
-
-    // B closes the PIN step first, then the switcher; without this the app-level back handler
-    // would navigate away from the screen underneath the popup.
-    RegisterControllerHandler(
-        key = "profile_switcher",
-        onBack = {
-            if (pinProfile != null) {
-                pinProfile = null
-            } else {
-                onDismissRequest()
-            }
-            true
-        },
-    )
 
     // When the popup is opened with the controller/keyboard, move the spatial focus into it so the
     // next A press selects a profile instead of toggling the popup closed again.
@@ -403,6 +403,7 @@ fun SidebarProfileSwitcherStack(
         ControllerFocusEngine.requestFocus(targetId, triggerScroll = false)
     }
 
+    CompositionLocalProvider(LocalControllerModalOverlayToken provides switcherOverlayToken) {
     Box(modifier = modifier) {
         if (pinProfile == null) {
             Column(
@@ -442,6 +443,7 @@ fun SidebarProfileSwitcherStack(
                 )
             }
         }
+    }
     }
 }
 

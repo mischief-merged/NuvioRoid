@@ -114,6 +114,7 @@ internal class ControllerFocusNode(
     var rowItemIndex: Int = -1,
     var rowTotalCount: Int = 0,
     var coroutineScope: CoroutineScope? = null,
+    var modalOverlayToken: Any? = null,
 ) {
     val isVisibleAndValid: Boolean
         get() = enabled && (
@@ -156,6 +157,7 @@ val LocalControllerVerticalScrollState = compositionLocalOf<ScrollState?> { null
 val LocalControllerRowLazyListState = compositionLocalOf<LazyListState?> { null }
 val LocalControllerGroupKey = compositionLocalOf<String?> { null }
 val LocalControllerFocusZone = compositionLocalOf { ControllerFocusZone.Content }
+val LocalControllerModalOverlayToken = compositionLocalOf<Any?> { null }
 
 @Composable
 fun ProvideControllerRowLazyListState(
@@ -193,8 +195,13 @@ object ControllerFocusEngine {
      */
     var deferNavigationToCompose: Boolean = false
 
+    private data class ModalOverlayEntry(
+        val token: Any,
+        val onBack: (() -> Boolean)?,
+    )
+
     private val modalOverlayLock = SynchronizedObject()
-    private val activeModalOverlays = mutableListOf<Any>()
+    private val activeModalOverlays = mutableListOf<ModalOverlayEntry>()
 
     @Volatile
     private var hasVisibleOverlayNodes: Boolean = false
@@ -220,8 +227,11 @@ object ControllerFocusEngine {
         yieldedToCompose = false
     }
 
+    private val topModalOverlay: ModalOverlayEntry?
+        get() = synchronized(modalOverlayLock) { activeModalOverlays.lastOrNull() }
+
     private val hasExplicitModalOverlay: Boolean
-        get() = synchronized(modalOverlayLock) { activeModalOverlays.isNotEmpty() }
+        get() = topModalOverlay != null
 
     /**
      * True while a modal sheet, dialog, dropdown, switcher, or any visible [ControllerFocusZone.Overlay]
@@ -230,48 +240,65 @@ object ControllerFocusEngine {
     val isModalOverlayActive: Boolean
         get() = hasExplicitModalOverlay || hasVisibleOverlayNodes
 
+    private fun isActiveOverlayNode(node: ControllerFocusNode): Boolean {
+        if (node.zone != ControllerFocusZone.Overlay || !node.isVisibleAndValid) return false
+        val topToken = topModalOverlay?.token ?: return true
+        return node.modalOverlayToken === topToken
+    }
+
+    private fun activeOverlayNodes(): List<ControllerFocusNode> =
+        nodes.values.filter(::isActiveOverlayNode)
+
     /**
-     * Marks a modal overlay (sheet, dialog, action menu) as owning input above the active route.
-     * While active, the spatial engine stays confined to [ControllerFocusZone.Overlay] nodes (even
-     * on Compose-driven routes) and never focuses background content or navigation nodes.
+     * Marks a modal overlay (sheet, dialog, dropdown, action menu) as owning input above the active
+     * route. While active, the spatial engine is scoped strictly to [ControllerFocusZone.Overlay]
+     * nodes belonging to the topmost modal, and Back routes to [onBack] before any lower modal.
      */
-    fun pushModalOverlay(token: Any) {
+    fun pushModalOverlay(token: Any, onBack: (() -> Boolean)? = null) {
         yieldedToCompose = false
         synchronized(modalOverlayLock) {
-            if (!activeModalOverlays.any { it === token }) {
-                activeModalOverlays.add(token)
-            }
+            activeModalOverlays.removeAll { it.token === token }
+            activeModalOverlays.add(ModalOverlayEntry(token = token, onBack = onBack))
         }
         val current = _focusedNodeId.value?.let { nodes[it] }
-        if (current != null && current.zone != ControllerFocusZone.Overlay) {
+        if (current != null && (current.zone != ControllerFocusZone.Overlay || current.modalOverlayToken !== token)) {
             _focusedNodeId.value = null
             _focusedNodeSnapshot.value = null
         }
     }
 
-    /** Releases a previously pushed modal overlay and restores content focus if none remain. */
+    /** Releases a previously pushed modal overlay and restores focus to the next modal or content. */
     fun popModalOverlay(token: Any) {
         yieldedToCompose = false
-        val noOverlaysLeft = synchronized(modalOverlayLock) {
-            activeModalOverlays.removeAll { it === token }
-            activeModalOverlays.isEmpty()
+        val remainingTop = synchronized(modalOverlayLock) {
+            activeModalOverlays.removeAll { it.token === token }
+            activeModalOverlays.lastOrNull()
         }
-        if (noOverlaysLeft) {
-            val current = _focusedNodeId.value?.let { nodes[it] }
-            if (current == null || current.zone == ControllerFocusZone.Overlay) {
-                if (current?.zone == ControllerFocusZone.Overlay) {
-                    _focusedNodeId.value = null
-                    _focusedNodeSnapshot.value = null
-                }
-                if (!deferNavigationToCompose && ControllerManager.isNavigationActive.value) {
-                    val restored = lastFocusedByZone[ControllerFocusZone.Content]
-                        ?.let { nodes[it] }
-                        ?.takeIf(::canSpatiallyFocus)
-                    if (restored != null) {
-                        focusNodeInternal(restored, triggerScroll = false)
-                    } else {
-                        ensureValidFocus()
-                    }
+        val current = _focusedNodeId.value?.let { nodes[it] }
+        if (current != null && current.modalOverlayToken === token) {
+            _focusedNodeId.value = null
+            _focusedNodeSnapshot.value = null
+        }
+        if (remainingTop != null) {
+            if (ControllerManager.isNavigationActive.value) {
+                ensureValidFocus()
+            }
+            return
+        }
+        val activeAfterPop = _focusedNodeId.value?.let { nodes[it] }
+        if (activeAfterPop == null || activeAfterPop.zone == ControllerFocusZone.Overlay) {
+            if (activeAfterPop?.zone == ControllerFocusZone.Overlay) {
+                _focusedNodeId.value = null
+                _focusedNodeSnapshot.value = null
+            }
+            if (!deferNavigationToCompose && ControllerManager.isNavigationActive.value) {
+                val restored = lastFocusedByZone[ControllerFocusZone.Content]
+                    ?.let { nodes[it] }
+                    ?.takeIf(::canSpatiallyFocus)
+                if (restored != null) {
+                    focusNodeInternal(restored, triggerScroll = false)
+                } else {
+                    ensureValidFocus()
                 }
             }
         }
@@ -280,7 +307,7 @@ object ControllerFocusEngine {
     private fun canSpatiallyFocus(node: ControllerFocusNode): Boolean {
         if (!node.isVisibleAndValid) return false
         if (yieldedToCompose) return false
-        if (isModalOverlayActive) return node.zone == ControllerFocusZone.Overlay
+        if (isModalOverlayActive) return isActiveOverlayNode(node)
         if (deferNavigationToCompose) return false
         return true
     }
@@ -576,10 +603,10 @@ object ControllerFocusEngine {
         nodes[node.id] = node
         updateInteractiveContentStatus()
         val currentId = _focusedNodeId.value
-        val activeOverlayNodes = nodes.values.filter { it.zone == ControllerFocusZone.Overlay && it.isVisibleAndValid }
+        val activeOverlayNodes = activeOverlayNodes()
         if (activeOverlayNodes.isNotEmpty()) {
             val currentNode = currentId?.let { nodes[it] }
-            if (currentNode == null || currentNode.zone != ControllerFocusZone.Overlay || !currentNode.isVisibleAndValid) {
+            if (currentNode == null || !isActiveOverlayNode(currentNode)) {
                 val target = activeOverlayNodes.firstOrNull { it.isDefaultFocus }
                     ?: activeOverlayNodes.minWithOrNull(compareBy({ it.boundsInRoot.top }, { it.boundsInRoot.left }))
                 if (target != null) {
@@ -665,7 +692,7 @@ object ControllerFocusEngine {
             try {
                 // If an overlay just closed, restore Content focus unless Navigation focus is actively selected
                 if (removed?.zone == ControllerFocusZone.Overlay) {
-                    val remainingOverlay = nodes.values.filter { it.zone == ControllerFocusZone.Overlay && it.isVisibleAndValid }
+                    val remainingOverlay = activeOverlayNodes()
                     if (remainingOverlay.isNotEmpty()) {
                         focusNodeInternal(remainingOverlay.first(), triggerScroll = false)
                         return
@@ -779,10 +806,11 @@ object ControllerFocusEngine {
         preferBounds: Rect? = null,
         preferZone: ControllerFocusZone? = null,
     ): Boolean {
-        val overlayNodes = nodes.values.filter { it.zone == ControllerFocusZone.Overlay && it.isVisibleAndValid }
+        if (yieldedToCompose) return false
+        val overlayNodes = activeOverlayNodes()
         if (overlayNodes.isNotEmpty()) {
             val current = _focusedNodeId.value?.let { nodes[it] }
-            if (current != null && current.zone == ControllerFocusZone.Overlay && current.isVisibleAndValid) {
+            if (current != null && isActiveOverlayNode(current)) {
                 return true
             }
             val target = overlayNodes.firstOrNull { it.isDefaultFocus }
@@ -1467,7 +1495,7 @@ object ControllerFocusEngine {
     }
     fun handleEvent(event: ControllerEvent): Boolean {
         // If native player is active and handles the event directly, delegate first
-        val overlayNodes = nodes.values.filter { it.zone == ControllerFocusZone.Overlay && it.isVisibleAndValid }
+        val overlayNodes = activeOverlayNodes()
         if (!isModalOverlayActive && overlayNodes.isEmpty()) {
             val playerHandler = customPlayerEventHandler
             if (playerHandler != null && playerHandler(event)) {
@@ -1562,7 +1590,7 @@ object ControllerFocusEngine {
     }
 
     private fun handleButtonPressed(button: XboxButton): Boolean {
-        val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf { it.isVisibleAndValid }
+        val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf(::canSpatiallyFocus)
         return when (button) {
             XboxButton.DPadUp -> handleNavigate(ControllerDirection.Up)
             XboxButton.DPadDown -> handleNavigate(ControllerDirection.Down)
@@ -1593,8 +1621,15 @@ object ControllerFocusEngine {
                     return true
                 }
                 PlatformVirtualKeyboard.hide()
+                // When a modal overlay is on top, route Back strictly to the top modal so an
+                // underlying sheet or screen cannot be dismissed behind a confirmation dialog.
+                val activeTopModal = topModalOverlay
+                if (activeTopModal != null) {
+                    return activeTopModal.onBack?.invoke()
+                        ?: invokeGlobalHandler { it.onBack?.invoke() == true }
+                }
                 // If currently in Sidebar/Navigation zone (and no modal overlay is open), B returns focus to Content
-                if (!isModalOverlayActive && current?.zone == ControllerFocusZone.Navigation) {
+                if (current?.zone == ControllerFocusZone.Navigation) {
                     manualSidebarOpen = false
                     val contentNodes = nodes.values.filter { it.zone == ControllerFocusZone.Content && it.isVisibleAndValid }
                     if (contentNodes.isNotEmpty()) {
@@ -2035,21 +2070,21 @@ object ControllerFocusEngine {
         if (PlatformVirtualKeyboard.isKeyboardActive) {
             PlatformVirtualKeyboard.hide()
         }
-        val overlayNodes = nodes.values.filter { it.zone == ControllerFocusZone.Overlay && it.isVisibleAndValid }
+        val overlayNodes = activeOverlayNodes()
         if (isModalOverlayActive && overlayNodes.isEmpty()) {
             return false
         }
         val activeZone = if (overlayNodes.isNotEmpty()) {
             ControllerFocusZone.Overlay
         } else {
-            val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf { it.isVisibleAndValid }
+            val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf(::canSpatiallyFocus)
             if (current == null) {
                 return ensureValidFocus()
             }
             current.zone
         }
 
-        val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf { it.isVisibleAndValid && it.zone == activeZone }
+        val current = _focusedNodeId.value?.let { nodes[it] }?.takeIf { canSpatiallyFocus(it) && it.zone == activeZone }
             ?: run {
                 return ensureValidFocus()
             }
@@ -2131,7 +2166,7 @@ object ControllerFocusEngine {
         }
 
         val zoneCandidates = nodes.values.filter {
-            it.zone == activeZone && it.isVisibleAndValid && it.id != current.id
+            it.zone == activeZone && canSpatiallyFocus(it) && it.id != current.id
         }
 
         val nextInZone = findBestSpatialCandidate(current, zoneCandidates, direction)
@@ -2679,6 +2714,7 @@ fun Modifier.controllerFocusable(
     val ambientZone = LocalControllerFocusZone.current
     val ambientGroupKey = LocalControllerGroupKey.current
     val ambientRowState = LocalControllerRowLazyListState.current
+    val ambientModalToken = LocalControllerModalOverlayToken.current
     val effectiveId = remember(id, ambientGroupKey, dedupeByGroup) {
         val base = id.ifEmpty { "ctrl_node_${++autoControllerNodeCounter}" }
         if (dedupeByGroup && !ambientGroupKey.isNullOrEmpty()) "$base@$ambientGroupKey" else base
@@ -2725,6 +2761,7 @@ fun Modifier.controllerFocusable(
 
     node.zone = effectiveZone
     node.groupKey = effectiveGroupKey
+    node.modalOverlayToken = ambientModalToken
     node.enabled = effectiveEnabled
     node.isDefaultFocus = isDefaultFocus
     node.isTextInput = isTextInput

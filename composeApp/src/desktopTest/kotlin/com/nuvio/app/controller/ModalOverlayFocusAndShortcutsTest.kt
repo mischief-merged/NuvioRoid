@@ -23,6 +23,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.AppScreenTab
 import com.nuvio.app.core.ui.ComposePopupFocus
+import com.nuvio.app.core.ui.DialogSurface
 import com.nuvio.app.core.ui.NuvioBottomSheetActionRow
 import com.nuvio.app.core.ui.NuvioDropdownChip
 import com.nuvio.app.core.ui.NuvioDropdownOption
@@ -617,5 +618,141 @@ class ModalOverlayFocusAndShortcutsTest {
         assertNull(ControllerFocusEngine.focusedNodeId.value)
         assertFalse(ControllerManager.dispatchKeyboardSelect())
         assertEquals(0, floatingClicks)
+    }
+
+    @Test
+    fun desktop_dropdown_registers_its_own_popup_focus_manager_for_tab_handoff() {
+        var outerFocusManager: FocusManager? = null
+
+        compose.setContent {
+            NuvioTheme {
+                outerFocusManager = LocalFocusManager.current
+                PlatformKeyboardNavigationHost()
+                NuvioDropdownChip(
+                    title = "Filter",
+                    label = "All Types",
+                    options = listOf(
+                        NuvioDropdownOption("all", "All Types"),
+                        NuvioDropdownOption("movie", "Movies"),
+                        NuvioDropdownOption("series", "Series"),
+                    ),
+                    selectedKey = "all",
+                    onSelected = {},
+                )
+            }
+        }
+        compose.waitForIdle()
+        assertNull(ComposePopupFocus.active)
+
+        compose.onNodeWithText("All Types").performClick()
+        compose.waitForIdle()
+
+        // The desktop dropdown popup must register its own FocusManager distinct from the page's.
+        val menuFocusManager = ComposePopupFocus.active
+        assertNotNull(menuFocusManager)
+        assertNotNull(outerFocusManager)
+        assertNotSame(outerFocusManager, menuFocusManager)
+
+        // Tab yields spatial focus to the dropdown popup's FocusManager, never the page behind it.
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.requestFocus("dropdown_item_0", triggerScroll = false))
+        val tabEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_TAB,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(tabEvent)
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertEquals(menuFocusManager, ComposePopupFocus.active)
+
+        // Closing the dropdown clears both popup focus and Compose handoff.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertNull(ComposePopupFocus.active)
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
+        assertFalse(ControllerFocusEngine.isYieldedToCompose)
+    }
+
+    @Test
+    fun dialog_above_bottom_sheet_scopes_overlay_focus_and_gamepad_back_to_dialog() {
+        var sheetOpen by mutableStateOf(true)
+        var dialogOpen by mutableStateOf(false)
+        var adaptiveClicks = 0
+        var sheetFocusManager: FocusManager? = null
+
+        compose.setContent {
+            NuvioTheme {
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        sheetFocusManager = LocalFocusManager.current
+                        NuvioBottomSheetActionRow(
+                            title = "Adaptive",
+                            focusId = "stacked_sheet_adaptive",
+                            onClick = { adaptiveClicks += 1 },
+                        )
+                        NuvioBottomSheetActionRow(
+                            title = "Floating",
+                            focusId = "stacked_sheet_floating",
+                            onClick = {},
+                        )
+                    }
+                }
+                if (dialogOpen) {
+                    DialogSurface(
+                        onDismissRequest = { dialogOpen = false },
+                        title = "Quit while downloading?",
+                    ) {
+                        Button(onClick = { dialogOpen = false }) { Text("Keep open") }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Focus a row inside the open bottom sheet.
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
+        assertEquals("stacked_sheet_adaptive", ControllerFocusEngine.focusedNodeId.value)
+        assertNotNull(sheetFocusManager)
+
+        // Open a confirmation dialog on top of the sheet (e.g. QuitWithDownloadsDialog).
+        dialogOpen = true
+        compose.waitForIdle()
+
+        // The dialog takes top modal ownership: sheet selection is cleared and sheet rows are unreachable.
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        val dialogFocusManager = ComposePopupFocus.active
+        assertNotNull(dialogFocusManager)
+        assertNotSame(sheetFocusManager, dialogFocusManager)
+        assertFalse(ControllerFocusEngine.requestFocus("stacked_sheet_adaptive", triggerScroll = false))
+        assertFalse(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
+        assertFalse(ControllerManager.dispatchKeyboardNavigation(ControllerDirection.Down))
+        assertFalse(ControllerManager.dispatchKeyboardSelect())
+        assertFalse(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.A)))
+        assertEquals(0, adaptiveClicks)
+
+        // Gamepad B dismisses ONLY the top dialog, keeping the underlying sheet open.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(dialogOpen)
+        assertTrue(sheetOpen)
+        assertTrue(ControllerFocusEngine.isModalOverlayActive)
+        assertEquals(sheetFocusManager, ComposePopupFocus.active)
+
+        // Now the sheet regains Overlay focus and the next Gamepad B dismisses the sheet.
+        assertTrue(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
+        assertEquals("stacked_sheet_adaptive", ControllerFocusEngine.focusedNodeId.value)
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(sheetOpen)
+        assertFalse(ControllerFocusEngine.isModalOverlayActive)
     }
 }

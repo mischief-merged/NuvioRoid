@@ -23,9 +23,11 @@ import androidx.compose.material3.SheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -40,7 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerFocusZone
 import com.nuvio.app.controller.ControllerManager
-import com.nuvio.app.controller.RegisterControllerHandler
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 import com.nuvio.app.controller.controllerFocusable
 import com.nuvio.app.isWindows
 import kotlinx.coroutines.delay
@@ -66,17 +68,17 @@ fun NuvioModalBottomSheet(
     // while sheets without action rows (or after swapping to a form/rating panel) hand arrows to
     // the popup's own Compose FocusManager captured inside the sheet content below.
     val modalOverlayToken = remember { Any() }
+    val currentOnDismiss by rememberUpdatedState(onDismissRequest)
     DisposableEffect(modalOverlayToken) {
-        ControllerFocusEngine.pushModalOverlay(modalOverlayToken)
+        ControllerFocusEngine.pushModalOverlay(
+            token = modalOverlayToken,
+            onBack = {
+                currentOnDismiss()
+                true
+            },
+        )
         onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
     }
-    RegisterControllerHandler(
-        key = "nuvio_bottom_sheet",
-        onBack = {
-            onDismissRequest()
-            true
-        },
-    )
     // Escape is captured by the AWT dispatcher before Compose sees it; put the sheet on top of the
     // Escape stack so it closes instead of leaving the page underneath.
     PlatformBackHandler(enabled = true) {
@@ -92,8 +94,10 @@ fun NuvioModalBottomSheet(
             showDragHandle = showDragHandle,
             fullHeight = fullHeight,
         ) {
-            BottomSheetPopupFocusHost {
-                content()
+            CompositionLocalProvider(LocalControllerModalOverlayToken provides modalOverlayToken) {
+                BottomSheetPopupFocusHost {
+                    content()
+                }
             }
         }
     } else {
@@ -107,7 +111,10 @@ fun NuvioModalBottomSheet(
             scrimColor = tokens.colors.overlayScrim,
             dragHandle = null,
         ) {
-            CompositionLocalProvider(LocalBottomInsetsConsumed provides true) {
+            CompositionLocalProvider(
+                LocalBottomInsetsConsumed provides true,
+                LocalControllerModalOverlayToken provides modalOverlayToken,
+            ) {
                 BottomSheetPopupFocusHost {
                     Column(
                         modifier = modifier

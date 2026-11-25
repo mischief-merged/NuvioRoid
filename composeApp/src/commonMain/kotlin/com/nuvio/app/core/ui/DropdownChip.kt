@@ -25,6 +25,7 @@ import androidx.compose.material3.SheetState
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,12 +36,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerFocusZone
 import com.nuvio.app.controller.ControllerManager
-import com.nuvio.app.controller.RegisterControllerHandler
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 import com.nuvio.app.controller.controllerFocusable
 import com.nuvio.app.isDesktop
 import kotlinx.coroutines.delay
@@ -111,6 +114,7 @@ fun NuvioDropdownChip(
         }
 
         if (isDesktop) {
+            val dropdownOverlayToken = remember { Any() }
             DropdownMenu(
                 expanded = isSheetVisible,
                 onDismissRequest = { isSheetVisible = false },
@@ -118,63 +122,74 @@ fun NuvioDropdownChip(
                 containerColor = tokens.colors.surfacePopover,
                 shape = tokens.shapes.compactCard,
             ) {
-                options.forEachIndexed { index, option ->
-                    DropdownMenuItem(
-                        modifier = Modifier.controllerFocusable(
-                            id = "dropdown_item_$index",
-                            zone = ControllerFocusZone.Overlay,
-                            groupKey = "dropdown_items",
-                            selectLabel = option.label,
-                            onSelect = {
-                                onSelected(option)
-                                isSheetVisible = false
-                            },
-                        ),
-                        text = {
-                            Text(
-                                text = option.label,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
+                val menuFocusManager = LocalFocusManager.current
+                DisposableEffect(menuFocusManager) {
+                    ComposePopupFocus.push(menuFocusManager)
+                    onDispose { ComposePopupFocus.pop(menuFocusManager) }
+                }
+                CompositionLocalProvider(LocalControllerModalOverlayToken provides dropdownOverlayToken) {
+                    Column(
+                        modifier = Modifier.onFocusChanged {
+                            ComposePopupFocus.setFocused(menuFocusManager, it.hasFocus)
+                        },
+                    ) {
+                        options.forEachIndexed { index, option ->
+                            DropdownMenuItem(
+                                modifier = Modifier.controllerFocusable(
+                                    id = "dropdown_item_$index",
+                                    zone = ControllerFocusZone.Overlay,
+                                    groupKey = "dropdown_items",
+                                    selectLabel = option.label,
+                                    onSelect = {
+                                        onSelected(option)
+                                        isSheetVisible = false
+                                    },
+                                ),
+                                text = {
+                                    Text(
+                                        text = option.label,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                },
+                                trailingIcon = {
+                                    if (option.key == selectedKey) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Check,
+                                            contentDescription = null,
+                                            tint = tokens.colors.accent,
+                                            modifier = Modifier.size(tokens.icons.md),
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    onSelected(option)
+                                    isSheetVisible = false
+                                },
                             )
-                        },
-                        trailingIcon = {
-                            if (option.key == selectedKey) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Check,
-                                    contentDescription = null,
-                                    tint = tokens.colors.accent,
-                                    modifier = Modifier.size(tokens.icons.md),
-                                )
-                            }
-                        },
-                        onClick = {
-                            onSelected(option)
-                            isSheetVisible = false
-                        },
-                    )
+                        }
+                    }
                 }
             }
 
             if (isSheetVisible) {
-                val dropdownOverlayToken = remember { Any() }
                 DisposableEffect(dropdownOverlayToken) {
-                    ControllerFocusEngine.pushModalOverlay(dropdownOverlayToken)
+                    ControllerFocusEngine.pushModalOverlay(
+                        token = dropdownOverlayToken,
+                        onBack = {
+                            isSheetVisible = false
+                            true
+                        },
+                    )
                     onDispose { ControllerFocusEngine.popModalOverlay(dropdownOverlayToken) }
                 }
                 PlatformBackHandler(enabled = true) {
                     isSheetVisible = false
                 }
-                // B closes the popup and returns to the chip.
-                RegisterControllerHandler(
-                    key = "dropdown_menu",
-                    onBack = {
-                        isSheetVisible = false
-                        true
-                    },
-                )
                 LaunchedEffect(isSheetVisible, options) {
                     if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
                     delay(120)
+                    if (ControllerFocusEngine.isYieldedToCompose || ComposePopupFocus.hasActiveFocus) return@LaunchedEffect
                     val selectedIndex = options.indexOfFirst { it.key == selectedKey }.coerceAtLeast(0)
                     ControllerFocusEngine.requestFocus("dropdown_item_$selectedIndex", triggerScroll = false)
                 }
