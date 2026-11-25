@@ -277,17 +277,21 @@ internal class AutoDownloadStore(
     }
 
     /**
-     * Updates the Trash pointer on [entry] when a failed Undo rolled the file back to Trash under a
-     * new Trash address, even if the active profile changed while the rollback ran.
+     * Durably updates the Trash pointer on [entry] when a partial Undo kept un-restored subtitles
+     * or a failed Undo rolled the file back to Trash under a new Trash address, even if the active
+     * profile changed while the operation ran. Returns false without altering in-memory state when
+     * persistence fails.
      */
     fun updateDeletedUndo(
         profileId: Int,
         entry: AutoDownloadDeleted,
         trashed: TrashedWatchedFile,
     ): Boolean = synchronized(lock) {
-        if (ensureLoaded() == profileId) {
+        val active = runCatching { ensureLoaded() }.getOrNull()
+        if (active == profileId) {
+            val previousRaw = runCatching { payloads.loadFresh(profileId) }.getOrNull()
             var changed = false
-            val updated = state.recentlyDeleted.map { current ->
+            val updatedEntries = state.recentlyDeleted.map { current ->
                 if (current == entry) {
                     changed = true
                     current.copy(trashed = trashed)
@@ -296,11 +300,18 @@ internal class AutoDownloadStore(
                 }
             }
             if (!changed) return false
-            save(profileId, state.copy(recentlyDeleted = updated))
+            val updated = state.copy(recentlyDeleted = updatedEntries).normalized()
+            if (updated == state) return true
+            if (!writeDurably(profileId, updated, previousRaw)) return false
+            publishState(updated)
             return true
         }
-        val raw = runCatching { payloads.loadFresh(profileId) }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
-        val decoded = runCatching { json.decodeFromString<StoredAutoDownloads>(raw) }.getOrNull() ?: return false
+        val previousRaw = try {
+            payloads.loadFresh(profileId)
+        } catch (_: Exception) {
+            return false
+        }?.takeIf { it.isNotBlank() } ?: return false
+        val decoded = runCatching { json.decodeFromString<StoredAutoDownloads>(previousRaw) }.getOrNull() ?: return false
         var changed = false
         val updatedEntries = decoded.recentlyDeleted.map { current ->
             if (current == entry) {
@@ -312,7 +323,7 @@ internal class AutoDownloadStore(
         }
         if (!changed) return false
         val updated = decoded.copy(recentlyDeleted = updatedEntries).normalized()
-        runCatching { payloads.save(profileId, json.encodeToString(updated)) }.isSuccess
+        writeDurably(profileId, updated, previousRaw)
     }
 
     /** Drops any scheduled removal for [downloadId] after manual clean-up or make-room moved it. */

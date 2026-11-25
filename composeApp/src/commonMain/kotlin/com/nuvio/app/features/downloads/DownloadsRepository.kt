@@ -3278,6 +3278,7 @@ object DownloadsRepository {
         profileId: Int,
         item: DownloadItem,
         trashed: TrashedWatchedFile,
+        onRollbackMoved: (TrashedWatchedFile) -> Boolean = { true },
     ): UndoRestoreOutcome {
         ensureLoaded()
         return SidecarLocks.withLock(trashed.originalFileUri) {
@@ -3291,23 +3292,44 @@ object DownloadsRepository {
                     }
                     if (!backend.isConnected(item)) return@synchronized UndoTrashResult.NotReachable
                     val targetItem = item.copy(localFileUri = trashed.originalFileUri)
-                    if (_uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed } &&
-                        backend.locate(targetItem) is FileLookup.Found
-                    ) {
+                    val locatedTarget = backend.locate(targetItem)
+                    val alreadyCompletedInCatalog =
+                        _uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed }
+                    if (!trashed.hasPendingVideo) {
+                        return@synchronized when (locatedTarget) {
+                            is FileLookup.Found -> if (!trashed.hasPendingSubtitles && alreadyCompletedInCatalog) {
+                                UndoTrashResult.Restored
+                            } else {
+                                null
+                            }
+                            is FileLookup.Unreachable -> UndoTrashResult.NotReachable
+                            FileLookup.Missing -> UndoTrashResult.FileGone
+                        }
+                    }
+                    if (alreadyCompletedInCatalog && locatedTarget is FileLookup.Found && !trashed.hasPendingSubtitles) {
                         return@synchronized UndoTrashResult.Restored
                     }
                     null
                 }
                 if (precheck != null) return@withLock UndoRestoreOutcome(precheck)
 
-                val moveResult = backend.restoreTrashedFile(trashed)
-                if (moveResult != UndoTrashResult.Restored) return@withLock UndoRestoreOutcome(moveResult)
+                val moveOutcome = backend.restoreTrashedFileWithOutcome(trashed)
+                if (moveOutcome.result != UndoTrashResult.Restored &&
+                    moveOutcome.result != UndoTrashResult.PartiallyRestored
+                ) {
+                    return@withLock moveOutcome
+                }
 
                 val saved = synchronized(stateLock) {
                     if (loadedProfileId != profileId ||
                         com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != profileId
                     ) {
                         return@synchronized false
+                    }
+                    if (!trashed.hasPendingVideo &&
+                        _uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed }
+                    ) {
+                        return@synchronized true
                     }
                     val restored = item.copy(
                         status = DownloadStatus.Completed,
@@ -3316,10 +3338,16 @@ object DownloadsRepository {
                     )
                     backend.withListLock {
                         val previousItems = _uiState.value.items
-                        if (previousItems.none { it.id == restored.id }) {
-                            publish(listOf(restored) + previousItems)
+                        val deduped = previousItems.filterNot { existing ->
+                            existing.id != restored.id &&
+                                existing.status == DownloadStatus.Completed &&
+                                existing.videoId == restored.videoId &&
+                                existing.localFileUri?.let { backend.isSameFile(it, trashed.originalFileUri) } == true
+                        }
+                        if (deduped.none { it.id == restored.id }) {
+                            publish(listOf(restored) + deduped)
                         } else {
-                            publish(previousItems.map { if (it.id == restored.id) restored else it })
+                            publish(deduped.map { if (it.id == restored.id) restored else it })
                         }
                         if (persist(durably = true)) {
                             true
@@ -3330,18 +3358,48 @@ object DownloadsRepository {
                         }
                     }
                 }
-                if (saved) return@withLock UndoRestoreOutcome(UndoTrashResult.Restored)
+                if (saved) return@withLock moveOutcome
 
-                // List save failed or profile changed after moving the file back: put the file back in the Trash.
-                val rollback = runCatching {
-                    backend.trashWatchedFileWithUndo(
-                        localFileUri = trashed.originalFileUri,
-                        allowHoldingWhenNoSystemTrash = trashed.heldInArchive,
-                    ) { true }
-                }.getOrNull()
+                // List save failed or profile changed after moving the file back: put what moved back in the Trash
+                // and commit its replacement address through the move callback so recovery is never lost.
+                var committedReplacement: TrashedWatchedFile? = null
+                val rollback = synchronized(WatchedRemovalGuard.lock) {
+                    runCatching {
+                        if (!trashed.hasPendingVideo) {
+                            backend.trashRestoredSubtitlesWithUndo(trashed) { updated ->
+                                val ok = onRollbackMoved(updated)
+                                if (ok) committedReplacement = updated
+                                ok
+                            }
+                        } else {
+                            val includeSubs = trashed.hasPendingSubtitles && moveOutcome.result == UndoTrashResult.Restored
+                            backend.trashWatchedFileWithUndo(
+                                localFileUri = trashed.originalFileUri,
+                                allowHoldingWhenNoSystemTrash = trashed.heldInArchive,
+                                includeSubtitles = includeSubs,
+                                stillWanted = { true },
+                                onMoved = { movedBack ->
+                                    val base = movedBack?.takeIf { it.hasPendingVideo } ?: return@trashWatchedFileWithUndo false
+                                    val replacement = if (includeSubs || !trashed.hasPendingSubtitles) {
+                                        base
+                                    } else {
+                                        val pendingSubs = moveOutcome.updatedTrashed
+                                        base.copy(
+                                            originalSubtitlesUri = pendingSubs?.originalSubtitlesUri,
+                                            trashedSubtitlesUri = pendingSubs?.trashedSubtitlesUri,
+                                        )
+                                    }
+                                    val ok = onRollbackMoved(replacement)
+                                    if (ok) committedReplacement = replacement
+                                    ok
+                                },
+                            )
+                        }
+                    }.getOrNull()
+                }
                 UndoRestoreOutcome(
                     result = UndoTrashResult.NotRestored,
-                    updatedTrashed = rollback?.trashed?.takeIf { rollback.result == AutoDownloadRemovalResult.Removed },
+                    updatedTrashed = committedReplacement?.takeIf { rollback?.result == AutoDownloadRemovalResult.Removed },
                 )
             } finally {
                 ItemLocks.release(item.id)
@@ -3830,7 +3888,28 @@ internal interface DownloadsBackend {
         return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
     }
 
+    fun trashWatchedFileWithUndo(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean = false,
+        includeSubtitles: Boolean,
+        stillWanted: () -> Boolean,
+        onMoved: (TrashedWatchedFile?) -> Boolean,
+    ): WatchedTrashOutcome = trashWatchedFileWithUndo(
+        localFileUri = localFileUri,
+        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        stillWanted = stillWanted,
+        onMoved = onMoved,
+    )
+
     fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult = UndoTrashResult.NotRestored
+
+    fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+        UndoRestoreOutcome(restoreTrashedFile(trashed))
+
+    fun trashRestoredSubtitlesWithUndo(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean,
+    ): WatchedTrashOutcome = WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
 
     /** True when [trashFile] puts files in the trash of the system, false when it only holds them for days. */
     val usesSystemTrash: Boolean get() = true
@@ -4041,8 +4120,30 @@ private object PlatformDownloadsBackend : DownloadsBackend {
         onMoved = onMoved,
     )
 
+    override fun trashWatchedFileWithUndo(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean,
+        includeSubtitles: Boolean,
+        stillWanted: () -> Boolean,
+        onMoved: (TrashedWatchedFile?) -> Boolean,
+    ): WatchedTrashOutcome = DownloadsTrash.moveWatchedAwayWithUndo(
+        localFileUri = localFileUri,
+        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        includeSubtitles = includeSubtitles,
+        stillWanted = stillWanted,
+        onMoved = onMoved,
+    )
+
     override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
         DownloadsTrash.restoreFromTrash(trashed)
+
+    override fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+        DownloadsTrash.restoreFromTrashWithOutcome(trashed)
+
+    override fun trashRestoredSubtitlesWithUndo(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean,
+    ): WatchedTrashOutcome = DownloadsTrash.trashSubtitlesForUndoRollback(trashed, onMoved)
 
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
     override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash

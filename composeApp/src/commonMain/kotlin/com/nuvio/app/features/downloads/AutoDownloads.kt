@@ -53,6 +53,7 @@ import nuvio.composeapp.generated.resources.downloads_cleanup_moved_toast
 import nuvio.composeapp.generated.resources.downloads_undo_failed_toast
 import nuvio.composeapp.generated.resources.downloads_undo_file_gone_toast
 import nuvio.composeapp.generated.resources.downloads_undo_restored_toast
+import nuvio.composeapp.generated.resources.downloads_undo_subtitles_not_restored_toast
 import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 
@@ -464,6 +465,8 @@ internal object AutoDownloads : AutoDownloadController {
             when (result) {
                 UndoTrashResult.Restored ->
                     NuvioToastController.show(getString(Res.string.downloads_undo_restored_toast, label))
+                UndoTrashResult.PartiallyRestored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_subtitles_not_restored_toast, label))
                 UndoTrashResult.FileGone ->
                     NuvioToastController.show(getString(Res.string.downloads_undo_file_gone_toast))
                 UndoTrashResult.NotReachable ->

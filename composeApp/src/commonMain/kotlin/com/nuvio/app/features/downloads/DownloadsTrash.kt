@@ -12,12 +12,19 @@ internal data class TrashedWatchedFile(
     val fileKey: String? = null,
     val heldInArchive: Boolean = false,
 ) {
-    val canRestore: Boolean
+    val hasPendingVideo: Boolean
         get() = !trashedFileUri.isNullOrBlank()
+
+    val hasPendingSubtitles: Boolean
+        get() = !originalSubtitlesUri.isNullOrBlank() && !trashedSubtitlesUri.isNullOrBlank()
+
+    val canRestore: Boolean
+        get() = hasPendingVideo || hasPendingSubtitles
 }
 
 internal enum class UndoTrashResult {
     Restored,
+    PartiallyRestored,
     FileGone,
     TargetTaken,
     NotReachable,
@@ -58,12 +65,22 @@ internal expect object DownloadsTrash {
     fun moveWatchedAwayWithUndo(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean = false,
+        includeSubtitles: Boolean = true,
         stillWanted: () -> Boolean = { true },
         onMoved: (TrashedWatchedFile?) -> Boolean = { true },
     ): WatchedTrashOutcome
 
     /** Restores a trashed watched download back to its original folder if it is still in the Trash. */
     fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult
+
+    /** Restores a trashed watched download and reports any remaining un-restored companion reference. */
+    fun restoreFromTrashWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome
+
+    /** Moves restored sidecar subtitles back to Trash or archive when a subtitle-only Undo rolls back. */
+    fun trashSubtitlesForUndoRollback(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean = { true },
+    ): WatchedTrashOutcome
 
     /** Whether two addresses name the same file, however they are spelled. */
     fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean

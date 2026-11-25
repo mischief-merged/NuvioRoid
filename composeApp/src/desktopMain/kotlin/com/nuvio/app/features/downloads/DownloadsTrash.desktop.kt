@@ -53,16 +53,26 @@ internal actual object DownloadsTrash {
     actual fun moveWatchedAwayWithUndo(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean,
+        includeSubtitles: Boolean,
         stillWanted: () -> Boolean,
         onMoved: (TrashedWatchedFile?) -> Boolean,
     ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
         localFileUri = localFileUri,
         allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        includeSubtitles = includeSubtitles,
         stillWanted = stillWanted,
         onMoved = onMoved,
     )
 
     actual fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult = trash.restoreFromTrash(trashed)
+
+    actual fun restoreFromTrashWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+        trash.restoreFromTrashWithOutcome(trashed)
+
+    actual fun trashSubtitlesForUndoRollback(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean,
+    ): WatchedTrashOutcome = trash.trashSubtitlesForUndoRollback(trashed, onMoved)
 
     actual fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
         trash.isSameFile(firstFileUri, secondFileUri)
@@ -167,6 +177,7 @@ internal class DesktopDownloadsTrash(
         moveWatchedInternal(
             localFileUri = localFileUri,
             allowHoldingWhenNoSystemTrash = false,
+            includeSubtitles = true,
             requireUndo = false,
             stillWanted = stillWanted,
             onMoved = { true },
@@ -175,11 +186,13 @@ internal class DesktopDownloadsTrash(
     fun moveWatchedAwayWithUndo(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean = false,
+        includeSubtitles: Boolean = true,
         stillWanted: () -> Boolean = { true },
         onMoved: (TrashedWatchedFile?) -> Boolean = { true },
     ): WatchedTrashOutcome = moveWatchedInternal(
         localFileUri = localFileUri,
         allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        includeSubtitles = includeSubtitles,
         requireUndo = true,
         stillWanted = stillWanted,
         onMoved = onMoved,
@@ -188,6 +201,7 @@ internal class DesktopDownloadsTrash(
     private fun moveWatchedInternal(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean,
+        includeSubtitles: Boolean,
         requireUndo: Boolean,
         stillWanted: () -> Boolean,
         onMoved: (TrashedWatchedFile?) -> Boolean,
@@ -211,7 +225,11 @@ internal class DesktopDownloadsTrash(
             ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         if (!file.isRegularFileInside(root)) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         val fileIdentity = DownloadMover.identityOf(file)
-        val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
+        val subtitles = if (includeSubtitles) {
+            file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
+        } else {
+            null
+        }
         val recordedSubtitlesUri = subtitles?.let { requested.resolveSibling("${requested.fileName}$SubtitlesSuffix").toUri().toString() }
 
         if (!trashAvailable) {
@@ -330,7 +348,7 @@ internal class DesktopDownloadsTrash(
                 fileKey = fileIdentity,
                 heldInArchive = false,
             )
-            if (requireUndo && !trashed.canRestore) {
+            if (requireUndo && !trashed.hasPendingVideo) {
                 return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
             }
             if (!runCatching { onMoved(trashed) }.getOrDefault(false)) {
@@ -356,63 +374,257 @@ internal class DesktopDownloadsTrash(
      * Restores a file previously moved via [moveWatchedAwayWithUndo] back to its original download folder.
      * Only touches the Trash path here (when Undo is pressed), never on a background poll.
      */
-    fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult = synchronized(this) {
+    fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult =
+        restoreFromTrashWithOutcome(trashed).result
+
+    fun restoreFromTrashWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome = synchronized(this) {
+        if (!trashed.canRestore) return UndoRestoreOutcome(UndoTrashResult.NotRestored)
         val original = runCatching { Paths.get(URI(trashed.originalFileUri)) }.getOrNull()
-            ?: return UndoTrashResult.NotRestored
+            ?: return UndoRestoreOutcome(UndoTrashResult.NotRestored)
         val (root, target) = locate(original, directChild = true)
-            ?: return UndoTrashResult.NotReachable
-        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
-            return UndoTrashResult.TargetTaken
-        }
-        val trashedUri = trashed.trashedFileUri?.takeIf { it.isNotBlank() }
-            ?: return UndoTrashResult.NotRestored
-        val trashedPath = runCatching { Paths.get(URI(trashedUri)) }.getOrNull()
-            ?: return UndoTrashResult.NotRestored
-        if (!Files.exists(trashedPath, LinkOption.NOFOLLOW_LINKS)) {
-            return UndoTrashResult.FileGone
-        }
-        if (Files.isSymbolicLink(trashedPath) || !Files.isRegularFile(trashedPath, LinkOption.NOFOLLOW_LINKS)) {
-            return UndoTrashResult.FileGone
-        }
-        if (trashed.fileKey != null) {
-            val actualKey = DownloadMover.identityOf(trashedPath)
-            if (actualKey != null && actualKey != trashed.fileKey) {
-                return UndoTrashResult.FileGone
-            }
-        }
-        if (runCatching { Files.move(trashedPath, target) }.isFailure) {
-            return if (!Files.exists(trashedPath, LinkOption.NOFOLLOW_LINKS)) UndoTrashResult.FileGone else UndoTrashResult.NotRestored
-        }
-        if (trashed.heldInArchive) {
-            val holding = root.resolve(HoldingFolderName)
-            if (holding.isDirectoryInside(root)) {
-                val restoredNames = buildSet {
-                    add(trashedPath.fileName.toString())
-                    trashed.trashedSubtitlesUri?.let { subsUri ->
-                        runCatching { Paths.get(URI(subsUri)).fileName?.toString() }.getOrNull()?.let(::add)
+            ?: return UndoRestoreOutcome(UndoTrashResult.NotReachable)
+
+        var videoAlreadyInPlace = false
+        var restoredVideoArchiveName: String? = null
+
+        if (trashed.hasPendingVideo) {
+            val trashedUri = trashed.trashedFileUri?.takeIf { it.isNotBlank() }
+                ?: return UndoRestoreOutcome(UndoTrashResult.NotRestored)
+            val trashedPath = runCatching { Paths.get(URI(trashedUri)) }.getOrNull()
+                ?: return UndoRestoreOutcome(UndoTrashResult.NotRestored)
+
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                val sameRestoredVideo = trashed.fileKey != null &&
+                    target.isRegularFileInside(root) &&
+                    DownloadMover.identityOf(target) == trashed.fileKey &&
+                    !Files.exists(trashedPath, LinkOption.NOFOLLOW_LINKS)
+                if (!sameRestoredVideo) {
+                    return UndoRestoreOutcome(UndoTrashResult.TargetTaken)
+                }
+                videoAlreadyInPlace = true
+                if (trashed.heldInArchive) {
+                    restoredVideoArchiveName = trashedPath.fileName?.toString()
+                }
+            } else {
+                if (!Files.exists(trashedPath, LinkOption.NOFOLLOW_LINKS)) {
+                    return UndoRestoreOutcome(UndoTrashResult.FileGone)
+                }
+                if (Files.isSymbolicLink(trashedPath) || !Files.isRegularFile(trashedPath, LinkOption.NOFOLLOW_LINKS)) {
+                    return UndoRestoreOutcome(UndoTrashResult.FileGone)
+                }
+                if (trashed.fileKey != null) {
+                    val actualKey = DownloadMover.identityOf(trashedPath)
+                    if (actualKey != null && actualKey != trashed.fileKey) {
+                        return UndoRestoreOutcome(UndoTrashResult.FileGone)
                     }
                 }
-                val updated = readIndex(holding).filterNot { (_, name) -> name in restoredNames }
-                runCatching { writeIndex(holding, updated) }
-                val updatedUndo = readUndoNames(holding) - restoredNames
-                runCatching { writeUndoNames(holding, updatedUndo) }
+                if (runCatching { Files.move(trashedPath, target) }.isFailure) {
+                    val failure = if (!Files.exists(trashedPath, LinkOption.NOFOLLOW_LINKS)) {
+                        UndoTrashResult.FileGone
+                    } else {
+                        UndoTrashResult.NotRestored
+                    }
+                    return UndoRestoreOutcome(failure)
+                }
+                if (trashed.heldInArchive) {
+                    restoredVideoArchiveName = trashedPath.fileName?.toString()
+                }
+            }
+        } else {
+            if (!target.isRegularFileInside(root)) {
+                return UndoRestoreOutcome(UndoTrashResult.FileGone)
+            }
+            if (trashed.fileKey != null) {
+                val actualTargetKey = DownloadMover.identityOf(target)
+                if (actualTargetKey != null && actualTargetKey != trashed.fileKey) {
+                    return UndoRestoreOutcome(UndoTrashResult.TargetTaken)
+                }
             }
         }
-        val origSubsUri = trashed.originalSubtitlesUri
-        val trashedSubsUri = trashed.trashedSubtitlesUri
-        if (!origSubsUri.isNullOrBlank() && !trashedSubsUri.isNullOrBlank()) {
-            val origSubs = runCatching { Paths.get(URI(origSubsUri)) }.getOrNull()
-            val trashedSubs = runCatching { Paths.get(URI(trashedSubsUri)) }.getOrNull()
-            val locatedSubs = origSubs?.let { locate(it, directChild = true) }
-            if (locatedSubs != null && locatedSubs.root == root && trashedSubs != null &&
-                !Files.exists(locatedSubs.file, LinkOption.NOFOLLOW_LINKS) &&
-                !Files.isSymbolicLink(trashedSubs) &&
-                Files.isDirectory(trashedSubs, LinkOption.NOFOLLOW_LINKS)
+
+        if (!trashed.hasPendingSubtitles) {
+            if (trashed.heldInArchive && restoredVideoArchiveName != null) {
+                removeArchiveEntries(root, setOf(restoredVideoArchiveName))
+            }
+            return UndoRestoreOutcome(UndoTrashResult.Restored)
+        }
+
+        val origSubsUri = trashed.originalSubtitlesUri.orEmpty()
+        val trashedSubsUri = trashed.trashedSubtitlesUri.orEmpty()
+        val origSubs = runCatching { Paths.get(URI(origSubsUri)) }.getOrNull()
+        val trashedSubs = runCatching { Paths.get(URI(trashedSubsUri)) }.getOrNull()
+        val locatedSubs = origSubs?.let { locate(it, directChild = true) }?.takeIf { it.root == root }
+        val subsArchiveName = if (trashed.heldInArchive) trashedSubs?.fileName?.toString() else null
+
+        if (videoAlreadyInPlace &&
+            locatedSubs != null &&
+            trashedSubs != null &&
+            !Files.exists(trashedSubs, LinkOption.NOFOLLOW_LINKS) &&
+            locatedSubs.file.isDirectoryInside(root)
+        ) {
+            if (trashed.heldInArchive) {
+                removeArchiveEntries(root, setOfNotNull(restoredVideoArchiveName, subsArchiveName))
+            }
+            return UndoRestoreOutcome(UndoTrashResult.Restored)
+        }
+
+        val subsPresentInTrash = trashedSubs != null &&
+            Files.exists(trashedSubs, LinkOption.NOFOLLOW_LINKS) &&
+            !Files.isSymbolicLink(trashedSubs) &&
+            Files.isDirectory(trashedSubs, LinkOption.NOFOLLOW_LINKS)
+        if (!subsPresentInTrash) {
+            if (trashed.heldInArchive) {
+                removeArchiveEntries(root, setOfNotNull(restoredVideoArchiveName, subsArchiveName))
+            }
+            return if (trashed.hasPendingVideo) {
+                UndoRestoreOutcome(result = UndoTrashResult.PartiallyRestored, updatedTrashed = null)
+            } else {
+                UndoRestoreOutcome(result = UndoTrashResult.FileGone)
+            }
+        }
+
+        if (locatedSubs == null) {
+            if (trashed.heldInArchive && restoredVideoArchiveName != null) {
+                removeArchiveEntries(root, setOf(restoredVideoArchiveName))
+            }
+            return if (trashed.hasPendingVideo) {
+                UndoRestoreOutcome(
+                    result = UndoTrashResult.PartiallyRestored,
+                    updatedTrashed = trashed.copy(trashedFileUri = null),
+                )
+            } else {
+                UndoRestoreOutcome(result = UndoTrashResult.NotRestored, updatedTrashed = trashed)
+            }
+        }
+        if (Files.exists(locatedSubs.file, LinkOption.NOFOLLOW_LINKS)) {
+            if (trashed.heldInArchive && restoredVideoArchiveName != null) {
+                removeArchiveEntries(root, setOf(restoredVideoArchiveName))
+            }
+            return if (trashed.hasPendingVideo) {
+                UndoRestoreOutcome(
+                    result = UndoTrashResult.PartiallyRestored,
+                    updatedTrashed = trashed.copy(trashedFileUri = null),
+                )
+            } else {
+                UndoRestoreOutcome(result = UndoTrashResult.TargetTaken, updatedTrashed = trashed)
+            }
+        }
+
+        if (runCatching { Files.move(trashedSubs!!, locatedSubs.file) }.isFailure) {
+            val subsStillInTrash = Files.exists(trashedSubs!!, LinkOption.NOFOLLOW_LINKS)
+            if (trashed.heldInArchive) {
+                val namesToDrop = if (subsStillInTrash) {
+                    setOfNotNull(restoredVideoArchiveName)
+                } else {
+                    setOfNotNull(restoredVideoArchiveName, subsArchiveName)
+                }
+                if (namesToDrop.isNotEmpty()) removeArchiveEntries(root, namesToDrop)
+            }
+            return if (trashed.hasPendingVideo) {
+                UndoRestoreOutcome(
+                    result = UndoTrashResult.PartiallyRestored,
+                    updatedTrashed = if (subsStillInTrash) trashed.copy(trashedFileUri = null) else null,
+                )
+            } else if (!subsStillInTrash) {
+                UndoRestoreOutcome(result = UndoTrashResult.FileGone)
+            } else {
+                UndoRestoreOutcome(result = UndoTrashResult.NotRestored, updatedTrashed = trashed)
+            }
+        }
+
+        if (trashed.heldInArchive) {
+            removeArchiveEntries(root, setOfNotNull(restoredVideoArchiveName, subsArchiveName))
+        }
+        return UndoRestoreOutcome(UndoTrashResult.Restored)
+    }
+
+    fun trashSubtitlesForUndoRollback(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean = { true },
+    ): WatchedTrashOutcome = synchronized(this) {
+        val origSubsUri = trashed.originalSubtitlesUri?.takeIf { it.isNotBlank() }
+            ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        val requestedSubs = runCatching { Paths.get(URI(origSubsUri)) }.getOrNull()
+            ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        val (root, subsDir) = locate(requestedSubs, directChild = true)
+            ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        if (!subsDir.isDirectoryInside(root)) {
+            return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        }
+
+        if (!usesUndoableSystemTrash) {
+            if (!trashed.heldInArchive) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            val heldSubs = runCatching { hold(root, subsDir) }.getOrNull()
+                ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            val holding = root.resolve(HoldingFolderName)
+            val heldName = heldSubs.fileName?.toString()
+            val updated = trashed.copy(
+                trashedSubtitlesUri = heldSubs.toUri().toString(),
+                heldInArchive = true,
+            )
+            if (heldName == null ||
+                runCatching { writeUndoNames(holding, readUndoNames(holding) + heldName) }.isFailure ||
+                !runCatching { onMoved(updated) }.getOrDefault(false)
             ) {
-                runCatching { Files.move(trashedSubs, locatedSubs.file) }
+                runCatching { Files.move(heldSubs, subsDir) }
+                if (heldName != null) removeArchiveEntries(root, setOf(heldName))
+                return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            }
+            return WatchedTrashOutcome(AutoDownloadRemovalResult.Removed, updated)
+        }
+
+        val recovery = runCatching { Files.createTempDirectory(root, ".watched-removal-") }.getOrNull()
+            ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        try {
+            linkForRecovery(subsDir, recovery.resolve(subsDir.fileName))
+        } catch (_: Exception) {
+            runCatching { deleteWithoutFollowingLinks(recovery) }
+            return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        }
+
+        var accepted = false
+        var trashedSubsPath: Path? = null
+        try {
+            val outcome = runCatching { invokeSystemTrash(subsDir, requireResultingPath = true) }.getOrNull()
+            trashedSubsPath = (outcome as? SystemTrashOutcome.Moved)?.resultingPath
+            if (outcome !is SystemTrashOutcome.Moved ||
+                Files.exists(subsDir, LinkOption.NOFOLLOW_LINKS) ||
+                trashedSubsPath == null ||
+                !Files.exists(trashedSubsPath, LinkOption.NOFOLLOW_LINKS)
+            ) {
+                return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            }
+            val updated = trashed.copy(
+                trashedSubtitlesUri = trashedSubsPath.toUri().toString(),
+                heldInArchive = false,
+            )
+            if (!runCatching { onMoved(updated) }.getOrDefault(false)) {
+                return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            }
+            accepted = true
+            return WatchedTrashOutcome(AutoDownloadRemovalResult.Removed, updated)
+        } finally {
+            if (!accepted &&
+                trashedSubsPath != null &&
+                Files.exists(trashedSubsPath, LinkOption.NOFOLLOW_LINKS) &&
+                !Files.exists(subsDir, LinkOption.NOFOLLOW_LINKS)
+            ) {
+                runCatching { Files.move(trashedSubsPath, subsDir) }
+            }
+            if (accepted || runCatching { restoreRecovery(recovery.resolve(subsDir.fileName), subsDir) }.isSuccess) {
+                runCatching { deleteWithoutFollowingLinks(recovery) }
             }
         }
-        return UndoTrashResult.Restored
+    }
+
+    private fun removeArchiveEntries(root: Path, names: Set<String>) {
+        if (names.isEmpty()) return
+        val holding = root.resolve(HoldingFolderName)
+        if (!holding.isDirectoryInside(root)) return
+        val updated = readIndex(holding).filterNot { (_, name) -> name in names }
+        runCatching { writeIndex(holding, updated) }
+        val updatedUndo = readUndoNames(holding) - names
+        runCatching { writeUndoNames(holding, updatedUndo) }
     }
 
     private fun restoreRecovery(saved: Path, source: Path) {

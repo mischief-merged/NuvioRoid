@@ -103,16 +103,35 @@ class MakeRoomAutomaticallyTest {
             localFileUri: String,
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
-        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            stillWanted = stillWanted,
+        )
 
         override fun trashWatchedFileWithUndo(
             localFileUri: String,
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
             onMoved: (TrashedWatchedFile?) -> Boolean,
+        ): WatchedTrashOutcome = trashWatchedFileWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            includeSubtitles = true,
+            stillWanted = stillWanted,
+            onMoved = onMoved,
+        )
+
+        override fun trashWatchedFileWithUndo(
+            localFileUri: String,
+            allowHoldingWhenNoSystemTrash: Boolean,
+            includeSubtitles: Boolean,
+            stillWanted: () -> Boolean,
+            onMoved: (TrashedWatchedFile?) -> Boolean,
         ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
             localFileUri = localFileUri,
             allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            includeSubtitles = includeSubtitles,
             stillWanted = stillWanted,
             onMoved = { trashed ->
                 onAfterTrashMove?.invoke()
@@ -122,6 +141,14 @@ class MakeRoomAutomaticallyTest {
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
             trash.restoreFromTrash(trashed)
+
+        override fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+            trash.restoreFromTrashWithOutcome(trashed)
+
+        override fun trashRestoredSubtitlesWithUndo(
+            trashed: TrashedWatchedFile,
+            onMoved: (TrashedWatchedFile) -> Boolean,
+        ): WatchedTrashOutcome = trash.trashSubtitlesForUndoRollback(trashed, onMoved)
 
         override fun start(
             request: DownloadPlatformRequest,

@@ -3586,6 +3586,7 @@
     <string name="downloads_undo">Undo</string>
     <string name="downloads_undo_deleted_description">Undo moving %1$s to the Trash</string>
     <string name="downloads_undo_restored_toast">Restored %1$s from the Trash</string>
+    <string name="downloads_undo_subtitles_not_restored_toast">Restored %1$s, but could not restore its subtitles</string>
     <string name="downloads_undo_file_gone_toast">No longer in the Trash</string>
     <string name="downloads_undo_failed_toast">Could not restore from the Trash</string>
     <string name="downloads_recent_cleaned_up_today">cleaned up today</string>

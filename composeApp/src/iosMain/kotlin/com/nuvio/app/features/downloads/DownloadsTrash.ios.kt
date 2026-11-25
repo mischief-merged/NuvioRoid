@@ -13,11 +13,20 @@ internal actual object DownloadsTrash {
     actual fun moveWatchedAwayWithUndo(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean,
+        includeSubtitles: Boolean,
         stillWanted: () -> Boolean,
         onMoved: (TrashedWatchedFile?) -> Boolean,
     ): WatchedTrashOutcome = WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
 
     actual fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult = UndoTrashResult.NotRestored
+
+    actual fun restoreFromTrashWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+        UndoRestoreOutcome(UndoTrashResult.NotRestored)
+
+    actual fun trashSubtitlesForUndoRollback(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean,
+    ): WatchedTrashOutcome = WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
 
     actual fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean = firstFileUri == secondFileUri
 

@@ -66,6 +66,7 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -130,16 +131,35 @@ class WatchedCleanupModelAndUndoTest {
             localFileUri: String,
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
-        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            stillWanted = stillWanted,
+        )
 
         override fun trashWatchedFileWithUndo(
             localFileUri: String,
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
             onMoved: (TrashedWatchedFile?) -> Boolean,
+        ): WatchedTrashOutcome = trashWatchedFileWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            includeSubtitles = true,
+            stillWanted = stillWanted,
+            onMoved = onMoved,
+        )
+
+        override fun trashWatchedFileWithUndo(
+            localFileUri: String,
+            allowHoldingWhenNoSystemTrash: Boolean,
+            includeSubtitles: Boolean,
+            stillWanted: () -> Boolean,
+            onMoved: (TrashedWatchedFile?) -> Boolean,
         ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
             localFileUri = localFileUri,
             allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            includeSubtitles = includeSubtitles,
             stillWanted = stillWanted,
             onMoved = { trashed ->
                 onAfterTrashMove?.invoke()
@@ -148,9 +168,24 @@ class WatchedCleanupModelAndUndoTest {
         )
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
-            trash.restoreFromTrash(trashed).also { result ->
-                if (result == UndoTrashResult.Restored) onAfterRestoreMove?.invoke()
+            restoreTrashedFileWithOutcome(trashed).result
+
+        override fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
+            trash.restoreFromTrashWithOutcome(trashed).also { outcome ->
+                if (outcome.result == UndoTrashResult.Restored ||
+                    outcome.result == UndoTrashResult.PartiallyRestored
+                ) {
+                    onAfterRestoreMove?.invoke()
+                }
             }
+
+        override fun trashRestoredSubtitlesWithUndo(
+            trashed: TrashedWatchedFile,
+            onMoved: (TrashedWatchedFile) -> Boolean,
+        ): WatchedTrashOutcome = trash.trashSubtitlesForUndoRollback(trashed) { updated ->
+            onAfterTrashMove?.invoke()
+            onMoved(updated)
+        }
 
         override fun start(
             request: DownloadPlatformRequest,
@@ -1054,6 +1089,334 @@ class WatchedCleanupModelAndUndoTest {
         } finally {
             ProfileRepository.setActiveProfileIdForTest(originalProfile)
             DownloadsRepository.onProfileChanged()
+            DesktopStorage.setRootDirForTest(null, null)
+        }
+    }
+
+    @Test
+    fun failed_undo_preserves_recovery_when_rollback_undo_save_fails_and_succeeds_on_retry() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val otherProfile = originalProfile + 31
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+
+        try {
+            // 1. Catalog save fails AND Undo-store save fails during rollback: recovery must not be lost as FileGone.
+            val ep1File = downloadsDir.resolve("ep-rb-1.mkv").also { it.writeText("rb-1-video") }
+            val ep1Subs = downloadsDir.resolve("ep-rb-1.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("rb-1-subs") }
+            val ep1 = movie("m-rb-1", "Rollback One", 700L, uri = ep1File.toUri().toString())
+                .copy(fileName = "ep-rb-1.mkv")
+            backend.payload = DownloadsCodec.encode(listOf(ep1), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                1,
+                executeWatchedCleanup(
+                    profileId = originalProfile,
+                    downloadIds = listOf("m-rb-1"),
+                    store = store,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { now },
+                ),
+            )
+            assertFalse(ep1File.exists())
+
+            backend.failSave = true
+            payloads.failSave = true
+            val firstEntry = store.recentlyDeleted.value.single { it.downloadId == "m-rb-1" }
+            val failedWriteUndo = runCatching { undoDeletedWatchedDownload(originalProfile, firstEntry, store) }
+                .getOrDefault(UndoTrashResult.NotRestored)
+            assertEquals(UndoTrashResult.NotRestored, failedWriteUndo)
+
+            // Once storage is writable again, retrying Undo must restore both video and subtitles (never FileGone or TargetTaken).
+            backend.failSave = false
+            payloads.failSave = false
+            val afterWriteFailure = store.recentlyDeleted.value.single { it.downloadId == "m-rb-1" }
+            assertTrue(afterWriteFailure.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, afterWriteFailure, store))
+            assertEquals("rb-1-video", ep1File.readText())
+            assertEquals("rb-1-subs", ep1Subs.resolve("en.srt").readText())
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-rb-1" && it.status == DownloadStatus.Completed })
+            assertTrue("m-rb-1" in store.keptDownloadIds.value)
+            assertTrue(store.recentlyDeleted.value.none { it.downloadId == "m-rb-1" })
+
+            // 2. Mid-restore profile switch + Undo-store durable sync failure during rollback also retains recovery.
+            val ep2File = downloadsDir.resolve("ep-rb-2.mkv").also { it.writeText("rb-2-video") }
+            val ep2Subs = downloadsDir.resolve("ep-rb-2.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("rb-2-subs") }
+            val ep2 = movie("m-rb-2", "Rollback Two", 700L, uri = ep2File.toUri().toString())
+                .copy(fileName = "ep-rb-2.mkv")
+            backend.payload = DownloadsCodec.encode(listOf(ep2), null, 2L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                1,
+                executeWatchedCleanup(
+                    profileId = originalProfile,
+                    downloadIds = listOf("m-rb-2"),
+                    store = store,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { now },
+                ),
+            )
+            val secondEntry = store.recentlyDeleted.value.single { it.downloadId == "m-rb-2" }
+            backend.onAfterRestoreMove = {
+                backend.onAfterRestoreMove = null
+                payloads.failSync = true
+                ProfileRepository.setActiveProfileIdForTest(otherProfile)
+                DownloadsRepository.onProfileChanged()
+            }
+            assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(originalProfile, secondEntry, store))
+
+            payloads.failSync = false
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+            val afterSyncAndSwitchFailure = store.recentlyDeleted.value.single { it.downloadId == "m-rb-2" }
+            assertTrue(afterSyncAndSwitchFailure.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, afterSyncAndSwitchFailure, store))
+            assertEquals("rb-2-video", ep2File.readText())
+            assertEquals("rb-2-subs", ep2Subs.resolve("en.srt").readText())
+
+            // 3. Real PlatformAutoDownloadPayloads (DesktopStorage + real filesystem IOException blocking .tmp) during rollback.
+            val realStoreDir = root.resolve("rb-real-store").createDirectories()
+            val realCacheDir = root.resolve("rb-real-cache").createDirectories()
+            DesktopStorage.setRootDirForTest(realStoreDir, realCacheDir)
+            try {
+                val diskStore = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { now }) {
+                    ProfileRepository.activeProfileId
+                }
+                val ep3File = downloadsDir.resolve("ep-rb-3.mkv").also { it.writeText("rb-3-real-video") }
+                val ep3Subs = downloadsDir.resolve("ep-rb-3.mkv.subtitles").createDirectories()
+                    .also { it.resolve("en.srt").writeText("rb-3-real-subs") }
+                val ep3 = movie("m-rb-3", "Rollback Three", 700L, uri = ep3File.toUri().toString())
+                    .copy(fileName = "ep-rb-3.mkv")
+                backend.payload = DownloadsCodec.encode(listOf(ep3), null, 3L)
+                DownloadsRepository.clearLocalState()
+                DownloadsRepository.ensureLoaded()
+
+                assertEquals(
+                    1,
+                    executeWatchedCleanup(
+                        profileId = originalProfile,
+                        downloadIds = listOf("m-rb-3"),
+                        store = diskStore,
+                        isWatched = { true },
+                        isPlaying = { false },
+                        nowEpochMs = { now },
+                    ),
+                )
+                val diskEntry = diskStore.recentlyDeleted.value.single { it.downloadId == "m-rb-3" }
+                val blockingTmpDir = realStoreDir.resolve("nuvio_auto_downloads.properties.tmp")
+                backend.failSave = true
+                backend.onAfterRestoreMove = {
+                    backend.onAfterRestoreMove = null
+                    blockingTmpDir.createDirectories()
+                }
+                assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(originalProfile, diskEntry, diskStore))
+
+                Files.deleteIfExists(blockingTmpDir)
+                backend.failSave = false
+                val reopenedStore = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { now }) {
+                    ProfileRepository.activeProfileId
+                }
+                reopenedStore.currentRules()
+                val reopenedEntry = reopenedStore.recentlyDeleted.value.single { it.downloadId == "m-rb-3" }
+                assertTrue(reopenedEntry.canUndo)
+                assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, reopenedEntry, reopenedStore))
+                assertEquals("rb-3-real-video", ep3File.readText())
+                assertEquals("rb-3-real-subs", ep3Subs.resolve("en.srt").readText())
+                assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-rb-3" && it.status == DownloadStatus.Completed })
+            } finally {
+                DesktopStorage.setRootDirForTest(null, null)
+            }
+        } finally {
+            backend.onAfterRestoreMove = null
+            backend.failSave = false
+            backend.failDurableSync = false
+            payloads.failSave = false
+            payloads.failSync = false
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+        }
+    }
+
+    @Test
+    fun undo_keeps_recovery_entry_when_subtitle_destination_collides_or_subtitle_move_fails() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+
+        // 1. Subtitle destination collision in system Trash mode: video restores, collision stays untouched, Undo entry kept for subtitles.
+        val ep1File = downloadsDir.resolve("ep-sub-1.mkv").also { it.writeText("sub-1-video") }
+        val ep1Subs = downloadsDir.resolve("ep-sub-1.mkv.subtitles").createDirectories()
+            .also { it.resolve("en.srt").writeText("sub-1-original") }
+        val ep1 = movie("m-sub-1", "Subtitle Collision", 600L, uri = ep1File.toUri().toString())
+            .copy(fileName = "ep-sub-1.mkv")
+        backend.payload = DownloadsCodec.encode(listOf(ep1), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(
+            1,
+            executeWatchedCleanup(
+                profileId = profile,
+                downloadIds = listOf("m-sub-1"),
+                store = store,
+                isWatched = { true },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            ),
+        )
+        assertFalse(ep1File.exists())
+        assertFalse(ep1Subs.exists())
+
+        // Occupy the subtitle destination before pressing Undo.
+        ep1Subs.createDirectories().resolve("other.srt").writeText("colliding-subtitle")
+        val initialEntry1 = store.recentlyDeleted.value.single { it.downloadId == "m-sub-1" }
+
+        // If catalog persistence also fails during a partial Undo, video rolls back without trashing colliding subtitles.
+        backend.failSave = true
+        assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(profile, initialEntry1, store))
+        assertFalse(ep1File.exists())
+        assertEquals("colliding-subtitle", ep1Subs.resolve("other.srt").readText())
+        backend.failSave = false
+
+        val afterRollbackEntry1 = store.recentlyDeleted.value.single { it.downloadId == "m-sub-1" }
+        val collisionUndo = undoDeletedWatchedDownload(profile, afterRollbackEntry1, store)
+        assertNotEquals(UndoTrashResult.Restored, collisionUndo, "Undo must not report full Restored when subtitles failed to restore")
+        assertEquals(UndoTrashResult.PartiallyRestored, collisionUndo)
+        assertEquals("sub-1-video", ep1File.readText(), "video should be restored")
+        assertEquals("colliding-subtitle", ep1Subs.resolve("other.srt").readText(), "occupied subtitle destination must not be overwritten")
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-sub-1" && it.status == DownloadStatus.Completed })
+        assertTrue("m-sub-1" in store.keptDownloadIds.value)
+        val pendingSubsEntry1 = store.recentlyDeleted.value.single { it.downloadId == "m-sub-1" }
+        assertTrue(pendingSubsEntry1.canUndo, "Undo entry must be retained for un-restored subtitles")
+        assertNull(pendingSubsEntry1.trashed?.trashedFileUri)
+        assertNotNull(pendingSubsEntry1.trashed?.trashedSubtitlesUri)
+
+        // Retrying while destination is still occupied returns TargetTaken and keeps recovery.
+        assertEquals(UndoTrashResult.TargetTaken, undoDeletedWatchedDownload(profile, pendingSubsEntry1, store))
+        assertTrue(store.recentlyDeleted.value.single { it.downloadId == "m-sub-1" }.canUndo)
+
+        // Removing the colliding directory allows Undo to restore the original subtitles and clear the Undo entry.
+        ep1Subs.toFile().deleteRecursively()
+        val afterClearCollision = store.recentlyDeleted.value.single { it.downloadId == "m-sub-1" }
+        assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, afterClearCollision, store))
+        assertEquals("sub-1-original", ep1Subs.resolve("en.srt").readText())
+        assertTrue(store.recentlyDeleted.value.none { it.downloadId == "m-sub-1" })
+
+        // 2. Real OS filesystem move failure on subtitle directory (read-only Trash parent directory).
+        val videoTrashDir = trashDir.resolve("videos").createDirectories()
+        val lockedSubsTrashDir = trashDir.resolve("locked-subs").createDirectories()
+        var moveCount = 0
+        trash = DesktopDownloadsTrash(
+            downloadsDir = { downloadsDir },
+            systemTrash = null,
+            nowEpochMs = { now },
+            systemTrashWithResult = { source ->
+                moveCount++
+                val parent = if (source.fileName.toString().endsWith(".subtitles")) lockedSubsTrashDir else videoTrashDir
+                val dest = parent.resolve("$moveCount-${source.fileName}")
+                Files.move(source, dest)
+                SystemTrashOutcome.Moved(dest)
+            },
+        )
+        try {
+            val ep2File = downloadsDir.resolve("ep-sub-2.mkv").also { it.writeText("sub-2-video") }
+            val ep2Subs = downloadsDir.resolve("ep-sub-2.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("sub-2-original") }
+            val ep2 = movie("m-sub-2", "Subtitle Move Failure", 600L, uri = ep2File.toUri().toString())
+                .copy(fileName = "ep-sub-2.mkv")
+            backend.payload = DownloadsCodec.encode(listOf(ep2), null, 2L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                1,
+                executeWatchedCleanup(
+                    profileId = profile,
+                    downloadIds = listOf("m-sub-2"),
+                    store = store,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { now },
+                ),
+            )
+            assertTrue(lockedSubsTrashDir.toFile().setWritable(false), "must lock subtitle Trash parent directory")
+
+            val initialEntry2 = store.recentlyDeleted.value.single { it.downloadId == "m-sub-2" }
+            val moveFailUndo = undoDeletedWatchedDownload(profile, initialEntry2, store)
+            assertNotEquals(UndoTrashResult.Restored, moveFailUndo, "Undo must not report full Restored when subtitle move fails")
+            assertEquals(UndoTrashResult.PartiallyRestored, moveFailUndo)
+            assertEquals("sub-2-video", ep2File.readText())
+            assertFalse(ep2Subs.exists())
+            val pendingSubsEntry2 = store.recentlyDeleted.value.single { it.downloadId == "m-sub-2" }
+            assertTrue(pendingSubsEntry2.canUndo, "Undo entry must be retained when subtitle move throws IOException")
+
+            assertTrue(lockedSubsTrashDir.toFile().setWritable(true))
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, pendingSubsEntry2, store))
+            assertEquals("sub-2-original", ep2Subs.resolve("en.srt").readText())
+            assertTrue(store.recentlyDeleted.value.none { it.downloadId == "m-sub-2" })
+        } finally {
+            lockedSubsTrashDir.toFile().setWritable(true)
+        }
+
+        // 3. Archive mode (.removed) subtitle collision keeps archived subtitles protected across the 7-day sweep until restored.
+        val archiveStoreDir = root.resolve("sub-archive-store").createDirectories()
+        val archiveCacheDir = root.resolve("sub-archive-cache").createDirectories()
+        DesktopStorage.setRootDirForTest(archiveStoreDir, archiveCacheDir)
+        try {
+            var archiveClock = now
+            trash = DesktopDownloadsTrash(
+                downloadsDir = { downloadsDir },
+                systemTrash = { file -> file.renameTo(trashDir.resolve("swept-sub-${file.name}").toFile()) },
+                nowEpochMs = { archiveClock },
+                systemTrashWithResult = null,
+                isUndoStillPending = AutoDownloadStorage::isArchivePathReferencedByUndo,
+            )
+            val diskStore = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { archiveClock }) { profile }
+            val ep3File = downloadsDir.resolve("ep-sub-3.mkv").also { it.writeText("sub-3-video") }
+            val ep3Subs = downloadsDir.resolve("ep-sub-3.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("sub-3-archive") }
+            val ep3 = movie("m-sub-3", "Archive Subtitle Collision", 600L, uri = ep3File.toUri().toString())
+                .copy(fileName = "ep-sub-3.mkv")
+            backend.payload = DownloadsCodec.encode(listOf(ep3), null, 3L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                1,
+                executeWatchedCleanup(
+                    profileId = profile,
+                    downloadIds = listOf("m-sub-3"),
+                    store = diskStore,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { archiveClock },
+                ),
+            )
+            ep3Subs.createDirectories().resolve("other.srt").writeText("archive-colliding-sub")
+            val archiveEntry = diskStore.recentlyDeleted.value.single { it.downloadId == "m-sub-3" }
+            assertEquals(UndoTrashResult.PartiallyRestored, undoDeletedWatchedDownload(profile, archiveEntry, diskStore))
+            assertEquals("sub-3-video", ep3File.readText())
+            assertEquals("archive-colliding-sub", ep3Subs.resolve("other.srt").readText())
+
+            // Advance 8 days (> HeldFileDays = 7): pending archived subtitles must NOT be swept to Trash.
+            archiveClock = now + 8 * dayMs
+            assertEquals(0, trash.purgeHeldFiles(archiveClock))
+
+            ep3Subs.toFile().deleteRecursively()
+            val pendingArchiveSubs = diskStore.recentlyDeleted.value.single { it.downloadId == "m-sub-3" }
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, pendingArchiveSubs, diskStore))
+            assertEquals("sub-3-archive", ep3Subs.resolve("en.srt").readText())
+            assertTrue(diskStore.recentlyDeleted.value.none { it.downloadId == "m-sub-3" })
+        } finally {
             DesktopStorage.setRootDirForTest(null, null)
         }
     }

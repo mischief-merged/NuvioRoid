@@ -167,22 +167,42 @@ internal fun undoDeletedWatchedDownload(
     profileId: Int,
     entry: AutoDownloadDeleted,
     store: AutoDownloadStore,
-    restoreDownload: (profileId: Int, item: DownloadItem, trashed: TrashedWatchedFile) -> UndoRestoreOutcome =
-        DownloadsRepository::restoreTrashedDownloadWithOutcome,
+    restoreDownload: (
+        profileId: Int,
+        item: DownloadItem,
+        trashed: TrashedWatchedFile,
+        onRollbackMoved: (TrashedWatchedFile) -> Boolean,
+    ) -> UndoRestoreOutcome = DownloadsRepository::restoreTrashedDownloadWithOutcome,
 ): UndoTrashResult {
     val item = entry.restorableItem ?: return UndoTrashResult.NotRestored
     val trashed = entry.trashed?.takeIf { it.canRestore } ?: return UndoTrashResult.NotRestored
-    val outcome = restoreDownload(profileId, item, trashed)
+    var rollbackSaved = false
+    val commitRollback: (TrashedWatchedFile) -> Boolean = { replacement ->
+        val saved = store.updateDeletedUndo(profileId, entry, replacement)
+        if (saved) rollbackSaved = true
+        saved
+    }
+    val outcome = restoreDownload(profileId, item, trashed, commitRollback)
     when (outcome.result) {
         UndoTrashResult.Restored -> {
-            store.keep(profileId, item.id)
-            store.removeDeletedEntry(profileId, entry)
+            runCatching { store.keep(profileId, item.id) }
+            runCatching { store.removeDeletedEntry(profileId, entry) }
+        }
+        UndoTrashResult.PartiallyRestored -> {
+            runCatching { store.keep(profileId, item.id) }
+            val remaining = outcome.updatedTrashed
+            if (remaining != null && remaining.canRestore) {
+                store.updateDeletedUndo(profileId, entry, remaining)
+            } else {
+                runCatching { store.clearDeletedUndo(profileId, entry) }
+            }
         }
         UndoTrashResult.FileGone -> {
-            store.clearDeletedUndo(profileId, entry)
+            runCatching { store.clearDeletedUndo(profileId, entry) }
         }
         UndoTrashResult.TargetTaken, UndoTrashResult.NotReachable, UndoTrashResult.NotRestored -> {
-            outcome.updatedTrashed?.let { updated ->
+            val updated = outcome.updatedTrashed
+            if (!rollbackSaved && updated != null && updated != trashed) {
                 store.updateDeletedUndo(profileId, entry, updated)
             }
         }
