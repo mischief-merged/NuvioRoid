@@ -332,6 +332,24 @@ internal class DesktopDownloadFolders(
         return trashOwnedPartial(owner, item, item.activePartialFileName, item.partialFileKey)
     }
 
+    override fun keptPartialBytes(item: DownloadItem, kept: KeptPartialFile): Long {
+        if (kept.bytes > 0L) return kept.bytes
+        val owner = locations.ownerOf(
+            kept.locationId ?: item.locationId,
+            item.localFileUri.takeIf { kept.locationId == null },
+        ) ?: return 0L
+        if (locations.availability(owner) != FolderAvailability.Available) return 0L
+        val name = kept.fileName
+        if (name.isBlank() || name.contains('/') || name.contains('\\') || name == "." || name == "..") return 0L
+        val path = owner.path.resolve(name)
+        if (Files.isSymbolicLink(path) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return 0L
+        if (kept.partialFileKey.isNotBlank()) {
+            val actualKey = DownloadMover.identityOf(path)
+            if (actualKey != null && actualKey != kept.partialFileKey) return 0L
+        }
+        return runCatching { Files.size(path) }.getOrDefault(0L).coerceAtLeast(0L)
+    }
+
     override fun removePartialOf(item: DownloadItem): Boolean {
         val owner = locations.ownerOf(item.locationId, item.localFileUri) ?: return false
         if (locations.availability(owner) != FolderAvailability.Available) return false

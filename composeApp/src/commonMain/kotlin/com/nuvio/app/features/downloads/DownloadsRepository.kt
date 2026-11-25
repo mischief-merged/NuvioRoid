@@ -1490,8 +1490,18 @@ object DownloadsRepository {
                 val normalized = decoded?.items.orEmpty()
                     .map { item ->
                         val statusNormalized = backend.restoreItem(item)
+                        val partialsNormalized = if (statusNormalized.supersededPartials.any { it.bytes <= 0L }) {
+                            statusNormalized.copy(
+                                supersededPartials = statusNormalized.supersededPartials.map { kept ->
+                                    if (kept.bytes > 0L) kept
+                                    else kept.copy(bytes = backend.keptPartialBytes(statusNormalized, kept))
+                                },
+                            )
+                        } else {
+                            statusNormalized
+                        }
 
-                        val localUriNormalized = normalizeCompletedLocalFileUri(statusNormalized).withoutLostFile()
+                        val localUriNormalized = normalizeCompletedLocalFileUri(partialsNormalized).withoutLostFile()
                         if (localUriNormalized != item) {
                             shouldPersistNormalized = true
                         }
@@ -1743,6 +1753,7 @@ object DownloadsRepository {
      */
     private fun applyConnectionHold(): Unit = synchronized(stateLock) {
         if (!hasLoaded) return
+        var pausedAny = false
         _uiState.value.items
             .filter { it.status == DownloadStatus.Downloading && it.connectionHoldReason() != null }
             // A transfer whose file is complete and being checked is left to finish: stopping it then would lose the file.
@@ -1750,10 +1761,12 @@ object DownloadsRepository {
             .forEach { item ->
                 removeTransfer(item.id)?.cancel()
                 mutateItem(item.id) { it.waitingForConnection() }
+                pausedAny = true
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByConnection && it.connectionHoldReason() == null }
             .forEach { resumeDownloadLocked(it.id) }
+        if (pausedAny) resumeWaitingForStorageLimitLocked()
     }
 
     /** Why this download waits for the connection now: some reasons hold automatic downloads only. */
@@ -1779,16 +1792,19 @@ object DownloadsRepository {
      */
     private fun applyFreeSpaceHold(): Unit = synchronized(stateLock) {
         if (!hasLoaded) return
+        var pausedAny = false
         _uiState.value.items
             .filter { it.status == DownloadStatus.Downloading && it.isBelowFreeSpaceFloor() }
             .filter { activeTransfers[it.id]?.finishing != true }
             .forEach { item ->
                 removeTransfer(item.id)?.cancel()
                 mutateItem(item.id) { it.waitingForFreeSpace() }
+                pausedAny = true
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByFreeSpace && it.canResumeFromFreeSpaceFloor() }
             .forEach { resumeDownloadLocked(it.id, keepWaitingSize = true) }
+        if (pausedAny) resumeWaitingForStorageLimitLocked()
     }
 
     private fun DownloadItem.resolvedLocationId(): String = backend.locationIdOf(this)
@@ -1818,6 +1834,7 @@ object DownloadsRepository {
                 status = DownloadStatus.Paused, pausedByFolder = true, errorMessage = null,
                 updatedAtEpochMs = DownloadsClock.nowEpochMs(),
             ) }
+            resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
             return
         }
         // On a limited connection a download waits instead of starting, and goes on when that ends.
@@ -1825,11 +1842,13 @@ object DownloadsRepository {
         if (!item.awaitingCheck && item.connectionHoldReason() != null) {
             rateTracker.clear(item.id)
             mutateItem(item.id) { it.waitingForConnection() }
+            resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
             return
         }
         if (!item.awaitingCheck && item.isBelowFreeSpaceFloor()) {
             rateTracker.clear(item.id)
             mutateItem(item.id) { it.waitingForFreeSpace() }
+            resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
             return
         }
         if (!item.awaitingCheck && backend.isConnected(item)) {
@@ -1964,6 +1983,7 @@ object DownloadsRepository {
                     }
                 },
                 onSwitchedToNewPartial = { newPartialFileName, kept ->
+                    val measuredKeptBytes = kept?.let { backend.keptPartialBytes(item, it) } ?: 0L
                     ifCurrent(item.id, transfer) {
                         val now = DownloadsClock.nowEpochMs()
                         rateTracker.recordStart(item.id, 0L, now)
@@ -1971,8 +1991,14 @@ object DownloadsRepository {
                             if (current.status != DownloadStatus.Downloading) {
                                 current
                             } else {
-                                val nextSuperseded = if (kept != null && current.supersededPartials.none { it.partialFileKey == kept.partialFileKey }) {
-                                    current.supersededPartials + kept
+                                val enrichedKept = kept?.let {
+                                    it.copy(bytes = maxOf(it.bytes, measuredKeptBytes, current.downloadedBytes))
+                                }
+                                val nextSuperseded = if (
+                                    enrichedKept != null &&
+                                    current.supersededPartials.none { it.partialFileKey == enrichedKept.partialFileKey }
+                                ) {
+                                    current.supersededPartials + enrichedKept
                                 } else {
                                     current.supersededPartials
                                 }
@@ -2105,6 +2131,7 @@ object DownloadsRepository {
                             // waits for it, and goes on by itself.
                             current.copy(status = DownloadStatus.Paused, errorMessage = null, pausedByFolder = backend.heldByFolder(current))
                         }
+                        resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
                     }
                 } finally {
                     finishing.end(transfer)
@@ -2416,6 +2443,7 @@ object DownloadsRepository {
                     )
                 }
             }
+            resumeWaitingForStorageLimitLocked()
         }
     }
 
@@ -2723,36 +2751,60 @@ object DownloadsRepository {
 
     internal fun autoDownloadMinFreeBytes(): Long = autoDownloadLimits.minFreeBytes
 
+    private fun DownloadItem.connectedSupersededBytes(): Long =
+        if (supersededPartials.isEmpty()) {
+            0L
+        } else {
+            supersededPartials.sumOf { kept ->
+                val connected = if (kept.locationId != null) backend.locationConnected(kept.locationId) else backend.isConnected(this)
+                if (connected) kept.bytes.coerceAtLeast(0L) else 0L
+            }
+        }
+
     /**
-     * The bytes automatic downloads take: what each has recorded as downloaded, and for a running
-     * transfer the full size once the server announced it.
+     * The bytes automatic downloads take: what each has recorded as downloaded, preserved partials,
+     * and for a running transfer the full size once the server announced it.
      */
     internal fun autoDownloadBytes(exceptDownloadId: String? = null): Long =
         _uiState.value.items
             // Locations that are away are not counted; nothing is ever deleted to make room because of them.
-            .filter { (it.autoDownloadRuleKey != null || it.tripFill) && it.id != exceptDownloadId && backend.isConnected(it) }
+            .filter { it.autoDownloadRuleKey != null || it.tripFill }
             .sumOf { item ->
-                if (item.status == DownloadStatus.Downloading || (item.tripFill && item.status == DownloadStatus.Paused)) {
-                    maxOf(item.totalBytes ?: (item.expectedSizeBytes.takeIf { item.tripFill }) ?: 0L, item.downloadedBytes)
+                val retained = item.connectedSupersededBytes()
+                if (item.id == exceptDownloadId || !backend.isConnected(item)) {
+                    retained
                 } else {
-                    item.downloadedBytes
+                    val active = if (
+                        item.status == DownloadStatus.Downloading ||
+                            (item.tripFill && item.status == DownloadStatus.Paused && item.pausedByConnection)
+                    ) {
+                        maxOf(item.totalBytes ?: (item.expectedSizeBytes.takeIf { item.tripFill }) ?: 0L, item.downloadedBytes)
+                    } else {
+                        item.downloadedBytes
+                    }
+                    active + retained
                 }
             }
 
     /**
      * The bytes all downloads together take (hand-started and automatic): completed files on disk,
-     * partial bytes of paused or failed items, and reserved sizes of running transfers.
+     * partial and preserved-partial bytes of paused or failed items, and reserved sizes of running transfers.
      */
     internal fun allDownloadBytes(exceptDownloadId: String? = null): Long =
         _uiState.value.items
             // Locations that are away are not counted; nothing waits or is cleaned up because of them.
-            .filter { it.id != exceptDownloadId && backend.isConnected(it) }
             .sumOf { item ->
-                when {
-                    item.status == DownloadStatus.Completed -> maxOf(item.downloadedBytes, item.totalBytes ?: 0L)
-                    item.status == DownloadStatus.Downloading || (item.tripFill && item.status == DownloadStatus.Paused) ->
-                        maxOf(item.totalBytes ?: item.waitingSizeBytes ?: item.expectedSizeBytes ?: 0L, item.downloadedBytes)
-                    else -> item.downloadedBytes
+                val retained = item.connectedSupersededBytes()
+                if (item.id == exceptDownloadId || !backend.isConnected(item)) {
+                    retained
+                } else {
+                    val active = when (item.status) {
+                        DownloadStatus.Completed -> maxOf(item.downloadedBytes, item.totalBytes ?: 0L)
+                        DownloadStatus.Downloading ->
+                            maxOf(item.totalBytes ?: item.waitingSizeBytes ?: item.expectedSizeBytes ?: 0L, item.downloadedBytes)
+                        DownloadStatus.Paused, DownloadStatus.Failed -> item.downloadedBytes
+                    }
+                    active + retained
                 }
             }
 
@@ -3701,6 +3753,9 @@ internal interface DownloadsBackend {
         if (item.supersededPartials.isEmpty()) removePartialOf(item)
         else removePartialOf(item.copy(supersededPartials = emptyList()))
 
+    /** Measured byte size of a preserved partial file on disk when connected. */
+    fun keptPartialBytes(item: DownloadItem, kept: KeptPartialFile): Long = kept.bytes.coerceAtLeast(0L)
+
     /** Moves superseded partials of an accepted download to the Trash and returns their keys. */
     fun retireSupersededPartials(item: DownloadItem): Set<String> = emptySet()
 
@@ -3891,6 +3946,9 @@ private object PlatformDownloadsBackend : DownloadsBackend {
     override fun removeActivePartialOf(item: DownloadItem): Boolean =
         DownloadFolders.controller.removeActivePartialOf(item)
             ?: DownloadsPlatformDownloader.retirePartial(item.copy(supersededPartials = emptyList()))
+
+    override fun keptPartialBytes(item: DownloadItem, kept: KeptPartialFile): Long =
+        DownloadFolders.controller.keptPartialBytes(item, kept)
 
     override fun retireSupersededPartials(item: DownloadItem): Set<String> =
         DownloadsPlatformDownloader.retireSupersededPartials(item)

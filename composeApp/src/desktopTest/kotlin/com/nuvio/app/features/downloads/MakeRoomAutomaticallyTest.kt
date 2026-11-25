@@ -552,6 +552,44 @@ class MakeRoomAutomaticallyTest {
         assertEquals(0, runner.runOnce(profile))
         assertTrue(filmFile.exists())
     }
+
+    @Test
+    fun paused_trip_fill_download_counts_only_partial_bytes_and_does_not_trigger_make_room_eviction() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+        assertTrue(store.setMakeRoomAutomatically(profile, true))
+
+        val (watchedFile, watched) = movieOnDisk("m-watched", "Watched Film", 600L)
+        val pausedTrip = testDownload(1, DownloadStatus.Paused, showId = "tt-trip", id = "trip-paused").copy(
+            tripFill = true,
+            downloadedBytes = 200L,
+            totalBytes = 2_000L,
+            expectedSizeBytes = 2_000L,
+            pausedByConnection = false,
+            autoDownloadStop = null,
+        )
+
+        // On-disk usage is 600 + 200 = 800 <= 1,000 limit; user-paused trip's 2,000 B expected size must NOT trigger eviction!
+        totalLimitBytes = 1_000L
+        autoLimitBytes = 1_000L
+        backend.payload = DownloadsCodec.encode(listOf(watched, pausedTrip), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        val runner = makeRoomRunner(
+            store = store,
+            watchStatusOf = { item ->
+                DownloadWatchStatus(
+                    isWatched = item.id == "m-watched",
+                    watchedAtEpochMs = if (item.id == "m-watched") now - 30 * dayMs else null,
+                )
+            },
+        )
+
+        assertEquals(0, runner.runOnce(profile))
+        assertTrue(watchedFile.exists(), "user-paused trip download must not cause watched downloads to be trashed")
+    }
 }
 
 @OptIn(ExperimentalTestApi::class)

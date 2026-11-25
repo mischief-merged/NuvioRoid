@@ -373,6 +373,134 @@ class TotalDownloadStorageLimitTest {
         val reencoded = DownloadsCodec.encode(decoded.items, decoded, 2L)
         assertTrue("\"futureItemField\":\"kept\"" in reencoded)
     }
+
+    @Test
+    fun preserved_partials_count_against_combined_and_auto_limits_including_current_transfers_own_kept_partial() {
+        limits.totalLimitBytes = 10_000L
+        limits.autoLimitBytes = 10_000L
+
+        enqueueEpisode(1, automatic = true)
+        val first = transfers.single()
+        first.onProgress(8_000L, 9_000L)
+        val ep1Id = DownloadsRepository.uiState.value.items.single().id
+
+        // Switch to a fresh partial while keeping the 8,000 B partial untouched.
+        first.request.onSwitchedToNewPartial("1 (2).mp4.part", KeptPartialFile("1.mp4.part", "kept-key-1"))
+
+        val afterSwitch = DownloadsRepository.uiState.value.items.single()
+        assertEquals(0L, afterSwitch.downloadedBytes)
+        assertEquals(8_000L, afterSwitch.supersededPartials.single().bytes)
+        assertEquals(8_000L, DownloadsRepository.allDownloadBytes())
+        assertEquals(8_000L, DownloadsRepository.allDownloadBytes(exceptDownloadId = ep1Id))
+        assertEquals(8_000L, DownloadsRepository.autoDownloadBytes(exceptDownloadId = ep1Id))
+
+        // A 6,000 B replacement would put total on-disk bytes at 8,000 + 6,000 = 14,000 > 10,000 -> must stop!
+        val guard = assertNotNull(first.request.limits)
+        assertEquals(
+            AutoDownloadStop.TotalStorageLimit,
+            guard.stopBeforeBody(downloadedBytes = 0L, totalBytes = 6_000L, freeBytes = 100_000L),
+        )
+        // A 2,000 B replacement fits (8,000 + 2,000 <= 10,000).
+        assertNull(guard.stopBeforeBody(downloadedBytes = 0L, totalBytes = 2_000L, freeBytes = 100_000L))
+    }
+
+    @Test
+    fun paused_trip_fill_counts_only_partial_bytes_and_does_not_block_new_downloads() {
+        limits.totalLimitBytes = 10_000L
+
+        DownloadsRepository.enqueueFromStream(
+            contentType = "series",
+            videoId = "$showId:1:1",
+            parentMetaId = showId,
+            parentMetaType = "series",
+            title = "Show",
+            logo = null,
+            poster = null,
+            background = null,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            episodeTitle = "Ep 1",
+            episodeThumbnail = null,
+            stream = StreamItem(
+                name = "1080p",
+                url = "https://example.com/trip1.mp4",
+                addonName = "A",
+                addonId = "addon:A",
+                behaviorHints = StreamBehaviorHints(videoSize = 8_000L),
+            ),
+            tripFill = true,
+        )
+        val tripTransfer = transfers.single()
+        tripTransfer.onProgress(1_000L, 8_000L)
+        val tripId = DownloadsRepository.uiState.value.items.single().id
+
+        // User pauses the trip download: only the 1,000 B partial on disk should count.
+        DownloadsRepository.pauseDownload(tripId)
+        assertEquals(1_000L, DownloadsRepository.allDownloadBytes())
+        assertEquals(1_000L, DownloadsRepository.autoDownloadBytes())
+
+        // A 5,000 B hand-started download fits (1,000 + 5,000 <= 10,000) and starts right away.
+        enqueueEpisode(2, automatic = false, claimedBytes = 5_000L)
+        val second = DownloadsRepository.uiState.value.items.first { it.episodeNumber == 2 }
+        assertEquals(DownloadStatus.Downloading, second.status)
+        assertEquals(2, transfers.size)
+    }
+
+    @Test
+    fun free_space_hold_on_one_drive_wakes_storage_limit_waiter_on_another_healthy_drive() {
+        val realHold = DownloadsRepository.freeSpaceHold
+        val hold = FreeSpaceHold()
+        try {
+            DownloadsRepository.freeSpaceHold = hold
+            hold.setFloorGb(value = 5)
+            hold.reportLocationFreeBytes(
+                mapOf(
+                    "drive-a" to 20L * BytesPerGigabyte,
+                    "drive-b" to 20L * BytesPerGigabyte,
+                ),
+            )
+            limits.totalLimitBytes = 10_000L
+
+            val runningOnA = testDownload(1, DownloadStatus.Downloading, showId = showId, id = "dl-a").copy(
+                locationId = "drive-a",
+                downloadedBytes = 1_000L,
+                totalBytes = 8_000L,
+                createdAtEpochMs = 1L,
+            )
+            val waitingOnB = testDownload(2, DownloadStatus.Paused, showId = showId, id = "dl-b").copy(
+                locationId = "drive-b",
+                downloadedBytes = 0L,
+                totalBytes = 3_000L,
+                waitingSizeBytes = 3_000L,
+                autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                createdAtEpochMs = 2L,
+            )
+            backend.payload = DownloadsCodec.encode(listOf(runningOnA, waitingOnB), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            // Initially 8,000 + 3,000 = 11,000 > 10,000 -> dl-a is running and dl-b is still waiting.
+            assertEquals(DownloadStatus.Downloading, DownloadsRepository.uiState.value.items.first { it.id == "dl-a" }.status)
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.first { it.id == "dl-b" }.status)
+
+            // Drive A drops below the 5 GB floor while Drive B stays at 20 GB free.
+            hold.reportLocationFreeBytes(
+                mapOf(
+                    "drive-a" to 2L * BytesPerGigabyte,
+                    "drive-b" to 20L * BytesPerGigabyte,
+                ),
+            )
+
+            // dl-a pauses (releasing its 8,000 B reservation down to 1,000 B partial), waking dl-b (1,000 + 3,000 <= 10,000)!
+            val itemA = DownloadsRepository.uiState.value.items.first { it.id == "dl-a" }
+            val itemB = DownloadsRepository.uiState.value.items.first { it.id == "dl-b" }
+            assertEquals(DownloadStatus.Paused, itemA.status)
+            assertTrue(itemA.pausedByFreeSpace)
+            assertEquals(DownloadStatus.Downloading, itemB.status)
+        } finally {
+            DownloadsRepository.freeSpaceHold = realHold
+        }
+    }
 }
 
 class DesktopTotalStorageLimitTransferTest : TrustedLocalServerTest() {

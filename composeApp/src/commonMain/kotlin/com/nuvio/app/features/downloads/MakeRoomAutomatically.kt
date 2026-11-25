@@ -152,6 +152,10 @@ internal class MakeRoomAutomatically(
 
         val usedAll = allDownloadBytes()
         val usedAuto = autoDownloadBytes()
+        val pausedTripReservation = liveItems
+            .filter { it.tripFill && it.status == DownloadStatus.Paused && it.pausedByConnection && isConnected(it) }
+            .sumOf { (it.requiredBytes() - it.downloadedBytes).coerceAtLeast(0L) }
+        val onDiskOrRunningAuto = (usedAuto - pausedTripReservation).coerceAtLeast(0L)
         val ruleWaiting = hasRuleWaitingForStorage()
 
         val waitingItems = liveItems
@@ -198,8 +202,8 @@ internal class MakeRoomAutomatically(
                 waitingNeedsAll
             )
         val needAuto = autoLimit != null && freeableAuto > 0L && (
-            usedAuto > autoLimit ||
-                (ruleWaiting && usedAuto >= autoLimit) ||
+            onDiskOrRunningAuto > autoLimit ||
+                (ruleWaiting && onDiskOrRunningAuto >= autoLimit) ||
                 waitingNeedsAuto
             )
         return RoomNeed(needAll = needAll, needAuto = needAuto)
@@ -238,12 +242,11 @@ internal class MakeRoomAutomatically(
     private fun DownloadItem.requiredBytes(): Long =
         maxOf(totalBytes ?: waitingSizeBytes ?: expectedSizeBytes ?: 0L, downloadedBytes)
 
-    private fun DownloadItem.countedInAllBytes(): Long =
-        if (tripFill && status == DownloadStatus.Paused) requiredBytes() else downloadedBytes
+    private fun DownloadItem.countedInAllBytes(): Long = downloadedBytes
 
     private fun DownloadItem.countedInAutoBytes(): Long =
         if (isAutoOrTripItem()) {
-            if (tripFill && status == DownloadStatus.Paused) requiredBytes() else downloadedBytes
+            if (tripFill && status == DownloadStatus.Paused && pausedByConnection) requiredBytes() else downloadedBytes
         } else {
             0L
         }

@@ -40,6 +40,7 @@ data class KeptPartialFile(
     val fileName: String,
     val partialFileKey: String,
     val locationId: String? = null,
+    val bytes: Long = 0L,
 )
 
 @Serializable
