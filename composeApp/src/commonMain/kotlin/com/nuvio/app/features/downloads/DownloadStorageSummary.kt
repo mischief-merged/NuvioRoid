@@ -58,9 +58,12 @@ internal fun DownloadStorageSummary(
      */
     onChangeStorageLimit: ((profileId: Int, limitGb: Int?) -> Unit)? = null,
     profileId: Int = 0,
+    totalLimitGb: Int? = null,
+    onChangeTotalStorageLimit: ((profileId: Int, limitGb: Int?) -> Unit)? = null,
 ) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     var pickerProfileId by rememberSaveable { mutableStateOf<Int?>(null) }
+    var totalPickerProfileId by rememberSaveable { mutableStateOf<Int?>(null) }
     val used = state.totalUsedBytes
     val free = state.totalFreeBytes
     val headline = when {
@@ -88,6 +91,38 @@ internal fun DownloadStorageSummary(
                 modifier = Modifier.semantics(mergeDescendants = true) { contentDescription = spoken },
                 style = MaterialTheme.typography.titleSmall,
             )
+            if ((totalLimitGb != null && totalLimitGb > 0) || onChangeTotalStorageLimit != null) {
+                val totalLimitBytes = totalLimitGb?.takeIf { it > 0 }?.times(BytesPerGigabyte)
+                if (totalLimitBytes != null) {
+                    val fraction = (used.toDouble() / totalLimitBytes).toFloat().coerceIn(0f, 1f)
+                    val label = stringResource(Res.string.downloads_storage_all, formatBytes(used), formatBytes(totalLimitBytes))
+                    val spokenAll = stringResource(Res.string.downloads_storage_all_spoken, spokenBytes(used), spokenBytes(totalLimitBytes))
+                    StorageLimitLine(
+                        label = label,
+                        spoken = spokenAll,
+                        limitGb = totalLimitGb,
+                        title = stringResource(Res.string.downloads_total_storage_limit),
+                        buttonLabel = stringResource(Res.string.downloads_storage_change_total_limit),
+                        onChange = if (onChangeTotalStorageLimit != null) ({ totalPickerProfileId = profileId }) else null,
+                    )
+                    LinearProgressIndicator(
+                        progress = fraction,
+                        modifier = Modifier.fillMaxWidth().semantics {
+                            contentDescription = spokenAll
+                            progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+                        },
+                    )
+                } else if (onChangeTotalStorageLimit != null) {
+                    StorageLimitLine(
+                        label = stringResource(Res.string.downloads_storage_all_no_limit),
+                        spoken = stringResource(Res.string.downloads_storage_all_no_limit),
+                        limitGb = totalLimitGb,
+                        title = stringResource(Res.string.downloads_total_storage_limit),
+                        buttonLabel = stringResource(Res.string.downloads_storage_change_total_limit),
+                        onChange = { totalPickerProfileId = profileId },
+                    )
+                }
+            }
             if ((autoLimitGb != null && autoLimitGb > 0) || onChangeStorageLimit != null) {
                 val limitBytes = autoLimitGb?.takeIf { it > 0 }?.times(BytesPerGigabyte)
                 if (limitBytes != null) {
@@ -154,6 +189,20 @@ internal fun DownloadStorageSummary(
             }
         }
     }
+    if (totalPickerProfileId != null && onChangeTotalStorageLimit != null) {
+        val change = onChangeTotalStorageLimit
+        DownloadChoiceDialog(
+            title = stringResource(Res.string.downloads_total_storage_limit),
+            options = AutoDownloadStore.totalStorageLimitOptionsGb,
+            selected = totalLimitGb,
+            label = { autoDownloadStorageLimitLabel(it) },
+            onSelect = { limit ->
+                change(totalPickerProfileId ?: profileId, limit)
+                totalPickerProfileId = null
+            },
+            onDismiss = { totalPickerProfileId = null },
+        )
+    }
     if (pickerProfileId != null && onChangeStorageLimit != null) {
         val change = onChangeStorageLimit
         DownloadChoiceDialog(
@@ -176,6 +225,8 @@ private fun StorageLimitLine(
     spoken: String,
     limitGb: Int?,
     onChange: (() -> Unit)?,
+    title: String = stringResource(Res.string.downloads_auto_storage_limit),
+    buttonLabel: String = stringResource(Res.string.downloads_storage_change_limit),
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -189,7 +240,6 @@ private fun StorageLimitLine(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         if (onChange != null) {
-            val title = stringResource(Res.string.downloads_auto_storage_limit)
             val value = autoDownloadStorageLimitLabel(limitGb)
             TextButton(
                 onClick = onChange,
@@ -199,7 +249,7 @@ private fun StorageLimitLine(
                 },
             ) {
                 Text(
-                    text = stringResource(Res.string.downloads_storage_change_limit),
+                    text = buttonLabel,
                     style = MaterialTheme.typography.labelLarge,
                 )
             }

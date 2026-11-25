@@ -259,6 +259,8 @@ internal class DesktopDownloadFolders(
     private val freeSpaceOf: (File) -> Long? = { f -> f.usableSpace.takeIf { it > 0L || f.totalSpace > 0L } },
     /** The underlying file store identifier of a folder, used to deduplicate volumes. */
     private val fileStoreKeyOf: (Path) -> String = { path -> Files.getFileStore(path).toString() },
+    /** Publishes per-location free space so the free-space floor can hold or resume transfers off-lock. */
+    private val freeSpaceHold: FreeSpaceHold = FreeSpaceFloors.hold,
 ) : DownloadFolderController {
     override val supported: Boolean = true
 
@@ -328,6 +330,24 @@ internal class DesktopDownloadFolders(
         val owner = locations.ownerOf(item.locationId, item.localFileUri) ?: return false
         if (locations.availability(owner) != FolderAvailability.Available) return false
         return trashOwnedPartial(owner, item, item.activePartialFileName, item.partialFileKey)
+    }
+
+    override fun keptPartialBytes(item: DownloadItem, kept: KeptPartialFile): Long {
+        if (kept.bytes > 0L) return kept.bytes
+        val owner = locations.ownerOf(
+            kept.locationId ?: item.locationId,
+            item.localFileUri.takeIf { kept.locationId == null },
+        ) ?: return 0L
+        if (locations.availability(owner) != FolderAvailability.Available) return 0L
+        val name = kept.fileName
+        if (name.isBlank() || name.contains('/') || name.contains('\\') || name == "." || name == "..") return 0L
+        val path = owner.path.resolve(name)
+        if (Files.isSymbolicLink(path) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return 0L
+        if (kept.partialFileKey.isNotBlank()) {
+            val actualKey = DownloadMover.identityOf(path)
+            if (actualKey != null && actualKey != kept.partialFileKey) return 0L
+        }
+        return runCatching { Files.size(path) }.getOrDefault(0L).coerceAtLeast(0L)
     }
 
     override fun removePartialOf(item: DownloadItem): Boolean {
@@ -418,6 +438,11 @@ internal class DesktopDownloadFolders(
 
     override fun refresh() = synchronized(pollLock) { refreshLocked() }
 
+    private fun measureLocationFreeBytes(location: DesktopDownloadLocation): Long? =
+        existingAncestor(location.path)?.let { dir ->
+            FsGuard.call(3_000L, null) { freeSpaceOf(File(dir.toUri())) }
+        }
+
     private fun refreshLocked() {
         // A drive that came back under another name is found by the id in its marker.
         locations.all().filter { it.id != DownloadLocations.AppId }.forEach { location ->
@@ -451,7 +476,7 @@ internal class DesktopDownloadFolders(
                     location.id
                 },
                 freeBytes = if (availability == FolderAvailability.Available) {
-                    FsGuard.call(3_000L, null) { DownloadFolderValidator.freeBytes(location.path) }
+                    measureLocationFreeBytes(location)
                 } else {
                     null
                 },
@@ -466,6 +491,10 @@ internal class DesktopDownloadFolders(
             infos, isMac, moving = moveRunning.get(), movingIds = movingNow,
             autoDownloadUsedBytes = measured.autoDownloadBytes, totalFreeBytes = freeTotal, usageMeasured = true,
             leftovers = runCatching { mover.leftovers() }.getOrDefault(emptyList()),
+        )
+        freeSpaceHold.reportLocationFreeBytes(
+            infos.associate { it.id to it.freeBytes },
+            notifyInBackground = true,
         )
         if (noteAvailability(states)) {
             hooks.resumeHeld()
@@ -497,6 +526,15 @@ internal class DesktopDownloadFolders(
         }
         val allLocations = locations.all()
         val states = allLocations.associate { it.id to locations.availability(it) }
+        val measureFloor = freeSpaceHold.floorBytes != null ||
+            runCatching { hooks.items().any { it.pausedByFreeSpace } }.getOrDefault(false)
+        val measuredFree = if (measureFloor) {
+            allLocations.associate { loc ->
+                loc.id to if (states[loc.id] == FolderAvailability.Available) measureLocationFreeBytes(loc) else null
+            }
+        } else {
+            null
+        }
         val current = _state.value
         if (current.locations.isNotEmpty()) {
             _state.value = current.copy(
@@ -504,10 +542,21 @@ internal class DesktopDownloadFolders(
                     val availability = states[info.id] ?: info.availability
                     info.copy(
                         availability = availability,
-                        freeBytes = if (availability == FolderAvailability.Available) info.freeBytes else null,
+                        freeBytes = when {
+                            availability != FolderAvailability.Available -> null
+                            measuredFree != null -> measuredFree[info.id]
+                            else -> info.freeBytes
+                        },
                     )
                 },
             )
+        }
+        if (measuredFree != null) {
+            freeSpaceHold.reportLocationFreeBytes(measuredFree, notifyInBackground = true)
+        } else if (current.locations.any { states[it.id] != FolderAvailability.Available }) {
+            // Ensure unplugged locations report null free space while keeping known connected values.
+            val currentFree = _state.value.locations.associate { it.id to it.freeBytes }
+            if (currentFree.isNotEmpty()) freeSpaceHold.reportLocationFreeBytes(currentFree, notifyInBackground = true)
         }
         if (noteAvailability(states)) {
             hooks.resumeHeld()

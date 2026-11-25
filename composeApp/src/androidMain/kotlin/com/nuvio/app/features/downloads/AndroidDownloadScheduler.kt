@@ -154,6 +154,17 @@ internal class AndroidDownloadScheduler(val context: Context) {
             DownloadSubtitles.prepare(transfer.item, destination.toURI().toString())
             currentCoroutineContext().ensureActive()
             if (!isActive(transfer)) return@withLock false
+            val limits = DownloadsPlatformDownloader.limitsFor(transfer.item.id)
+            var lastMeasuredFree = reportAndroidDownloadsFreeSpace(directory)
+            val initialPartialBytes = File(directory, "$fileName.part")
+                .takeIf(File::isFile)
+                ?.length()
+                ?.coerceAtLeast(0L)
+                ?: transfer.item.downloadedBytes.coerceAtLeast(0L)
+            if (!destination.isFile) {
+                limits?.stopBeforeBody(initialPartialBytes, transfer.item.totalBytes, lastMeasuredFree)
+                    ?.let { throw AndroidTransferStoppedByLimit(it) }
+            }
             var lastProgressAt = 0L
             val partial = if (destination.isFile) destination else transferAndroidDownload(
                 item = transfer.item,
@@ -161,19 +172,38 @@ internal class AndroidDownloadScheduler(val context: Context) {
                 validator = transfer.validator,
                 client = client,
                 onHeaders = { total, validator ->
+                    lastMeasuredFree = reportAndroidDownloadsFreeSpace(directory)
+                    val currentDownloaded = store.get(fileName)
+                        ?.takeIf { it.generation == transfer.generation }
+                        ?.item
+                        ?.downloadedBytes
+                        ?.coerceAtLeast(0L)
+                        ?: initialPartialBytes
+                    limits?.stopBeforeBody(currentDownloaded, total, lastMeasuredFree)
+                        ?.let { throw AndroidTransferStoppedByLimit(it) }
                     updateActive(transfer) { it.copy(validator = validator, item = it.item.copy(totalBytes = total)) }
                 },
                 onProgress = { bytes, total ->
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastProgressAt >= 1_000L || bytes == total) {
                         lastProgressAt = now
+                        lastMeasuredFree = reportAndroidDownloadsFreeSpace(directory)
+                        limits?.stopFor(bytes, total, lastMeasuredFree)?.let { throw AndroidTransferStoppedByLimit(it) }
                         updateActive(transfer) {
                             it.copy(item = it.item.copy(downloadedBytes = bytes, totalBytes = total))
                         }?.let(onProgress)
+                    } else {
+                        limits?.stopFor(bytes, total, lastMeasuredFree)?.let { throw AndroidTransferStoppedByLimit(it) }
                     }
                 },
             )
             currentCoroutineContext().ensureActive()
+            if (partial != destination) {
+                lastMeasuredFree = reportAndroidDownloadsFreeSpace(directory)
+                val finalBytes = partial.length().coerceAtLeast(0L)
+                limits?.stopFor(finalBytes, finalBytes, lastMeasuredFree)
+                    ?.let { throw AndroidTransferStoppedByLimit(it) }
+            }
             updateActive(transfer) { current ->
                 if (partial != destination && !partial.renameTo(destination)) {
                     throw IOException("Could not finalize the downloaded file")
@@ -190,6 +220,12 @@ internal class AndroidDownloadScheduler(val context: Context) {
             false
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (stopped: AndroidTransferStoppedByLimit) {
+            val limits = DownloadsPlatformDownloader.limitsFor(transfer.item.id)
+            DownloadsPlatformDownloader.clearLimits(transfer.item.id, limits)
+            limits?.onStopped?.invoke(stopped.reason)
+            pause(fileName)
+            false
         } catch (error: Exception) {
             currentCoroutineContext().ensureActive()
             if (!isActive(transfer)) return@withLock false
@@ -233,6 +269,24 @@ internal class AndroidDownloadScheduler(val context: Context) {
         const val GENERATION = "download_generation"
         const val JOB_NAMESPACE = "nuvio-downloads"
     }
+}
+
+internal class AndroidTransferStoppedByLimit(val reason: AutoDownloadStop) : Exception()
+
+internal fun reportAndroidDownloadsFreeSpace(directory: File): Long? {
+    val free = runCatching {
+        directory.mkdirs()
+        directory.usableSpace.takeIf { it >= 0L }
+    }.getOrNull()
+    if (free != null) {
+        runCatching {
+            FreeSpaceFloors.hold.reportLocationFreeBytes(
+                mapOf(DefaultFloorLocationId to free),
+                notifyInBackground = true,
+            )
+        }
+    }
+    return free
 }
 
 internal fun shouldRetryAndroidDownload(error: Exception, retries: Int): Boolean =

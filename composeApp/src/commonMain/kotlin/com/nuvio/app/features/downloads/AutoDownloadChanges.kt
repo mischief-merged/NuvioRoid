@@ -52,3 +52,13 @@ internal fun changeAutoDownloadStorageLimit(store: AutoDownloadStore, profileId:
     } catch (error: Throwable) {
         false
     }
+
+/** Saves the combined storage limit for all downloads. True when saved; false otherwise. */
+internal fun changeTotalDownloadStorageLimit(store: AutoDownloadStore, profileId: Int, limitGb: Int?): Boolean =
+    try {
+        store.setTotalStorageLimit(profileId, limitGb)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        false
+    }

@@ -160,7 +160,9 @@ internal fun PlaybackPreferencesContent(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = NuvioTokens.Space.s14, vertical = NuvioTokens.Space.s12),
+                        verticalArrangement = Arrangement.spacedBy(MaterialTheme.nuvio.spacing.controlGap),
                     ) {
+                        TotalStorageLimitChoice(profileId = profileId, controller = autoDownloads)
                         StorageLimitChoice(profileId = profileId, controller = autoDownloads)
                     }
                 }
@@ -237,6 +239,31 @@ internal fun PlayChoiceOptions(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun TotalStorageLimitChoice(profileId: Int, controller: AutoDownloadController) {
+    val totalLimitGb by controller.totalStorageLimitGb.collectAsState()
+    var pickerOpen by remember(profileId) { mutableStateOf(false) }
+    SeasonDownloadChoiceRow(
+        title = stringResource(Res.string.downloads_total_storage_limit),
+        description = stringResource(Res.string.downloads_total_storage_limit_description),
+        value = autoDownloadStorageLimitLabel(totalLimitGb),
+        onClick = { pickerOpen = true },
+    )
+    if (pickerOpen) {
+        DownloadChoiceDialog(
+            title = stringResource(Res.string.downloads_total_storage_limit),
+            options = AutoDownloadStore.totalStorageLimitOptionsGb,
+            selected = totalLimitGb,
+            label = { autoDownloadStorageLimitLabel(it) },
+            onSelect = {
+                controller.setTotalStorageLimit(profileId, it)
+                pickerOpen = false
+            },
+            onDismiss = { pickerOpen = false },
+        )
     }
 }
 

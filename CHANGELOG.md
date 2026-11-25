@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Added
 
+- Storage limit for all downloads, with a clean-up list for watched downloads, an optional free-space floor per drive, and an optional make-room mode that moves the oldest watched downloads to the Trash; everything goes to the Trash with Undo (#120) ([#152](https://github.com/mischief-merged/NuvioRoid/pull/152)).
 - Subtitles are ready before playback starts ([#104](https://github.com/mischief-merged/NuvioRoid/pull/104)).
 - Offline first: downloaded copies play without internet and pages keep working offline ([#66](https://github.com/mischief-merged/NuvioRoid/pull/66)).
 - Trip ready: offline hours at a glance and a Fill for my trip button ([#100](https://github.com/mischief-merged/NuvioRoid/pull/100)).

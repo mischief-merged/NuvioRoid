@@ -5660,3 +5660,22 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_systemTrustCertifi
         return result;
     }
 }
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_nuvio_app_features_downloads_MacTrashNative_trashItem(JNIEnv *env, jobject, jstring path) {
+    @autoreleasepool {
+        if (!path) return nullptr;
+        std::string raw = jstringToString(env, path);
+        if (raw.empty()) return nullptr;
+        NSString *nsPath = [NSString stringWithUTF8String:raw.c_str()];
+        if (!nsPath) return nullptr;
+        NSURL *url = [NSURL fileURLWithPath:nsPath];
+        NSURL *resulting = nil;
+        NSError *error = nil;
+        BOOL ok = [[NSFileManager defaultManager] trashItemAtURL:url resultingItemURL:&resulting error:&error];
+        if (!ok) return nullptr;
+        NSString *resultPath = resulting.path;
+        if (!resultPath || resultPath.length == 0) return env->NewStringUTF("");
+        return env->NewStringUTF(resultPath.UTF8String);
+    }
+}

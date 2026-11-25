@@ -1,5 +1,46 @@
 package com.nuvio.app.features.downloads
 
+import kotlinx.serialization.Serializable
+
+/** Address and identity of a watched file moved to the Trash, so Undo can put it back while still there. */
+@Serializable
+internal data class TrashedWatchedFile(
+    val originalFileUri: String,
+    val trashedFileUri: String? = null,
+    val originalSubtitlesUri: String? = null,
+    val trashedSubtitlesUri: String? = null,
+    val fileKey: String? = null,
+    val heldInArchive: Boolean = false,
+) {
+    val hasPendingVideo: Boolean
+        get() = !trashedFileUri.isNullOrBlank()
+
+    val hasPendingSubtitles: Boolean
+        get() = !originalSubtitlesUri.isNullOrBlank() && !trashedSubtitlesUri.isNullOrBlank()
+
+    val canRestore: Boolean
+        get() = hasPendingVideo || hasPendingSubtitles
+}
+
+internal enum class UndoTrashResult {
+    Restored,
+    PartiallyRestored,
+    FileGone,
+    TargetTaken,
+    NotReachable,
+    NotRestored,
+}
+
+internal data class WatchedTrashOutcome(
+    val result: AutoDownloadRemovalResult,
+    val trashed: TrashedWatchedFile? = null,
+)
+
+internal data class UndoRestoreOutcome(
+    val result: UndoTrashResult,
+    val updatedTrashed: TrashedWatchedFile? = null,
+)
+
 /** Takes the file of a download out of the downloads folder without deleting it. */
 internal expect object DownloadsTrash {
     /**
@@ -8,11 +49,38 @@ internal expect object DownloadsTrash {
      */
     val usesSystemTrash: Boolean
 
+    /** True when system Trash returns a recoverable destination path so Undo can restore moved files. */
+    val usesUndoableSystemTrash: Boolean
+
+    /** True when watched clean-up can move files to system Trash or the local archive with Undo. */
+    val supportsWatchedCleanup: Boolean
+
     /** True when the file is out of the downloads folder, or was already gone. */
     fun moveAway(localFileUri: String): Boolean
 
     /** Moves to system Trash with a recoverable copy until the final check succeeds. */
     fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult
+
+    /** Moves to Trash and returns the trashed address when Undo can restore it. */
+    fun moveWatchedAwayWithUndo(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean = false,
+        includeSubtitles: Boolean = true,
+        stillWanted: () -> Boolean = { true },
+        onMoved: (TrashedWatchedFile?) -> Boolean = { true },
+    ): WatchedTrashOutcome
+
+    /** Restores a trashed watched download back to its original folder if it is still in the Trash. */
+    fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult
+
+    /** Restores a trashed watched download and reports any remaining un-restored companion reference. */
+    fun restoreFromTrashWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome
+
+    /** Moves restored sidecar subtitles back to Trash or archive when a subtitle-only Undo rolls back. */
+    fun trashSubtitlesForUndoRollback(
+        trashed: TrashedWatchedFile,
+        onMoved: (TrashedWatchedFile) -> Boolean = { true },
+    ): WatchedTrashOutcome
 
     /** Whether two addresses name the same file, however they are spelled. */
     fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean

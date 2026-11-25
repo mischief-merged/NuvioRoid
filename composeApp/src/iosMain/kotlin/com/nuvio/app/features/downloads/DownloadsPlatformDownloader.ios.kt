@@ -86,10 +86,16 @@ internal actual object DownloadsPlatformDownloader {
             try {
                 DownloadSubtitles.prepare(request.item, NSURL.fileURLWithPath(destinationPath).absoluteString!!)
                 var resumeFromBytes = fileSizeOrNull(tempPath)?.coerceAtLeast(0L) ?: 0L
+                val initialFree = reportIosDownloadsFreeSpace(downloadsDirectory)
+                request.limits?.stopBeforeBody(resumeFromBytes, request.item.totalBytes, initialFree)?.let { stop ->
+                    throw IosTransferStoppedByLimit(stop)
+                }
 
                 var attemptedRangeRequest = resumeFromBytes > 0L
                 var result = performDownloadRequest(
                     request = request,
+                    downloadsDirectory = downloadsDirectory,
+                    initialFreeBytes = initialFree,
                     rangeStart = if (attemptedRangeRequest) resumeFromBytes else null,
                     resumeFromBytes = resumeFromBytes,
                     tempPath = tempPath,
@@ -101,8 +107,11 @@ internal actual object DownloadsPlatformDownloader {
                     removePathIfExists(tempPath)
                     resumeFromBytes = 0L
                     attemptedRangeRequest = false
+                    val retryFree = reportIosDownloadsFreeSpace(downloadsDirectory)
                     result = performDownloadRequest(
                         request = request,
+                        downloadsDirectory = downloadsDirectory,
+                        initialFreeBytes = retryFree,
                         rangeStart = null,
                         resumeFromBytes = 0L,
                         tempPath = tempPath,
@@ -124,6 +133,12 @@ internal actual object DownloadsPlatformDownloader {
                     contentLength = result.contentLength,
                 )
 
+                val partialFinalBytes = fileSizeOrNull(tempPath)?.coerceAtLeast(0L) ?: 0L
+                val finalFree = reportIosDownloadsFreeSpace(downloadsDirectory)
+                request.limits?.stopFor(partialFinalBytes, totalBytes ?: partialFinalBytes, finalFree)?.let { stop ->
+                    throw IosTransferStoppedByLimit(stop)
+                }
+
                 removePathIfExists(destinationPath)
                 val moved = NSFileManager.defaultManager.moveItemAtPath(
                     srcPath = tempPath,
@@ -139,6 +154,9 @@ internal actual object DownloadsPlatformDownloader {
                 onSuccess(localFileUri, totalBytes ?: finalSize)
             } catch (_: CancellationException) {
                 handle.cancelNativeTask()
+            } catch (stopped: IosTransferStoppedByLimit) {
+                handle.cancelNativeTask()
+                request.limits?.onStopped?.invoke(stopped.reason)
             } catch (error: Throwable) {
                 onFailure(error.message ?: runBlocking { getString(Res.string.download_failed) })
             }
@@ -228,6 +246,8 @@ private class IosDownloadsTaskHandle(
     }
 }
 
+private class IosTransferStoppedByLimit(val reason: AutoDownloadStop) : Exception()
+
 private data class IosDownloadResult(
     val statusCode: Int,
     val contentRange: String?,
@@ -239,17 +259,23 @@ private class IosDownloadDelegate(
     private val attemptedRangeRequest: Boolean,
     private val resumeFromBytes: Long,
     private val tempPath: String,
+    private val downloadsDirectory: String,
+    private val initialFreeBytes: Long?,
+    private val limits: DownloadTransferLimits?,
     private val onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
 ) : NSObject(), NSURLSessionDataDelegateProtocol {
     private val completion = CompletableDeferred<IosDownloadResult>()
     private var result: IosDownloadResult? = null
     private var fileError: Throwable? = null
+    private var stoppedByLimit: AutoDownloadStop? = null
     private var outputFile: CPointer<FILE>? = null
     private var startingBytesForResponse = 0L
     private var bytesWrittenForResponse = 0L
     private var totalBytesForResponse: Long? = null
     private var lastProgressBytes = -1L
     private var lastProgressTimestampSeconds = 0.0
+    private var lastMeasuredFreeBytes: Long? = initialFreeBytes
+    private var lastFreeMeasureTimestampSeconds = 0.0
 
     suspend fun awaitCompletion(): IosDownloadResult = completion.await()
 
@@ -282,6 +308,16 @@ private class IosDownloadDelegate(
                 contentLength = nextResult.contentLength,
             )
 
+            val free = reportIosDownloadsFreeSpace(downloadsDirectory).also {
+                lastMeasuredFreeBytes = it
+                lastFreeMeasureTimestampSeconds = NSDate().timeIntervalSince1970
+            }
+            limits?.stopBeforeBody(startingBytesForResponse, totalBytesForResponse, free)?.let { stop ->
+                stoppedByLimit = stop
+                completionHandler(0L)
+                return
+            }
+
             outputFile = fopen(tempPath, if (isPartialResume) "ab" else "wb") ?: run {
                 fileError = IllegalStateException(runBlocking { getString(Res.string.downloads_error_open_partial_file_failed) })
                 null
@@ -298,7 +334,7 @@ private class IosDownloadDelegate(
         dataTask: NSURLSessionDataTask,
         didReceiveData: NSData,
     ) {
-        if (fileError != null) return
+        if (stoppedByLimit != null || fileError != null) return
 
         val file = outputFile ?: run {
             fileError = IllegalStateException(runBlocking { getString(Res.string.downloads_error_partial_file_not_open) })
@@ -306,6 +342,15 @@ private class IosDownloadDelegate(
         }
 
         val bytesToWrite = didReceiveData.length.toLong()
+        val nextDownloaded = startingBytesForResponse + bytesWrittenForResponse + bytesToWrite
+        val free = measureFreeBytesIfDue()
+        limits?.stopFor(nextDownloaded, totalBytesForResponse, free)?.let { stop ->
+            stoppedByLimit = stop
+            closeOutputFile()
+            dataTask.cancel()
+            return
+        }
+
         val wrote = fwrite(
             didReceiveData.bytes,
             1.convert(),
@@ -331,6 +376,11 @@ private class IosDownloadDelegate(
         didCompleteWithError: NSError?,
     ) {
         closeOutputFile()
+
+        stoppedByLimit?.let { stop ->
+            completion.completeExceptionally(IosTransferStoppedByLimit(stop))
+            return
+        }
 
         if (didCompleteWithError != null) {
             completion.completeExceptionally(
@@ -359,6 +409,15 @@ private class IosDownloadDelegate(
             fclose(file)
         }
         outputFile = null
+    }
+
+    private fun measureFreeBytesIfDue(): Long? {
+        val now = NSDate().timeIntervalSince1970
+        if (now - lastFreeMeasureTimestampSeconds >= PROGRESS_MIN_INTERVAL_SECONDS || lastMeasuredFreeBytes == null) {
+            lastFreeMeasureTimestampSeconds = now
+            lastMeasuredFreeBytes = reportIosDownloadsFreeSpace(downloadsDirectory)
+        }
+        return lastMeasuredFreeBytes
     }
 
     private fun reportProgress(
@@ -436,6 +495,8 @@ private fun removePathIfExists(path: String): Boolean {
 @OptIn(ExperimentalForeignApi::class)
 private suspend fun performDownloadRequest(
     request: DownloadPlatformRequest,
+    downloadsDirectory: String,
+    initialFreeBytes: Long?,
     rangeStart: Long?,
     resumeFromBytes: Long,
     tempPath: String,
@@ -463,6 +524,9 @@ private suspend fun performDownloadRequest(
         attemptedRangeRequest = rangeStart != null && rangeStart > 0L,
         resumeFromBytes = resumeFromBytes,
         tempPath = tempPath,
+        downloadsDirectory = downloadsDirectory,
+        initialFreeBytes = initialFreeBytes,
+        limits = request.limits,
         onProgress = onProgress,
     )
     val configuration = NSURLSessionConfiguration.defaultSessionConfiguration().apply {
@@ -490,6 +554,31 @@ private suspend fun performDownloadRequest(
         delegate.awaitCompletion()
     } finally {
         session.finishTasksAndInvalidate()
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun reportIosDownloadsFreeSpace(downloadsDirectory: String): Long? {
+    val free = freeSpaceOrNull(downloadsDirectory)?.takeIf { it >= 0L }
+    if (free != null) {
+        runCatching {
+            FreeSpaceFloors.hold.reportLocationFreeBytes(
+                mapOf(DefaultFloorLocationId to free),
+                notifyInBackground = true,
+            )
+        }
+    }
+    return free
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun freeSpaceOrNull(path: String): Long? {
+    val attrs = NSFileManager.defaultManager.attributesOfFileSystemForPath(path, error = null)
+    val value = attrs?.get("NSFileSystemFreeSize")
+    return when (value) {
+        is Long -> value
+        is Number -> value.toLong()
+        else -> null
     }
 }
 

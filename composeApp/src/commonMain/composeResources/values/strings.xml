@@ -3557,4 +3557,55 @@
     <string name="available_offline">Available offline</string>
     <string name="home_section_downloaded">Downloaded</string>
     <string name="offline_connect_to_play">Connect to the internet to play this</string>
+    <string name="downloads_total_storage_limit">Storage limit for all downloads</string>
+    <string name="downloads_total_storage_limit_description">Counts downloads you start and auto-downloads together. New downloads wait when it is full.</string>
+    <string name="downloads_storage_all">All downloads: %1$s of %2$s</string>
+    <string name="downloads_storage_all_no_limit">All downloads: No limit</string>
+    <string name="downloads_storage_all_spoken">All downloads use %1$s of %2$s</string>
+    <string name="downloads_storage_change_total_limit">Change total limit</string>
+    <string name="downloads_status_waiting_storage_limit">Waiting: storage limit reached • %1$s</string>
+    <string name="downloads_announce_waiting_storage_limit">Waiting because the storage limit was reached</string>
+    <string name="downloads_cleanup_watched_button">Clean up watched</string>
+    <string name="downloads_cleanup_watched_title">Clean up watched downloads</string>
+    <string name="downloads_cleanup_filter_all">All watched</string>
+    <string name="downloads_cleanup_filter_30_days">Watched 30+ days ago</string>
+    <string name="downloads_cleanup_select_all">Select all</string>
+    <string name="downloads_cleanup_clear_selection">Clear</string>
+    <string name="downloads_cleanup_total_selected">%1$d selected • %2$s</string>
+    <string name="downloads_cleanup_empty_all">No watched downloads to clean up.</string>
+    <string name="downloads_cleanup_empty_30_days">No downloads watched more than 30 days ago.</string>
+    <string name="downloads_cleanup_confirm_archive">Move to archive</string>
+    <plurals name="downloads_cleanup_moved_toast">
+        <item quantity="one">Moved %1$d watched download to the Trash</item>
+        <item quantity="other">Moved %1$d watched downloads to the Trash</item>
+    </plurals>
+    <plurals name="downloads_cleanup_held_toast">
+        <item quantity="one">Moved %1$d watched download to the downloads archive</item>
+        <item quantity="other">Moved %1$d watched downloads to the downloads archive</item>
+    </plurals>
+    <string name="downloads_undo">Undo</string>
+    <string name="downloads_undo_deleted_description">Undo moving %1$s to the Trash</string>
+    <string name="downloads_undo_restored_toast">Restored %1$s from the Trash</string>
+    <string name="downloads_undo_subtitles_not_restored_toast">Restored %1$s, but could not restore its subtitles</string>
+    <string name="downloads_undo_file_gone_toast">No longer in the Trash</string>
+    <string name="downloads_undo_failed_toast">Could not restore from the Trash</string>
+    <string name="downloads_recent_cleaned_up_today">cleaned up today</string>
+    <plurals name="downloads_recent_cleaned_up_days_ago">
+        <item quantity="one">cleaned up %1$d day ago</item>
+        <item quantity="other">cleaned up %1$d days ago</item>
+    </plurals>
+    <string name="downloads_recent_made_room_today">moved to the Trash to make room today</string>
+    <plurals name="downloads_recent_made_room_days_ago">
+        <item quantity="one">moved to the Trash to make room %1$d day ago</item>
+        <item quantity="other">moved to the Trash to make room %1$d days ago</item>
+    </plurals>
+    <string name="downloads_status_waiting_free_space">Waiting: free space low • %1$s</string>
+    <string name="downloads_announce_waiting_free_space">Waiting because free space on the drive is low</string>
+    <string name="settings_free_space_floor_title">Keep free space on drive</string>
+    <string name="settings_free_space_floor_description">Pauses downloads in a location when its drive drops below this free space, and resumes when space returns.</string>
+    <string name="settings_free_space_floor_off">Off</string>
+    <string name="settings_free_space_floor_value">%1$d GB</string>
+    <string name="settings_make_room_title">Make room automatically</string>
+    <string name="settings_make_room_description">When over a storage limit, moves watched downloads to the Trash, oldest watched first. Never touches unwatched, Keep, playing, or downloading titles.</string>
+    <string name="settings_make_room_unavailable_description">Unavailable on this computer because the Trash cannot restore moved downloads with Undo. Watched downloads stay where they are.</string>
 </resources>

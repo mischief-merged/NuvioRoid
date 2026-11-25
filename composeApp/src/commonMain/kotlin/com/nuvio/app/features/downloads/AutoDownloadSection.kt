@@ -198,25 +198,61 @@ internal fun AutoDownloadSection(
             )
             recent.forEach { entry ->
                 val days = daysSinceDeleted(entry, now)
-                val ago = if (days < 1) {
-                    stringResource(Res.string.downloads_auto_recent_today)
-                } else {
-                    pluralStringResource(Res.plurals.downloads_auto_recent_days_ago, days, days)
+                val ago = when (entry.reason) {
+                    DeletedDownloadReason.AfterWatching -> if (days < 1) {
+                        stringResource(Res.string.downloads_auto_recent_today)
+                    } else {
+                        pluralStringResource(Res.plurals.downloads_auto_recent_days_ago, days, days)
+                    }
+                    DeletedDownloadReason.CleanedUp -> if (days < 1) {
+                        stringResource(Res.string.downloads_recent_cleaned_up_today)
+                    } else {
+                        pluralStringResource(Res.plurals.downloads_recent_cleaned_up_days_ago, days, days)
+                    }
+                    DeletedDownloadReason.MadeRoom -> if (days < 1) {
+                        stringResource(Res.string.downloads_recent_made_room_today)
+                    } else {
+                        pluralStringResource(Res.plurals.downloads_recent_made_room_days_ago, days, days)
+                    }
                 }
-                Text(
-                    text = if (entry.seasonNumber == null || entry.episodeNumber == null) {
-                        stringResource(Res.string.downloads_movie_removal_row, entry.title, ago)
-                    } else stringResource(
-                        Res.string.downloads_auto_recent_row,
-                        entry.title,
-                        entry.seasonNumber ?: 0,
-                        entry.episodeNumber ?: 0,
-                        ago,
-                    ),
+                val entryLabel = entry.restorableItem?.nameForLabels()
+                    ?: if (entry.seasonNumber == null || entry.episodeNumber == null) {
+                        entry.title
+                    } else {
+                        "${entry.title} S${entry.seasonNumber}E${entry.episodeNumber}"
+                    }
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = tokens.colors.textPrimary,
-                )
+                    horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s8),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = if (entry.seasonNumber == null || entry.episodeNumber == null) {
+                            stringResource(Res.string.downloads_movie_removal_row, entry.title, ago)
+                        } else stringResource(
+                            Res.string.downloads_auto_recent_row,
+                            entry.title,
+                            entry.seasonNumber,
+                            entry.episodeNumber,
+                            ago,
+                        ),
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = tokens.colors.textPrimary,
+                    )
+                    if (entry.canUndo) {
+                        val undoDescription = stringResource(Res.string.downloads_undo_deleted_description, entryLabel)
+                        TextButton(
+                            modifier = Modifier.semantics { contentDescription = undoDescription },
+                            onClick = { controller.undoDeletedDownload(profileId, entry) },
+                        ) {
+                            Text(
+                                text = stringResource(Res.string.downloads_undo),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

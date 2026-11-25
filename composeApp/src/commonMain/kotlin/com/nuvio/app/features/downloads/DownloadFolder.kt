@@ -264,6 +264,9 @@ internal interface DownloadFolderController {
     /** Removes only the active partial file of [item], leaving any superseded partials intact. */
     fun removeActivePartialOf(item: DownloadItem): Boolean? = removePartialOf(item)
 
+    /** Measured byte size of a preserved partial file when its location is connected. */
+    fun keptPartialBytes(item: DownloadItem, kept: KeptPartialFile): Long = kept.bytes.coerceAtLeast(0L)
+
     /** Removes the extra copy of a leftover after checking it is equal and the record points at the other. Null text means done. */
     fun removeExtraCopy(leftoverId: String): LeftoverOutcome = LeftoverOutcome.Refused
     fun keepBoth(leftoverId: String) = Unit

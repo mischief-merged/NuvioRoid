@@ -44,6 +44,16 @@ internal class DeleteAfterWatching(
     private val removeDownload: (downloadId: String, ruleKey: String?, stillWanted: () -> Boolean) -> AutoDownloadRemovalResult,
     private val nowEpochMs: () -> Long,
     private val holdMs: Long = DefaultHoldMs,
+    private val removeDownloadWithUndo: (
+        (
+            downloadId: String,
+            ruleKey: String?,
+            expectedProfileId: Int?,
+            stillWanted: () -> Boolean,
+            onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
+        ) -> WatchedTrashOutcome
+    )? = null,
+    private val usesUndoableTrash: () -> Boolean = { true },
 ) {
     /** True when a removal was scheduled for [item]. */
     fun onLocalPlaybackCompleted(
@@ -172,20 +182,49 @@ internal class DeleteAfterWatching(
                 store.allowsRemoval(profileId, removal.ruleKey) &&
                 (askedByUser || isWatchedToTheEnd(item))
         }
-        return when (removeDownload(item.id, removal.ruleKey, stillWanted)) {
-            AutoDownloadRemovalResult.Removed -> {
-                // The rule must know it had this episode, so that it does not fetch it again.
-                val season = item.seasonNumber
-                val episode = item.episodeNumber
-                if (removal.ruleKey != null && season != null && episode != null) {
-                    store.update(profileId, removal.ruleKey) {
-                        it.copy(ownedEpisodeKeys = it.ownedEpisodeKeys + autoDownloadEpisodeKey(season, episode))
-                    }
-                }
-                store.dropRemoval(profileId, removal)
-                store.recordDeleted(profileId, AutoDownloadDeleted(item.title, season, episode, nowEpochMs()))
-                AutoDownloadRemovalOutcome.Removed
+        val commitDeleted: (DownloadItem, TrashedWatchedFile?) -> Boolean = { removedItem, trashed ->
+            // The rule must know it had this episode, so that it does not fetch it again.
+            val season = removedItem.seasonNumber
+            val episode = removedItem.episodeNumber
+            val deleted = if (trashed != null) {
+                AutoDownloadDeleted(
+                    title = removedItem.title,
+                    seasonNumber = season,
+                    episodeNumber = episode,
+                    atEpochMs = nowEpochMs(),
+                    downloadId = removedItem.id,
+                    reason = DeletedDownloadReason.AfterWatching,
+                    restorableItem = removedItem,
+                    trashed = trashed,
+                )
+            } else {
+                AutoDownloadDeleted(removedItem.title, season, episode, nowEpochMs())
             }
+            store.commitWatchedRemoval(
+                profileId = profileId,
+                deleted = deleted,
+                ruleKey = removal.ruleKey,
+                ownedEpisodeKey = if (removal.ruleKey != null && season != null && episode != null) {
+                    autoDownloadEpisodeKey(season, episode)
+                } else {
+                    null
+                },
+                droppedDownloadId = null,
+                droppedRemoval = removal,
+            )
+        }
+        val outcome = if (removeDownloadWithUndo != null && usesUndoableTrash()) {
+            removeDownloadWithUndo.invoke(item.id, removal.ruleKey, profileId, stillWanted, commitDeleted)
+        } else {
+            val result = removeDownload(item.id, removal.ruleKey, stillWanted)
+            if (result == AutoDownloadRemovalResult.Removed && !commitDeleted(item, null)) {
+                WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            } else {
+                WatchedTrashOutcome(result)
+            }
+        }
+        return when (outcome.result) {
+            AutoDownloadRemovalResult.Removed -> AutoDownloadRemovalOutcome.Removed
             AutoDownloadRemovalResult.Changed -> cancel(profileId, scheduled)
             AutoDownloadRemovalResult.NotMoved -> AutoDownloadRemovalOutcome.NotMoved
             AutoDownloadRemovalResult.NotReachable -> AutoDownloadRemovalOutcome.NotReachable
@@ -218,12 +257,23 @@ private const val MillisPerHour = 3_600_000L
 internal fun removalHoursLeft(dueAtEpochMs: Long, nowEpochMs: Long): Int =
     ((dueAtEpochMs - nowEpochMs + MillisPerHour / 2) / MillisPerHour).coerceAtLeast(0L).toInt()
 
-/** The removed episodes the user is still shown: those of the last week, newest first. */
-internal fun recentlyDeletedShown(entries: List<AutoDownloadDeleted>, nowEpochMs: Long, max: Int = 5): List<AutoDownloadDeleted> =
-    entries
-        .filter { nowEpochMs - it.atEpochMs < AutoDownloadStore.RecentlyDeletedMs }
-        .sortedByDescending { it.atEpochMs }
+/**
+ * The removed downloads shown to the user, newest first: every entry that can still be undone
+ * from the Trash, plus up to [max] non-undoable history entries from the last week.
+ */
+internal fun recentlyDeletedShown(entries: List<AutoDownloadDeleted>, nowEpochMs: Long, max: Int = 5): List<AutoDownloadDeleted> {
+    val keptNonUndo = entries
+        .withIndex()
+        .filter { (_, entry) -> !entry.canUndo && nowEpochMs - entry.atEpochMs < AutoDownloadStore.RecentlyDeletedMs }
+        .sortedWith(compareByDescending<IndexedValue<AutoDownloadDeleted>> { it.value.atEpochMs }.thenByDescending { it.index })
         .take(max)
+        .mapTo(HashSet()) { it.index }
+    return entries
+        .withIndex()
+        .filter { (index, entry) -> entry.canUndo || index in keptNonUndo }
+        .sortedWith(compareByDescending<IndexedValue<AutoDownloadDeleted>> { it.value.atEpochMs }.thenByDescending { it.index })
+        .map { it.value }
+}
 
 /** How many whole days ago [entry] was removed. */
 internal fun daysSinceDeleted(entry: AutoDownloadDeleted, nowEpochMs: Long): Int =

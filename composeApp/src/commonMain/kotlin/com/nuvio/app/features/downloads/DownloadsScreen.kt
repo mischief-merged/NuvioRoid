@@ -223,6 +223,7 @@ internal fun DownloadsScreenContent(
     }
     val folderState by folders.state.collectAsStateWithLifecycle()
     val storageLimitGb by (autoDownloads?.storageLimitGb ?: NoStorageLimit).collectAsStateWithLifecycle()
+    val totalStorageLimitGb by (autoDownloads?.totalStorageLimitGb ?: NoStorageLimit).collectAsStateWithLifecycle()
     var selecting by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf(emptySet<String>()) }
     var moveRequest by remember { mutableStateOf<MoveRequest?>(null) }
@@ -300,6 +301,7 @@ internal fun DownloadsScreenContent(
     // lazy list does not survive (an item count that changes between two lookups of one pass).
     val folderStateNow = folderState
     val storageLimitNow = storageLimitGb
+    val totalStorageLimitNow = totalStorageLimitGb
     val selectingNow = selecting
     val selectedNow = selectedIds
 
@@ -323,6 +325,7 @@ internal fun DownloadsScreenContent(
 
     var selectedShowId by rememberSaveable(initialShowId) { mutableStateOf(initialShowId) }
     var showingTripReady by rememberSaveable { mutableStateOf(false) }
+    var showingWatchedCleanup by rememberSaveable { mutableStateOf(false) }
     var downloadPendingDeletionId by rememberSaveable { mutableStateOf<String?>(null) }
     val openDownloadsDirectoryFailedText = stringResource(Res.string.downloads_open_directory_failed)
     val deleteScope = rememberCoroutineScope()
@@ -368,6 +371,47 @@ internal fun DownloadsScreenContent(
         { showId, title -> onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId } }
     }
     val completedRoot = remember(uiState.completedItems) { CompletedGroups(uiState.completedItems) }
+    val canCleanUpWatched = autoDownloads?.supportsWatchedCleanup == true
+    val nonCleanableWatchedIds by produceState(
+        initialValue = emptySet<String>(),
+        canCleanUpWatched,
+        uiState.items,
+        folderStateNow,
+    ) {
+        value = if (!canCleanUpWatched) {
+            emptySet()
+        } else {
+            withContext(Dispatchers.IO) {
+                DownloadsRepository.nonExclusivelyCleanableWatchedIds(uiState.items)
+            }
+        }
+    }
+    val cleanableWatched = remember(
+        canCleanUpWatched,
+        uiState.items,
+        watchStatusOf,
+        keptDownloadIds,
+        folderStateNow,
+        nonCleanableWatchedIds,
+    ) {
+        if (!canCleanUpWatched) {
+            emptyList()
+        } else {
+            cleanableWatchedDownloads(
+                items = uiState.items,
+                watchStatusOf = watchStatusOf,
+                keptDownloadIds = keptDownloadIds,
+                movingIds = folderStateNow.movingIds,
+                excludedIds = nonCleanableWatchedIds,
+                isReachable = { item ->
+                    if (!folders.supported) true
+                    else folderStateNow.location(folders.locationIdOf(item))?.availability == FolderAvailability.Available
+                },
+                isPlaying = AutoDownloads::isPlaying,
+                isSameFile = ::sameNormalizedLocalPath,
+            )
+        }
+    }
     val showGroups = remember(allEpisodes, selectedShowId) {
         allEpisodes.filter { it.parentMetaId == selectedShowId }
             .groupBy { it.seasonNumber ?: 0 }.toList()
@@ -440,6 +484,21 @@ internal fun DownloadsScreenContent(
                         ) {
                             Text(
                                 text = stringResource(Res.string.downloads_trip_ready_button),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = headerColor,
+                            )
+                        }
+                    }
+                    if (canCleanUpWatched && selectedShowId == null && !showingTripReady && cleanableWatched.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                selecting = false
+                                selectedIds = emptySet()
+                                showingWatchedCleanup = true
+                            },
+                        ) {
+                            Text(
+                                text = stringResource(Res.string.downloads_cleanup_watched_button),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = headerColor,
                             )
@@ -550,6 +609,10 @@ internal fun DownloadsScreenContent(
                             { profile, limit -> controller.setStorageLimit(profile, limit) }
                         },
                         profileId = activeProfileId,
+                        totalLimitGb = totalStorageLimitNow,
+                        onChangeTotalStorageLimit = autoDownloads?.let { controller ->
+                            { profile, limit -> controller.setTotalStorageLimit(profile, limit) }
+                        },
                     )
                 }
             }
@@ -684,6 +747,20 @@ internal fun DownloadsScreenContent(
             onPickOther = null,
             onDismiss = { chooseLocationFor = null },
         )
+    }
+    if (showingWatchedCleanup && canCleanUpWatched && autoDownloads != null && cleanableWatched.isNotEmpty()) {
+        WatchedCleanupDialog(
+            candidates = cleanableWatched,
+            nowEpochMs = now.value,
+            usesSystemTrash = autoDownloads.usesUndoableSystemTrash,
+            onConfirm = { chosenIds ->
+                showingWatchedCleanup = false
+                autoDownloads.cleanUpWatchedDownloads(activeProfileId, chosenIds)
+            },
+            onDismiss = { showingWatchedCleanup = false },
+        )
+    } else if (showingWatchedCleanup) {
+        showingWatchedCleanup = false
     }
     if (pendingDeletion != null) {
         val hasFile = pendingDeletion.status == DownloadStatus.Completed
@@ -858,7 +935,11 @@ private fun LazyListScope.downloadsRootContent(
         item(key = "active-heading") {
             val hasDownloading = activeItems.any { it.status == DownloadStatus.Downloading }
             val hasResumablePaused = activeItems.any {
-                it.status == DownloadStatus.Paused && !it.pausedByFolder && !it.pausedByConnection
+                it.status == DownloadStatus.Paused &&
+                    !it.pausedByFolder &&
+                    !it.pausedByConnection &&
+                    !it.pausedByFreeSpace &&
+                    it.autoDownloadStop != AutoDownloadStop.TotalStorageLimit
             }
             SectionTitle(
                 title = stringResource(Res.string.downloads_section_active),
@@ -1434,8 +1515,8 @@ private fun DownloadRow(
                                 )
                             }
                         }
-                        // One that waits for a better connection is offered a pause, which keeps it paused when that ends.
-                        DownloadStatus.Paused -> if (item.pausedByConnection) {
+                        // One that waits for a better connection, free space, or storage limit is offered a pause, which keeps it paused when that ends.
+                        DownloadStatus.Paused -> if (item.pausedByConnection || item.pausedByFreeSpace || item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit) {
                             IconButton(onClick = onPause) {
                                 Icon(
                                     imageVector = Icons.Rounded.Pause,
@@ -1627,6 +1708,8 @@ internal fun statusText(
         formatBytes(item.totalBytes ?: item.downloadedBytes)
     } else if (item.totalBytes != null && item.totalBytes > 0L) {
         "${formatBytes(item.downloadedBytes)} / ${formatBytes(item.totalBytes)}"
+    } else if (item.waitingSizeBytes != null && item.waitingSizeBytes > 0L) {
+        "${formatBytes(item.downloadedBytes)} / ${formatBytes(item.waitingSizeBytes)}"
     } else {
         formatBytes(item.downloadedBytes)
     }
