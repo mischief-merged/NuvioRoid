@@ -108,6 +108,7 @@ internal interface AutoDownloadController {
     /** False when removed files stay in the holding folder until you remove them. */
     val usesSystemTrash: Boolean
     val usesUndoableSystemTrash: Boolean get() = usesSystemTrash
+    val supportsWatchedCleanup: Boolean get() = true
 
     /**
      * Turns automatic downloads on for [meta], or changes its rule, and checks the show. Nothing
@@ -248,6 +249,7 @@ internal object AutoDownloads : AutoDownloadController {
     override val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = store.recentlyDeleted
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
     override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash
+    override val supportsWatchedCleanup: Boolean get() = isAvailable && DownloadsRepository.supportsWatchedCleanup
 
     fun storageLimitBytes(): Long? = store.storageLimitBytes()
     fun totalStorageLimitBytes(): Long? = store.totalStorageLimitBytes()
@@ -372,6 +374,7 @@ internal object AutoDownloads : AutoDownloadController {
     }
 
     override fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) {
+        if (enabled && !usesUndoableSystemTrash) return
         launchTrackedAction {
             val saved = runCatching { store.setMakeRoomAutomatically(profileId, enabled) }.getOrDefault(false)
             if (!saved) {

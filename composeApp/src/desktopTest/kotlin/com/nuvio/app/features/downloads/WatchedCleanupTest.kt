@@ -44,6 +44,7 @@ import nuvio.composeapp.generated.resources.downloads_cleanup_empty_all
 import nuvio.composeapp.generated.resources.downloads_cleanup_filter_30_days
 import nuvio.composeapp.generated.resources.downloads_cleanup_filter_all
 import nuvio.composeapp.generated.resources.downloads_cleanup_total_selected
+import nuvio.composeapp.generated.resources.downloads_cleanup_watched_button
 import nuvio.composeapp.generated.resources.downloads_cleanup_watched_title
 import nuvio.composeapp.generated.resources.downloads_delete_confirm_trash
 import nuvio.composeapp.generated.resources.downloads_delete_message_held
@@ -969,6 +970,93 @@ class WatchedCleanupModelAndUndoTest {
         assertEquals("subs-no-path", ep1Subs.resolve("en.srt").readText())
         assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-no-path" && it.status == DownloadStatus.Completed })
     }
+
+    @Test
+    fun archive_cleanup_preserves_undo_past_seven_day_sweep_including_across_profiles() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val otherProfile = originalProfile + 41
+        val realStoreDir = root.resolve("sweep-store").createDirectories()
+        val realCacheDir = root.resolve("sweep-cache").createDirectories()
+        DesktopStorage.setRootDirForTest(realStoreDir, realCacheDir)
+        try {
+            var currentClock = now
+            trash = DesktopDownloadsTrash(
+                downloadsDir = { downloadsDir },
+                systemTrash = { file -> file.renameTo(trashDir.resolve("swept-${file.name}").toFile()) },
+                nowEpochMs = { currentClock },
+                systemTrashWithResult = null,
+                isUndoStillPending = AutoDownloadStorage::isArchivePathReferencedByUndo,
+            )
+            assertTrue(trash.usesSystemTrash)
+            assertFalse(trash.usesUndoableSystemTrash)
+
+            val store = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { currentClock }) {
+                ProfileRepository.activeProfileId
+            }
+
+            // Hold an ordinary non-Undo deletion in .removed first (when system Trash was unavailable),
+            // alongside two Undo-backed watched clean-ups (when system Trash is pathless).
+            val archiveOnlyTrash = DesktopDownloadsTrash(
+                downloadsDir = { downloadsDir },
+                systemTrash = null,
+                nowEpochMs = { currentClock },
+            )
+            val ordinaryFile = downloadsDir.resolve("ordinary.mkv").also { it.writeText("ordinary-video") }
+            assertTrue(archiveOnlyTrash.moveAway(ordinaryFile.toUri().toString()))
+            assertFalse(ordinaryFile.exists())
+
+            val epKeepFile = downloadsDir.resolve("ep-keep-undo.mkv").also { it.writeText("keep-undo-video") }
+            val epKeepSubs = downloadsDir.resolve("ep-keep-undo.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("keep-undo-subs") }
+            val epClearedFile = downloadsDir.resolve("ep-cleared-undo.mkv").also { it.writeText("cleared-undo-video") }
+
+            val epKeep = testDownload(1, DownloadStatus.Completed, showId = "tt-sweep", localFileUri = epKeepFile.toUri().toString(), id = "ep-keep-undo")
+                .copy(fileName = "ep-keep-undo.mkv", downloadedBytes = 600L, totalBytes = 600L)
+            val epCleared = testDownload(2, DownloadStatus.Completed, showId = "tt-sweep", localFileUri = epClearedFile.toUri().toString(), id = "ep-cleared-undo")
+                .copy(fileName = "ep-cleared-undo.mkv", downloadedBytes = 600L, totalBytes = 600L)
+
+            backend.payload = DownloadsCodec.encode(listOf(epKeep, epCleared), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            assertEquals(
+                2,
+                executeWatchedCleanup(
+                    profileId = originalProfile,
+                    downloadIds = listOf("ep-keep-undo", "ep-cleared-undo"),
+                    store = store,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { currentClock },
+                ),
+            )
+            val clearedEntry = store.recentlyDeleted.value.single { it.downloadId == "ep-cleared-undo" }
+            assertTrue(store.clearDeletedUndo(originalProfile, clearedEntry))
+
+            // Switch to another profile and run the archive sweep after 8 days (> HeldFileDays = 7):
+            // ordinaryFile and clearedEntry move to systemTrash, while ep-keep-undo's video and subtitles stay restorable!
+            ProfileRepository.setActiveProfileIdForTest(otherProfile)
+            DownloadsRepository.onProfileChanged()
+            currentClock = now + 8 * dayMs
+            val sweptCount = trash.purgeHeldFiles(currentClock)
+            assertEquals(2, sweptCount, "only non-Undo and cleared-Undo archive entries should sweep to Trash after 7 days")
+
+            // Switch back to originalProfile after 8 days and press Undo -> restores both video and sidecar subtitles!
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+            val pendingEntry = store.recentlyDeleted.value.single { it.downloadId == "ep-keep-undo" }
+            assertTrue(pendingEntry.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, pendingEntry, store))
+            assertEquals("keep-undo-video", epKeepFile.readText())
+            assertEquals("keep-undo-subs", epKeepSubs.resolve("en.srt").readText())
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-keep-undo" && it.status == DownloadStatus.Completed })
+        } finally {
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            DesktopStorage.setRootDirForTest(null, null)
+        }
+    }
 }
 
 @OptIn(ExperimentalTestApi::class)
@@ -1177,5 +1265,153 @@ class WatchedCleanupUiTest {
 
         compose.onNodeWithText(text(Res.string.downloads_cleanup_filter_30_days)).performClick()
         compose.onNodeWithText(text(Res.string.downloads_cleanup_empty_30_days)).assertIsDisplayed()
+    }
+
+    @Test
+    fun downloads_screen_hides_cleanup_action_when_unsupported_and_routes_through_controller_when_supported() {
+        val profile = ProfileRepository.activeProfileId
+        val watchedStore = DesktopStorage.store("nuvio_watched")
+        val previousWatched = WatchedStorage.loadPayload(profile)
+        val realBackend = DownloadsRepository.backend
+        val realOnTrip = DownloadsRepository.onProfileReadyForTrip
+        val watchedFilm = DownloadItem(
+            id = "m-screen-cleanup",
+            contentType = "movie",
+            parentMetaId = "tt-screen-cleanup",
+            parentMetaType = "movie",
+            videoId = "tt-screen-cleanup",
+            title = "Arrival",
+            streamTitle = "1080p",
+            providerName = "A",
+            sourceUrl = "https://example.com/arrival.mkv",
+            localFileUri = "file:/downloads/arrival.mkv",
+            fileName = "arrival.mkv",
+            status = DownloadStatus.Completed,
+            downloadedBytes = 2_000_000_000L,
+            totalBytes = 2_000_000_000L,
+            framesCheck = DownloadFramesCheck.Passed,
+            createdAtEpochMs = 1L,
+            updatedAtEpochMs = 1L,
+        )
+        val memBackend = object : DownloadsBackend {
+            var stored: String? = DownloadsCodec.encode(listOf(watchedFilm), null, 1L)
+            override fun loadPayload(): String? = stored
+            override fun savePayload(payload: String) { stored = payload }
+            override fun restoreItem(item: DownloadItem): DownloadItem = item
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (Long, Long?) -> Unit,
+                onSuccess: (String, Long?) -> Unit,
+                onFailure: (String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle = object : DownloadsTaskHandle { override fun cancel() = Unit }
+            override fun removeFile(localFileUri: String?): Boolean = false
+            override fun removePartialFile(destinationFileName: String): Boolean = false
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+        }
+        try {
+            WatchedRepository.clearLocalState()
+            watchedStore.remove("watched_$profile")
+            WatchedRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+            WatchedRepository.markWatchedLocally(
+                listOf(WatchedItem(id = "tt-screen-cleanup", type = "movie", name = "Arrival", markedAtEpochMs = 1_700_000_000_000L)),
+            )
+
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = memBackend
+            DownloadsRepository.onProfileReadyForTrip = {}
+            DownloadsRepository.ensureLoaded()
+
+            val cleanedCalls = mutableListOf<Pair<Int, Set<String>>>()
+            var mode by mutableStateOf("mobile")
+            val unsupportedController = object : AutoDownloadController {
+                override val rules = MutableStateFlow(emptyList<AutoDownloadRule>())
+                override val statuses = MutableStateFlow(emptyMap<String, AutoDownloadStatus>())
+                override val storageLimitGb = MutableStateFlow<Int?>(null)
+                override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
+                override val usesSystemTrash = false
+                override val usesUndoableSystemTrash = false
+                override val supportsWatchedCleanup = false
+                override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
+                override fun turnOff(profileId: Int, ruleKey: String) = Unit
+                override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
+                override fun keepDownload(profileId: Int, downloadId: String) = Unit
+                override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
+                override fun checkNow() = Unit
+            }
+            val archiveController = object : AutoDownloadController {
+                override val rules = MutableStateFlow(emptyList<AutoDownloadRule>())
+                override val statuses = MutableStateFlow(emptyMap<String, AutoDownloadStatus>())
+                override val storageLimitGb = MutableStateFlow<Int?>(null)
+                override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
+                override val usesSystemTrash = true
+                override val usesUndoableSystemTrash = false
+                override val supportsWatchedCleanup = true
+                override fun cleanUpWatchedDownloads(profileId: Int, downloadIds: Set<String>) {
+                    cleanedCalls += profileId to downloadIds
+                }
+                override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
+                override fun turnOff(profileId: Int, ruleKey: String) = Unit
+                override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
+                override fun keepDownload(profileId: Int, downloadId: String) = Unit
+                override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
+                override fun checkNow() = Unit
+            }
+
+            compose.setContent {
+                NuvioTheme {
+                    when (mode) {
+                        "mobile" -> DownloadsScreenContent(
+                            onBack = {},
+                            onOpenDownload = {},
+                            showAutoDownloads = false,
+                            autoDownloads = null,
+                        )
+                        "unsupported" -> DownloadsScreenContent(
+                            onBack = {},
+                            onOpenDownload = {},
+                            showAutoDownloads = true,
+                            autoDownloads = unsupportedController,
+                        )
+                        else -> DownloadsScreenContent(
+                            onBack = {},
+                            onOpenDownload = {},
+                            showAutoDownloads = true,
+                            autoDownloads = archiveController,
+                        )
+                    }
+                }
+            }
+
+            // 1. Mobile default (showAutoDownloads = false, autoDownloads = null): Clean up watched action is not offered.
+            compose.onNodeWithText("Arrival").assertIsDisplayed()
+            compose.onNodeWithText(text(Res.string.downloads_cleanup_watched_button)).assertDoesNotExist()
+
+            // 2. Controller reporting supportsWatchedCleanup = false: Clean up watched action is not offered.
+            compose.runOnIdle { mode = "unsupported" }
+            compose.waitForIdle()
+            compose.onNodeWithText(text(Res.string.downloads_cleanup_watched_button)).assertDoesNotExist()
+
+            // 3. Supported controller (including archive mode on desktop): action opens dialog and confirms via controller.
+            compose.runOnIdle { mode = "archive" }
+            compose.waitForIdle()
+            compose.onNodeWithText(text(Res.string.downloads_cleanup_watched_button)).assertIsDisplayed().performClick()
+            compose.onNode(hasText(text(Res.string.downloads_cleanup_confirm_archive)) and hasAnyAncestor(isDialog()))
+                .assertIsEnabled()
+                .performClick()
+
+            assertEquals(listOf(profile to setOf("m-screen-cleanup")), cleanedCalls)
+        } finally {
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = realBackend
+            DownloadsRepository.onProfileReadyForTrip = realOnTrip
+            WatchedRepository.clearLocalState()
+            WatchedRepository.activateSource(WatchProgressSource.NUVIO_SYNC)
+            if (previousWatched == null) {
+                watchedStore.remove("watched_$profile")
+            } else {
+                WatchedStorage.savePayload(profile, previousWatched)
+            }
+        }
     }
 }

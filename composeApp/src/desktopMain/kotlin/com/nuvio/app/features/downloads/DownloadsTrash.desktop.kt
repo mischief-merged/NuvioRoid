@@ -31,6 +31,7 @@ internal actual object DownloadsTrash {
         downloadsDir = { DesktopStorage.rootDir.resolve("downloads").also { it.createDirectories() } },
         systemTrash = ::moveToSystemTrash.takeIf { systemTrashIsSupported() },
         systemTrashWithResult = ::moveToSystemTrashWithUndoPath.takeIf { isMacOs },
+        isUndoStillPending = AutoDownloadStorage::isArchivePathReferencedByUndo,
         otherDirs = {
             // Every other location that can be reached: its files are held on its own volume.
             val folders = DesktopDownloads.folders
@@ -42,6 +43,7 @@ internal actual object DownloadsTrash {
 
     actual val usesSystemTrash: Boolean get() = trash.usesSystemTrash
     actual val usesUndoableSystemTrash: Boolean get() = trash.usesUndoableSystemTrash
+    actual val supportsWatchedCleanup: Boolean = true
 
     actual fun moveAway(localFileUri: String): Boolean = trash.moveAway(localFileUri)
 
@@ -124,6 +126,8 @@ internal class DesktopDownloadsTrash(
     private val otherDirs: () -> List<Path> = { emptyList() },
     /** Optional Trash mover that reports the destination path in Trash so Undo can restore it. */
     private val systemTrashWithResult: ((Path) -> SystemTrashOutcome)? = null,
+    /** Whether an archived Undo entry is still referenced by a profile's Recently deleted Undo list. */
+    private val isUndoStillPending: ((Path) -> Boolean)? = null,
 ) {
     val usesSystemTrash: Boolean get() = systemTrash != null || systemTrashWithResult != null
     val usesUndoableSystemTrash: Boolean get() = systemTrashWithResult != null
@@ -216,7 +220,12 @@ internal class DesktopDownloadsTrash(
                 ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
             val heldSubs = if (subtitles != null) {
                 runCatching { hold(root, subtitles) }.getOrNull() ?: run {
+                    val holding = root.resolve(HoldingFolderName)
                     runCatching { Files.move(heldVideo, file) }
+                    if (holding.isDirectoryInside(root)) {
+                        val updated = readIndex(holding).filterNot { (_, name) -> name == heldVideo.fileName.toString() }
+                        runCatching { writeIndex(holding, updated) }
+                    }
                     return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
                 }
             } else {
@@ -230,6 +239,17 @@ internal class DesktopDownloadsTrash(
                 fileKey = fileIdentity,
                 heldInArchive = true,
             )
+            if (requireUndo) {
+                val holding = root.resolve(HoldingFolderName)
+                val addedUndoNames = listOfNotNull(
+                    heldVideo.fileName?.toString(),
+                    heldSubs?.fileName?.toString(),
+                )
+                if (runCatching { writeUndoNames(holding, readUndoNames(holding) + addedUndoNames) }.isFailure) {
+                    runCatching { restoreFromTrash(trashed) }
+                    return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+                }
+            }
             if (!runCatching { onMoved(trashed) }.getOrDefault(false)) {
                 runCatching { restoreFromTrash(trashed) }
                 return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
@@ -374,6 +394,8 @@ internal class DesktopDownloadsTrash(
                 }
                 val updated = readIndex(holding).filterNot { (_, name) -> name in restoredNames }
                 runCatching { writeIndex(holding, updated) }
+                val updatedUndo = readUndoNames(holding) - restoredNames
+                runCatching { writeUndoNames(holding, updatedUndo) }
             }
         }
         val origSubsUri = trashed.originalSubtitlesUri
@@ -491,23 +513,35 @@ internal class DesktopDownloadsTrash(
         if (!holding.isDirectoryInside(root)) return 0
         val maxAgeMs = HeldFileDays * 24L * 60 * 60 * 1000
         var movedToTrash = 0
+        val undoNames = readUndoNames(holding).toMutableSet()
         val remaining = readIndex(holding).filter { (heldAtEpochMs, name) ->
-            if (nowEpochMs - heldAtEpochMs < maxAgeMs) return@filter true
             val entry = holding.resolve(name)
             // Only a name this class wrote, directly inside the archive folder, and never through a link.
             val isOwn = entry.parent == holding && entry.fileName.toString() == name
-            when {
-                !isOwn -> false
-                !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) -> false
-                Files.isSymbolicLink(entry) -> false
-                runCatching { invokeSystemTrash(entry) is SystemTrashOutcome.Moved && !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) }.getOrDefault(false) -> {
-                    movedToTrash++
-                    false
+            if (!isOwn || !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(entry)) {
+                undoNames.remove(name)
+                return@filter false
+            }
+            if (name in undoNames) {
+                val stillPending = isUndoStillPending?.let { check ->
+                    runCatching { check(entry) }.getOrDefault(true)
+                } ?: true
+                if (stillPending) {
+                    return@filter true
                 }
-                else -> true
+                undoNames.remove(name)
+            }
+            if (nowEpochMs - heldAtEpochMs < maxAgeMs) return@filter true
+            if (runCatching { invokeSystemTrash(entry) is SystemTrashOutcome.Moved && !Files.exists(entry, LinkOption.NOFOLLOW_LINKS) }.getOrDefault(false)) {
+                movedToTrash++
+                false
+            } else {
+                true
             }
         }
         runCatching { writeIndex(holding, remaining) }
+        val remainingNames = remaining.mapTo(HashSet()) { it.second }
+        runCatching { writeUndoNames(holding, undoNames.intersect(remainingNames)) }
         return movedToTrash
     }
 
@@ -549,6 +583,25 @@ internal class DesktopDownloadsTrash(
         Files.write(index, entries.map { (heldAt, name) -> "$heldAt\t$name" })
     }
 
+    private fun readUndoNames(holding: Path): Set<String> {
+        val undoIndex = holding.resolve(UndoIndexFileName)
+        if (!Files.isRegularFile(undoIndex, LinkOption.NOFOLLOW_LINKS)) return emptySet()
+        return runCatching { Files.readAllLines(undoIndex) }.getOrDefault(emptyList()).mapNotNullTo(linkedSetOf()) { line ->
+            val name = line.trim()
+            if (name.isBlank() || name.contains('/') || name.contains('\\') || name == "." || name == "..") null else name
+        }
+    }
+
+    private fun writeUndoNames(holding: Path, names: Set<String>) {
+        val undoIndex = holding.resolve(UndoIndexFileName)
+        if (Files.isSymbolicLink(undoIndex)) throw IOException("The Undo index of held files is a link")
+        if (names.isEmpty()) {
+            Files.deleteIfExists(undoIndex)
+        } else {
+            Files.write(undoIndex, names.toList())
+        }
+    }
+
     private fun Path.hasLinkedComponentBelow(root: Path): Boolean {
         val absolute = toAbsolutePath()
         if (!absolute.startsWith(root) || absolute == root) return true
@@ -587,6 +640,7 @@ internal class DesktopDownloadsTrash(
     companion object {
         const val HoldingFolderName = ".removed"
         const val IndexFileName = "index"
+        const val UndoIndexFileName = "undo"
         private const val SubtitlesSuffix = ".subtitles"
     }
 }

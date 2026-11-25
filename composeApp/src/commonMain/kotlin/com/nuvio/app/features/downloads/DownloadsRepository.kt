@@ -1430,6 +1430,7 @@ object DownloadsRepository {
     /** Whether deleted downloads go to the system Trash. When they do not, the files stay in the holding folder. */
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
     internal val usesUndoableSystemTrash: Boolean get() = backend.usesUndoableSystemTrash
+    internal val supportsWatchedCleanup: Boolean get() = backend.supportsWatchedCleanup
 
     private fun loadFromDisk() {
         // The caller holds loadLock. The read holds the state lock; the scan below does not, so a pause
@@ -3164,6 +3165,9 @@ object DownloadsRepository {
         ) {
             return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
         }
+        if (withUndo && allowHoldingWhenNoSystemTrash && !backend.supportsWatchedCleanup) {
+            return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
+        }
         val trashAvailable = if (withUndo) backend.usesUndoableSystemTrash else backend.usesSystemTrash
         if (!trashAvailable && !allowHoldingWhenNoSystemTrash) {
             return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
@@ -3831,6 +3835,7 @@ internal interface DownloadsBackend {
     /** True when [trashFile] puts files in the trash of the system, false when it only holds them for days. */
     val usesSystemTrash: Boolean get() = true
     val usesUndoableSystemTrash: Boolean get() = usesSystemTrash
+    val supportsWatchedCleanup: Boolean get() = true
 
     /** Whether two addresses name the same file, however they are spelled. */
     fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
@@ -4041,6 +4046,7 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
     override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash
+    override val supportsWatchedCleanup: Boolean get() = DownloadsTrash.supportsWatchedCleanup
 
     override fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
         DownloadsTrash.isSameFile(firstFileUri, secondFileUri)

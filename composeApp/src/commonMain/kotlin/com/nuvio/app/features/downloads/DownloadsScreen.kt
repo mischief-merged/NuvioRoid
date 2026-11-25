@@ -371,18 +371,23 @@ internal fun DownloadsScreenContent(
         { showId, title -> onNavigateToShow?.invoke(showId, title) ?: run { selectedShowId = showId } }
     }
     val completedRoot = remember(uiState.completedItems) { CompletedGroups(uiState.completedItems) }
-    val cleanableWatched = remember(uiState.items, watchStatusOf, keptDownloadIds, folderStateNow) {
-        cleanableWatchedDownloads(
-            items = uiState.items,
-            watchStatusOf = watchStatusOf,
-            keptDownloadIds = keptDownloadIds,
-            movingIds = folderStateNow.movingIds,
-            isReachable = { item ->
-                if (!folders.supported) true
-                else folderStateNow.location(folders.locationIdOf(item))?.availability == FolderAvailability.Available
-            },
-            isPlaying = AutoDownloads::isPlaying,
-        )
+    val canCleanUpWatched = autoDownloads?.supportsWatchedCleanup == true
+    val cleanableWatched = remember(canCleanUpWatched, uiState.items, watchStatusOf, keptDownloadIds, folderStateNow) {
+        if (!canCleanUpWatched) {
+            emptyList()
+        } else {
+            cleanableWatchedDownloads(
+                items = uiState.items,
+                watchStatusOf = watchStatusOf,
+                keptDownloadIds = keptDownloadIds,
+                movingIds = folderStateNow.movingIds,
+                isReachable = { item ->
+                    if (!folders.supported) true
+                    else folderStateNow.location(folders.locationIdOf(item))?.availability == FolderAvailability.Available
+                },
+                isPlaying = AutoDownloads::isPlaying,
+            )
+        }
     }
     val showGroups = remember(allEpisodes, selectedShowId) {
         allEpisodes.filter { it.parentMetaId == selectedShowId }
@@ -461,7 +466,7 @@ internal fun DownloadsScreenContent(
                             )
                         }
                     }
-                    if (selectedShowId == null && !showingTripReady && cleanableWatched.isNotEmpty()) {
+                    if (canCleanUpWatched && selectedShowId == null && !showingTripReady && cleanableWatched.isNotEmpty()) {
                         TextButton(
                             onClick = {
                                 selecting = false
@@ -720,23 +725,14 @@ internal fun DownloadsScreenContent(
             onDismiss = { chooseLocationFor = null },
         )
     }
-    if (showingWatchedCleanup && cleanableWatched.isNotEmpty()) {
+    if (showingWatchedCleanup && canCleanUpWatched && autoDownloads != null && cleanableWatched.isNotEmpty()) {
         WatchedCleanupDialog(
             candidates = cleanableWatched,
             nowEpochMs = now.value,
-            usesSystemTrash = autoDownloads?.usesUndoableSystemTrash ?: DownloadsRepository.usesUndoableSystemTrash,
+            usesSystemTrash = autoDownloads.usesUndoableSystemTrash,
             onConfirm = { chosenIds ->
                 showingWatchedCleanup = false
-                if (autoDownloads != null) {
-                    autoDownloads.cleanUpWatchedDownloads(activeProfileId, chosenIds)
-                } else {
-                    deleteScope.launch {
-                        chosenIds.forEach { id ->
-                            uiState.items.firstOrNull { it.id == id }?.let { rememberDeletion(it) }
-                            DownloadsRepository.deleteDownload(id)
-                        }
-                    }
-                }
+                autoDownloads.cleanUpWatchedDownloads(activeProfileId, chosenIds)
             },
             onDismiss = { showingWatchedCleanup = false },
         )

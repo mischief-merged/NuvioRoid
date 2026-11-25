@@ -7,6 +7,7 @@ import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.isToggleable
@@ -30,6 +31,7 @@ import nuvio.composeapp.generated.resources.downloads_recent_made_room_today
 import nuvio.composeapp.generated.resources.downloads_undo_deleted_description
 import nuvio.composeapp.generated.resources.settings_make_room_description
 import nuvio.composeapp.generated.resources.settings_make_room_title
+import nuvio.composeapp.generated.resources.settings_make_room_unavailable_description
 import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.getString
 import org.junit.Rule
@@ -901,5 +903,46 @@ class MakeRoomAutomaticallyUiTest {
             .performClick()
 
         assertEquals(listOf(5 to deleted), undone)
+    }
+
+    @Test
+    fun setting_is_disabled_with_explanation_when_undoable_system_trash_is_unavailable() {
+        val toggled = mutableListOf<Pair<Int, Boolean>>()
+        val controller = object : AutoDownloadController {
+            override val rules = MutableStateFlow(emptyList<AutoDownloadRule>())
+            override val statuses = MutableStateFlow(emptyMap<String, AutoDownloadStatus>())
+            override val storageLimitGb = MutableStateFlow<Int?>(null)
+            override val makeRoomAutomatically = MutableStateFlow(true)
+            override val removals = MutableStateFlow(emptyList<AutoDownloadRemoval>())
+            override val usesSystemTrash = true
+            override val usesUndoableSystemTrash = false
+
+            override fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) {
+                toggled += profileId to enabled
+            }
+
+            override fun save(profileId: Int, meta: MetaDetails, keepCount: Int, scope: AutoDownloadScope, deleteAfterWatching: Boolean) = Unit
+            override fun turnOff(profileId: Int, ruleKey: String) = Unit
+            override fun setStorageLimit(profileId: Int, limitGb: Int?) = Unit
+            override fun keepDownload(profileId: Int, downloadId: String) = Unit
+            override fun deleteDownloadNow(profileId: Int, downloadId: String) = Unit
+            override fun checkNow() = Unit
+        }
+
+        compose.setContent {
+            NuvioTheme {
+                MakeRoomAutomaticallySetting(isTablet = false, controller = controller, profileId = 5)
+            }
+        }
+
+        compose.onNodeWithText(text(Res.string.settings_make_room_title)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.settings_make_room_unavailable_description)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.settings_make_room_description)).assertDoesNotExist()
+        compose.onNode(isToggleable())
+            .assertIsOff()
+            .assertIsNotEnabled()
+
+        compose.onNodeWithText(text(Res.string.settings_make_room_title)).performClick()
+        assertEquals(emptyList(), toggled)
     }
 }

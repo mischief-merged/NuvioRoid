@@ -109,11 +109,23 @@ internal fun MakeRoomAutomaticallySetting(
         if (controller === AutoDownloads) AutoDownloads.onProfileChanged()
     }
     val enabled by controller.makeRoomAutomatically.collectAsStateWithLifecycle()
+    val supported = controller.usesUndoableSystemTrash
     SettingsSwitchRow(
         title = stringResource(Res.string.settings_make_room_title),
-        description = stringResource(Res.string.settings_make_room_description),
-        checked = enabled,
+        description = stringResource(
+            if (supported) {
+                Res.string.settings_make_room_description
+            } else {
+                Res.string.settings_make_room_unavailable_description
+            },
+        ),
+        checked = enabled && supported,
+        enabled = supported,
         isTablet = isTablet,
-        onCheckedChange = { controller.setMakeRoomAutomatically(profileId, it) },
+        onCheckedChange = {
+            if (supported) {
+                controller.setMakeRoomAutomatically(profileId, it)
+            }
+        },
     )
 }

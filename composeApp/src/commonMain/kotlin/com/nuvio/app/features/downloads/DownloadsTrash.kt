@@ -45,6 +45,9 @@ internal expect object DownloadsTrash {
     /** True when system Trash returns a recoverable destination path so Undo can restore moved files. */
     val usesUndoableSystemTrash: Boolean
 
+    /** True when watched clean-up can move files to system Trash or the local archive with Undo. */
+    val supportsWatchedCleanup: Boolean
+
     /** True when the file is out of the downloads folder, or was already gone. */
     fun moveAway(localFileUri: String): Boolean
 

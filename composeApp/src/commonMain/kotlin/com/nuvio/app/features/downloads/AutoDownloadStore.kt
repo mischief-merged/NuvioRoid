@@ -90,6 +90,30 @@ internal data class ScheduledAutoDownloadRemoval(
     val keepEpoch: Long,
 )
 
+private val AutoDownloadPayloadJson = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+}
+
+/**
+ * True when [payload] has any pending Undo entry whose trashed video or subtitle URI satisfies
+ * [matchesUri]. Unreadable payloads return true so background archive sweeps never drop Undo files.
+ */
+internal fun autoDownloadPayloadReferencesUndoUri(
+    payload: String,
+    matchesUri: (String) -> Boolean,
+): Boolean {
+    if (payload.isBlank()) return false
+    val decoded = runCatching { AutoDownloadPayloadJson.decodeFromString<StoredAutoDownloads>(payload) }.getOrNull()
+        ?: return true
+    return decoded.recentlyDeleted.any { entry ->
+        if (!entry.canUndo) return@any false
+        val trashed = entry.trashed ?: return@any false
+        (trashed.trashedFileUri?.let(matchesUri) == true) ||
+            (trashed.trashedSubtitlesUri?.let(matchesUri) == true)
+    }
+}
+
 /**
  * The automatic-download rules of the active profile.
  *
