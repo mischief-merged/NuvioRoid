@@ -62,10 +62,17 @@ internal class DownloadTransferLimits(
         { check, _ -> check() },
     /** The most bytes this file may have under the combined limit for all downloads. Null: no limit. */
     private val maxAllDownloadsBytes: () -> Long? = { null },
+    /** Optional per-profile free-space floor set by the user (distinct from the automatic-only [minFreeBytes] reserve). */
+    private val userFreeSpaceFloorBytes: () -> Long = { 0L },
 ) {
     /** The size in bytes of the transfer when a limit last stopped it, if known. */
     @kotlin.concurrent.Volatile
     var lastRefusedSizeBytes: Long? = null
+        private set
+
+    /** True when the last [AutoDownloadStop.LowDiskSpace] stop came from [userFreeSpaceFloorBytes] rather than [minFreeBytes]. */
+    @kotlin.concurrent.Volatile
+    var lastStoppedByUserFreeSpaceFloor: Boolean = false
         private set
 
     /** [stopFor] for a transfer that is about to write its body. A size that is allowed is reserved. */
@@ -82,15 +89,25 @@ internal class DownloadTransferLimits(
         val maxAll = maxAllDownloadsBytes()
         if (maxAll != null && size > maxAll) {
             lastRefusedSizeBytes = size.takeIf { it > 0L }
+            lastStoppedByUserFreeSpaceFloor = false
             return AutoDownloadStop.TotalStorageLimit
         }
         val max = maxTotalBytes()
         if (max != null && size > max) {
             lastRefusedSizeBytes = size.takeIf { it > 0L }
+            lastStoppedByUserFreeSpaceFloor = false
             return AutoDownloadStop.StorageLimit
         }
-        if (minFreeBytes > 0L && freeBytes != null && freeBytes - (size - downloadedBytes) < minFreeBytes) {
+        val remaining = (size - downloadedBytes).coerceAtLeast(0L)
+        val userFloor = userFreeSpaceFloorBytes()
+        if (userFloor > 0L && freeBytes != null && freeBytes - remaining < userFloor) {
             lastRefusedSizeBytes = size.takeIf { it > 0L }
+            lastStoppedByUserFreeSpaceFloor = true
+            return AutoDownloadStop.LowDiskSpace
+        }
+        if (minFreeBytes > 0L && freeBytes != null && freeBytes - remaining < minFreeBytes) {
+            lastRefusedSizeBytes = size.takeIf { it > 0L }
+            lastStoppedByUserFreeSpaceFloor = false
             return AutoDownloadStop.LowDiskSpace
         }
         return null

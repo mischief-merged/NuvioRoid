@@ -372,9 +372,9 @@ internal expect object LimitedConnectionStorage {
     fun loadPolite(): Boolean?
     fun savePolite(value: Boolean)
 
-    /** Optional free-space floor in gigabytes across download locations. Null: off. */
-    fun loadFreeSpaceFloorGb(): Int?
-    fun saveFreeSpaceFloorGb(value: Int?)
+    /** Optional per-profile free-space floor in gigabytes across download locations. Null: off. */
+    fun loadFreeSpaceFloorGb(profileId: Int): Int?
+    fun saveFreeSpaceFloorGb(profileId: Int, value: Int?)
 }
 
 /** The setting "Let other apps go first" and what the downloads screen shows about it. */

@@ -1,6 +1,7 @@
 package com.nuvio.app.features.downloads
 
 import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.core.storage.ProfileScopedKey
 
 internal actual object LimitedConnectionStorage {
     private val store by lazy { DesktopStorage.store("nuvio_limited_connections") }
@@ -21,10 +22,10 @@ internal actual object LimitedConnectionStorage {
         store.putString("let_others_first", value.toString())
     }
 
-    actual fun loadFreeSpaceFloorGb(): Int? =
-        store.getString("free_space_floor_gb")?.toIntOrNull()?.takeIf { it > 0 }
+    actual fun loadFreeSpaceFloorGb(profileId: Int): Int? =
+        store.getString(ProfileScopedKey.of("free_space_floor_gb", profileId))?.toIntOrNull()?.takeIf { it > 0 }
 
-    actual fun saveFreeSpaceFloorGb(value: Int?) {
-        store.putString("free_space_floor_gb", value?.toString().orEmpty())
+    actual fun saveFreeSpaceFloorGb(profileId: Int, value: Int?) {
+        store.putString(ProfileScopedKey.of("free_space_floor_gb", profileId), value?.toString().orEmpty())
     }
 }

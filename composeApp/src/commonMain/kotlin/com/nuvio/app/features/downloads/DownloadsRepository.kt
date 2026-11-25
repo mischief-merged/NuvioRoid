@@ -376,6 +376,7 @@ object DownloadsRepository {
     internal fun selectProfileForDownloads(select: () -> Unit) = synchronized(stateLock) { select() }
 
     fun onProfileChanged() {
+        freeSpaceHold.onProfileChanged()
         beforeCatalogLoad()
         synchronized(loadLock) {
             // A read already on this thread must not start another, or the two would wait on each other.
@@ -1809,11 +1810,15 @@ object DownloadsRepository {
 
     private fun DownloadItem.resolvedLocationId(): String = backend.locationIdOf(this)
 
+    private fun DownloadItem.remainingBytesToWrite(): Long =
+        (knownRequiredBytes() - downloadedBytes).coerceAtLeast(0L)
+
     private fun DownloadItem.isBelowFreeSpaceFloor(): Boolean =
-        backend.isConnected(this) && freeSpaceHold.isLocationBelowFloor(resolvedLocationId())
+        backend.isConnected(this) && freeSpaceHold.isLocationBelowFloor(resolvedLocationId(), remainingBytesToWrite())
 
     private fun DownloadItem.canResumeFromFreeSpaceFloor(): Boolean =
-        backend.isConnected(this) && !backend.heldByFolder(this) && freeSpaceHold.canResumeLocation(resolvedLocationId())
+        backend.isConnected(this) && !backend.heldByFolder(this) &&
+            freeSpaceHold.canResumeLocation(resolvedLocationId(), remainingBytesToWrite())
 
     private fun DownloadItem.waitingForFreeSpace(): DownloadItem =
         if (status != DownloadStatus.Downloading) {
@@ -1822,6 +1827,7 @@ object DownloadsRepository {
             copy(
                 status = DownloadStatus.Paused,
                 pausedByFreeSpace = true,
+                waitingSizeBytes = knownRequiredBytes().takeIf { it > 0L } ?: waitingSizeBytes,
                 errorMessage = null,
                 updatedAtEpochMs = DownloadsClock.nowEpochMs(),
             )
@@ -2048,6 +2054,30 @@ object DownloadsRepository {
                                         downloadedBytes = normalizedBytes,
                                         totalBytes = positiveTotal,
                                         autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                                        waitingSizeBytes = size.takeIf { it > 0L },
+                                        updatedAtEpochMs = now,
+                                        errorMessage = null,
+                                    )
+                                }
+                            }
+                            resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
+                            return@ifCurrent
+                        }
+                        val updatedCandidate = currentItem.copy(
+                            downloadedBytes = normalizedBytes,
+                            totalBytes = positiveTotal,
+                        )
+                        if (updatedCandidate.isBelowFreeSpaceFloor()) {
+                            removeTransfer(item.id)?.cancel()
+                            mutateItem(item.id) { current ->
+                                if (current.status != DownloadStatus.Downloading) {
+                                    current
+                                } else {
+                                    current.copy(
+                                        status = DownloadStatus.Paused,
+                                        pausedByFreeSpace = true,
+                                        downloadedBytes = normalizedBytes,
+                                        totalBytes = positiveTotal,
                                         waitingSizeBytes = size.takeIf { it > 0L },
                                         updatedAtEpochMs = now,
                                         errorMessage = null,
@@ -2935,7 +2965,8 @@ object DownloadsRepository {
             maxTotalBytes = {
                 if (isAutoOrTrip) limits.storageLimitBytes()?.let { it - autoDownloadBytes(exceptDownloadId = item.id) } else null
             },
-            minFreeBytes = maxOf(if (isAutoOrTrip) limits.minFreeBytes else 0L, userFloor),
+            minFreeBytes = if (isAutoOrTrip) limits.minFreeBytes else 0L,
+            userFreeSpaceFloorBytes = { effectiveUserFreeSpaceFloorBytes() },
             checkAndReserve = { check, announcedBytes ->
                 synchronized(stateLock) {
                     check() ?: run {
@@ -2960,17 +2991,16 @@ object DownloadsRepository {
                 ifCurrent(item.id, transfer) {
                     removeTransfer(item.id)
                     val refusedBytes = guard.lastRefusedSizeBytes
-                    val hasUserFloor = effectiveUserFreeSpaceFloorBytes() > 0L
+                    val stoppedByUserFloor = reason == AutoDownloadStop.LowDiskSpace && guard.lastStoppedByUserFreeSpaceFloor
                     mutateItem(item.id) { current ->
                         if (current.status != DownloadStatus.Downloading) return@mutateItem current
                         val isStorageStop = reason == AutoDownloadStop.TotalStorageLimit || reason == AutoDownloadStop.StorageLimit
                         if (isStorageStop) blockedByStorage = true
-                        val stoppedByUserFloor = reason == AutoDownloadStop.LowDiskSpace && (hasUserFloor || !isAutoOrTrip)
                         current.copy(
                             status = DownloadStatus.Paused,
-                            pausedByFreeSpace = stoppedByUserFloor || current.pausedByFreeSpace,
+                            pausedByFreeSpace = if (reason == AutoDownloadStop.LowDiskSpace) stoppedByUserFloor else current.pausedByFreeSpace,
                             autoDownloadStop = if (stoppedByUserFloor && !isAutoOrTrip) null else reason,
-                            waitingSizeBytes = if (isStorageStop) {
+                            waitingSizeBytes = if (isStorageStop || stoppedByUserFloor) {
                                 refusedBytes ?: current.waitingSizeBytes ?: current.knownRequiredBytes().takeIf { it > 0L }
                             } else {
                                 null

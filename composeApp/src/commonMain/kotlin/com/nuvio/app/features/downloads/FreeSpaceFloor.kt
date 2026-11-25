@@ -1,5 +1,6 @@
 package com.nuvio.app.features.downloads
 
+import com.nuvio.app.features.profiles.ProfileRepository
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,34 +19,36 @@ internal data class FreeSpaceFloorState(
     val floorBytes: Long?
         get() = floorGb?.takeIf { it > 0 }?.times(BytesPerGigabyte)
 
-    fun isLocationBelowFloor(locationId: String?): Boolean {
+    fun isLocationBelowFloor(locationId: String?, remainingBytesToWrite: Long = 0L): Boolean {
         val floor = floorBytes ?: return false
         val free = locationFreeBytes[normalizeFloorLocationId(locationId)] ?: return false
-        return free < floor
+        return free - remainingBytesToWrite.coerceAtLeast(0L) < floor
     }
 
     /**
-     * True when a location held by the free-space floor may resume: either the floor is off,
-     * or the location's free space is known and at least [floorBytes].
+     * True when a download held by the free-space floor may resume: either the floor is off,
+     * or the location's free space minus [remainingBytesToWrite] is known and at least [floorBytes].
      * Unknown free space (such as an unplugged drive) never clears a free-space hold.
      */
-    fun canResumeLocation(locationId: String?): Boolean {
+    fun canResumeLocation(locationId: String?, remainingBytesToWrite: Long = 0L): Boolean {
         val floor = floorBytes ?: return true
         val free = locationFreeBytes[normalizeFloorLocationId(locationId)] ?: return false
-        return free >= floor
+        return free - remainingBytesToWrite.coerceAtLeast(0L) >= floor
     }
 }
 
 /**
- * Per-location free-space floor. Measured off-lock by the folder monitor and read in memory
- * by [DownloadsRepository], so holding or resuming transfers never touches the disk under locks.
+ * Per-profile, per-location free-space floor. Measured off-lock by the folder monitor and read in
+ * memory by [DownloadsRepository], so holding or resuming transfers never touches disk under locks.
  */
 internal class FreeSpaceHold(
-    private val loadFloorGb: () -> Int? = { null },
-    private val saveFloorGb: (Int?) -> Unit = {},
+    private val loadFloorGb: (profileId: Int) -> Int? = { null },
+    private val saveFloorGb: (profileId: Int, Int?) -> Unit = { _, _ -> },
+    private val activeProfileId: () -> Int = { ProfileRepository.activeProfileId },
 ) {
     private val lock = SynchronizedObject()
     private var loaded = false
+    private var loadedProfileId: Int? = null
     private var floorGb: Int? = null
     private var locationFreeBytes: Map<String, Long?> = emptyMap()
     private var listener: (() -> Unit)? = null
@@ -63,14 +66,14 @@ internal class FreeSpaceHold(
             return _state.value.floorBytes
         }
 
-    fun isLocationBelowFloor(locationId: String?): Boolean {
+    fun isLocationBelowFloor(locationId: String?, remainingBytesToWrite: Long = 0L): Boolean {
         ensureLoaded()
-        return _state.value.isLocationBelowFloor(locationId)
+        return _state.value.isLocationBelowFloor(locationId, remainingBytesToWrite)
     }
 
-    fun canResumeLocation(locationId: String?): Boolean {
+    fun canResumeLocation(locationId: String?, remainingBytesToWrite: Long = 0L): Boolean {
         ensureLoaded()
-        return _state.value.canResumeLocation(locationId)
+        return _state.value.canResumeLocation(locationId, remainingBytesToWrite)
     }
 
     fun listen(onChanged: () -> Unit) {
@@ -80,10 +83,24 @@ internal class FreeSpaceHold(
         }
     }
 
-    fun setFloorGb(value: Int?, notifyInBackground: Boolean = false) {
+    fun onProfileChanged(notifyInBackground: Boolean = false) {
+        val notify = synchronized(lock) {
+            val before = _state.value
+            ensureLoadedLocked()
+            listener.takeIf { _state.value != before }
+        } ?: return
+        if (notifyInBackground) ConnectionUpdates.submit(notify) else notify()
+    }
+
+    fun setFloorGb(
+        value: Int?,
+        profileId: Int = activeProfileId(),
+        notifyInBackground: Boolean = false,
+    ): Boolean {
         val normalized = value?.takeIf { it in optionsGb }
         val work = synchronized(lock) {
             ensureLoadedLocked()
+            if (loadedProfileId != profileId) return false
             val before = _state.value
             val changedSetting = floorGb != normalized
             floorGb = normalized
@@ -91,12 +108,13 @@ internal class FreeSpaceHold(
             _state.value = next
             val notify = listener.takeIf { next != before }
             val runEffects: () -> Unit = {
-                if (changedSetting) runCatching { saveFloorGb(normalized) }
+                if (changedSetting) runCatching { saveFloorGb(profileId, normalized) }
                 notify?.invoke()
             }
             runEffects
         }
         if (notifyInBackground) ConnectionUpdates.submit(work) else work()
+        return true
     }
 
     fun reportLocationFreeBytes(freeByLocation: Map<String, Long?>, notifyInBackground: Boolean = false) {
@@ -117,9 +135,11 @@ internal class FreeSpaceHold(
     }
 
     private fun ensureLoadedLocked() {
-        if (loaded) return
+        val currentProfile = activeProfileId()
+        if (loaded && loadedProfileId == currentProfile) return
         loaded = true
-        val stored = runCatching { loadFloorGb() }.getOrNull()
+        loadedProfileId = currentProfile
+        val stored = runCatching { loadFloorGb(currentProfile) }.getOrNull()
         floorGb = stored?.takeIf { it in optionsGb }
         _state.value = FreeSpaceFloorState(floorGb = floorGb, locationFreeBytes = locationFreeBytes)
     }

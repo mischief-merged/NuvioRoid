@@ -8,8 +8,13 @@ import androidx.compose.ui.test.isDialog
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import com.nuvio.app.core.storage.DesktopStorage
+import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.FreeSpaceFloorSetting
+import com.nuvio.app.features.streams.StreamBehaviorHints
+import com.nuvio.app.features.streams.StreamItem
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.settings_free_space_floor_off
@@ -103,8 +108,8 @@ class FreeSpaceFloorTest {
     fun set_up() {
         savedFloor = null
         hold = FreeSpaceHold(
-            loadFloorGb = { savedFloor },
-            saveFloorGb = { savedFloor = it },
+            loadFloorGb = { _ -> savedFloor },
+            saveFloorGb = { _, value -> savedFloor = value },
         )
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
@@ -310,6 +315,161 @@ class FreeSpaceFloorTest {
         }
     }
 
+    @Test
+    fun floor_is_scoped_per_profile_in_desktop_storage_and_switching_profiles_applies_each_profiles_floor() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val profileA = originalProfile + 31
+        val profileB = originalProfile + 32
+        val store = DesktopStorage.store("nuvio_limited_connections")
+        val payloadsByProfile = mutableMapOf<Int, String?>()
+        val profileBackend = object : DownloadsBackend by backend {
+            override fun loadPayload(profileId: Int): String? = payloadsByProfile[profileId]
+            override fun savePayload(profileId: Int, payload: String) {
+                payloadsByProfile[profileId] = payload
+            }
+        }
+        try {
+            store.remove(ProfileScopedKey.of("free_space_floor_gb", profileA))
+            store.remove(ProfileScopedKey.of("free_space_floor_gb", profileB))
+
+            val storageBackedHold = FreeSpaceHold(
+                loadFloorGb = LimitedConnectionStorage::loadFreeSpaceFloorGb,
+                saveFloorGb = LimitedConnectionStorage::saveFreeSpaceFloorGb,
+            )
+            DownloadsRepository.backend = profileBackend
+            DownloadsRepository.freeSpaceHold = storageBackedHold
+            storageBackedHold.reportLocationFreeBytes(mapOf("app" to 15L * BytesPerGigabyte))
+
+            ProfileRepository.setActiveProfileIdForTest(profileA)
+            DownloadsRepository.onProfileChanged()
+            assertTrue(storageBackedHold.setFloorGb(value = 20, profileId = profileA))
+            assertEquals(20, LimitedConnectionStorage.loadFreeSpaceFloorGb(profileA))
+            assertNull(LimitedConnectionStorage.loadFreeSpaceFloorGb(profileB))
+
+            enqueueMovie("profile-a-movie", locationId = "app")
+            assertEquals(DownloadStatus.Paused, itemOf("profile-a-movie").status)
+            assertTrue(itemOf("profile-a-movie").pausedByFreeSpace)
+
+            // Switch to profile B (floor is Off): 15 GB free must NOT hold profile B's downloads!
+            ProfileRepository.setActiveProfileIdForTest(profileB)
+            DownloadsRepository.onProfileChanged()
+            assertNull(storageBackedHold.floorBytes)
+
+            enqueueMovie("profile-b-movie", locationId = "app")
+            assertEquals(DownloadStatus.Downloading, itemOf("profile-b-movie").status)
+            assertFalse(itemOf("profile-b-movie").pausedByFreeSpace)
+
+            // Switch back to profile A -> 20 GB floor reloads automatically!
+            ProfileRepository.setActiveProfileIdForTest(profileA)
+            DownloadsRepository.onProfileChanged()
+            assertEquals(20L * BytesPerGigabyte, storageBackedHold.floorBytes)
+            assertEquals(DownloadStatus.Paused, itemOf("profile-a-movie").status)
+            assertTrue(itemOf("profile-a-movie").pausedByFreeSpace)
+        } finally {
+            store.remove(ProfileScopedKey.of("free_space_floor_gb", profileA))
+            store.remove(ProfileScopedKey.of("free_space_floor_gb", profileB))
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+        }
+    }
+
+    @Test
+    fun resume_requires_free_space_minus_remaining_bytes_at_least_floor_preventing_restart_thrash() {
+        hold.setFloorGb(10)
+        hold.reportLocationFreeBytes(mapOf("app" to 12L * BytesPerGigabyte))
+
+        // Start a download with 1 GB already on disk; server announces 4 GB total (3 GB remaining -> 12 - 3 = 9 < 10 GB floor).
+        val partialItem = testDownload(1, DownloadStatus.Downloading, id = "dl-4gb").copy(
+            locationId = "app",
+            downloadedBytes = 1L * BytesPerGigabyte,
+            createdAtEpochMs = 1L,
+        )
+        backend.payload = DownloadsCodec.encode(listOf(partialItem), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        assertEquals(listOf("dl-4gb"), backend.startedIds)
+
+        val guard = assertNotNull(backend.requestLimits["dl-4gb"])
+        val stop = guard.stopBeforeBody(
+            downloadedBytes = 1L * BytesPerGigabyte,
+            totalBytes = 4L * BytesPerGigabyte,
+            freeBytes = 12L * BytesPerGigabyte,
+        )
+        assertEquals(AutoDownloadStop.LowDiskSpace, stop)
+        assertTrue(guard.lastStoppedByUserFreeSpaceFloor)
+        guard.onStopped(AutoDownloadStop.LowDiskSpace)
+
+        val held = DownloadsRepository.uiState.value.items.single()
+        assertEquals(DownloadStatus.Paused, held.status)
+        assertTrue(held.pausedByFreeSpace)
+        assertEquals(4L * BytesPerGigabyte, held.waitingSizeBytes)
+
+        // Small free-space fluctuations above 10 GB but below 13 GB (10 GB floor + 3 GB remaining) must NOT restart!
+        hold.reportLocationFreeBytes(mapOf("app" to 12_100_000_000L))
+        hold.reportLocationFreeBytes(mapOf("app" to 12_900_000_000L))
+        assertEquals(1, backend.startedIds.size, "must not restart HTTP transfer when remaining bytes would still cross floor")
+        assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.single().status)
+
+        // Once 13 GB is free (13 - 3 >= 10), the download resumes cleanly!
+        hold.reportLocationFreeBytes(mapOf("app" to 13L * BytesPerGigabyte))
+        assertEquals(2, backend.startedIds.size)
+        assertEquals(DownloadStatus.Downloading, DownloadsRepository.uiState.value.items.single().status)
+        assertFalse(DownloadsRepository.uiState.value.items.single().pausedByFreeSpace)
+    }
+
+    @Test
+    fun automatic_ten_gigabyte_reserve_does_not_set_paused_by_free_space_or_thrash_with_five_gigabyte_floor() {
+        hold.setFloorGb(5)
+        hold.reportLocationFreeBytes(mapOf("app" to 8L * BytesPerGigabyte))
+
+        // Queue a 1 GB automatic download with 8 GB free: 8 - 1 = 7 >= 5 GB user floor, but 7 < 10 GB automatic reserve!
+        DownloadsRepository.enqueueFromStream(
+            contentType = "series",
+            videoId = "tt-auto:1:1",
+            parentMetaId = "tt-auto",
+            parentMetaType = "series",
+            title = "Auto Show",
+            logo = null,
+            poster = null,
+            background = null,
+            seasonNumber = 1,
+            episodeNumber = 1,
+            episodeTitle = "Ep 1",
+            episodeThumbnail = null,
+            stream = StreamItem(
+                name = "1080p",
+                url = "https://example.com/auto.mkv",
+                addonName = "A",
+                addonId = "addon:A",
+                behaviorHints = StreamBehaviorHints(videoSize = 1L * BytesPerGigabyte),
+            ),
+            autoDownloadRuleKey = "series:tt-auto",
+        )
+        val autoItem = itemOf("tt-auto")
+        val guard = assertNotNull(backend.requestLimits[autoItem.id])
+        val stop = guard.stopBeforeBody(
+            downloadedBytes = 0L,
+            totalBytes = 1L * BytesPerGigabyte,
+            freeBytes = 8L * BytesPerGigabyte,
+        )
+        assertEquals(AutoDownloadStop.LowDiskSpace, stop)
+        assertFalse(guard.lastStoppedByUserFreeSpaceFloor, "10 GB automatic reserve stop must not claim user floor")
+        guard.onStopped(AutoDownloadStop.LowDiskSpace)
+
+        val stoppedAuto = itemOf("tt-auto")
+        assertEquals(DownloadStatus.Paused, stoppedAuto.status)
+        assertFalse(stoppedAuto.pausedByFreeSpace, "automatic reserve stop must not set pausedByFreeSpace")
+        assertEquals(AutoDownloadStop.LowDiskSpace, stoppedAuto.autoDownloadStop)
+        assertTrue(downloadRowStatus(stoppedAuto, nowEpochMs = 0L).phase != DownloadPhase.WaitingForFreeSpace)
+
+        // Subsequent free-space updates between 5 and 10 GB must NOT restart the automatic download!
+        val startsBefore = backend.startedIds.size
+        hold.reportLocationFreeBytes(mapOf("app" to 8_200_000_000L))
+        hold.reportLocationFreeBytes(mapOf("app" to 8_800_000_000L))
+        assertEquals(startsBefore, backend.startedIds.size)
+        assertEquals(DownloadStatus.Paused, itemOf("tt-auto").status)
+    }
+
     private fun awaitConnectionUpdates() {
         val latch = CountDownLatch(1)
         ConnectionUpdates.submit { latch.countDown() }
@@ -326,12 +486,16 @@ class FreeSpaceFloorSettingTest {
 
     @Test
     fun setting_defaults_to_off_and_saves_chosen_floor_and_turns_back_off() {
-        var stored: Int? = null
-        val hold = FreeSpaceHold(loadFloorGb = { stored }, saveFloorGb = { stored = it })
+        val storedByProfile = mutableMapOf<Int, Int?>()
+        val hold = FreeSpaceHold(
+            loadFloorGb = { profile -> storedByProfile[profile] },
+            saveFloorGb = { profile, value -> storedByProfile[profile] = value },
+            activeProfileId = { 4 },
+        )
 
         compose.setContent {
             NuvioTheme {
-                FreeSpaceFloorSetting(isTablet = false, hold = hold)
+                FreeSpaceFloorSetting(isTablet = false, hold = hold, profileId = 4)
             }
         }
 
@@ -345,7 +509,8 @@ class FreeSpaceFloorSettingTest {
         val latch1 = CountDownLatch(1)
         ConnectionUpdates.submit { latch1.countDown() }
         assertTrue(latch1.await(5, TimeUnit.SECONDS))
-        assertEquals(20, stored)
+        assertEquals(20, storedByProfile[4])
+        assertNull(storedByProfile[5])
         assertEquals(20L * BytesPerGigabyte, hold.floorBytes)
         compose.onNodeWithText(text(Res.string.settings_free_space_floor_value, 20)).assertIsDisplayed()
 
@@ -356,7 +521,7 @@ class FreeSpaceFloorSettingTest {
         val latch2 = CountDownLatch(1)
         ConnectionUpdates.submit { latch2.countDown() }
         assertTrue(latch2.await(5, TimeUnit.SECONDS))
-        assertNull(stored)
+        assertNull(storedByProfile[4])
         assertNull(hold.floorBytes)
     }
 }
