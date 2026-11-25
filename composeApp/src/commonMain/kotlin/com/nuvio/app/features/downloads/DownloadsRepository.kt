@@ -2879,48 +2879,121 @@ object DownloadsRepository {
         downloadId: String,
         ruleKey: String?,
         stillWanted: () -> Boolean = { true },
-    ): AutoDownloadRemovalResult {
+    ): AutoDownloadRemovalResult =
+        removeWatchedAutoDownloadWithUndo(downloadId, ruleKey, stillWanted).result
+
+    internal fun removeWatchedAutoDownloadWithUndo(
+        downloadId: String,
+        ruleKey: String?,
+        stillWanted: () -> Boolean = { true },
+    ): WatchedTrashOutcome =
+        removeWatchedWithUndoInternal(
+            downloadId = downloadId,
+            expectedRuleKey = ruleKey,
+            requireMatchingRuleKey = true,
+            allowHoldingWhenNoSystemTrash = false,
+            stillWanted = stillWanted,
+        ).outcome
+
+    internal data class RemovedWatchedDownload(
+        val outcome: WatchedTrashOutcome,
+        val removedItem: DownloadItem? = null,
+    )
+
+    internal fun cleanUpWatchedDownload(
+        downloadId: String,
+        allowHoldingWhenNoSystemTrash: Boolean = true,
+        stillWanted: () -> Boolean = { true },
+    ): RemovedWatchedDownload =
+        removeWatchedWithUndoInternal(
+            downloadId = downloadId,
+            expectedRuleKey = null,
+            requireMatchingRuleKey = false,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            stillWanted = stillWanted,
+        )
+
+    private fun removeWatchedWithUndoInternal(
+        downloadId: String,
+        expectedRuleKey: String?,
+        requireMatchingRuleKey: Boolean,
+        allowHoldingWhenNoSystemTrash: Boolean,
+        stillWanted: () -> Boolean,
+    ): RemovedWatchedDownload {
         ensureLoaded()
         // Per-video lock first, then the state lock (see the lock order at stateLock).
         repeat(LockAttempts) {
             val locked = finishedFileUriOf(downloadId)
-            val result = if (locked != null) {
-                SidecarLocks.withLock(locked) { removeAutoWithLocksHeld(downloadId, ruleKey, stillWanted, locked) }
+            val outcome = if (locked != null) {
+                SidecarLocks.withLock(locked) {
+                    removeWatchedWithLocksHeld(
+                        downloadId = downloadId,
+                        expectedRuleKey = expectedRuleKey,
+                        requireMatchingRuleKey = requireMatchingRuleKey,
+                        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                        stillWanted = stillWanted,
+                        lockedUri = locked,
+                    )
+                }
             } else {
-                removeAutoWithLocksHeld(downloadId, ruleKey, stillWanted, null)
+                removeWatchedWithLocksHeld(
+                    downloadId = downloadId,
+                    expectedRuleKey = expectedRuleKey,
+                    requireMatchingRuleKey = requireMatchingRuleKey,
+                    allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                    stillWanted = stillWanted,
+                    lockedUri = null,
+                )
             }
-            if (result != null) {
-                if (result == AutoDownloadRemovalResult.Removed) resumeWaitingForStorageLimit()
-                return result
+            if (outcome != null) {
+                if (outcome.outcome.result == AutoDownloadRemovalResult.Removed) resumeWaitingForStorageLimit()
+                return outcome
             }
         }
-        return AutoDownloadRemovalResult.NotMoved
+        return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
     }
 
-    private fun removeAutoWithLocksHeld(
+    private fun removeWatchedWithLocksHeld(
         downloadId: String,
-        ruleKey: String?,
+        expectedRuleKey: String?,
+        requireMatchingRuleKey: Boolean,
+        allowHoldingWhenNoSystemTrash: Boolean,
         stillWanted: () -> Boolean,
         lockedUri: String?,
-    ): AutoDownloadRemovalResult? = synchronized(stateLock) {
+    ): RemovedWatchedDownload? = synchronized(stateLock) {
         val items = _uiState.value.items
-        val item = items.firstOrNull { it.id == downloadId } ?: return AutoDownloadRemovalResult.Changed
-        // A file flagged as a placeholder is never removed automatically.
-        if (item.autoDownloadRuleKey != ruleKey || item.status != DownloadStatus.Completed || item.isPlaceholder) {
-            return AutoDownloadRemovalResult.Changed
+        val item = items.firstOrNull { it.id == downloadId }
+            ?: return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
+        // A file flagged as a placeholder is never removed as a watched clean-up.
+        if ((requireMatchingRuleKey && item.autoDownloadRuleKey != expectedRuleKey) ||
+            item.status != DownloadStatus.Completed ||
+            item.isPlaceholder
+        ) {
+            return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
         }
-        // Scheduled removals need the system Trash. Without it the file is left where it is.
-        if (!backend.usesSystemTrash) return AutoDownloadRemovalResult.NotMoved
-        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+        if (!backend.usesSystemTrash && !allowHoldingWhenNoSystemTrash) {
+            return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
+        }
+        if (!stillWanted()) return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
         val fileUri = backend.resolveLocalFileUri(item.localFileUri, item.fileName)
         if (fileUri != lockedUri) return null
-        if (!backend.isConnected(item)) return AutoDownloadRemovalResult.NotReachable
-        // A move has the item: it stays scheduled and is looked at again later.
-        if (!ItemLocks.tryAcquire(downloadId)) return AutoDownloadRemovalResult.Busy
+        if (!backend.isConnected(item)) {
+            return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotReachable))
+        }
+        // A move has the item: it stays untouched.
+        if (!ItemLocks.tryAcquire(downloadId)) {
+            return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Busy))
+        }
         try {
             return synchronized(WatchedRemovalGuard.lock) {
                 val checked = WatchedRemovalGuard.check(stillWanted)
-                backend.withListLock { removeWatchedLocked(item, items, checked) }
+                backend.withListLock {
+                    val outcome = removeWatchedLocked(item, items, allowHoldingWhenNoSystemTrash, checked)
+                    RemovedWatchedDownload(
+                        outcome = outcome,
+                        removedItem = item.takeIf { outcome.result == AutoDownloadRemovalResult.Removed },
+                    )
+                }
             }
         } finally {
             ItemLocks.release(downloadId)
@@ -2930,24 +3003,81 @@ object DownloadsRepository {
     private fun removeWatchedLocked(
         item: DownloadItem,
         items: List<DownloadItem>,
+        allowHoldingWhenNoSystemTrash: Boolean,
         stillWanted: () -> Boolean,
-    ): AutoDownloadRemovalResult {
-        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
+    ): WatchedTrashOutcome {
+        if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
         val lookup = backend.locate(item)
         // A file whose location is away is not gone: it is left, and the entry stays.
-        if (lookup is FileLookup.Unreachable) return AutoDownloadRemovalResult.NotReachable
+        if (lookup is FileLookup.Unreachable) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotReachable)
         val fileUri = (lookup as? FileLookup.Found)?.uri
-        val shared = fileUri?.let { usedByAnother(item, items, it) ?: return AutoDownloadRemovalResult.NotMoved } ?: false
-        if (!stillWanted()) return AutoDownloadRemovalResult.Changed
-        if (!removeRecordDurably(item)) return AutoDownloadRemovalResult.NotMoved
+        val shared = fileUri?.let { usedByAnother(item, items, it) ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved) } ?: false
+        if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
+        if (!removeRecordDurably(item)) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         // Saving the list may block. Keep, settings, playback and progress must be checked again.
-        val result = runCatching {
-            if (!stillWanted()) AutoDownloadRemovalResult.Changed
-            else if (fileUri != null && !shared) backend.trashWatchedFile(fileUri, stillWanted)
-            else AutoDownloadRemovalResult.Removed
-        }.getOrDefault(AutoDownloadRemovalResult.NotMoved)
-        if (result != AutoDownloadRemovalResult.Removed) restoreRecord(item)
-        return result
+        val outcome = runCatching {
+            if (!stillWanted()) WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
+            else if (fileUri != null && !shared) {
+                backend.trashWatchedFileWithUndo(fileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+            } else {
+                WatchedTrashOutcome(AutoDownloadRemovalResult.Removed)
+            }
+        }.getOrDefault(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
+        if (outcome.result != AutoDownloadRemovalResult.Removed) restoreRecord(item)
+        return outcome
+    }
+
+    /**
+     * Restores a watched download moved to the Trash back to its original location and list entry.
+     * File I/O runs outside [stateLock], under [SidecarLocks] and [ItemLocks].
+     */
+    internal fun restoreTrashedDownload(
+        profileId: Int,
+        item: DownloadItem,
+        trashed: TrashedWatchedFile,
+    ): UndoTrashResult {
+        ensureLoaded()
+        return SidecarLocks.withLock(trashed.originalFileUri) {
+            if (!ItemLocks.tryAcquire(item.id)) return@withLock UndoTrashResult.NotRestored
+            try {
+                val precheck = synchronized(stateLock) {
+                    if (loadedProfileId != profileId ||
+                        com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != profileId
+                    ) {
+                        return@synchronized UndoTrashResult.NotRestored
+                    }
+                    if (!backend.isConnected(item)) return@synchronized UndoTrashResult.NotReachable
+                    if (_uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed }) {
+                        return@synchronized UndoTrashResult.Restored
+                    }
+                    null
+                }
+                if (precheck != null) return@withLock precheck
+
+                val moveResult = backend.restoreTrashedFile(trashed)
+                if (moveResult != UndoTrashResult.Restored) return@withLock moveResult
+
+                synchronized(stateLock) {
+                    if (loadedProfileId != profileId) return@synchronized UndoTrashResult.NotRestored
+                    val restored = item.copy(
+                        status = DownloadStatus.Completed,
+                        localFileUri = trashed.originalFileUri,
+                        updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                    )
+                    backend.withListLock {
+                        if (_uiState.value.items.none { it.id == restored.id }) {
+                            publish(listOf(restored) + _uiState.value.items)
+                        } else {
+                            publish(_uiState.value.items.map { if (it.id == restored.id) restored else it })
+                        }
+                        persist(durably = true)
+                    }
+                    UndoTrashResult.Restored
+                }
+            } finally {
+                ItemLocks.release(item.id)
+            }
+        }
     }
 
     /** Removes [item]'s record and saves the list durably. False (and the record back in place) when that save failed. */
@@ -3412,6 +3542,14 @@ internal interface DownloadsBackend {
     fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
         AutoDownloadRemovalResult.NotMoved
 
+    fun trashWatchedFileWithUndo(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean = false,
+        stillWanted: () -> Boolean,
+    ): WatchedTrashOutcome = WatchedTrashOutcome(trashWatchedFile(localFileUri, stillWanted))
+
+    fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult = UndoTrashResult.NotRestored
+
     /** True when [trashFile] puts files in the trash of the system, false when it only holds them for days. */
     val usesSystemTrash: Boolean get() = true
 
@@ -3590,6 +3728,19 @@ private object PlatformDownloadsBackend : DownloadsBackend {
 
     override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
         DownloadsTrash.moveWatchedAway(localFileUri, stillWanted)
+
+    override fun trashWatchedFileWithUndo(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean,
+        stillWanted: () -> Boolean,
+    ): WatchedTrashOutcome = DownloadsTrash.moveWatchedAwayWithUndo(
+        localFileUri = localFileUri,
+        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        stillWanted = stillWanted,
+    )
+
+    override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
+        DownloadsTrash.restoreFromTrash(trashed)
 
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
 

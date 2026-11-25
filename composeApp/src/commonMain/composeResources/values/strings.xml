@@ -3565,4 +3565,31 @@
     <string name="downloads_storage_change_total_limit">Change total limit</string>
     <string name="downloads_status_waiting_storage_limit">Waiting: storage limit reached • %1$s</string>
     <string name="downloads_announce_waiting_storage_limit">Waiting because the storage limit was reached</string>
+    <string name="downloads_cleanup_watched_button">Clean up watched</string>
+    <string name="downloads_cleanup_watched_title">Clean up watched downloads</string>
+    <string name="downloads_cleanup_filter_all">All watched</string>
+    <string name="downloads_cleanup_filter_30_days">Watched 30+ days ago</string>
+    <string name="downloads_cleanup_select_all">Select all</string>
+    <string name="downloads_cleanup_clear_selection">Clear</string>
+    <string name="downloads_cleanup_total_selected">%1$d selected • %2$s</string>
+    <string name="downloads_cleanup_empty_30_days">No downloads watched more than 30 days ago.</string>
+    <plurals name="downloads_cleanup_moved_toast">
+        <item quantity="one">Moved %1$d watched download to the Trash</item>
+        <item quantity="other">Moved %1$d watched downloads to the Trash</item>
+    </plurals>
+    <string name="downloads_undo">Undo</string>
+    <string name="downloads_undo_deleted_description">Undo moving %1$s to the Trash</string>
+    <string name="downloads_undo_restored_toast">Restored %1$s from the Trash</string>
+    <string name="downloads_undo_file_gone_toast">No longer in the Trash</string>
+    <string name="downloads_undo_failed_toast">Could not restore from the Trash</string>
+    <string name="downloads_recent_cleaned_up_today">cleaned up today</string>
+    <plurals name="downloads_recent_cleaned_up_days_ago">
+        <item quantity="one">cleaned up %1$d day ago</item>
+        <item quantity="other">cleaned up %1$d days ago</item>
+    </plurals>
+    <string name="downloads_recent_made_room_today">moved to Trash to make room today</string>
+    <plurals name="downloads_recent_made_room_days_ago">
+        <item quantity="one">moved to Trash to make room %1$d day ago</item>
+        <item quantity="other">moved to Trash to make room %1$d days ago</item>
+    </plurals>
 </resources>

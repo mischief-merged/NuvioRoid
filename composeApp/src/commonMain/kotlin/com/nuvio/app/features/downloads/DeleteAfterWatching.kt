@@ -44,6 +44,7 @@ internal class DeleteAfterWatching(
     private val removeDownload: (downloadId: String, ruleKey: String?, stillWanted: () -> Boolean) -> AutoDownloadRemovalResult,
     private val nowEpochMs: () -> Long,
     private val holdMs: Long = DefaultHoldMs,
+    private val removeDownloadWithUndo: ((downloadId: String, ruleKey: String?, stillWanted: () -> Boolean) -> WatchedTrashOutcome)? = null,
 ) {
     /** True when a removal was scheduled for [item]. */
     fun onLocalPlaybackCompleted(
@@ -172,7 +173,9 @@ internal class DeleteAfterWatching(
                 store.allowsRemoval(profileId, removal.ruleKey) &&
                 (askedByUser || isWatchedToTheEnd(item))
         }
-        return when (removeDownload(item.id, removal.ruleKey, stillWanted)) {
+        val outcome = removeDownloadWithUndo?.invoke(item.id, removal.ruleKey, stillWanted)
+            ?: WatchedTrashOutcome(removeDownload(item.id, removal.ruleKey, stillWanted))
+        return when (outcome.result) {
             AutoDownloadRemovalResult.Removed -> {
                 // The rule must know it had this episode, so that it does not fetch it again.
                 val season = item.seasonNumber
@@ -183,7 +186,21 @@ internal class DeleteAfterWatching(
                     }
                 }
                 store.dropRemoval(profileId, removal)
-                store.recordDeleted(profileId, AutoDownloadDeleted(item.title, season, episode, nowEpochMs()))
+                val deleted = if (outcome.trashed != null) {
+                    AutoDownloadDeleted(
+                        title = item.title,
+                        seasonNumber = season,
+                        episodeNumber = episode,
+                        atEpochMs = nowEpochMs(),
+                        downloadId = item.id,
+                        reason = DeletedDownloadReason.AfterWatching,
+                        restorableItem = item,
+                        trashed = outcome.trashed,
+                    )
+                } else {
+                    AutoDownloadDeleted(item.title, season, episode, nowEpochMs())
+                }
+                store.recordDeleted(profileId, deleted)
                 AutoDownloadRemovalOutcome.Removed
             }
             AutoDownloadRemovalResult.Changed -> cancel(profileId, scheduled)

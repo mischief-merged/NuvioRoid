@@ -46,14 +46,28 @@ private data class StoredAutoDownloads(
     val recentlyDeleted: List<AutoDownloadDeleted> = emptyList(),
 )
 
-/** An episode that was removed after it was watched. Kept for [AutoDownloadStore.RecentlyDeletedMs] so that the user can see it happened. */
+@Serializable
+internal enum class DeletedDownloadReason {
+    AfterWatching,
+    CleanedUp,
+    MadeRoom,
+}
+
+/** A watched download that was moved to the Trash. Kept for [AutoDownloadStore.RecentlyDeletedMs] so that the user can see it and undo while still in the Trash. */
 @Serializable
 internal data class AutoDownloadDeleted(
     val title: String,
     val seasonNumber: Int? = null,
     val episodeNumber: Int? = null,
     val atEpochMs: Long,
-)
+    val downloadId: String? = null,
+    val reason: DeletedDownloadReason = DeletedDownloadReason.AfterWatching,
+    val restorableItem: DownloadItem? = null,
+    val trashed: TrashedWatchedFile? = null,
+) {
+    val canUndo: Boolean
+        get() = restorableItem != null && trashed?.canRestore == true
+}
 
 /** A watched download that is removed once [dueAtEpochMs] has passed. */
 @Serializable
@@ -142,6 +156,42 @@ internal class AutoDownloadStore(
         if (ensureLoaded() != profileId) return false
         val cutoff = entry.atEpochMs - RecentlyDeletedMs
         save(profileId, state.copy(recentlyDeleted = state.recentlyDeleted.filter { it.atEpochMs >= cutoff } + entry))
+        true
+    }
+
+    /** Drops [entry] from recently deleted after Undo put the download back. */
+    fun removeDeletedEntry(profileId: Int, entry: AutoDownloadDeleted): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        val updated = state.recentlyDeleted.filterNot { it == entry }
+        if (updated.size == state.recentlyDeleted.size) return false
+        save(profileId, state.copy(recentlyDeleted = updated))
+        true
+    }
+
+    /** Clears the Trash undo reference on [entry] once the file is no longer in the Trash. */
+    fun clearDeletedUndo(profileId: Int, entry: AutoDownloadDeleted): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        var changed = false
+        val updated = state.recentlyDeleted.map { current ->
+            if (current == entry) {
+                changed = true
+                current.copy(restorableItem = null, trashed = null)
+            } else {
+                current
+            }
+        }
+        if (!changed) return false
+        save(profileId, state.copy(recentlyDeleted = updated))
+        true
+    }
+
+    /** Drops any scheduled removal for [downloadId] after manual clean-up or make-room moved it. */
+    fun dropRemovalById(profileId: Int, downloadId: String): Boolean = synchronized(lock) {
+        if (ensureLoaded() != profileId) return false
+        val updatedRemovals = state.removals.filterNot { it.downloadId == downloadId }
+        val updatedKept = state.keptRemovals.filterNot { it.downloadId == downloadId }
+        if (updatedRemovals.size == state.removals.size && updatedKept.size == state.keptRemovals.size) return false
+        save(profileId, state.copy(removals = updatedRemovals, keptRemovals = updatedKept))
         true
     }
 

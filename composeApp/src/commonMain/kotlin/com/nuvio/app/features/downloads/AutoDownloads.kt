@@ -48,6 +48,10 @@ import nuvio.composeapp.generated.resources.downloads_auto_toast_on
 import nuvio.composeapp.generated.resources.downloads_auto_toast_save_failed
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast_soon
+import nuvio.composeapp.generated.resources.downloads_cleanup_moved_toast
+import nuvio.composeapp.generated.resources.downloads_undo_failed_toast
+import nuvio.composeapp.generated.resources.downloads_undo_file_gone_toast
+import nuvio.composeapp.generated.resources.downloads_undo_restored_toast
 import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 
@@ -114,6 +118,12 @@ internal interface AutoDownloadController {
 
     /** Removes a watched episode now instead of when its time comes. */
     fun deleteDownloadNow(profileId: Int, downloadId: String)
+
+    /** Moves chosen watched downloads to the Trash and lists them under Recently deleted with Undo. */
+    fun cleanUpWatchedDownloads(profileId: Int, downloadIds: Set<String>) = Unit
+
+    /** Restores a recently trashed watched download if it is still in the Trash. */
+    fun undoDeletedDownload(profileId: Int, entry: AutoDownloadDeleted) = Unit
 
     fun checkNow()
 }
@@ -194,6 +204,7 @@ internal object AutoDownloads : AutoDownloadController {
         hasLaterEpisode = { rule, item -> engine.knownEpisodes(rule.key)?.let { hasLaterReleasedEpisode(item, it) } },
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
+        removeDownloadWithUndo = DownloadsRepository::removeWatchedAutoDownloadWithUndo,
     )
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
@@ -358,6 +369,47 @@ internal object AutoDownloads : AutoDownloadController {
                 AutoDownloadRemovalOutcome.LastEpisode, AutoDownloadRemovalOutcome.Cancelled, null -> null
             }
             if (message != null) NuvioToastController.show(getString(message))
+        }
+    }
+
+    override fun cleanUpWatchedDownloads(profileId: Int, downloadIds: Set<String>) {
+        if (downloadIds.isEmpty()) return
+        launchTrackedAction {
+            val moved = runCatching {
+                executeWatchedCleanup(
+                    profileId = profileId,
+                    downloadIds = downloadIds,
+                    store = store,
+                    isWatched = { item ->
+                        WatchProgressRepository.ensureLoaded()
+                        WatchedRepository.ensureLoaded()
+                        item.watchStatus(WatchProgressRepository.uiState.value).isWatched
+                    },
+                )
+            }.getOrDefault(0)
+            if (moved > 0) {
+                NuvioToastController.show(getPluralString(Res.plurals.downloads_cleanup_moved_toast, moved, moved))
+            } else {
+                NuvioToastController.show(getString(Res.string.downloads_auto_delete_failed_toast))
+            }
+        }
+    }
+
+    override fun undoDeletedDownload(profileId: Int, entry: AutoDownloadDeleted) {
+        launchTrackedAction {
+            val result = runCatching { undoDeletedWatchedDownload(profileId, entry, store) }
+                .getOrDefault(UndoTrashResult.NotRestored)
+            val label = entry.restorableItem?.nameForLabels() ?: entry.title
+            when (result) {
+                UndoTrashResult.Restored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_restored_toast, label))
+                UndoTrashResult.FileGone ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_file_gone_toast))
+                UndoTrashResult.NotReachable ->
+                    NuvioToastController.show(getString(Res.string.downloads_auto_delete_not_connected_toast))
+                UndoTrashResult.TargetTaken, UndoTrashResult.NotRestored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_failed_toast))
+            }
         }
     }
 

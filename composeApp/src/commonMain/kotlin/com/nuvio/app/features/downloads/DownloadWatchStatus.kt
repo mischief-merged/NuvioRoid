@@ -7,9 +7,18 @@ internal data class DownloadWatchStatus(
     val isWatched: Boolean = false,
     val progress: Float = 0f,
     val remainingMs: Long = 0L,
+    val watchedAtEpochMs: Long? = null,
 )
 
-internal fun DownloadItem.watchStatus(progressState: WatchProgressUiState): DownloadWatchStatus {
+internal fun DownloadItem.watchStatus(
+    progressState: WatchProgressUiState,
+    isHistoryWatched: (id: String, type: String, season: Int?, episode: Int?) -> Boolean = { id, type, season, episode ->
+        WatchedRepository.isWatched(id = id, type = type, season = season, episode = episode)
+    },
+    historyWatchedAt: (id: String, type: String, season: Int?, episode: Int?) -> Long? = { id, type, season, episode ->
+        WatchedRepository.watchedAtEpochMs(id = id, type = type, season = season, episode = episode)
+    },
+): DownloadWatchStatus {
     val entry = progressState.progressForVideo(
         videoId = videoId,
         parentMetaId = parentMetaId,
@@ -26,12 +35,14 @@ internal fun DownloadItem.watchStatus(progressState: WatchProgressUiState): Down
             },
         )
     }
+    val completedProgressAt = entry?.takeIf { it.isEffectivelyCompleted }?.lastUpdatedEpochMs?.takeIf { it > 0L }
+    val markedAt = historyWatchedAt(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
+    val watched = entry?.isEffectivelyCompleted == true ||
+        markedAt != null ||
+        isHistoryWatched(parentMetaId, parentMetaType, seasonNumber, episodeNumber)
+    val watchedAt = if (!watched) null else listOfNotNull(completedProgressAt, markedAt).maxOrNull()
     return DownloadWatchStatus(
-        isWatched = entry?.isEffectivelyCompleted == true || WatchedRepository.isWatched(
-            id = parentMetaId,
-            type = parentMetaType,
-            season = seasonNumber,
-            episode = episodeNumber,
-        ),
+        isWatched = watched,
+        watchedAtEpochMs = watchedAt,
     )
 }

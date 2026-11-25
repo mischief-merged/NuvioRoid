@@ -1125,6 +1125,21 @@ object WatchedRepository {
         return providerExtraWatchedKeys[providerId]?.let { extraKeys -> keys.any(extraKeys::contains) } == true
     }
 
+    internal fun watchedAtEpochMs(
+        id: String,
+        type: String,
+        season: Int? = null,
+        episode: Int? = null,
+    ): Long? {
+        ensureLoaded()
+        val source = activeSource
+        val keys = watchedItemKeys(type = type, id = id, season = season, episode = episode)
+        return itemsStore.read { nuvioItems, providerItems, _, _ ->
+            val map = source.providerId?.let { providerItems[it] } ?: nuvioItems
+            keys.mapNotNull { key -> map?.get(key)?.normalizedMarkedAt()?.markedAtEpochMs?.takeIf { it > 0L } }.maxOrNull()
+        }
+    }
+
     fun isFullyWatchedSeries(id: String, type: String): Boolean {
         val keys = watchedItemKeys(type = type, id = id)
         return keys.any(_fullyWatchedSeriesKeys.value::contains)
