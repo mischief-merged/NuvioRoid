@@ -91,10 +91,15 @@ class WatchedCleanupModelAndUndoTest {
                 payloadsByProfile[ProfileRepository.activeProfileId] = value
             }
         val disconnectedLocations = mutableSetOf<String>()
+        val ownedFileUris = mutableSetOf<String>()
+        var useProductionDownloadsTrash = false
         var failSave = false
         var failDurableSync = false
         var onAfterTrashMove: (() -> Unit)? = null
         var onAfterRestoreMove: (() -> Unit)? = null
+
+        override fun ownershipOf(item: DownloadItem, fileUri: String): FileOwnership? =
+            if (fileUri in ownedFileUris) FileOwnership.Owned else null
 
         override fun loadPayload(): String? = payload
 
@@ -118,24 +123,38 @@ class WatchedCleanupModelAndUndoTest {
 
         override fun locationConnected(locationId: String?): Boolean = locationId !in disconnectedLocations
 
-        override val usesSystemTrash: Boolean get() = trash.usesSystemTrash
+        override val usesSystemTrash: Boolean
+            get() = if (useProductionDownloadsTrash) DownloadsTrash.usesSystemTrash else trash.usesSystemTrash
 
-        override val usesUndoableSystemTrash: Boolean get() = trash.usesUndoableSystemTrash
+        override val usesUndoableSystemTrash: Boolean
+            get() = if (useProductionDownloadsTrash) DownloadsTrash.usesUndoableSystemTrash else trash.usesUndoableSystemTrash
 
-        override fun trashFile(localFileUri: String): Boolean = trash.moveAway(localFileUri)
+        override fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
+            if (useProductionDownloadsTrash) DownloadsTrash.isSameFile(firstFileUri, secondFileUri) else trash.isSameFile(firstFileUri, secondFileUri)
+
+        override fun trashFile(localFileUri: String): Boolean =
+            if (useProductionDownloadsTrash) DownloadsTrash.moveAway(localFileUri) else trash.moveAway(localFileUri)
 
         override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
-            trash.moveWatchedAway(localFileUri, stillWanted)
+            if (useProductionDownloadsTrash) DownloadsTrash.moveWatchedAway(localFileUri, stillWanted) else trash.moveWatchedAway(localFileUri, stillWanted)
 
         override fun trashWatchedFileWithUndo(
             localFileUri: String,
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
-        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
-            localFileUri = localFileUri,
-            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
-            stillWanted = stillWanted,
-        )
+        ): WatchedTrashOutcome = if (useProductionDownloadsTrash) {
+            DownloadsTrash.moveWatchedAwayWithUndo(
+                localFileUri = localFileUri,
+                allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                stillWanted = stillWanted,
+            )
+        } else {
+            trash.moveWatchedAwayWithUndo(
+                localFileUri = localFileUri,
+                allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                stillWanted = stillWanted,
+            )
+        }
 
         override fun trashWatchedFileWithUndo(
             localFileUri: String,
@@ -156,35 +175,60 @@ class WatchedCleanupModelAndUndoTest {
             includeSubtitles: Boolean,
             stillWanted: () -> Boolean,
             onMoved: (TrashedWatchedFile?) -> Boolean,
-        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
-            localFileUri = localFileUri,
-            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
-            includeSubtitles = includeSubtitles,
-            stillWanted = stillWanted,
-            onMoved = { trashed ->
-                onAfterTrashMove?.invoke()
-                onMoved(trashed)
-            },
-        )
+        ): WatchedTrashOutcome = if (useProductionDownloadsTrash) {
+            DownloadsTrash.moveWatchedAwayWithUndo(
+                localFileUri = localFileUri,
+                allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                includeSubtitles = includeSubtitles,
+                stillWanted = stillWanted,
+                onMoved = { trashed ->
+                    onAfterTrashMove?.invoke()
+                    onMoved(trashed)
+                },
+            )
+        } else {
+            trash.moveWatchedAwayWithUndo(
+                localFileUri = localFileUri,
+                allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                includeSubtitles = includeSubtitles,
+                stillWanted = stillWanted,
+                onMoved = { trashed ->
+                    onAfterTrashMove?.invoke()
+                    onMoved(trashed)
+                },
+            )
+        }
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
             restoreTrashedFileWithOutcome(trashed).result
 
-        override fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome =
-            trash.restoreFromTrashWithOutcome(trashed).also { outcome ->
-                if (outcome.result == UndoTrashResult.Restored ||
-                    outcome.result == UndoTrashResult.PartiallyRestored
-                ) {
-                    onAfterRestoreMove?.invoke()
-                }
+        override fun restoreTrashedFileWithOutcome(trashed: TrashedWatchedFile): UndoRestoreOutcome {
+            val outcome = if (useProductionDownloadsTrash) {
+                DownloadsTrash.restoreFromTrashWithOutcome(trashed)
+            } else {
+                trash.restoreFromTrashWithOutcome(trashed)
             }
+            if (outcome.result == UndoTrashResult.Restored ||
+                outcome.result == UndoTrashResult.PartiallyRestored
+            ) {
+                onAfterRestoreMove?.invoke()
+            }
+            return outcome
+        }
 
         override fun trashRestoredSubtitlesWithUndo(
             trashed: TrashedWatchedFile,
             onMoved: (TrashedWatchedFile) -> Boolean,
-        ): WatchedTrashOutcome = trash.trashSubtitlesForUndoRollback(trashed) { updated ->
-            onAfterTrashMove?.invoke()
-            onMoved(updated)
+        ): WatchedTrashOutcome = if (useProductionDownloadsTrash) {
+            DownloadsTrash.trashSubtitlesForUndoRollback(trashed) { updated ->
+                onAfterTrashMove?.invoke()
+                onMoved(updated)
+            }
+        } else {
+            trash.trashSubtitlesForUndoRollback(trashed) { updated ->
+                onAfterTrashMove?.invoke()
+                onMoved(updated)
+            }
         }
 
         override fun start(
@@ -240,6 +284,8 @@ class WatchedCleanupModelAndUndoTest {
         totalLimitBytes = null
         backend.payloadsByProfile.clear()
         backend.disconnectedLocations.clear()
+        backend.ownedFileUris.clear()
+        backend.useProductionDownloadsTrash = false
         backend.failSave = false
         backend.failDurableSync = false
         backend.onAfterTrashMove = null
@@ -1417,6 +1463,285 @@ class WatchedCleanupModelAndUndoTest {
             assertEquals("sub-3-archive", ep3Subs.resolve("en.srt").readText())
             assertTrue(diskStore.recentlyDeleted.value.none { it.downloadId == "m-sub-3" })
         } finally {
+            DesktopStorage.setRootDirForTest(null, null)
+        }
+    }
+
+    @Test
+    fun undo_commits_keep_and_history_atomically_so_save_failure_never_exposes_restored_file_without_keep() {
+        val profile = ProfileRepository.activeProfileId
+        var failRemainingSaves = 0
+        val payloads = object : AutoDownloadPayloads {
+            val saved = mutableMapOf<Int, String>()
+            override fun load(profileId: Int): String? = saved[profileId]
+            override fun save(profileId: Int, payload: String) {
+                if (failRemainingSaves > 0) {
+                    failRemainingSaves--
+                    throw java.io.IOException("Simulated transient store write failure")
+                }
+                saved[profileId] = payload
+            }
+            override fun saveUnreadable(profileId: Int, payload: String) = Unit
+        }
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+        assertTrue(store.setMakeRoomAutomatically(profile, true))
+
+        val ep1File = downloadsDir.resolve("ep-atomic-keep.mkv").also { it.writeText("atomic-keep-video") }
+        val ep1Subs = downloadsDir.resolve("ep-atomic-keep.mkv.subtitles").createDirectories()
+            .also { it.resolve("en.srt").writeText("atomic-keep-subs") }
+        val blockerFile = downloadsDir.resolve("blocker.mkv").also { it.writeText("blocker-video") }
+        val ep1 = movie("m-atomic-keep", "Atomic Keep", 600L, uri = ep1File.toUri().toString())
+            .copy(fileName = "ep-atomic-keep.mkv")
+        val blocker = movie("m-blocker", "Unwatched Blocker", 500L, uri = blockerFile.toUri().toString())
+            .copy(fileName = "blocker.mkv")
+        totalLimitBytes = 800L
+        backend.payload = DownloadsCodec.encode(listOf(ep1, blocker), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(
+            1,
+            executeWatchedCleanup(
+                profileId = profile,
+                downloadIds = listOf("m-atomic-keep"),
+                store = store,
+                isWatched = { it.id == "m-atomic-keep" },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            ),
+        )
+        assertFalse(ep1File.exists())
+
+        val makeRoom = MakeRoomAutomatically(
+            store = store,
+            downloads = { DownloadsRepository.uiState.value.items },
+            allDownloadBytes = DownloadsRepository::allDownloadBytes,
+            autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+            totalStorageLimitBytes = { totalLimitBytes },
+            autoStorageLimitBytes = { null },
+            watchStatusOf = { item ->
+                DownloadWatchStatus(isWatched = item.id == "m-atomic-keep", watchedAtEpochMs = if (item.id == "m-atomic-keep") now - dayMs else null)
+            },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+
+        // Fail ONLY the first store save during Undo (while subsequent saves succeed):
+        // Undo must NOT drop the Undo entry or leave an un-kept restored download that makeRoom would re-trash!
+        backend.onAfterRestoreMove = {
+            backend.onAfterRestoreMove = null
+            failRemainingSaves = 1
+        }
+        val firstEntry = store.recentlyDeleted.value.single { it.downloadId == "m-atomic-keep" }
+        assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(profile, firstEntry, store))
+        assertEquals(0, makeRoom.runOnce(profile), "make-room must not find an un-kept restored title after failed Undo")
+        val retainedEntry = store.recentlyDeleted.value.single { it.downloadId == "m-atomic-keep" }
+        assertTrue(retainedEntry.canUndo, "Undo entry must stay intact when Keep+history commit failed")
+
+        // Retry Undo once writes succeed -> atomically marks Keep and removes Undo entry; makeRoom leaves it alone.
+        assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, retainedEntry, store))
+        assertTrue("m-atomic-keep" in store.keptDownloadIds.value)
+        assertTrue(store.recentlyDeleted.value.none { it.downloadId == "m-atomic-keep" })
+        assertEquals("atomic-keep-video", ep1File.readText())
+        assertEquals("atomic-keep-subs", ep1Subs.resolve("en.srt").readText())
+        assertEquals(0, makeRoom.runOnce(profile), "restored title must stay protected by Keep")
+        assertTrue(ep1File.exists())
+
+        // Also verify PartiallyRestored (occupied subtitle destination) commits Keep + remaining Undo atomically.
+        val ep2File = downloadsDir.resolve("ep-atomic-partial.mkv").also { it.writeText("atomic-partial-video") }
+        val ep2Subs = downloadsDir.resolve("ep-atomic-partial.mkv.subtitles").createDirectories()
+            .also { it.resolve("en.srt").writeText("atomic-partial-subs") }
+        val ep2 = movie("m-atomic-partial", "Atomic Partial", 600L, uri = ep2File.toUri().toString())
+            .copy(fileName = "ep-atomic-partial.mkv")
+        backend.payload = DownloadsCodec.encode(listOf(ep2, blocker), null, 2L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(
+            1,
+            executeWatchedCleanup(
+                profileId = profile,
+                downloadIds = listOf("m-atomic-partial"),
+                store = store,
+                isWatched = { it.id == "m-atomic-partial" },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            ),
+        )
+        ep2Subs.createDirectories().resolve("other.srt").writeText("colliding-partial-sub")
+        backend.onAfterRestoreMove = {
+            backend.onAfterRestoreMove = null
+            failRemainingSaves = 1
+        }
+        val partialEntry = store.recentlyDeleted.value.single { it.downloadId == "m-atomic-partial" }
+        assertEquals(UndoTrashResult.NotRestored, undoDeletedWatchedDownload(profile, partialEntry, store))
+        assertFalse("m-atomic-partial" in store.keptDownloadIds.value)
+        assertTrue(DownloadsRepository.uiState.value.items.none { it.id == "m-atomic-partial" })
+        assertEquals("colliding-partial-sub", ep2Subs.resolve("other.srt").readText())
+
+        val partialRetained = store.recentlyDeleted.value.single { it.downloadId == "m-atomic-partial" }
+        assertEquals(UndoTrashResult.PartiallyRestored, undoDeletedWatchedDownload(profile, partialRetained, store))
+        assertTrue("m-atomic-partial" in store.keptDownloadIds.value)
+        assertTrue(store.recentlyDeleted.value.single { it.downloadId == "m-atomic-partial" }.canUndo)
+    }
+
+    @Test
+    fun shared_file_is_excluded_from_watched_cleanup_and_make_room_and_never_drops_row_without_undo() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+        assertTrue(store.setMakeRoomAutomatically(profile, true))
+
+        val sharedFile = downloadsDir.resolve("shared.mkv").also { it.writeText("shared-video") }
+        val aliasDir = Files.createSymbolicLink(root.resolve("alias-downloads"), downloadsDir)
+        val exclusiveFile = downloadsDir.resolve("exclusive.mkv").also { it.writeText("exclusive-video") }
+        val crossProfileFile = downloadsDir.resolve("cross.mkv").also { it.writeText("cross-video") }
+
+        val sharedWatched = movie("m-shared-a", "Shared A", 600L, uri = sharedFile.toUri().toString())
+            .copy(fileName = "shared.mkv")
+        val sharedSibling = movie("m-shared-b", "Shared B", 600L, uri = aliasDir.resolve("shared.mkv").toUri().toString())
+            .copy(fileName = "shared.mkv")
+        val crossShared = movie("m-cross", "Cross Profile Shared", 600L, uri = crossProfileFile.toUri().toString())
+            .copy(fileName = "cross.mkv")
+        val exclusiveWatched = movie("m-exclusive", "Exclusive", 500L, uri = exclusiveFile.toUri().toString())
+            .copy(fileName = "exclusive.mkv")
+
+        backend.ownedFileUris += crossProfileFile.toUri().toString()
+        totalLimitBytes = 1_500L
+        backend.payload = DownloadsCodec.encode(listOf(sharedWatched, sharedSibling, crossShared, exclusiveWatched), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        // 1. Clean-up candidate list excludes both same-profile (including alias path) and cross-profile shared files.
+        val currentItems = DownloadsRepository.uiState.value.items
+        val nonExclusivelyCleanable = DownloadsRepository.nonExclusivelyCleanableWatchedIds(currentItems)
+        assertEquals(setOf("m-shared-a", "m-shared-b", "m-cross"), nonExclusivelyCleanable)
+        val listed = cleanableWatchedDownloads(
+            items = currentItems,
+            watchStatusOf = { item ->
+                DownloadWatchStatus(
+                    isWatched = item.id != "m-shared-b",
+                    watchedAtEpochMs = now - 5 * dayMs,
+                )
+            },
+            excludedIds = nonExclusivelyCleanable,
+        )
+        assertEquals(listOf("m-exclusive"), listed.map { it.item.id })
+
+        // 2. Direct executeWatchedCleanup on both same-profile and cross-profile shared items refuses to drop rows without Trash/Undo.
+        val movedShared = executeWatchedCleanup(
+            profileId = profile,
+            downloadIds = listOf("m-shared-a", "m-cross"),
+            store = store,
+            isWatched = { true },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+        assertEquals(0, movedShared, "shared files must not be reported as moved to Trash")
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-shared-a" && it.status == DownloadStatus.Completed })
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-cross" && it.status == DownloadStatus.Completed })
+        assertTrue(sharedFile.exists())
+        assertTrue(crossProfileFile.exists())
+        assertTrue(store.recentlyDeleted.value.isEmpty(), "must not record non-undoable cleanup history for unmoved shared files")
+
+        // 3. MakeRoomAutomatically skips shared files and only moves the exclusively owned watched download.
+        val makeRoom = MakeRoomAutomatically(
+            store = store,
+            downloads = { DownloadsRepository.uiState.value.items },
+            allDownloadBytes = DownloadsRepository::allDownloadBytes,
+            autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+            totalStorageLimitBytes = { 2_000L },
+            autoStorageLimitBytes = { null },
+            watchStatusOf = { item ->
+                DownloadWatchStatus(isWatched = item.id != "m-shared-b", watchedAtEpochMs = now - 10 * dayMs)
+            },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+        assertEquals(1, makeRoom.runOnce(profile))
+        assertFalse(exclusiveFile.exists())
+        assertTrue(sharedFile.exists())
+        assertTrue(crossProfileFile.exists())
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-shared-a" })
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-cross" })
+        assertEquals(listOf("m-exclusive"), store.recentlyDeleted.value.map { it.downloadId })
+        assertTrue(store.recentlyDeleted.value.single().canUndo)
+    }
+
+    @Test
+    fun production_macos_downloads_trash_moves_video_and_subtitles_to_system_trash_and_undo_restores_both() {
+        val isMac = System.getProperty("os.name").orEmpty().lowercase().contains("mac")
+        org.junit.Assume.assumeTrue(isMac)
+
+        val profile = ProfileRepository.activeProfileId
+        val realStoreDir = root.resolve("prod-trash-store").createDirectories()
+        val realCacheDir = root.resolve("prod-trash-cache").createDirectories()
+        val prodDownloadsDir = realStoreDir.resolve("downloads").createDirectories()
+        val uniqueName = "nuvio-prod-trash-${java.util.UUID.randomUUID()}.mkv"
+        val videoFile = prodDownloadsDir.resolve(uniqueName).also { it.writeText("prod-macos-video-bytes") }
+        val subsDir = prodDownloadsDir.resolve("$uniqueName.subtitles").createDirectories()
+            .also { it.resolve("en.srt").writeText("prod-macos-subtitle-bytes") }
+
+        var lastTrashed: TrashedWatchedFile? = null
+        DesktopDownloads.resetForTest()
+        DesktopStorage.setRootDirForTest(realStoreDir, realCacheDir)
+        try {
+            assertTrue(DownloadsTrash.usesSystemTrash)
+            assertTrue(DownloadsTrash.usesUndoableSystemTrash)
+            backend.useProductionDownloadsTrash = true
+
+            val store = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { now }) { profile }
+            val film = movie("m-prod-mac", "Production Mac Trash", 900L, uri = videoFile.toUri().toString())
+                .copy(fileName = uniqueName)
+            backend.payload = DownloadsCodec.encode(listOf(film), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            val moved = executeWatchedCleanup(
+                profileId = profile,
+                downloadIds = listOf("m-prod-mac"),
+                store = store,
+                isWatched = { true },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            )
+            assertEquals(1, moved)
+            assertFalse(videoFile.exists(), "production macOS Trash must move video out of downloads folder")
+            assertFalse(subsDir.exists(), "production macOS Trash must move sidecar subtitles out of downloads folder")
+
+            val deletedEntry = store.recentlyDeleted.value.single { it.downloadId == "m-prod-mac" }
+            assertTrue(deletedEntry.canUndo)
+            val trashed = assertNotNull(deletedEntry.trashed)
+            lastTrashed = trashed
+            assertFalse(trashed.heldInArchive, "macOS must use real system Trash rather than .removed archive")
+            val trashedVideoPath = Path.of(java.net.URI(assertNotNull(trashed.trashedFileUri)))
+            val trashedSubsPath = Path.of(java.net.URI(assertNotNull(trashed.trashedSubtitlesUri)))
+            assertTrue(Files.exists(trashedVideoPath), "trashed video must exist at resultingItemURL in macOS Trash")
+            assertTrue(Files.isDirectory(trashedSubsPath), "trashed subtitles must exist at resultingItemURL in macOS Trash")
+
+            // Restore via production DownloadsTrash -> moves both video and subtitles back out of macOS Trash.
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, deletedEntry, store))
+            lastTrashed = null
+            assertEquals("prod-macos-video-bytes", videoFile.readText())
+            assertEquals("prod-macos-subtitle-bytes", subsDir.resolve("en.srt").readText())
+            assertFalse(Files.exists(trashedVideoPath), "restored video must no longer remain in macOS Trash")
+            assertFalse(Files.exists(trashedSubsPath), "restored subtitles must no longer remain in macOS Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-prod-mac" && it.status == DownloadStatus.Completed })
+            assertTrue("m-prod-mac" in store.keptDownloadIds.value)
+        } finally {
+            // Safety net: if an assertion failed mid-test, move our uniquely named test items out of Trash back into root before root cleanup.
+            lastTrashed?.let { leftover ->
+                listOfNotNull(leftover.trashedFileUri, leftover.trashedSubtitlesUri).forEach { uri ->
+                    runCatching {
+                        val path = Path.of(java.net.URI(uri))
+                        if (Files.exists(path)) {
+                            Files.move(path, root.resolve("cleanup-${path.fileName}"))
+                        }
+                    }
+                }
+            }
+            backend.useProductionDownloadsTrash = false
+            DesktopDownloads.resetForTest()
             DesktopStorage.setRootDirForTest(null, null)
         }
     }

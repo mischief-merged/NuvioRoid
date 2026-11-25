@@ -47,24 +47,51 @@ internal data class CleanableWatchedDownload(
     val watchedAtEpochMs: Long?,
 )
 
+internal fun sameNormalizedLocalPath(firstFileUri: String, secondFileUri: String): Boolean =
+    firstFileUri.trim().removePrefix("file:").trimStart('/') ==
+        secondFileUri.trim().removePrefix("file:").trimStart('/')
+
+private fun sharesFileWithAnotherItem(
+    item: DownloadItem,
+    items: List<DownloadItem>,
+    isSameFile: (String, String) -> Boolean,
+): Boolean {
+    val itemUri = item.localFileUri?.takeIf { it.isNotBlank() }
+    val itemLoc = normalizeFloorLocationId(item.locationId)
+    return items.any { other ->
+        if (other.id == item.id) return@any false
+        val otherUri = other.localFileUri?.takeIf { it.isNotBlank() }
+        if (itemUri != null && otherUri != null) {
+            isSameFile(itemUri, otherUri)
+        } else {
+            other.status == DownloadStatus.Completed &&
+                normalizeFloorLocationId(other.locationId) == itemLoc &&
+                other.fileName == item.fileName
+        }
+    }
+}
+
 /**
  * Completed watched downloads that can be cleaned up right now.
  * Never includes unwatched, mid-rewatch, Keep, playing, downloading, paused, failed,
- * placeholder, moving, or unreachable items.
+ * placeholder, moving, shared-file, or unreachable items.
  */
 internal fun cleanableWatchedDownloads(
     items: List<DownloadItem>,
     watchStatusOf: (DownloadItem) -> DownloadWatchStatus,
     keptDownloadIds: Set<String> = emptySet(),
     movingIds: Set<String> = emptySet(),
+    excludedIds: Set<String> = emptySet(),
     isReachable: (DownloadItem) -> Boolean = { true },
     isPlaying: (DownloadItem) -> Boolean = { false },
+    isSameFile: (String, String) -> Boolean = DownloadsRepository.backend::isSameFile,
 ): List<CleanableWatchedDownload> =
     items
         .mapNotNull { item ->
             if (item.status != DownloadStatus.Completed || item.isPlaceholder) return@mapNotNull null
-            if (item.id in keptDownloadIds || item.id in movingIds) return@mapNotNull null
+            if (item.id in keptDownloadIds || item.id in movingIds || item.id in excludedIds) return@mapNotNull null
             if (!isReachable(item) || isPlaying(item)) return@mapNotNull null
+            if (sharesFileWithAnotherItem(item, items, isSameFile)) return@mapNotNull null
             val status = watchStatusOf(item)
             if (!status.isWatched) return@mapNotNull null
             CleanableWatchedDownload(
@@ -131,29 +158,33 @@ internal fun executeWatchedCleanup(
                 isWatched(candidate)
         }
         val commitUndo: (DownloadItem, TrashedWatchedFile?) -> Boolean = { item, trashed ->
-            val ruleKey = item.autoDownloadRuleKey
-            val season = item.seasonNumber
-            val episode = item.episodeNumber
-            store.commitWatchedRemoval(
-                profileId = profileId,
-                deleted = AutoDownloadDeleted(
-                    title = item.title,
-                    seasonNumber = season,
-                    episodeNumber = episode,
-                    atEpochMs = nowEpochMs(),
-                    downloadId = item.id,
-                    reason = DeletedDownloadReason.CleanedUp,
-                    restorableItem = item,
-                    trashed = trashed,
-                ),
-                ruleKey = ruleKey,
-                ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
-                    autoDownloadEpisodeKey(season, episode)
-                } else {
-                    null
-                },
-                droppedDownloadId = item.id,
-            )
+            if (trashed == null || !trashed.canRestore) {
+                false
+            } else {
+                val ruleKey = item.autoDownloadRuleKey
+                val season = item.seasonNumber
+                val episode = item.episodeNumber
+                store.commitWatchedRemoval(
+                    profileId = profileId,
+                    deleted = AutoDownloadDeleted(
+                        title = item.title,
+                        seasonNumber = season,
+                        episodeNumber = episode,
+                        atEpochMs = nowEpochMs(),
+                        downloadId = item.id,
+                        reason = DeletedDownloadReason.CleanedUp,
+                        restorableItem = item,
+                        trashed = trashed,
+                    ),
+                    ruleKey = ruleKey,
+                    ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
+                        autoDownloadEpisodeKey(season, episode)
+                    } else {
+                        null
+                    },
+                    droppedDownloadId = item.id,
+                )
+            }
         }
         val removed = removeDownload(downloadId, stillWanted, commitUndo)
         if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {
@@ -172,29 +203,54 @@ internal fun undoDeletedWatchedDownload(
         item: DownloadItem,
         trashed: TrashedWatchedFile,
         onRollbackMoved: (TrashedWatchedFile) -> Boolean,
+        onRestoredCommitted: (UndoRestoreOutcome) -> Boolean,
     ) -> UndoRestoreOutcome = DownloadsRepository::restoreTrashedDownloadWithOutcome,
 ): UndoTrashResult {
     val item = entry.restorableItem ?: return UndoTrashResult.NotRestored
     val trashed = entry.trashed?.takeIf { it.canRestore } ?: return UndoTrashResult.NotRestored
     var rollbackSaved = false
+    var restoredSaved = false
     val commitRollback: (TrashedWatchedFile) -> Boolean = { replacement ->
         val saved = store.updateDeletedUndo(profileId, entry, replacement)
         if (saved) rollbackSaved = true
         saved
     }
-    val outcome = restoreDownload(profileId, item, trashed, commitRollback)
-    when (outcome.result) {
-        UndoTrashResult.Restored -> {
-            runCatching { store.keep(profileId, item.id) }
-            runCatching { store.removeDeletedEntry(profileId, entry) }
+    val commitRestored: (UndoRestoreOutcome) -> Boolean = { restoredOutcome ->
+        val saved = when (restoredOutcome.result) {
+            UndoTrashResult.Restored ->
+                store.commitUndoRestore(
+                    profileId = profileId,
+                    downloadId = item.id,
+                    entry = entry,
+                )
+            UndoTrashResult.PartiallyRestored -> {
+                val remaining = restoredOutcome.updatedTrashed
+                if (remaining != null && remaining.canRestore) {
+                    store.commitUndoRestore(
+                        profileId = profileId,
+                        downloadId = item.id,
+                        entry = entry,
+                        remainingTrashed = remaining,
+                    )
+                } else {
+                    store.commitUndoRestore(
+                        profileId = profileId,
+                        downloadId = item.id,
+                        entry = entry,
+                        clearUndoOnly = true,
+                    )
+                }
+            }
+            else -> false
         }
-        UndoTrashResult.PartiallyRestored -> {
-            runCatching { store.keep(profileId, item.id) }
-            val remaining = outcome.updatedTrashed
-            if (remaining != null && remaining.canRestore) {
-                store.updateDeletedUndo(profileId, entry, remaining)
-            } else {
-                runCatching { store.clearDeletedUndo(profileId, entry) }
+        if (saved) restoredSaved = true
+        saved
+    }
+    val outcome = restoreDownload(profileId, item, trashed, commitRollback, commitRestored)
+    when (outcome.result) {
+        UndoTrashResult.Restored, UndoTrashResult.PartiallyRestored -> {
+            if (!restoredSaved && !commitRestored(outcome)) {
+                return UndoTrashResult.NotRestored
             }
         }
         UndoTrashResult.FileGone -> {

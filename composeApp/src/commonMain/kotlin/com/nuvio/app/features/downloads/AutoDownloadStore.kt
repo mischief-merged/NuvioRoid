@@ -497,6 +497,86 @@ internal class AutoDownloadStore(
         true
     }
 
+    /**
+     * Atomically marks [downloadId] as Keep and updates [entry] in [recentlyDeleted] (dropping it
+     * on full restore, updating its Trash pointer when un-restored subtitles remain, or clearing
+     * its Undo fields when nothing remains in Trash) in a single durable write. Returns false
+     * without changing stored or in-memory state when persistence fails or [profileId] is no longer
+     * active.
+     */
+    fun commitUndoRestore(
+        profileId: Int,
+        downloadId: String,
+        entry: AutoDownloadDeleted,
+        remainingTrashed: TrashedWatchedFile? = null,
+        clearUndoOnly: Boolean = false,
+    ): Boolean {
+        val key = profileId to downloadId
+        synchronized(keepSignalLock) {
+            pendingKeeps[key] = (pendingKeeps[key] ?: 0) + 1
+        }
+        var settled = false
+        try {
+            return WatchedRemovalGuard.signalChange {
+                afterSignallingKeep()
+                synchronized(lock) {
+                    try {
+                        if (runCatching { ensureLoaded() }.getOrNull() != profileId) return@synchronized false
+                        val previousRaw = runCatching { payloads.loadFresh(profileId) }.getOrNull()
+                        val scheduled = state.removals.firstOrNull { it.downloadId == downloadId }
+                        val nextRecentlyDeleted = when {
+                            remainingTrashed != null && remainingTrashed.canRestore ->
+                                state.recentlyDeleted.map { current ->
+                                    if (current == entry) current.copy(trashed = remainingTrashed) else current
+                                }
+                            clearUndoOnly ->
+                                state.recentlyDeleted.map { current ->
+                                    if (current == entry) current.copy(restorableItem = null, trashed = null) else current
+                                }
+                            else ->
+                                state.recentlyDeleted.filterNot { it == entry }
+                        }
+                        val updated = state.copy(
+                            removals = state.removals.filterNot { it.downloadId == downloadId },
+                            keptDownloadIds = state.keptDownloadIds + downloadId,
+                            keptRemovals = if (scheduled != null) {
+                                state.keptRemovals.filterNot { it.downloadId == downloadId } + scheduled
+                            } else {
+                                state.keptRemovals
+                            },
+                            recentlyDeleted = nextRecentlyDeleted,
+                        ).normalized()
+                        if (updated != state && !writeDurably(profileId, updated, previousRaw)) {
+                            return@synchronized false
+                        }
+                        publishState(updated)
+                        synchronized(keepSignalLock) {
+                            if ((activeRemovalSnapshots[key] ?: 0) > 0) {
+                                acceptedKeepEpochs[key] = (acceptedKeepEpochs[key] ?: 0L) + 1L
+                            }
+                            decrementPendingKeep(key)
+                            settled = true
+                        }
+                        true
+                    } finally {
+                        if (!settled) {
+                            synchronized(keepSignalLock) {
+                                decrementPendingKeep(key)
+                                settled = true
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            if (!settled) {
+                synchronized(keepSignalLock) {
+                    decrementPendingKeep(key)
+                }
+            }
+        }
+    }
+
     /** Keeps a download for good: its scheduled removal is set aside and none is scheduled again. */
     fun keep(profileId: Int, downloadId: String): Boolean {
         val key = profileId to downloadId

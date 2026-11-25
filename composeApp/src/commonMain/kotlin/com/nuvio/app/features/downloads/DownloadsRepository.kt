@@ -3074,6 +3074,22 @@ object DownloadsRepository {
         val removedItem: DownloadItem? = null,
     )
 
+    internal fun canCleanUpWatchedExclusively(
+        item: DownloadItem,
+        items: List<DownloadItem> = _uiState.value.items,
+    ): Boolean {
+        if (item.status != DownloadStatus.Completed || item.isPlaceholder) return false
+        val lookup = backend.locate(item)
+        if (lookup !is FileLookup.Found) return false
+        return usedByAnother(item, items, lookup.uri) == false
+    }
+
+    internal fun nonExclusivelyCleanableWatchedIds(
+        items: List<DownloadItem> = _uiState.value.items,
+    ): Set<String> = items
+        .filter { it.status == DownloadStatus.Completed && !it.isPlaceholder && !canCleanUpWatchedExclusively(it, items) }
+        .mapTo(linkedSetOf()) { it.id }
+
     internal fun cleanUpWatchedDownload(
         downloadId: String,
         allowHoldingWhenNoSystemTrash: Boolean = true,
@@ -3088,6 +3104,7 @@ object DownloadsRepository {
             requireMatchingRuleKey = false,
             allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
             withUndo = true,
+            requireExclusiveFileMove = true,
             stillWanted = stillWanted,
             onCommitted = onCommitted,
         )
@@ -3099,6 +3116,7 @@ object DownloadsRepository {
         requireMatchingRuleKey: Boolean,
         allowHoldingWhenNoSystemTrash: Boolean,
         withUndo: Boolean,
+        requireExclusiveFileMove: Boolean = false,
         stillWanted: () -> Boolean,
         onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
     ): RemovedWatchedDownload {
@@ -3115,6 +3133,7 @@ object DownloadsRepository {
                         requireMatchingRuleKey = requireMatchingRuleKey,
                         allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
                         withUndo = withUndo,
+                        requireExclusiveFileMove = requireExclusiveFileMove,
                         stillWanted = stillWanted,
                         onCommitted = onCommitted,
                         lockedUri = locked,
@@ -3128,6 +3147,7 @@ object DownloadsRepository {
                     requireMatchingRuleKey = requireMatchingRuleKey,
                     allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
                     withUndo = withUndo,
+                    requireExclusiveFileMove = requireExclusiveFileMove,
                     stillWanted = stillWanted,
                     onCommitted = onCommitted,
                     lockedUri = null,
@@ -3148,6 +3168,7 @@ object DownloadsRepository {
         requireMatchingRuleKey: Boolean,
         allowHoldingWhenNoSystemTrash: Boolean,
         withUndo: Boolean,
+        requireExclusiveFileMove: Boolean,
         stillWanted: () -> Boolean,
         onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
         lockedUri: String?,
@@ -3186,7 +3207,15 @@ object DownloadsRepository {
             return synchronized(WatchedRemovalGuard.lock) {
                 val checked = WatchedRemovalGuard.check(stillWanted)
                 backend.withListLock {
-                    val outcome = removeWatchedLocked(item, items, allowHoldingWhenNoSystemTrash, withUndo, checked, onCommitted)
+                    val outcome = removeWatchedLocked(
+                        item = item,
+                        items = items,
+                        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                        withUndo = withUndo,
+                        requireExclusiveFileMove = requireExclusiveFileMove,
+                        stillWanted = checked,
+                        onCommitted = onCommitted,
+                    )
                     RemovedWatchedDownload(
                         outcome = outcome,
                         removedItem = item.takeIf { outcome.result == AutoDownloadRemovalResult.Removed },
@@ -3203,6 +3232,7 @@ object DownloadsRepository {
         items: List<DownloadItem>,
         allowHoldingWhenNoSystemTrash: Boolean,
         withUndo: Boolean,
+        requireExclusiveFileMove: Boolean,
         stillWanted: () -> Boolean,
         onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
     ): WatchedTrashOutcome {
@@ -3212,6 +3242,9 @@ object DownloadsRepository {
         if (lookup is FileLookup.Unreachable) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotReachable)
         val fileUri = (lookup as? FileLookup.Found)?.uri
         val shared = fileUri?.let { usedByAnother(item, items, it) ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved) } ?: false
+        if (requireExclusiveFileMove && (fileUri == null || shared)) {
+            return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+        }
         if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
         if (!removeRecordDurably(item)) return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         var committed = false
@@ -3279,6 +3312,7 @@ object DownloadsRepository {
         item: DownloadItem,
         trashed: TrashedWatchedFile,
         onRollbackMoved: (TrashedWatchedFile) -> Boolean = { true },
+        onRestoredCommitted: (UndoRestoreOutcome) -> Boolean = { true },
     ): UndoRestoreOutcome {
         ensureLoaded()
         return SidecarLocks.withLock(trashed.originalFileUri) {
@@ -3311,7 +3345,17 @@ object DownloadsRepository {
                     }
                     null
                 }
-                if (precheck != null) return@withLock UndoRestoreOutcome(precheck)
+                if (precheck != null) {
+                    if (precheck == UndoTrashResult.Restored) {
+                        val precheckOutcome = UndoRestoreOutcome(UndoTrashResult.Restored)
+                        return@withLock if (runCatching { onRestoredCommitted(precheckOutcome) }.getOrDefault(false)) {
+                            precheckOutcome
+                        } else {
+                            UndoRestoreOutcome(UndoTrashResult.NotRestored)
+                        }
+                    }
+                    return@withLock UndoRestoreOutcome(precheck)
+                }
 
                 val moveOutcome = backend.restoreTrashedFileWithOutcome(trashed)
                 if (moveOutcome.result != UndoTrashResult.Restored &&
@@ -3320,6 +3364,8 @@ object DownloadsRepository {
                     return@withLock moveOutcome
                 }
 
+                var wasAlreadyCompleted = false
+                var previousItemsSnapshot: List<DownloadItem>? = null
                 val saved = synchronized(stateLock) {
                     if (loadedProfileId != profileId ||
                         com.nuvio.app.features.profiles.ProfileRepository.activeProfileId != profileId
@@ -3329,6 +3375,7 @@ object DownloadsRepository {
                     if (!trashed.hasPendingVideo &&
                         _uiState.value.items.any { it.id == item.id && it.status == DownloadStatus.Completed }
                     ) {
+                        wasAlreadyCompleted = true
                         return@synchronized true
                     }
                     val restored = item.copy(
@@ -3338,6 +3385,9 @@ object DownloadsRepository {
                     )
                     backend.withListLock {
                         val previousItems = _uiState.value.items
+                        wasAlreadyCompleted =
+                            previousItems.any { it.id == restored.id && it.status == DownloadStatus.Completed }
+                        previousItemsSnapshot = previousItems
                         val deduped = previousItems.filterNot { existing ->
                             existing.id != restored.id &&
                                 existing.status == DownloadStatus.Completed &&
@@ -3358,7 +3408,21 @@ object DownloadsRepository {
                         }
                     }
                 }
-                if (saved) return@withLock moveOutcome
+                val storeCommitted = saved && runCatching { onRestoredCommitted(moveOutcome) }.getOrDefault(false)
+                if (storeCommitted) return@withLock moveOutcome
+
+                if (saved && !wasAlreadyCompleted) {
+                    synchronized(stateLock) {
+                        if (loadedProfileId == profileId) {
+                            backend.withListLock {
+                                val fallback = previousItemsSnapshot
+                                val reverted = _uiState.value.items.filterNot { it.id == item.id }
+                                publish(if (fallback != null && reverted.size == fallback.size) fallback else reverted)
+                                if (!persist(durably = true)) persist()
+                            }
+                        }
+                    }
+                }
 
                 // List save failed or profile changed after moving the file back: put what moved back in the Trash
                 // and commit its replacement address through the move callback so recovery is never lost.

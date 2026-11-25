@@ -24,6 +24,8 @@ internal class MakeRoomAutomatically(
     private val isBusyOrMoving: (DownloadItem) -> Boolean = { false },
     private val usesSystemTrash: () -> Boolean = { true },
     private val hasRuleWaitingForStorage: () -> Boolean = { false },
+    private val isExclusivelyCleanable: (DownloadItem, List<DownloadItem>) -> Boolean =
+        DownloadsRepository::canCleanUpWatchedExclusively,
     private val removeDownload: (
         profileId: Int,
         downloadId: String,
@@ -72,11 +74,13 @@ internal class MakeRoomAutomatically(
         // Start anything that already fits before moving any watched file to the Trash.
         resumeAllFittingWaitingDownloads()
 
-        val candidates = downloads()
+        val initialItems = downloads()
+        val candidates = initialItems
             .mapNotNull { item ->
                 if (item.status != DownloadStatus.Completed || item.isPlaceholder || item.awaitingCheck) return@mapNotNull null
                 if (!isConnected(item) || isBusyOrMoving(item) || isPlaying(item)) return@mapNotNull null
                 if (store.isKept(profileId, item.id) || store.hasPendingKeep(profileId, item.id)) return@mapNotNull null
+                if (!isExclusivelyCleanable(item, initialItems)) return@mapNotNull null
                 val watch = watchStatusOf(item)
                 if (!watch.isWatched) return@mapNotNull null
                 CleanableWatchedDownload(
@@ -112,29 +116,33 @@ internal class MakeRoomAutomatically(
                     watchStatusOf(item).isWatched
             }
             val commitUndo: (DownloadItem, TrashedWatchedFile?) -> Boolean = { removedItem, trashed ->
-                val ruleKey = removedItem.autoDownloadRuleKey
-                val season = removedItem.seasonNumber
-                val episode = removedItem.episodeNumber
-                store.commitWatchedRemoval(
-                    profileId = profileId,
-                    deleted = AutoDownloadDeleted(
-                        title = removedItem.title,
-                        seasonNumber = season,
-                        episodeNumber = episode,
-                        atEpochMs = nowEpochMs(),
-                        downloadId = removedItem.id,
-                        reason = DeletedDownloadReason.MadeRoom,
-                        restorableItem = removedItem,
-                        trashed = trashed,
-                    ),
-                    ruleKey = ruleKey,
-                    ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
-                        autoDownloadEpisodeKey(season, episode)
-                    } else {
-                        null
-                    },
-                    droppedDownloadId = removedItem.id,
-                )
+                if (trashed == null || !trashed.canRestore) {
+                    false
+                } else {
+                    val ruleKey = removedItem.autoDownloadRuleKey
+                    val season = removedItem.seasonNumber
+                    val episode = removedItem.episodeNumber
+                    store.commitWatchedRemoval(
+                        profileId = profileId,
+                        deleted = AutoDownloadDeleted(
+                            title = removedItem.title,
+                            seasonNumber = season,
+                            episodeNumber = episode,
+                            atEpochMs = nowEpochMs(),
+                            downloadId = removedItem.id,
+                            reason = DeletedDownloadReason.MadeRoom,
+                            restorableItem = removedItem,
+                            trashed = trashed,
+                        ),
+                        ruleKey = ruleKey,
+                        ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
+                            autoDownloadEpisodeKey(season, episode)
+                        } else {
+                            null
+                        },
+                        droppedDownloadId = removedItem.id,
+                    )
+                }
             }
             val removed = removeDownload(profileId, item.id, stillWanted, commitUndo)
             if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {

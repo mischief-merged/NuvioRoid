@@ -372,7 +372,28 @@ internal fun DownloadsScreenContent(
     }
     val completedRoot = remember(uiState.completedItems) { CompletedGroups(uiState.completedItems) }
     val canCleanUpWatched = autoDownloads?.supportsWatchedCleanup == true
-    val cleanableWatched = remember(canCleanUpWatched, uiState.items, watchStatusOf, keptDownloadIds, folderStateNow) {
+    val nonCleanableWatchedIds by produceState(
+        initialValue = emptySet<String>(),
+        canCleanUpWatched,
+        uiState.items,
+        folderStateNow,
+    ) {
+        value = if (!canCleanUpWatched) {
+            emptySet()
+        } else {
+            withContext(Dispatchers.IO) {
+                DownloadsRepository.nonExclusivelyCleanableWatchedIds(uiState.items)
+            }
+        }
+    }
+    val cleanableWatched = remember(
+        canCleanUpWatched,
+        uiState.items,
+        watchStatusOf,
+        keptDownloadIds,
+        folderStateNow,
+        nonCleanableWatchedIds,
+    ) {
         if (!canCleanUpWatched) {
             emptyList()
         } else {
@@ -381,11 +402,13 @@ internal fun DownloadsScreenContent(
                 watchStatusOf = watchStatusOf,
                 keptDownloadIds = keptDownloadIds,
                 movingIds = folderStateNow.movingIds,
+                excludedIds = nonCleanableWatchedIds,
                 isReachable = { item ->
                     if (!folders.supported) true
                     else folderStateNow.location(folders.locationIdOf(item))?.availability == FolderAvailability.Available
                 },
                 isPlaying = AutoDownloads::isPlaying,
+                isSameFile = ::sameNormalizedLocalPath,
             )
         }
     }
