@@ -268,9 +268,22 @@ internal fun WatchedCleanupDialog(
                         }
                     }
                 }
+                if (!usesSystemTrash) {
+                    Text(
+                        text = stringResource(Res.string.downloads_delete_message_held),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 if (visible.isEmpty()) {
                     Text(
-                        text = stringResource(Res.string.downloads_cleanup_empty_30_days),
+                        text = stringResource(
+                            if (filter == WatchedCleanupFilter.OlderThan30Days) {
+                                Res.string.downloads_cleanup_empty_30_days
+                            } else {
+                                Res.string.downloads_cleanup_empty_all
+                            },
+                        ),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -320,7 +333,7 @@ internal fun WatchedCleanupDialog(
             ) {
                 Text(
                     stringResource(
-                        if (usesSystemTrash) Res.string.downloads_delete_confirm_trash else Res.string.action_delete,
+                        if (usesSystemTrash) Res.string.downloads_delete_confirm_trash else Res.string.downloads_cleanup_confirm_archive,
                     ),
                 )
             }

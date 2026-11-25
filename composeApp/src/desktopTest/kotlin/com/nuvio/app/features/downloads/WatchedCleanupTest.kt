@@ -38,12 +38,15 @@ import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_auto_recent_heading
 import nuvio.composeapp.generated.resources.downloads_cleanup_clear_selection
+import nuvio.composeapp.generated.resources.downloads_cleanup_confirm_archive
 import nuvio.composeapp.generated.resources.downloads_cleanup_empty_30_days
+import nuvio.composeapp.generated.resources.downloads_cleanup_empty_all
 import nuvio.composeapp.generated.resources.downloads_cleanup_filter_30_days
 import nuvio.composeapp.generated.resources.downloads_cleanup_filter_all
 import nuvio.composeapp.generated.resources.downloads_cleanup_total_selected
 import nuvio.composeapp.generated.resources.downloads_cleanup_watched_title
 import nuvio.composeapp.generated.resources.downloads_delete_confirm_trash
+import nuvio.composeapp.generated.resources.downloads_delete_message_held
 import nuvio.composeapp.generated.resources.downloads_recent_cleaned_up_today
 import nuvio.composeapp.generated.resources.downloads_select_description
 import nuvio.composeapp.generated.resources.downloads_undo
@@ -114,6 +117,8 @@ class WatchedCleanupModelAndUndoTest {
         override fun locationConnected(locationId: String?): Boolean = locationId !in disconnectedLocations
 
         override val usesSystemTrash: Boolean get() = trash.usesSystemTrash
+
+        override val usesUndoableSystemTrash: Boolean get() = trash.usesUndoableSystemTrash
 
         override fun trashFile(localFileUri: String): Boolean = trash.moveAway(localFileUri)
 
@@ -888,6 +893,82 @@ class WatchedCleanupModelAndUndoTest {
             DownloadsRepository.onProfileChanged()
         }
     }
+
+    @Test
+    fun cleanup_requires_restorable_trash_destination_or_uses_archive_and_never_commits_without_undo() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+
+        val ep1File = downloadsDir.resolve("ep-no-path.mkv").also { it.writeText("video-no-path") }
+        val ep1Subs = downloadsDir.resolve("ep-no-path.mkv.subtitles").createDirectories()
+            .also { it.resolve("en.srt").writeText("subs-no-path") }
+        val ep1 = testDownload(1, DownloadStatus.Completed, showId = "tt-undo-req", localFileUri = ep1File.toUri().toString(), id = "ep-no-path")
+            .copy(fileName = "ep-no-path.mkv", downloadedBytes = 500L, totalBytes = 500L)
+
+        backend.payload = DownloadsCodec.encode(listOf(ep1), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        // 1. System Trash moves the file away without returning a destination path (e.g. Java fallback):
+        // cleanup refuses to commit without Undo and restores video + subtitles from hard-link recovery.
+        trash = DesktopDownloadsTrash(
+            downloadsDir = { downloadsDir },
+            systemTrash = null,
+            nowEpochMs = { now },
+            systemTrashWithResult = { source ->
+                Files.move(source, trashDir.resolve("untracked-${source.fileName}"))
+                SystemTrashOutcome.Moved(null)
+            },
+        )
+
+        val movedWithoutPath = executeWatchedCleanup(
+            profileId = profile,
+            downloadIds = listOf("ep-no-path"),
+            store = store,
+            isWatched = { true },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+        assertEquals(0, movedWithoutPath, "cleanup must not succeed when Trash provides no restorable destination")
+        assertEquals("video-no-path", ep1File.readText())
+        assertEquals("subs-no-path", ep1Subs.resolve("en.srt").readText())
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-no-path" && it.status == DownloadStatus.Completed })
+        assertTrue(store.recentlyDeleted.value.isEmpty())
+        Files.list(downloadsDir).use { entries ->
+            assertTrue(entries.noneMatch { it.fileName.toString().startsWith(".watched-removal-") })
+        }
+
+        // 2. When system Trash is boolean-only (no undoable path API), cleanup uses the .removed archive so Undo works.
+        trash = DesktopDownloadsTrash(
+            downloadsDir = { downloadsDir },
+            systemTrash = { file -> file.renameTo(trashDir.resolve("legacy-${file.name}").toFile()) },
+            nowEpochMs = { now },
+            systemTrashWithResult = null,
+        )
+        assertTrue(trash.usesSystemTrash)
+        assertFalse(trash.usesUndoableSystemTrash)
+
+        val movedToArchive = executeWatchedCleanup(
+            profileId = profile,
+            downloadIds = listOf("ep-no-path"),
+            store = store,
+            isWatched = { true },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+        assertEquals(1, movedToArchive)
+        assertFalse(ep1File.exists())
+        assertFalse(ep1Subs.exists())
+        val archivedEntry = store.recentlyDeleted.value.single()
+        assertTrue(archivedEntry.canUndo)
+        assertEquals(true, archivedEntry.trashed?.heldInArchive)
+
+        assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, archivedEntry, store))
+        assertEquals("video-no-path", ep1File.readText())
+        assertEquals("subs-no-path", ep1Subs.resolve("en.srt").readText())
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-no-path" && it.status == DownloadStatus.Completed })
+    }
 }
 
 @OptIn(ExperimentalTestApi::class)
@@ -1071,5 +1152,30 @@ class WatchedCleanupUiTest {
 
         compose.onNode(hasText(text(Res.string.downloads_delete_confirm_trash)) and hasAnyAncestor(isDialog())).performClick()
         assertEquals(setOf("ep-2"), confirmed)
+    }
+
+    @Test
+    fun dialog_distinguishes_all_watched_empty_state_and_archive_mode_wording() {
+        val now = 1_800_000_000_000L
+        compose.setContent {
+            NuvioTheme {
+                WatchedCleanupDialog(
+                    candidates = emptyList(),
+                    nowEpochMs = now,
+                    usesSystemTrash = false,
+                    onConfirm = {},
+                    onDismiss = {},
+                )
+            }
+        }
+
+        compose.onNodeWithText(text(Res.string.downloads_delete_message_held)).assertIsDisplayed()
+        compose.onNodeWithText(text(Res.string.downloads_cleanup_empty_all)).assertIsDisplayed()
+        compose.onNode(hasText(text(Res.string.downloads_cleanup_confirm_archive)) and hasAnyAncestor(isDialog()))
+            .assertIsDisplayed()
+            .assertIsNotEnabled()
+
+        compose.onNodeWithText(text(Res.string.downloads_cleanup_filter_30_days)).performClick()
+        compose.onNodeWithText(text(Res.string.downloads_cleanup_empty_30_days)).assertIsDisplayed()
     }
 }

@@ -30,7 +30,7 @@ internal actual object DownloadsTrash {
     private val trash = DesktopDownloadsTrash(
         downloadsDir = { DesktopStorage.rootDir.resolve("downloads").also { it.createDirectories() } },
         systemTrash = ::moveToSystemTrash.takeIf { systemTrashIsSupported() },
-        systemTrashWithResult = ::moveToSystemTrashWithResult.takeIf { systemTrashIsSupported() },
+        systemTrashWithResult = ::moveToSystemTrashWithUndoPath.takeIf { isMacOs },
         otherDirs = {
             // Every other location that can be reached: its files are held on its own volume.
             val folders = DesktopDownloads.folders
@@ -41,6 +41,7 @@ internal actual object DownloadsTrash {
     )
 
     actual val usesSystemTrash: Boolean get() = trash.usesSystemTrash
+    actual val usesUndoableSystemTrash: Boolean get() = trash.usesUndoableSystemTrash
 
     actual fun moveAway(localFileUri: String): Boolean = trash.moveAway(localFileUri)
 
@@ -78,28 +79,31 @@ private fun systemTrashIsSupported(): Boolean =
         Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.MOVE_TO_TRASH)
     }.getOrDefault(false)
 
-private fun moveToSystemTrash(file: File): Boolean =
-    moveToSystemTrashWithResult(file.toPath()) is SystemTrashOutcome.Moved
-
-private fun moveToSystemTrashWithResult(path: Path): SystemTrashOutcome {
-    if (isMacOs) {
-        val macOutcome = runCatching {
-            NativePlayerBridge.ensureLoaded()
-            val resulting = MacTrashNative.trashItem(path.toString())
-            if (resulting != null) {
-                SystemTrashOutcome.Moved(resulting.takeIf { it.isNotBlank() }?.let { Paths.get(it) })
-            } else {
-                SystemTrashOutcome.Failed
-            }
-        }.getOrNull()
-        if (macOutcome is SystemTrashOutcome.Moved) return macOutcome
-    }
-    val moved = runCatching {
+private fun moveToSystemTrash(file: File): Boolean {
+    val path = file.toPath()
+    if (moveToSystemTrashWithUndoPath(path) is SystemTrashOutcome.Moved) return true
+    return runCatching {
         Desktop.isDesktopSupported() &&
             Desktop.getDesktop().isSupported(Desktop.Action.MOVE_TO_TRASH) &&
-            Desktop.getDesktop().moveToTrash(path.toFile())
+            Desktop.getDesktop().moveToTrash(file)
     }.getOrDefault(false)
-    return if (moved) SystemTrashOutcome.Moved(null) else SystemTrashOutcome.Failed
+}
+
+/**
+ * Moves [path] to the system Trash only when the platform reports the resulting path in Trash so
+ * Undo can restore it. Never falls back to [Desktop.moveToTrash], which discards the destination.
+ */
+private fun moveToSystemTrashWithUndoPath(path: Path): SystemTrashOutcome {
+    if (!isMacOs) return SystemTrashOutcome.Failed
+    return runCatching {
+        NativePlayerBridge.ensureLoaded()
+        val resulting = MacTrashNative.trashItem(path.toString())?.takeIf { it.isNotBlank() }?.let(Paths::get)
+        if (resulting != null && Files.exists(resulting, LinkOption.NOFOLLOW_LINKS)) {
+            SystemTrashOutcome.Moved(resulting)
+        } else {
+            SystemTrashOutcome.Failed
+        }
+    }.getOrDefault(SystemTrashOutcome.Failed)
 }
 
 /**
@@ -122,9 +126,11 @@ internal class DesktopDownloadsTrash(
     private val systemTrashWithResult: ((Path) -> SystemTrashOutcome)? = null,
 ) {
     val usesSystemTrash: Boolean get() = systemTrash != null || systemTrashWithResult != null
+    val usesUndoableSystemTrash: Boolean get() = systemTrashWithResult != null
 
-    private fun invokeSystemTrash(path: Path): SystemTrashOutcome? {
+    private fun invokeSystemTrash(path: Path, requireResultingPath: Boolean = false): SystemTrashOutcome? {
         systemTrashWithResult?.let { return it(path) }
+        if (requireResultingPath) return null
         val legacy = systemTrash ?: return null
         return if (legacy(path.toFile())) SystemTrashOutcome.Moved(null) else SystemTrashOutcome.Failed
     }
@@ -154,15 +160,36 @@ internal class DesktopDownloadsTrash(
      * moved them. If links cannot be made on this volume, leave the download alone.
      */
     fun moveWatchedAway(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
-        moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash = false, stillWanted = stillWanted).result
+        moveWatchedInternal(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = false,
+            requireUndo = false,
+            stillWanted = stillWanted,
+            onMoved = { true },
+        ).result
 
     fun moveWatchedAwayWithUndo(
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean = false,
         stillWanted: () -> Boolean = { true },
         onMoved: (TrashedWatchedFile?) -> Boolean = { true },
+    ): WatchedTrashOutcome = moveWatchedInternal(
+        localFileUri = localFileUri,
+        allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+        requireUndo = true,
+        stillWanted = stillWanted,
+        onMoved = onMoved,
+    )
+
+    private fun moveWatchedInternal(
+        localFileUri: String,
+        allowHoldingWhenNoSystemTrash: Boolean,
+        requireUndo: Boolean,
+        stillWanted: () -> Boolean,
+        onMoved: (TrashedWatchedFile?) -> Boolean,
     ): WatchedTrashOutcome = synchronized(this) {
-        if (!usesSystemTrash && !allowHoldingWhenNoSystemTrash) {
+        val trashAvailable = if (requireUndo) usesUndoableSystemTrash else usesSystemTrash
+        if (!trashAvailable && !allowHoldingWhenNoSystemTrash) {
             return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         }
         if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
@@ -183,11 +210,18 @@ internal class DesktopDownloadsTrash(
         val subtitles = file.resolveSibling("${file.fileName}$SubtitlesSuffix").takeIf { it.isDirectoryInside(root) }
         val recordedSubtitlesUri = subtitles?.let { requested.resolveSibling("${requested.fileName}$SubtitlesSuffix").toUri().toString() }
 
-        if (!usesSystemTrash) {
+        if (!trashAvailable) {
             if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
             val heldVideo = runCatching { hold(root, file) }.getOrNull()
                 ?: return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
-            val heldSubs = subtitles?.let { runCatching { hold(root, it) }.getOrNull() }
+            val heldSubs = if (subtitles != null) {
+                runCatching { hold(root, subtitles) }.getOrNull() ?: run {
+                    runCatching { Files.move(heldVideo, file) }
+                    return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+                }
+            } else {
+                null
+            }
             val trashed = TrashedWatchedFile(
                 originalFileUri = localFileUri,
                 trashedFileUri = heldVideo.toUri().toString(),
@@ -216,6 +250,26 @@ internal class DesktopDownloadsTrash(
             return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
         }
 
+        var accepted = false
+        var trashedVideoPath: Path? = null
+        var trashedSubsPath: Path? = null
+
+        fun moveBackFromTrashIfPossible() {
+            if (trashedVideoPath != null &&
+                Files.exists(trashedVideoPath, LinkOption.NOFOLLOW_LINKS) &&
+                !Files.exists(file, LinkOption.NOFOLLOW_LINKS)
+            ) {
+                runCatching { Files.move(trashedVideoPath, file) }
+            }
+            if (subtitles != null &&
+                trashedSubsPath != null &&
+                Files.exists(trashedSubsPath, LinkOption.NOFOLLOW_LINKS) &&
+                !Files.exists(subtitles, LinkOption.NOFOLLOW_LINKS)
+            ) {
+                runCatching { Files.move(trashedSubsPath, subtitles) }
+            }
+        }
+
         fun restore() {
             sources.forEach { source ->
                 val saved = recovery.resolve(source.fileName)
@@ -223,20 +277,29 @@ internal class DesktopDownloadsTrash(
             }
         }
 
-        var accepted = false
-        var trashedVideoPath: Path? = null
-        var trashedSubsPath: Path? = null
         try {
             if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
-            val videoOutcome = runCatching { invokeSystemTrash(file) }.getOrNull()
+            val videoOutcome = runCatching { invokeSystemTrash(file, requireResultingPath = requireUndo) }.getOrNull()
             trashedVideoPath = (videoOutcome as? SystemTrashOutcome.Moved)?.resultingPath
             if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
             if (videoOutcome !is SystemTrashOutcome.Moved || Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
                 return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
             }
+            if (requireUndo && (trashedVideoPath == null || !Files.exists(trashedVideoPath, LinkOption.NOFOLLOW_LINKS))) {
+                return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            }
             if (subtitles != null) {
-                val subsOutcome = runCatching { invokeSystemTrash(subtitles) }.getOrNull()
+                val subsOutcome = runCatching { invokeSystemTrash(subtitles, requireResultingPath = requireUndo) }.getOrNull()
                 trashedSubsPath = (subsOutcome as? SystemTrashOutcome.Moved)?.resultingPath
+                if (requireUndo && (
+                        subsOutcome !is SystemTrashOutcome.Moved ||
+                            Files.exists(subtitles, LinkOption.NOFOLLOW_LINKS) ||
+                            trashedSubsPath == null ||
+                            !Files.exists(trashedSubsPath, LinkOption.NOFOLLOW_LINKS)
+                        )
+                ) {
+                    return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+                }
             }
             if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
             val trashed = TrashedWatchedFile(
@@ -247,20 +310,10 @@ internal class DesktopDownloadsTrash(
                 fileKey = fileIdentity,
                 heldInArchive = false,
             )
+            if (requireUndo && !trashed.canRestore) {
+                return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
+            }
             if (!runCatching { onMoved(trashed) }.getOrDefault(false)) {
-                if (trashedVideoPath != null &&
-                    Files.exists(trashedVideoPath, LinkOption.NOFOLLOW_LINKS) &&
-                    !Files.exists(file, LinkOption.NOFOLLOW_LINKS)
-                ) {
-                    runCatching { Files.move(trashedVideoPath, file) }
-                }
-                if (subtitles != null &&
-                    trashedSubsPath != null &&
-                    Files.exists(trashedSubsPath, LinkOption.NOFOLLOW_LINKS) &&
-                    !Files.exists(subtitles, LinkOption.NOFOLLOW_LINKS)
-                ) {
-                    runCatching { Files.move(trashedSubsPath, subtitles) }
-                }
                 return WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
             }
             accepted = true
@@ -270,6 +323,9 @@ internal class DesktopDownloadsTrash(
             )
         } finally {
             // If restoring fails, keep the recovery links. Never discard the only remaining copy.
+            if (!accepted) {
+                moveBackFromTrashIfPossible()
+            }
             if (accepted || runCatching { restore() }.isSuccess) {
                 runCatching { deleteWithoutFollowingLinks(recovery) }
             }

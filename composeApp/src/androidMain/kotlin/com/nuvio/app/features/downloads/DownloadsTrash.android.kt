@@ -2,6 +2,7 @@ package com.nuvio.app.features.downloads
 
 internal actual object DownloadsTrash {
     actual val usesSystemTrash: Boolean = false
+    actual val usesUndoableSystemTrash: Boolean = false
 
     actual fun moveAway(localFileUri: String): Boolean = false
 

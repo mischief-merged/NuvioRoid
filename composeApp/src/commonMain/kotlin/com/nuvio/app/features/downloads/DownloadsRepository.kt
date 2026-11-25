@@ -3158,7 +3158,8 @@ object DownloadsRepository {
         ) {
             return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
         }
-        if (!backend.usesSystemTrash && !allowHoldingWhenNoSystemTrash) {
+        val trashAvailable = if (withUndo) backend.usesUndoableSystemTrash else backend.usesSystemTrash
+        if (!trashAvailable && !allowHoldingWhenNoSystemTrash) {
             return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved))
         }
         if (!stillWanted()) return RemovedWatchedDownload(WatchedTrashOutcome(AutoDownloadRemovalResult.Changed))
@@ -3827,6 +3828,7 @@ internal interface DownloadsBackend {
 
     /** True when [trashFile] puts files in the trash of the system, false when it only holds them for days. */
     val usesSystemTrash: Boolean get() = true
+    val usesUndoableSystemTrash: Boolean get() = usesSystemTrash
 
     /** Whether two addresses name the same file, however they are spelled. */
     fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
@@ -4036,6 +4038,7 @@ private object PlatformDownloadsBackend : DownloadsBackend {
         DownloadsTrash.restoreFromTrash(trashed)
 
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
+    override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash
 
     override fun isSameFile(firstFileUri: String, secondFileUri: String): Boolean =
         DownloadsTrash.isSameFile(firstFileUri, secondFileUri)

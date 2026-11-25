@@ -53,6 +53,7 @@ internal class DeleteAfterWatching(
             onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
         ) -> WatchedTrashOutcome
     )? = null,
+    private val usesUndoableTrash: () -> Boolean = { true },
 ) {
     /** True when a removal was scheduled for [item]. */
     fun onLocalPlaybackCompleted(
@@ -212,7 +213,7 @@ internal class DeleteAfterWatching(
                 droppedRemoval = removal,
             )
         }
-        val outcome = if (removeDownloadWithUndo != null) {
+        val outcome = if (removeDownloadWithUndo != null && usesUndoableTrash()) {
             removeDownloadWithUndo.invoke(item.id, removal.ruleKey, profileId, stillWanted, commitDeleted)
         } else {
             val result = removeDownload(item.id, removal.ruleKey, stillWanted)

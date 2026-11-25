@@ -724,7 +724,7 @@ internal fun DownloadsScreenContent(
         WatchedCleanupDialog(
             candidates = cleanableWatched,
             nowEpochMs = now.value,
-            usesSystemTrash = autoDownloads?.usesSystemTrash ?: DownloadsRepository.usesSystemTrash,
+            usesSystemTrash = autoDownloads?.usesUndoableSystemTrash ?: DownloadsRepository.usesUndoableSystemTrash,
             onConfirm = { chosenIds ->
                 showingWatchedCleanup = false
                 if (autoDownloads != null) {

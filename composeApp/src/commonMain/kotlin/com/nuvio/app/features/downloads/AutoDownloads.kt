@@ -48,6 +48,7 @@ import nuvio.composeapp.generated.resources.downloads_auto_toast_on
 import nuvio.composeapp.generated.resources.downloads_auto_toast_save_failed
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast_soon
+import nuvio.composeapp.generated.resources.downloads_cleanup_held_toast
 import nuvio.composeapp.generated.resources.downloads_cleanup_moved_toast
 import nuvio.composeapp.generated.resources.downloads_undo_failed_toast
 import nuvio.composeapp.generated.resources.downloads_undo_file_gone_toast
@@ -106,6 +107,7 @@ internal interface AutoDownloadController {
 
     /** False when removed files stay in the holding folder until you remove them. */
     val usesSystemTrash: Boolean
+    val usesUndoableSystemTrash: Boolean get() = usesSystemTrash
 
     /**
      * Turns automatic downloads on for [meta], or changes its rule, and checks the show. Nothing
@@ -210,6 +212,7 @@ internal object AutoDownloads : AutoDownloadController {
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
         removeDownloadWithUndo = DownloadsRepository::removeWatchedAutoDownloadWithUndo,
+        usesUndoableTrash = { DownloadsRepository.usesUndoableSystemTrash },
     )
 
     private val makeRoom = MakeRoomAutomatically(
@@ -227,7 +230,7 @@ internal object AutoDownloads : AutoDownloadController {
         isPlaying = ::isPlaying,
         isConnected = DownloadsRepository.backend::isConnected,
         isBusyOrMoving = DownloadsRepository::isBusyOrAway,
-        usesSystemTrash = { DownloadsRepository.usesSystemTrash },
+        usesSystemTrash = { DownloadsRepository.usesUndoableSystemTrash },
         hasRuleWaitingForStorage = { engine.statuses.value.values.contains(AutoDownloadStatus.StorageLimitReached) },
     )
 
@@ -244,6 +247,7 @@ internal object AutoDownloads : AutoDownloadController {
     override val removals: StateFlow<List<AutoDownloadRemoval>> get() = store.removals
     override val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = store.recentlyDeleted
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
+    override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash
 
     fun storageLimitBytes(): Long? = store.storageLimitBytes()
     fun totalStorageLimitBytes(): Long? = store.totalStorageLimitBytes()
@@ -437,7 +441,12 @@ internal object AutoDownloads : AutoDownloadController {
                 )
             }.getOrDefault(0)
             if (moved > 0) {
-                NuvioToastController.show(getPluralString(Res.plurals.downloads_cleanup_moved_toast, moved, moved))
+                val toastPlural = if (usesUndoableSystemTrash) {
+                    Res.plurals.downloads_cleanup_moved_toast
+                } else {
+                    Res.plurals.downloads_cleanup_held_toast
+                }
+                NuvioToastController.show(getPluralString(toastPlural, moved, moved))
             } else {
                 NuvioToastController.show(getString(Res.string.downloads_auto_delete_failed_toast))
             }
