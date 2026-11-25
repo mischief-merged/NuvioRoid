@@ -18,6 +18,8 @@ internal actual object AutoDownloadStorage {
     actual fun loadPayload(profileId: Int): String? =
         preferences?.getString(ProfileScopedKey.of(payloadKey, profileId), null)
 
+    actual fun loadFreshPayload(profileId: Int): String? = loadPayload(profileId)
+
     actual fun savePayload(profileId: Int, payload: String) {
         preferences
             ?.edit()
@@ -31,4 +33,6 @@ internal actual object AutoDownloadStorage {
             ?.putString(ProfileScopedKey.of(unreadablePayloadKey, profileId), payload)
             ?.apply()
     }
+
+    actual fun syncPayload(): Boolean = true
 }

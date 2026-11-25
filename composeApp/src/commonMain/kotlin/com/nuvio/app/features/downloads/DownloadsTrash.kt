@@ -53,6 +53,7 @@ internal expect object DownloadsTrash {
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean = false,
         stillWanted: () -> Boolean = { true },
+        onMoved: (TrashedWatchedFile?) -> Boolean = { true },
     ): WatchedTrashOutcome
 
     /** Restores a trashed watched download back to its original folder if it is still in the Trash. */

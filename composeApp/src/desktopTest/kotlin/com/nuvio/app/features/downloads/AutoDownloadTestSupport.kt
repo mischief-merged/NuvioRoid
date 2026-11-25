@@ -6,16 +6,21 @@ import com.nuvio.app.features.streams.StreamItem
 internal class MemoryAutoDownloadPayloads : AutoDownloadPayloads {
     val saved = mutableMapOf<Int, String>()
     val unreadable = mutableMapOf<Int, String>()
+    var failSave = false
+    var failSync = false
 
     override fun load(profileId: Int): String? = saved[profileId]
 
     override fun save(profileId: Int, payload: String) {
+        if (failSave) throw java.io.IOException("Simulated store save failure")
         saved[profileId] = payload
     }
 
     override fun saveUnreadable(profileId: Int, payload: String) {
         unreadable[profileId] = payload
     }
+
+    override fun sync(): Boolean = !failSync
 }
 
 internal fun testRule(

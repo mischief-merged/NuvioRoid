@@ -24,8 +24,19 @@ internal class MakeRoomAutomatically(
     private val isBusyOrMoving: (DownloadItem) -> Boolean = { false },
     private val usesSystemTrash: () -> Boolean = { true },
     private val hasRuleWaitingForStorage: () -> Boolean = { false },
-    private val removeDownload: (downloadId: String, stillWanted: () -> Boolean) -> DownloadsRepository.RemovedWatchedDownload = { id, stillWanted ->
-        DownloadsRepository.cleanUpWatchedDownload(id, allowHoldingWhenNoSystemTrash = false, stillWanted = stillWanted)
+    private val removeDownload: (
+        profileId: Int,
+        downloadId: String,
+        stillWanted: () -> Boolean,
+        onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
+    ) -> DownloadsRepository.RemovedWatchedDownload = { profileId, id, stillWanted, onCommitted ->
+        DownloadsRepository.cleanUpWatchedDownload(
+            downloadId = id,
+            allowHoldingWhenNoSystemTrash = false,
+            expectedProfileId = profileId,
+            stillWanted = stillWanted,
+            onCommitted = onCommitted,
+        )
     },
     private val resumeWaiting: () -> Unit = DownloadsRepository::resumeWaitingForStorageLimit,
     private val resumeDownload: (String) -> Unit = DownloadsRepository::resumeDownload,
@@ -100,21 +111,13 @@ internal class MakeRoomAutomatically(
                     !store.isKept(profileId, item.id) &&
                     watchStatusOf(item).isWatched
             }
-            val removed = removeDownload(item.id, stillWanted)
-            if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {
-                val removedItem = removed.removedItem ?: item
+            val commitUndo: (DownloadItem, TrashedWatchedFile?) -> Boolean = { removedItem, trashed ->
                 val ruleKey = removedItem.autoDownloadRuleKey
                 val season = removedItem.seasonNumber
                 val episode = removedItem.episodeNumber
-                if (ruleKey != null && season != null && episode != null) {
-                    store.update(profileId, ruleKey) {
-                        it.copy(ownedEpisodeKeys = it.ownedEpisodeKeys + autoDownloadEpisodeKey(season, episode))
-                    }
-                }
-                store.dropRemovalById(profileId, removedItem.id)
-                store.recordDeleted(
-                    profileId,
-                    AutoDownloadDeleted(
+                store.commitWatchedRemoval(
+                    profileId = profileId,
+                    deleted = AutoDownloadDeleted(
                         title = removedItem.title,
                         seasonNumber = season,
                         episodeNumber = episode,
@@ -122,9 +125,19 @@ internal class MakeRoomAutomatically(
                         downloadId = removedItem.id,
                         reason = DeletedDownloadReason.MadeRoom,
                         restorableItem = removedItem,
-                        trashed = removed.outcome.trashed,
+                        trashed = trashed,
                     ),
+                    ruleKey = ruleKey,
+                    ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
+                        autoDownloadEpisodeKey(season, episode)
+                    } else {
+                        null
+                    },
+                    droppedDownloadId = removedItem.id,
                 )
+            }
+            val removed = removeDownload(profileId, item.id, stillWanted, commitUndo)
+            if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {
                 movedCount++
                 // Resume any waiting downloads that now fit so live byte counts reflect them before the next check.
                 resumeAllFittingWaitingDownloads()

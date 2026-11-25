@@ -88,6 +88,7 @@ class WatchedCleanupModelAndUndoTest {
         val disconnectedLocations = mutableSetOf<String>()
         var failSave = false
         var failDurableSync = false
+        var onAfterTrashMove: (() -> Unit)? = null
         var onAfterRestoreMove: (() -> Unit)? = null
 
         override fun loadPayload(): String? = payload
@@ -124,6 +125,21 @@ class WatchedCleanupModelAndUndoTest {
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
         ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+
+        override fun trashWatchedFileWithUndo(
+            localFileUri: String,
+            allowHoldingWhenNoSystemTrash: Boolean,
+            stillWanted: () -> Boolean,
+            onMoved: (TrashedWatchedFile?) -> Boolean,
+        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            stillWanted = stillWanted,
+            onMoved = { trashed ->
+                onAfterTrashMove?.invoke()
+                onMoved(trashed)
+            },
+        )
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
             trash.restoreFromTrash(trashed).also { result ->
@@ -185,6 +201,7 @@ class WatchedCleanupModelAndUndoTest {
         backend.disconnectedLocations.clear()
         backend.failSave = false
         backend.failDurableSync = false
+        backend.onAfterTrashMove = null
         backend.onAfterRestoreMove = null
 
         DownloadsRepository.clearLocalState()
@@ -650,6 +667,226 @@ class WatchedCleanupModelAndUndoTest {
         assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "batch-1" && it.status == DownloadStatus.Completed })
         assertTrue("batch-1" in reloaded.keptDownloadIds.value)
         assertEquals((2..batchCount).map { "batch-$it" }, reloaded.recentlyDeleted.value.filter { it.canUndo }.map { it.downloadId })
+    }
+
+    @Test
+    fun cleanup_preserves_undo_across_profile_switch_and_rolls_back_when_undo_save_fails() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val otherProfile = originalProfile + 23
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+        val rule = testRule(showId = "tt-tx-cleanup")
+        store.upsert(originalProfile, rule)
+
+        try {
+            // 1. Profile switches right after the file moves to Trash: originating profile keeps its Undo entry and owned key.
+            val ep1File = downloadsDir.resolve("ep1.mkv").also { it.writeText("ep1-video-bytes") }
+            val ep1Subs = downloadsDir.resolve("ep1.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("ep1-subtitles") }
+            val ep2File = downloadsDir.resolve("ep2.mkv").also { it.writeText("ep2-video-bytes") }
+            val ep2Subs = downloadsDir.resolve("ep2.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("ep2-subtitles") }
+
+            val ep1 = testDownload(1, DownloadStatus.Completed, showId = "tt-tx-cleanup", ruleKey = rule.key, localFileUri = ep1File.toUri().toString(), id = "ep-1")
+                .copy(fileName = "ep1.mkv", downloadedBytes = 600L, totalBytes = 600L)
+            val ep2 = testDownload(2, DownloadStatus.Completed, showId = "tt-tx-cleanup", ruleKey = rule.key, localFileUri = ep2File.toUri().toString(), id = "ep-2")
+                .copy(fileName = "ep2.mkv", downloadedBytes = 600L, totalBytes = 600L)
+
+            backend.payload = DownloadsCodec.encode(listOf(ep1, ep2), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                ProfileRepository.setActiveProfileIdForTest(otherProfile)
+            }
+
+            val movedOnSwitch = executeWatchedCleanup(
+                profileId = originalProfile,
+                downloadIds = listOf("ep-1"),
+                store = store,
+                isWatched = { true },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            )
+            assertEquals(1, movedOnSwitch)
+            assertFalse(ep1File.exists())
+            assertFalse(ep1Subs.exists())
+
+            // Other profile's state remains empty; switching back reveals originalProfile's Undo entry and owned key.
+            assertTrue(store.currentRules().isEmpty())
+            assertTrue(store.recentlyDeleted.value.isEmpty())
+
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+
+            assertTrue(autoDownloadEpisodeKey(1, 1) in store.rule(originalProfile, rule.key)!!.ownedEpisodeKeys)
+            val switchedEntry = store.recentlyDeleted.value.single { it.downloadId == "ep-1" }
+            assertEquals(DeletedDownloadReason.CleanedUp, switchedEntry.reason)
+            assertTrue(switchedEntry.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, switchedEntry, store))
+            assertEquals("ep1-video-bytes", ep1File.readText())
+            assertEquals("ep1-subtitles", ep1Subs.resolve("en.srt").readText())
+
+            // 2. Saving Undo metadata throws IOException after the Trash move: move and catalog removal roll back cleanly.
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                payloads.failSave = true
+            }
+            val movedOnFailure = executeWatchedCleanup(
+                profileId = originalProfile,
+                downloadIds = listOf("ep-2"),
+                store = store,
+                isWatched = { true },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            )
+            assertEquals(0, movedOnFailure, "failed Undo save must not report a completed cleanup")
+            assertEquals("ep2-video-bytes", ep2File.readText(), "failed Undo save must restore video out of Trash")
+            assertEquals("ep2-subtitles", ep2Subs.resolve("en.srt").readText(), "failed Undo save must restore subtitles out of Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-2" && it.status == DownloadStatus.Completed })
+            assertTrue(store.recentlyDeleted.value.none { it.downloadId == "ep-2" })
+
+            // Once storage recovers, retrying cleanup moves ep-2 with a valid Undo entry.
+            payloads.failSave = false
+            val movedOnRetry = executeWatchedCleanup(
+                profileId = originalProfile,
+                downloadIds = listOf("ep-2"),
+                store = store,
+                isWatched = { true },
+                isPlaying = { false },
+                nowEpochMs = { now },
+            )
+            assertEquals(1, movedOnRetry)
+            assertFalse(ep2File.exists())
+            val retriedEntry = store.recentlyDeleted.value.single { it.downloadId == "ep-2" }
+            assertTrue(retriedEntry.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, retriedEntry, store))
+            assertEquals("ep2-video-bytes", ep2File.readText())
+
+            // 3. DeleteAfterWatching with Undo also preserves Undo across profile switches and rolls back on sync failure.
+            val deleteRule = testRule(showId = "tt-tx-delete").copy(deleteAfterWatching = true)
+            store.upsert(originalProfile, deleteRule)
+            val ep3File = downloadsDir.resolve("ep3.mkv").also { it.writeText("ep3-video-bytes") }
+            val ep3 = testDownload(3, DownloadStatus.Completed, showId = "tt-tx-delete", ruleKey = deleteRule.key, localFileUri = ep3File.toUri().toString(), id = "ep-3")
+                .copy(fileName = "ep3.mkv", downloadedBytes = 600L, totalBytes = 600L)
+            backend.payload = DownloadsCodec.encode(listOf(ep3), null, 2L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            val deleteAfterWatching = DeleteAfterWatching(
+                store = store,
+                downloads = { DownloadsRepository.uiState.value.items },
+                isWatchedToTheEnd = { true },
+                isInPlayer = { false },
+                hasLaterEpisode = { _, _ -> true },
+                removeDownload = DownloadsRepository::removeWatchedAutoDownload,
+                nowEpochMs = { now },
+                holdMs = 0L,
+                removeDownloadWithUndo = DownloadsRepository::removeWatchedAutoDownloadWithUndo,
+            )
+            assertTrue(deleteAfterWatching.onLocalPlaybackCompleted(originalProfile, ep3))
+
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                payloads.failSync = true
+            }
+            assertEquals(AutoDownloadRemovalOutcome.NotMoved, deleteAfterWatching.runDue(originalProfile).getValue("ep-3"))
+            assertEquals("ep3-video-bytes", ep3File.readText(), "failed durable Undo sync must roll back DeleteAfterWatching Trash move")
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-3" && it.status == DownloadStatus.Completed })
+            payloads.failSync = false
+
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                ProfileRepository.setActiveProfileIdForTest(otherProfile)
+            }
+            assertEquals(AutoDownloadRemovalOutcome.Removed, deleteAfterWatching.runDue(originalProfile).getValue("ep-3"))
+            assertFalse(ep3File.exists())
+
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+            val afterWatchingEntry = store.recentlyDeleted.value.single { it.downloadId == "ep-3" }
+            assertEquals(DeletedDownloadReason.AfterWatching, afterWatchingEntry.reason)
+            assertTrue(afterWatchingEntry.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, afterWatchingEntry, store))
+            assertEquals("ep3-video-bytes", ep3File.readText())
+
+            // 4. Real PlatformAutoDownloadPayloads (DesktopStorage + fsync) across real IOException and profile switch.
+            val realStoreDir = root.resolve("real-store").createDirectories()
+            val realCacheDir = root.resolve("real-cache").createDirectories()
+            DesktopStorage.setRootDirForTest(realStoreDir, realCacheDir)
+            try {
+                val diskStore = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+                diskStore.upsert(originalProfile, rule)
+
+                val ep4File = downloadsDir.resolve("ep4.mkv").also { it.writeText("ep4-real-disk-bytes") }
+                val ep4Subs = downloadsDir.resolve("ep4.mkv.subtitles").createDirectories()
+                    .also { it.resolve("en.srt").writeText("ep4-real-disk-subs") }
+                val ep4 = testDownload(4, DownloadStatus.Completed, showId = "tt-tx-cleanup", ruleKey = rule.key, localFileUri = ep4File.toUri().toString(), id = "ep-4")
+                    .copy(fileName = "ep4.mkv", downloadedBytes = 600L, totalBytes = 600L)
+                backend.payload = DownloadsCodec.encode(listOf(ep4), null, 3L)
+                DownloadsRepository.clearLocalState()
+                DownloadsRepository.ensureLoaded()
+
+                // Force a real filesystem IOException inside DesktopStorage.Store.persist() right after the Trash move.
+                val blockingTmpDir = realStoreDir.resolve("nuvio_auto_downloads.properties.tmp")
+                backend.onAfterTrashMove = {
+                    backend.onAfterTrashMove = null
+                    blockingTmpDir.createDirectories()
+                }
+                val diskFailedMove = executeWatchedCleanup(
+                    profileId = originalProfile,
+                    downloadIds = listOf("ep-4"),
+                    store = diskStore,
+                    isWatched = { true },
+                    isPlaying = { false },
+                    nowEpochMs = { now },
+                )
+                assertEquals(0, diskFailedMove)
+                assertEquals("ep4-real-disk-bytes", ep4File.readText())
+                assertEquals("ep4-real-disk-subs", ep4Subs.resolve("en.srt").readText())
+                assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "ep-4" && it.status == DownloadStatus.Completed })
+
+                // Remove blocking directory and switch profile right after Trash move on the real disk store.
+                Files.deleteIfExists(blockingTmpDir)
+                backend.onAfterTrashMove = {
+                    backend.onAfterTrashMove = null
+                    ProfileRepository.setActiveProfileIdForTest(otherProfile)
+                }
+                assertEquals(
+                    1,
+                    executeWatchedCleanup(
+                        profileId = originalProfile,
+                        downloadIds = listOf("ep-4"),
+                        store = diskStore,
+                        isWatched = { true },
+                        isPlaying = { false },
+                        nowEpochMs = { now },
+                    ),
+                )
+                assertFalse(ep4File.exists())
+
+                ProfileRepository.setActiveProfileIdForTest(originalProfile)
+                DownloadsRepository.onProfileChanged()
+                val reopenedDiskStore = AutoDownloadStore(PlatformAutoDownloadPayloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+                reopenedDiskStore.currentRules()
+                val diskEntry = reopenedDiskStore.recentlyDeleted.value.single { it.downloadId == "ep-4" }
+                assertTrue(diskEntry.canUndo)
+                assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, diskEntry, reopenedDiskStore))
+                assertEquals("ep4-real-disk-bytes", ep4File.readText())
+                assertEquals("ep4-real-disk-subs", ep4Subs.resolve("en.srt").readText())
+            } finally {
+                DesktopStorage.setRootDirForTest(null, null)
+            }
+        } finally {
+            backend.onAfterTrashMove = null
+            payloads.failSave = false
+            payloads.failSync = false
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+        }
     }
 }
 

@@ -13,17 +13,23 @@ import kotlinx.serialization.json.Json
 /** Where the automatic-download state of a profile is kept. Always [AutoDownloadStorage] in the app. */
 internal interface AutoDownloadPayloads {
     fun load(profileId: Int): String?
+    fun loadFresh(profileId: Int): String? = load(profileId)
     fun save(profileId: Int, payload: String)
     fun saveUnreadable(profileId: Int, payload: String)
+    fun sync(): Boolean = true
 }
 
 internal object PlatformAutoDownloadPayloads : AutoDownloadPayloads {
     override fun load(profileId: Int): String? = AutoDownloadStorage.loadPayload(profileId)
 
+    override fun loadFresh(profileId: Int): String? = AutoDownloadStorage.loadFreshPayload(profileId)
+
     override fun save(profileId: Int, payload: String) = AutoDownloadStorage.savePayload(profileId, payload)
 
     override fun saveUnreadable(profileId: Int, payload: String) =
         AutoDownloadStorage.saveUnreadablePayload(profileId, payload)
+
+    override fun sync(): Boolean = AutoDownloadStorage.syncPayload()
 }
 
 @Serializable
@@ -176,6 +182,50 @@ internal class AutoDownloadStore(
         true
     }
 
+    /**
+     * Atomically records a completed watched-download removal (owned episode key, cleared pending
+     * removal, and [deleted] history/Undo entry) for the originating [profileId], even if the active
+     * profile switched while the removal committed. Returns false when the payload cannot be saved
+     * durably, leaving stored and in-memory state unchanged.
+     */
+    fun commitWatchedRemoval(
+        profileId: Int,
+        deleted: AutoDownloadDeleted,
+        ruleKey: String? = null,
+        ownedEpisodeKey: String? = null,
+        droppedDownloadId: String? = deleted.downloadId,
+        droppedRemoval: AutoDownloadRemoval? = null,
+    ): Boolean = synchronized(lock) {
+        val active = ensureLoaded()
+        if (active == profileId) {
+            val previousRaw = runCatching { payloads.loadFresh(profileId) }.getOrNull()
+            val updated = state.withCommittedRemoval(
+                deleted = deleted,
+                ruleKey = ruleKey,
+                ownedEpisodeKey = ownedEpisodeKey,
+                droppedDownloadId = droppedDownloadId,
+                droppedRemoval = droppedRemoval,
+            ).normalized()
+            if (!writeDurably(profileId, updated, previousRaw)) return false
+            publishState(updated)
+            return true
+        }
+        val previousRaw = try {
+            payloads.loadFresh(profileId)
+        } catch (_: Exception) {
+            return false
+        }
+        val base = readFromRaw(profileId, previousRaw)
+        val updated = base.withCommittedRemoval(
+            deleted = deleted,
+            ruleKey = ruleKey,
+            ownedEpisodeKey = ownedEpisodeKey,
+            droppedDownloadId = droppedDownloadId,
+            droppedRemoval = droppedRemoval,
+        ).normalized()
+        writeDurably(profileId, updated, previousRaw)
+    }
+
     /** Drops [entry] from recently deleted after Undo put the download back. */
     fun removeDeletedEntry(profileId: Int, entry: AutoDownloadDeleted): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false
@@ -225,7 +275,7 @@ internal class AutoDownloadStore(
             save(profileId, state.copy(recentlyDeleted = updated))
             return true
         }
-        val raw = runCatching { payloads.load(profileId) }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
+        val raw = runCatching { payloads.loadFresh(profileId) }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
         val decoded = runCatching { json.decodeFromString<StoredAutoDownloads>(raw) }.getOrNull() ?: return false
         var changed = false
         val updatedEntries = decoded.recentlyDeleted.map { current ->
@@ -591,6 +641,10 @@ internal class AutoDownloadStore(
         if (updated == state) return
         // Written first: when that fails, nothing in memory has changed, so what is shown is what is stored.
         payloads.save(profileId, json.encodeToString(updated))
+        publishState(updated)
+    }
+
+    private fun publishState(updated: StoredAutoDownloads) {
         state = updated
         _deleteAfterWatchingMode.value = updated.deleteAfterWatchingMode
         _keptDownloadIds.value = updated.keptDownloadIds
@@ -602,29 +656,70 @@ internal class AutoDownloadStore(
         _recentlyDeleted.value = updated.recentlyDeleted
     }
 
+    private fun writeDurably(
+        profileId: Int,
+        updated: StoredAutoDownloads,
+        previousRaw: String?,
+    ): Boolean {
+        val encoded = json.encodeToString(updated)
+        if (runCatching { payloads.save(profileId, encoded) }.isFailure) return false
+        if (runCatching { payloads.sync() }.getOrDefault(false)) return true
+        runCatching { payloads.save(profileId, previousRaw ?: json.encodeToString(StoredAutoDownloads())) }
+        return false
+    }
+
+    private fun StoredAutoDownloads.withCommittedRemoval(
+        deleted: AutoDownloadDeleted,
+        ruleKey: String?,
+        ownedEpisodeKey: String?,
+        droppedDownloadId: String?,
+        droppedRemoval: AutoDownloadRemoval?,
+    ): StoredAutoDownloads {
+        val nextRules = if (ruleKey != null && ownedEpisodeKey != null) {
+            rules.map { rule ->
+                if (rule.key == ruleKey) rule.copy(ownedEpisodeKeys = rule.ownedEpisodeKeys + ownedEpisodeKey) else rule
+            }
+        } else {
+            rules
+        }
+        val nextRemovals = removals.filterNot { current ->
+            (droppedRemoval != null && current == droppedRemoval) ||
+                (droppedDownloadId != null && current.downloadId == droppedDownloadId)
+        }
+        val nextKeptRemovals = if (droppedDownloadId != null) {
+            keptRemovals.filterNot { it.downloadId == droppedDownloadId }
+        } else {
+            keptRemovals
+        }
+        val cutoff = deleted.atEpochMs - RecentlyDeletedMs
+        val nextRecentlyDeleted = recentlyDeleted.filter { it.canUndo || it.atEpochMs >= cutoff } + deleted
+        return copy(
+            rules = nextRules,
+            removals = nextRemovals,
+            keptRemovals = nextKeptRemovals,
+            recentlyDeleted = nextRecentlyDeleted,
+        )
+    }
+
     private fun ensureLoaded(): Int {
         val active = activeProfileId()
         if (loadedProfileId != active) {
-            state = read(active)
+            val loaded = read(active)
             loadedProfileId = active
-            _deleteAfterWatchingMode.value = state.deleteAfterWatchingMode
-            _keptDownloadIds.value = state.keptDownloadIds
-            _rules.value = state.rules
-            _storageLimitGb.value = state.storageLimitGb
-            _totalStorageLimitGb.value = state.totalStorageLimitGb
-            _makeRoomAutomatically.value = state.makeRoomAutomatically
-            _removals.value = state.removals
-            _recentlyDeleted.value = state.recentlyDeleted
+            publishState(loaded)
         }
         return active
     }
 
-    private fun read(profileId: Int): StoredAutoDownloads {
-        val payload = payloads.load(profileId)?.takeIf { it.isNotBlank() } ?: return StoredAutoDownloads()
+    private fun read(profileId: Int): StoredAutoDownloads =
+        readFromRaw(profileId, payloads.load(profileId))
+
+    private fun readFromRaw(profileId: Int, rawPayload: String?): StoredAutoDownloads {
+        val payload = rawPayload?.takeIf { it.isNotBlank() } ?: return StoredAutoDownloads()
         return runCatching {
             json.decodeFromString<StoredAutoDownloads>(payload).normalized()
         }.getOrElse {
-            payloads.saveUnreadable(profileId, payload)
+            runCatching { payloads.saveUnreadable(profileId, payload) }
             StoredAutoDownloads()
         }
     }

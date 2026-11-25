@@ -61,13 +61,25 @@ class MakeRoomAutomaticallyTest {
     private var autoLimitBytes: Long? = null
 
     private inner class TrashBackedBackend : DownloadsBackend {
-        var payload: String? = null
+        val payloadsByProfile = mutableMapOf<Int, String?>()
+        var payload: String?
+            get() = payloadsByProfile[ProfileRepository.activeProfileId]
+            set(value) {
+                payloadsByProfile[ProfileRepository.activeProfileId] = value
+            }
         val disconnectedLocations = mutableSetOf<String>()
+        var onAfterTrashMove: (() -> Unit)? = null
 
         override fun loadPayload(): String? = payload
 
+        override fun loadPayload(profileId: Int): String? = payloadsByProfile[profileId]
+
         override fun savePayload(payload: String) {
             this.payload = payload
+        }
+
+        override fun savePayload(profileId: Int, payload: String) {
+            payloadsByProfile[profileId] = payload
         }
 
         override fun restoreItem(item: DownloadItem): DownloadItem = item
@@ -88,6 +100,21 @@ class MakeRoomAutomaticallyTest {
             allowHoldingWhenNoSystemTrash: Boolean,
             stillWanted: () -> Boolean,
         ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(localFileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+
+        override fun trashWatchedFileWithUndo(
+            localFileUri: String,
+            allowHoldingWhenNoSystemTrash: Boolean,
+            stillWanted: () -> Boolean,
+            onMoved: (TrashedWatchedFile?) -> Boolean,
+        ): WatchedTrashOutcome = trash.moveWatchedAwayWithUndo(
+            localFileUri = localFileUri,
+            allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            stillWanted = stillWanted,
+            onMoved = { trashed ->
+                onAfterTrashMove?.invoke()
+                onMoved(trashed)
+            },
+        )
 
         override fun restoreTrashedFile(trashed: TrashedWatchedFile): UndoTrashResult =
             trash.restoreFromTrash(trashed)
@@ -110,6 +137,12 @@ class MakeRoomAutomaticallyTest {
         override fun removePartialFile(destinationFileName: String): Boolean = true
 
         override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+
+        override fun locate(item: DownloadItem): FileLookup {
+            val uri = item.localFileUri ?: return FileLookup.Missing
+            val path = runCatching { Path.of(java.net.URI(uri)) }.getOrNull() ?: return FileLookup.Missing
+            return if (path.exists()) FileLookup.Found(uri, item.locationId) else FileLookup.Missing
+        }
     }
 
     private val backend = TrashBackedBackend()
@@ -138,6 +171,9 @@ class MakeRoomAutomaticallyTest {
         startedIds.clear()
         totalLimitBytes = null
         autoLimitBytes = null
+        backend.payloadsByProfile.clear()
+        backend.disconnectedLocations.clear()
+        backend.onAfterTrashMove = null
 
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
@@ -589,6 +625,87 @@ class MakeRoomAutomaticallyTest {
 
         assertEquals(0, runner.runOnce(profile))
         assertTrue(watchedFile.exists(), "user-paused trip download must not cause watched downloads to be trashed")
+    }
+
+    @Test
+    fun make_room_preserves_undo_across_profile_switch_and_rolls_back_when_undo_save_fails() {
+        val originalProfile = ProfileRepository.activeProfileId
+        val otherProfile = originalProfile + 31
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { ProfileRepository.activeProfileId }
+        assertTrue(store.setMakeRoomAutomatically(originalProfile, true))
+
+        try {
+            // 1. Profile switches right after make-room moves a watched file to Trash: originating profile keeps Undo.
+            val (oldFile, oldWatched) = movieOnDisk("m-switch", "Switched Film", 800L)
+            val oldSubs = downloadsDir.resolve("m-switch.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("switch-subs") }
+            totalLimitBytes = 500L
+            backend.payload = DownloadsCodec.encode(listOf(oldWatched), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            val runner = makeRoomRunner(
+                store = store,
+                watchStatusOf = { DownloadWatchStatus(isWatched = true, watchedAtEpochMs = now - 20 * dayMs) },
+            )
+
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                ProfileRepository.setActiveProfileIdForTest(otherProfile)
+            }
+
+            assertEquals(1, runner.runOnce(originalProfile))
+            assertFalse(oldFile.exists())
+            assertFalse(oldSubs.exists())
+            assertTrue(store.recentlyDeleted.value.isEmpty(), "other profile must not receive originalProfile's Undo entry")
+
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+            store.currentRules()
+
+            val switchedEntry = store.recentlyDeleted.value.single { it.downloadId == "m-switch" }
+            assertEquals(DeletedDownloadReason.MadeRoom, switchedEntry.reason)
+            assertTrue(switchedEntry.canUndo)
+            assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(originalProfile, switchedEntry, store))
+            assertEquals("video-m-switch", oldFile.readText())
+            assertEquals("switch-subs", oldSubs.resolve("en.srt").readText())
+
+            // 2. Saving Undo metadata throws IOException after the Trash move: move and catalog removal roll back cleanly.
+            val (failFile, failWatched) = movieOnDisk("m-fail-save", "Rollback Film", 800L)
+            val failSubs = downloadsDir.resolve("m-fail-save.mkv.subtitles").createDirectories()
+                .also { it.resolve("en.srt").writeText("fail-subs") }
+            val waiting = testDownload(1, DownloadStatus.Paused, showId = "tt-wait-fail", id = "wait-fail").copy(
+                downloadedBytes = 0L,
+                totalBytes = 400L,
+                waitingSizeBytes = 400L,
+                autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                createdAtEpochMs = 5L,
+            )
+            totalLimitBytes = 900L
+            startedIds.clear()
+            backend.payload = DownloadsCodec.encode(listOf(failWatched, waiting), null, 2L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            backend.onAfterTrashMove = {
+                backend.onAfterTrashMove = null
+                payloads.failSave = true
+            }
+
+            assertEquals(0, runner.runOnce(originalProfile))
+            assertEquals("video-m-fail-save", failFile.readText(), "failed Undo save must restore video out of Trash")
+            assertEquals("fail-subs", failSubs.resolve("en.srt").readText(), "failed Undo save must restore subtitles out of Trash")
+            assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "m-fail-save" && it.status == DownloadStatus.Completed })
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.first { it.id == "wait-fail" }.status)
+            assertTrue(startedIds.isEmpty(), "waiting download must stay waiting when eviction rolled back")
+            assertTrue(store.recentlyDeleted.value.none { it.downloadId == "m-fail-save" })
+        } finally {
+            backend.onAfterTrashMove = null
+            payloads.failSave = false
+            ProfileRepository.setActiveProfileIdForTest(originalProfile)
+            DownloadsRepository.onProfileChanged()
+        }
     }
 }
 

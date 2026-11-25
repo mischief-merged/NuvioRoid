@@ -103,36 +103,40 @@ internal fun executeWatchedCleanup(
     isWatched: (DownloadItem) -> Boolean,
     isPlaying: (DownloadItem) -> Boolean = AutoDownloads::isPlaying,
     nowEpochMs: () -> Long = { DownloadsClock.nowEpochMs() },
-    removeDownload: (downloadId: String, stillWanted: () -> Boolean) -> DownloadsRepository.RemovedWatchedDownload = { id, stillWanted ->
-        DownloadsRepository.cleanUpWatchedDownload(id, allowHoldingWhenNoSystemTrash = true, stillWanted = stillWanted)
+    removeDownload: (
+        downloadId: String,
+        stillWanted: () -> Boolean,
+        onCommitted: (DownloadItem, TrashedWatchedFile?) -> Boolean,
+    ) -> DownloadsRepository.RemovedWatchedDownload = { id, stillWanted, onCommitted ->
+        DownloadsRepository.cleanUpWatchedDownload(
+            downloadId = id,
+            allowHoldingWhenNoSystemTrash = true,
+            expectedProfileId = profileId,
+            stillWanted = stillWanted,
+            onCommitted = onCommitted,
+        )
     },
 ): Int {
     var moved = 0
     for (downloadId in downloadIds.distinct()) {
+        if (store.profileId() != profileId) break
         val candidate = downloads().firstOrNull { it.id == downloadId } ?: continue
         if (store.isKept(profileId, downloadId) || store.hasPendingKeep(profileId, downloadId)) continue
         if (isPlaying(candidate) || !isWatched(candidate)) continue
         val stillWanted = {
-            !isPlaying(candidate) &&
+            store.profileId() == profileId &&
+                !isPlaying(candidate) &&
                 !store.hasPendingKeep(profileId, downloadId) &&
                 !store.isKept(profileId, downloadId) &&
                 isWatched(candidate)
         }
-        val removed = removeDownload(downloadId, stillWanted)
-        if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {
-            val item = removed.removedItem ?: candidate
+        val commitUndo: (DownloadItem, TrashedWatchedFile?) -> Boolean = { item, trashed ->
             val ruleKey = item.autoDownloadRuleKey
             val season = item.seasonNumber
             val episode = item.episodeNumber
-            if (ruleKey != null && season != null && episode != null) {
-                store.update(profileId, ruleKey) {
-                    it.copy(ownedEpisodeKeys = it.ownedEpisodeKeys + autoDownloadEpisodeKey(season, episode))
-                }
-            }
-            store.dropRemovalById(profileId, item.id)
-            store.recordDeleted(
-                profileId,
-                AutoDownloadDeleted(
+            store.commitWatchedRemoval(
+                profileId = profileId,
+                deleted = AutoDownloadDeleted(
                     title = item.title,
                     seasonNumber = season,
                     episodeNumber = episode,
@@ -140,9 +144,19 @@ internal fun executeWatchedCleanup(
                     downloadId = item.id,
                     reason = DeletedDownloadReason.CleanedUp,
                     restorableItem = item,
-                    trashed = removed.outcome.trashed,
+                    trashed = trashed,
                 ),
+                ruleKey = ruleKey,
+                ownedEpisodeKey = if (ruleKey != null && season != null && episode != null) {
+                    autoDownloadEpisodeKey(season, episode)
+                } else {
+                    null
+                },
+                droppedDownloadId = item.id,
             )
+        }
+        val removed = removeDownload(downloadId, stillWanted, commitUndo)
+        if (removed.outcome.result == AutoDownloadRemovalResult.Removed) {
             moved++
         }
     }

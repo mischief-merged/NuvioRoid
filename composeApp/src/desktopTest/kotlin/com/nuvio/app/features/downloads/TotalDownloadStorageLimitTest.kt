@@ -568,6 +568,60 @@ class TotalDownloadStorageLimitTest {
             DownloadsRepository.freeSpaceHold = realHold
         }
     }
+
+    @Test
+    fun pausing_single_or_all_active_downloads_never_starts_storage_limit_waiters() {
+        val gb = BytesPerGigabyte
+        limits.totalLimitBytes = 10L * gb
+
+        enqueueEpisode(1, automatic = false, claimedBytes = 8L * gb)
+        transfers[0].onProgress(1L * gb, 8L * gb)
+
+        enqueueEpisode(2, automatic = false, claimedBytes = 2L * gb)
+        transfers[1].onProgress(gb / 2, 2L * gb)
+        assertEquals(2, transfers.size)
+
+        enqueueEpisode(3, automatic = false, claimedBytes = 3L * gb)
+        enqueueEpisode(4, automatic = true, claimedBytes = 3L * gb)
+        assertEquals(DownloadStatus.Paused, item(3).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(3).autoDownloadStop)
+        assertEquals(DownloadStatus.Paused, item(4).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(4).autoDownloadStop)
+        assertEquals(2, transfers.size)
+
+        // Pause all must pause Ep 1 and Ep 2 while leaving Ep 3 and Ep 4 waiting (zero downloads running).
+        DownloadsRepository.pauseActiveDownloads()
+
+        assertEquals(DownloadStatus.Paused, item(1).status)
+        assertNull(item(1).autoDownloadStop)
+        assertEquals(1L * gb, item(1).downloadedBytes)
+        assertEquals(DownloadStatus.Paused, item(2).status)
+        assertNull(item(2).autoDownloadStop)
+        assertEquals(gb / 2, item(2).downloadedBytes)
+        assertEquals(DownloadStatus.Paused, item(3).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(3).autoDownloadStop)
+        assertEquals(3L * gb, item(3).waitingSizeBytes)
+        assertEquals(DownloadStatus.Paused, item(4).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(4).autoDownloadStop)
+        assertEquals(3L * gb, item(4).waitingSizeBytes)
+        assertTrue(DownloadsRepository.uiState.value.items.none { it.status == DownloadStatus.Downloading })
+        assertEquals(2, transfers.size, "Pause all must never start waiting downloads")
+
+        // Resume Ep 1 (8 GB reserved + 0.5 GB on disk = 8.5 GB; Ep 3 needs 3 GB -> still waiting), then pause Ep 1 alone.
+        DownloadsRepository.resumeDownload(item(1).id)
+        assertEquals(DownloadStatus.Downloading, item(1).status)
+        assertEquals(3, transfers.size)
+        assertEquals(DownloadStatus.Paused, item(3).status)
+
+        DownloadsRepository.pauseDownload(item(1).id)
+        assertEquals(DownloadStatus.Paused, item(1).status)
+        assertNull(item(1).autoDownloadStop)
+        assertEquals(DownloadStatus.Paused, item(3).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(3).autoDownloadStop)
+        assertEquals(DownloadStatus.Paused, item(4).status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, item(4).autoDownloadStop)
+        assertEquals(3, transfers.size, "Pausing a single download must never start waiting downloads")
+    }
 }
 
 class DesktopTotalStorageLimitTransferTest : TrustedLocalServerTest() {

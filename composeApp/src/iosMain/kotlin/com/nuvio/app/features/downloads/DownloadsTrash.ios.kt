@@ -12,6 +12,7 @@ internal actual object DownloadsTrash {
         localFileUri: String,
         allowHoldingWhenNoSystemTrash: Boolean,
         stillWanted: () -> Boolean,
+        onMoved: (TrashedWatchedFile?) -> Boolean,
     ): WatchedTrashOutcome = WatchedTrashOutcome(AutoDownloadRemovalResult.NotMoved)
 
     actual fun restoreFromTrash(trashed: TrashedWatchedFile): UndoTrashResult = UndoTrashResult.NotRestored
