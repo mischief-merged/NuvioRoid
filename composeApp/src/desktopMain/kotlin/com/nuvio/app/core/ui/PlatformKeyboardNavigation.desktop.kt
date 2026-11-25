@@ -215,6 +215,7 @@ actual fun PlatformKeyboardNavigationHost() {
                     ControllerManager.notifyNavigationInput()
                     val padMoved = activeFocusManager().moveSpatialFocus(event.direction)
                     if (padMoved) {
+                        ControllerFocusEngine.yieldFocusToCompose()
                         ControllerSoundPlayer.playNavigate()
                     } else if (
                         !ControllerFocusEngine.isModalOverlayActive &&
@@ -293,6 +294,9 @@ actual fun PlatformKeyboardNavigationHost() {
             }
 
             if (event.keyCode == KeyEvent.VK_TAB) {
+                // Tab hands focus traversal to Compose; clear spatial selection so Enter activates
+                // the Compose-focused control rather than a stale spatial row.
+                ControllerFocusEngine.yieldFocusToCompose()
                 ControllerManager.notifyNavigationInput()
                 return@KeyEventDispatcher false
             }
@@ -329,6 +333,7 @@ actual fun PlatformKeyboardNavigationHost() {
             // content, scroll it a page so navigation keeps going to the end of the list.
             ControllerManager.notifyNavigationInput()
             if (activeFocusManager().moveSpatialFocus(direction)) {
+                ControllerFocusEngine.yieldFocusToCompose()
                 ControllerSoundPlayer.playNavigate()
             } else if (
                 !ControllerFocusEngine.isModalOverlayActive &&

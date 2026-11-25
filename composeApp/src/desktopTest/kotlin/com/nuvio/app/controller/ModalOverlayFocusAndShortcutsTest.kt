@@ -28,9 +28,13 @@ import com.nuvio.app.core.ui.NuvioDropdownChip
 import com.nuvio.app.core.ui.NuvioDropdownOption
 import com.nuvio.app.core.ui.NuvioModalBottomSheet
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.core.ui.PlatformKeyboardNavigationHost
 import com.nuvio.app.features.profiles.SidebarProfileSwitcherStack
 import com.nuvio.app.navigation.DetailRoute
 import com.nuvio.app.navigation.TabsRoute
+import java.awt.Canvas
+import java.awt.KeyboardFocusManager
+import java.awt.event.KeyEvent
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -472,5 +476,146 @@ class ModalOverlayFocusAndShortcutsTest {
         compose.waitForIdle()
 
         assertEquals("sidebar_home", ControllerFocusEngine.focusedNodeId.value)
+    }
+
+    @Test
+    fun tab_in_mixed_bottom_sheet_clears_spatial_selection_so_enter_targets_compose_control() {
+        var sheetOpen by mutableStateOf(true)
+        var glowEnabled by mutableStateOf(false)
+        var adaptiveClicks = 0
+
+        compose.setContent {
+            NuvioTheme {
+                PlatformKeyboardNavigationHost()
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        NuvioBottomSheetActionRow(
+                            title = "Adaptive",
+                            focusId = "sheet_style_adaptive",
+                            selected = true,
+                            onClick = { adaptiveClicks += 1 },
+                        )
+                        NuvioBottomSheetActionRow(
+                            title = "Floating",
+                            focusId = "sheet_style_floating",
+                            selected = false,
+                            onClick = {},
+                        )
+                        Button(onClick = { glowEnabled = !glowEnabled }) {
+                            Text(if (glowEnabled) "Glow On" else "Glow Off")
+                        }
+                        Button(onClick = { sheetOpen = false }) {
+                            Text("Done")
+                        }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Spatially select the first action row as if the user entered the sheet with arrows/gamepad.
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions"))
+        assertEquals("sheet_style_adaptive", ControllerFocusEngine.focusedNodeId.value)
+
+        // Press Tab via AWT dispatcher: must yield focus to Compose and clear the stale spatial row.
+        val tabEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_TAB,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(tabEvent)
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+
+        // Pressing Enter via AWT dispatcher must NOT activate the stale spatial action row.
+        val enterEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_ENTER,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        assertFalse(ControllerManager.dispatchKeyboardSelect())
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(enterEvent)
+        assertEquals(0, adaptiveClicks)
+
+        // Recomposing the sheet (e.g. after toggling Glow) must not steal focus back to spatial rows.
+        glowEnabled = true
+        compose.waitForIdle()
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertFalse(ControllerManager.dispatchKeyboardNavigation(ControllerDirection.Down))
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+
+        // Gamepad B still dismisses the sheet and resets the Compose handoff.
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.B)))
+        compose.waitForIdle()
+        assertFalse(sheetOpen)
+        assertFalse(ControllerFocusEngine.isYieldedToCompose)
+    }
+
+    @Test
+    fun arrow_down_past_last_sheet_action_row_hands_focus_to_compose_via_awt_dispatcher() {
+        var sheetOpen by mutableStateOf(true)
+        var floatingClicks = 0
+
+        compose.setContent {
+            NuvioTheme {
+                PlatformKeyboardNavigationHost()
+                if (sheetOpen) {
+                    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    NuvioModalBottomSheet(
+                        onDismissRequest = { sheetOpen = false },
+                        sheetState = sheetState,
+                    ) {
+                        NuvioBottomSheetActionRow(
+                            title = "Adaptive",
+                            focusId = "sheet_row_a",
+                            onClick = {},
+                        )
+                        NuvioBottomSheetActionRow(
+                            title = "Floating",
+                            focusId = "sheet_row_b",
+                            onClick = { floatingClicks += 1 },
+                        )
+                        Button(onClick = { sheetOpen = false }) {
+                            Text("Done")
+                        }
+                    }
+                }
+            }
+        }
+        compose.waitForIdle()
+
+        // Focus the last spatial action row in the sheet.
+        ControllerManager.notifyNavigationInput()
+        assertTrue(ControllerFocusEngine.requestFocus("sheet_row_b", triggerScroll = false))
+        assertEquals("sheet_row_b", ControllerFocusEngine.focusedNodeId.value)
+
+        // Arrow Down past the last action row moves Compose focus into the sheet controls and clears spatial selection.
+        val downEvent = KeyEvent(
+            Canvas(),
+            KeyEvent.KEY_PRESSED,
+            System.currentTimeMillis(),
+            0,
+            KeyEvent.VK_DOWN,
+            KeyEvent.CHAR_UNDEFINED,
+        )
+        assertTrue(KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(downEvent))
+        compose.waitForIdle()
+
+        assertTrue(ControllerFocusEngine.isYieldedToCompose)
+        assertNull(ControllerFocusEngine.focusedNodeId.value)
+        assertFalse(ControllerManager.dispatchKeyboardSelect())
+        assertEquals(0, floatingClicks)
     }
 }

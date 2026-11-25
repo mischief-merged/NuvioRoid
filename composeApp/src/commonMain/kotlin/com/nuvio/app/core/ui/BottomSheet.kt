@@ -150,6 +150,8 @@ private fun BottomSheetPopupFocusHost(
     LaunchedEffect(popupFocusManager) {
         if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
         delay(220)
+        // If the user already tabbed or moved Compose focus inside this sheet, do not steal it back.
+        if (ControllerFocusEngine.isYieldedToCompose || ComposePopupFocus.hasActiveFocus) return@LaunchedEffect
         // Sheets made of action rows are driven by the spatial engine (white ring + bring-into-view);
         // forms without rows fall back to Compose focus inside this popup.
         if (!ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions")) {

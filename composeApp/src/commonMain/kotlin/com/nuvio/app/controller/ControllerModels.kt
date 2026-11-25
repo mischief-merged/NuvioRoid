@@ -170,6 +170,7 @@ object ControllerManager {
         // Guard against synthetic AWT mouse move events fired immediately during layout/cursor changes
         val elapsed = System.currentTimeMillis() - lastControllerInputEpochMs
         if (elapsed < 180L) return
+        ControllerFocusEngine.resumeSpatialFocus()
         if (_isControllerActive.value) {
             _isControllerActive.value = false
         }
@@ -179,6 +180,7 @@ object ControllerManager {
     }
 
     fun forceDeactivateController() {
+        ControllerFocusEngine.resumeSpatialFocus()
         if (_isControllerActive.value) {
             _isControllerActive.value = false
         }
@@ -244,6 +246,7 @@ object ControllerManager {
         // activate the focused button instead of the engine swallowing the key.
         // Modal overlays with spatial Overlay rows (e.g. bottom sheet action rows) still activate
         // their focused Overlay node even when the route underneath defers to Compose.
+        if (ControllerFocusEngine.isYieldedToCompose) return false
         if (ControllerFocusEngine.deferNavigationToCompose && !ControllerFocusEngine.isModalOverlayActive) return false
         if (ControllerFocusEngine.focusedNodeId.value == null) return false
         notifyNavigationInput()

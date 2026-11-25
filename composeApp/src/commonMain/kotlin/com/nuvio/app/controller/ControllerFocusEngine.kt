@@ -199,6 +199,27 @@ object ControllerFocusEngine {
     @Volatile
     private var hasVisibleOverlayNodes: Boolean = false
 
+    @Volatile
+    private var yieldedToCompose: Boolean = false
+
+    /**
+     * True after focus was explicitly handed off to Compose (e.g. via Tab or arrowing past the
+     * spatial Overlay rows into a Compose control inside a sheet). While true, the spatial engine
+     * stays idle and clears its selection so Enter activates the Compose-focused control.
+     */
+    val isYieldedToCompose: Boolean
+        get() = yieldedToCompose
+
+    fun yieldFocusToCompose() {
+        yieldedToCompose = true
+        _focusedNodeId.value = null
+        _focusedNodeSnapshot.value = null
+    }
+
+    fun resumeSpatialFocus() {
+        yieldedToCompose = false
+    }
+
     private val hasExplicitModalOverlay: Boolean
         get() = synchronized(modalOverlayLock) { activeModalOverlays.isNotEmpty() }
 
@@ -215,6 +236,7 @@ object ControllerFocusEngine {
      * on Compose-driven routes) and never focuses background content or navigation nodes.
      */
     fun pushModalOverlay(token: Any) {
+        yieldedToCompose = false
         synchronized(modalOverlayLock) {
             if (!activeModalOverlays.any { it === token }) {
                 activeModalOverlays.add(token)
@@ -229,6 +251,7 @@ object ControllerFocusEngine {
 
     /** Releases a previously pushed modal overlay and restores content focus if none remain. */
     fun popModalOverlay(token: Any) {
+        yieldedToCompose = false
         val noOverlaysLeft = synchronized(modalOverlayLock) {
             activeModalOverlays.removeAll { it === token }
             activeModalOverlays.isEmpty()
@@ -256,6 +279,7 @@ object ControllerFocusEngine {
 
     private fun canSpatiallyFocus(node: ControllerFocusNode): Boolean {
         if (!node.isVisibleAndValid) return false
+        if (yieldedToCompose) return false
         if (isModalOverlayActive) return node.zone == ControllerFocusZone.Overlay
         if (deferNavigationToCompose) return false
         return true
@@ -462,6 +486,7 @@ object ControllerFocusEngine {
         val newRouteStr = routeKey?.toString()
         val routeChanged = activeRouteKey != null && activeRouteKey != newRouteStr
         if (routeChanged) {
+            yieldedToCompose = false
             saveCurrentRouteFocusMemory()
             _routeGeneration.value = _routeGeneration.value + 1
         }
@@ -717,14 +742,21 @@ object ControllerFocusEngine {
      */
     fun focusNavigationItem(vararg candidateIds: String): Boolean {
         if (isModalOverlayActive || deferNavigationToCompose) return false
+        val wasYielded = yieldedToCompose
+        yieldedToCompose = false
         val target = candidateIds.firstNotNullOfOrNull { id ->
             nodes[id]?.takeIf { it.zone == ControllerFocusZone.Navigation && canSpatiallyFocus(it) }
-        } ?: return false
+        }
+        if (target == null) {
+            yieldedToCompose = wasYielded
+            return false
+        }
         hasUserNavigatedOnCurrentRoute = true
         manualSidebarOpen = true
         val focused = focusNodeInternal(target, triggerScroll = false)
         if (!focused) {
             manualSidebarOpen = false
+            yieldedToCompose = wasYielded
         }
         return focused
     }
@@ -760,10 +792,10 @@ object ControllerFocusEngine {
             }
         }
 
-        // While a modal overlay is open without spatial Overlay nodes (e.g. a form sheet, dialog,
-        // or rating panel), or while the current route defers to Compose, never focus background
-        // Content or Navigation nodes.
-        if (isModalOverlayActive || deferNavigationToCompose) {
+        // While focus is yielded to Compose, or a modal overlay is open without spatial Overlay
+        // nodes (e.g. a form sheet, dialog, or rating panel), or while the current route defers to
+        // Compose, never focus background Content or Navigation nodes.
+        if (yieldedToCompose || isModalOverlayActive || deferNavigationToCompose) {
             return false
         }
 
@@ -1440,6 +1472,24 @@ object ControllerFocusEngine {
             val playerHandler = customPlayerEventHandler
             if (playerHandler != null && playerHandler(event)) {
                 return true
+            }
+        }
+
+        // When focus has been explicitly handed off to Compose (Tab or arrowing into a Compose
+        // control), keep Navigate/DPad/A in Compose while letting B/back and shell actions through.
+        if (yieldedToCompose) {
+            when (event) {
+                is ControllerEvent.Navigate -> return false
+                is ControllerEvent.ButtonPressed -> when (event.button) {
+                    XboxButton.A,
+                    XboxButton.DPadUp,
+                    XboxButton.DPadDown,
+                    XboxButton.DPadLeft,
+                    XboxButton.DPadRight,
+                    -> return false
+                    else -> Unit
+                }
+                else -> Unit
             }
         }
 
