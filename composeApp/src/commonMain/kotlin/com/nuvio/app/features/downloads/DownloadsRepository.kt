@@ -1754,7 +1754,6 @@ object DownloadsRepository {
      */
     private fun applyConnectionHold(): Unit = synchronized(stateLock) {
         if (!hasLoaded) return
-        var pausedAny = false
         _uiState.value.items
             .filter { it.status == DownloadStatus.Downloading && it.connectionHoldReason() != null }
             // A transfer whose file is complete and being checked is left to finish: stopping it then would lose the file.
@@ -1762,12 +1761,11 @@ object DownloadsRepository {
             .forEach { item ->
                 removeTransfer(item.id)?.cancel()
                 mutateItem(item.id) { it.waitingForConnection() }
-                pausedAny = true
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByConnection && it.connectionHoldReason() == null }
             .forEach { resumeDownloadLocked(it.id) }
-        if (pausedAny) resumeWaitingForStorageLimitLocked()
+        resumeWaitingForStorageLimitLocked()
     }
 
     /** Why this download waits for the connection now: some reasons hold automatic downloads only. */
@@ -1793,19 +1791,17 @@ object DownloadsRepository {
      */
     private fun applyFreeSpaceHold(): Unit = synchronized(stateLock) {
         if (!hasLoaded) return
-        var pausedAny = false
         _uiState.value.items
             .filter { it.status == DownloadStatus.Downloading && it.isBelowFreeSpaceFloor() }
             .filter { activeTransfers[it.id]?.finishing != true }
             .forEach { item ->
                 removeTransfer(item.id)?.cancel()
                 mutateItem(item.id) { it.waitingForFreeSpace() }
-                pausedAny = true
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByFreeSpace && it.canResumeFromFreeSpaceFloor() }
             .forEach { resumeDownloadLocked(it.id, keepWaitingSize = true) }
-        if (pausedAny) resumeWaitingForStorageLimitLocked()
+        resumeWaitingForStorageLimitLocked()
     }
 
     private fun DownloadItem.resolvedLocationId(): String = backend.locationIdOf(this)
@@ -3530,6 +3526,7 @@ object DownloadsRepository {
             _uiState.value.items
                 .filter { it.status == DownloadStatus.Paused && it.pausedByFolder && !backend.heldByFolder(it) }
                 .forEach { resumeDownloadLocked(it.id) }
+            resumeWaitingForStorageLimitLocked()
             pendingTripRecovery?.takeIf { it.profileId == loadedProfileId && it.generation == catalogGeneration }
         }
         if (pending != null) {

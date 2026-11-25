@@ -755,21 +755,19 @@ internal actual object DownloadsPlatformDownloader {
         var downloadedBytes = startingBytes
         val traffic = DownloadTraffic.app
         val reporter = ThrottledProgress(progressIntervalMs, System::nanoTime) { bytes -> onProgress(bytes, totalBytes) }
-        // Checked before anything of the body is written, for every download: a file announced as
-        // larger than the room on the disk fails with a plain message instead of a system error.
-        if (totalBytes != null) {
-            val free = freeBytesFor(request.item)
-            if (free != null && totalBytes - startingBytes > free) {
-                opened.close()
-                error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
-            }
-        }
+        val free = freeBytesFor(request.item)
         // Checked before anything of the body is written: a file that is announced as too large for
-        // the limits of an automatic download is not started.
+        // the storage limits or free-space floor waits instead of failing.
         val limits = request.limits
-        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item))?.let { reason ->
+        limits?.stopBeforeBody(downloadedBytes, totalBytes, free)?.let { reason ->
             opened.close()
             throw TransferStoppedByLimit(reason)
+        }
+        // Checked before anything of the body is written, for every download: a file announced as
+        // larger than the room on the disk fails with a plain message instead of a system error.
+        if (totalBytes != null && free != null && totalBytes - startingBytes > free) {
+            opened.close()
+            error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
         }
         onIdentityObserved(SourceFileIdentity(totalBytes = totalBytes, eTag = opened.eTag, lastModified = opened.lastModified))
         onJoinVerified()

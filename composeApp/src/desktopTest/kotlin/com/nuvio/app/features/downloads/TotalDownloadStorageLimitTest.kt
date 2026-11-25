@@ -31,6 +31,7 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.downloads_auto_storage_limit
 import nuvio.composeapp.generated.resources.downloads_auto_storage_limit_none
 import nuvio.composeapp.generated.resources.downloads_auto_storage_limit_value
+import nuvio.composeapp.generated.resources.downloads_error_not_enough_space
 import nuvio.composeapp.generated.resources.downloads_storage_all
 import nuvio.composeapp.generated.resources.downloads_storage_all_no_limit
 import nuvio.composeapp.generated.resources.downloads_storage_auto
@@ -501,6 +502,72 @@ class TotalDownloadStorageLimitTest {
             DownloadsRepository.freeSpaceHold = realHold
         }
     }
+
+    @Test
+    fun storage_waiter_skipped_while_drive_below_floor_starts_when_free_space_returns_or_floor_disabled() {
+        val realHold = DownloadsRepository.freeSpaceHold
+        val hold = FreeSpaceHold()
+        try {
+            DownloadsRepository.freeSpaceHold = hold
+            hold.setFloorGb(value = 5)
+            hold.reportLocationFreeBytes(mapOf("drive-a" to 20L * BytesPerGigabyte))
+            limits.totalLimitBytes = 10L * BytesPerGigabyte
+
+            // 1. Recovery via free space returning on the drive:
+            val completed1 = testDownload(1, DownloadStatus.Completed, showId = showId, id = "done-1").copy(
+                locationId = "drive-a",
+                downloadedBytes = 9L * BytesPerGigabyte,
+                totalBytes = 9L * BytesPerGigabyte,
+                localFileUri = "file:/done-1.mkv",
+                createdAtEpochMs = 1L,
+            )
+            val waiter1 = testDownload(2, DownloadStatus.Paused, showId = showId, id = "wait-1").copy(
+                locationId = "drive-a",
+                downloadedBytes = 0L,
+                totalBytes = 3L * BytesPerGigabyte,
+                waitingSizeBytes = 3L * BytesPerGigabyte,
+                autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                createdAtEpochMs = 2L,
+            )
+            backend.payload = DownloadsCodec.encode(listOf(completed1, waiter1), null, 1L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.first { it.id == "wait-1" }.status)
+            assertFalse(DownloadsRepository.uiState.value.items.first { it.id == "wait-1" }.pausedByFreeSpace)
+
+            // Drive drops below the 5 GB floor; waiter1 stays a TotalStorageLimit waiter (not pausedByFreeSpace).
+            hold.reportLocationFreeBytes(mapOf("drive-a" to 2L * BytesPerGigabyte))
+            assertFalse(DownloadsRepository.uiState.value.items.first { it.id == "wait-1" }.pausedByFreeSpace)
+
+            // Storage quota becomes available during the free-space hold -> waiter1 is skipped because drive-a is below floor.
+            DownloadsRepository.deleteDownload("done-1")
+            val skipped1 = DownloadsRepository.uiState.value.items.first { it.id == "wait-1" }
+            assertEquals(DownloadStatus.Paused, skipped1.status)
+            assertEquals(AutoDownloadStop.TotalStorageLimit, skipped1.autoDownloadStop)
+            assertFalse(skipped1.pausedByFreeSpace)
+
+            // Free space returns (12 GB - 3 GB = 9 GB >= 5 GB floor) -> waiter1 starts without needing pausedByFreeSpace!
+            hold.reportLocationFreeBytes(mapOf("drive-a" to 12L * BytesPerGigabyte))
+            assertEquals(DownloadStatus.Downloading, DownloadsRepository.uiState.value.items.first { it.id == "wait-1" }.status)
+
+            // 2. Recovery via disabling the floor setting:
+            transfers.clear()
+            val completed2 = completed1.copy(id = "done-2", localFileUri = "file:/done-2.mkv")
+            val waiter2 = waiter1.copy(id = "wait-2")
+            backend.payload = DownloadsCodec.encode(listOf(completed2, waiter2), null, 2L)
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.ensureLoaded()
+
+            hold.reportLocationFreeBytes(mapOf("drive-a" to 2L * BytesPerGigabyte))
+            DownloadsRepository.deleteDownload("done-2")
+            assertEquals(DownloadStatus.Paused, DownloadsRepository.uiState.value.items.first { it.id == "wait-2" }.status)
+
+            hold.setFloorGb(value = null)
+            assertEquals(DownloadStatus.Downloading, DownloadsRepository.uiState.value.items.first { it.id == "wait-2" }.status)
+        } finally {
+            DownloadsRepository.freeSpaceHold = realHold
+        }
+    }
 }
 
 class DesktopTotalStorageLimitTransferTest : TrustedLocalServerTest() {
@@ -606,6 +673,121 @@ class DesktopTotalStorageLimitTransferTest : TrustedLocalServerTest() {
         assertNull(unsizedFailure, "stream over total limit must wait, never fail part way")
         val partial = File(downloadsDir, "$fileName.part")
         assertTrue(partial.exists() && partial.length() >= cap, "partial file must be preserved when total limit is reached")
+    }
+
+    @Test
+    fun real_downloader_evaluates_combined_limit_and_floor_before_hard_disk_space_failure() {
+        // Server announces 4 MB (bodyBytes) with no upfront size on the DownloadItem, while the drive has only 2 MB free.
+        val realFreeProvider = DownloadsPlatformDownloader.freeBytesProvider
+        val realBackend = DownloadsRepository.backend
+        val realLimits = DownloadsRepository.autoDownloadLimits
+        val realHold = DownloadsRepository.freeSpaceHold
+        var storedPayload: String? = null
+        var totalLimitBytes: Long? = null
+        val hold = FreeSpaceHold()
+        val liveBackend = object : DownloadsBackend {
+            override fun loadPayload(): String? = storedPayload
+            override fun savePayload(payload: String) {
+                storedPayload = payload
+            }
+            override fun restoreItem(item: DownloadItem): DownloadItem = item
+            override fun removeFile(localFileUri: String?): Boolean = true
+            override fun removePartialFile(destinationFileName: String): Boolean = true
+            override fun resolveLocalFileUri(localFileUri: String?, destinationFileName: String): String? = localFileUri
+            override fun start(
+                request: DownloadPlatformRequest,
+                onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit,
+                onSuccess: (localFileUri: String, totalBytes: Long?) -> Unit,
+                onFailure: (message: String) -> Unit,
+                onPaused: () -> Unit,
+            ): DownloadsTaskHandle = DownloadsPlatformDownloader.start(request, onProgress, onSuccess, onFailure, onPaused)
+        }
+        val liveLimits = object : AutoDownloadLimits {
+            override fun storageLimitBytes(): Long? = null
+            override fun totalStorageLimitBytes(): Long? = totalLimitBytes
+            override val minFreeBytes: Long = 0L
+            override fun userFreeSpaceFloorBytes(): Long? = hold.floorBytes
+        }
+
+        fun awaitStatus(downloadId: String, target: DownloadStatus): DownloadItem {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            while (System.nanoTime() < deadline) {
+                val current = DownloadsRepository.uiState.value.items.firstOrNull { it.id == downloadId }
+                if (current != null && current.status == target) return current
+                Thread.sleep(20)
+            }
+            error("Timed out waiting for $downloadId to reach $target: ${DownloadsRepository.uiState.value.items}")
+        }
+
+        try {
+            DownloadsPlatformDownloader.freeBytesProvider = { 2L * megabyte }
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = liveBackend
+            DownloadsRepository.autoDownloadLimits = liveLimits
+            DownloadsRepository.freeSpaceHold = hold
+
+            val unsizedStream = StreamItem(
+                url = "http://127.0.0.1:${server.address.port}/sized.mkv",
+                title = "Unsized Announced",
+                addonName = "test",
+                addonId = "addon:test",
+            )
+
+            fun enqueueMovie(movieId: String, title: String) {
+                DownloadsRepository.enqueueFromStream(
+                    contentType = "movie",
+                    videoId = movieId,
+                    parentMetaId = movieId,
+                    parentMetaType = "movie",
+                    title = title,
+                    logo = null,
+                    poster = null,
+                    background = null,
+                    seasonNumber = null,
+                    episodeNumber = null,
+                    episodeTitle = null,
+                    episodeThumbnail = null,
+                    stream = unsizedStream,
+                )
+            }
+
+            // 1. Combined limit (3 MB) < announced size (4 MB) on a drive with 2 MB free -> waits for TotalStorageLimit, NOT Failed!
+            totalLimitBytes = 3L * megabyte
+            hold.setFloorGb(null)
+            enqueueMovie("m-limit", "Limit Movie")
+            val limitId = DownloadsRepository.uiState.value.items.single().id
+            val heldByLimit = awaitStatus(limitId, DownloadStatus.Paused)
+            assertEquals(AutoDownloadStop.TotalStorageLimit, heldByLimit.autoDownloadStop)
+            assertFalse(heldByLimit.pausedByFreeSpace)
+            assertEquals(bodyBytes.toLong(), heldByLimit.waitingSizeBytes)
+            assertNull(heldByLimit.errorMessage)
+            DownloadsRepository.deleteDownload(limitId)
+
+            // 2. User free-space floor (5 GB) with no combined limit on a drive with 2 MB free -> waits for free space, NOT Failed!
+            totalLimitBytes = null
+            hold.setFloorGb(5)
+            enqueueMovie("m-floor", "Floor Movie")
+            val floorId = DownloadsRepository.uiState.value.items.single().id
+            val heldByFloor = awaitStatus(floorId, DownloadStatus.Paused)
+            assertTrue(heldByFloor.pausedByFreeSpace)
+            assertNull(heldByFloor.autoDownloadStop)
+            assertEquals(bodyBytes.toLong(), heldByFloor.waitingSizeBytes)
+            assertNull(heldByFloor.errorMessage)
+            DownloadsRepository.deleteDownload(floorId)
+
+            // 3. With neither combined limit nor floor, the announced 4 MB > 2 MB free still fails with NotEnoughSpace.
+            hold.setFloorGb(null)
+            enqueueMovie("m-plain", "Plain Movie")
+            val plainId = DownloadsRepository.uiState.value.items.single().id
+            val failedPlain = awaitStatus(plainId, DownloadStatus.Failed)
+            assertEquals(runBlocking { getString(Res.string.downloads_error_not_enough_space) }, failedPlain.errorMessage)
+        } finally {
+            DownloadsRepository.clearLocalState()
+            DownloadsRepository.backend = realBackend
+            DownloadsRepository.autoDownloadLimits = realLimits
+            DownloadsRepository.freeSpaceHold = realHold
+            DownloadsPlatformDownloader.freeBytesProvider = realFreeProvider
+        }
     }
 }
 
