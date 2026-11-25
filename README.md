@@ -12,7 +12,7 @@
 
 ![Platform](https://img.shields.io/badge/macOS-Apple%20silicon-111111?logo=apple&logoColor=white)
 ![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20fast%20development-8A2BE2)
-![Tests](https://img.shields.io/badge/desktop%20tests-3%2C356-2EA3F2)
+![Tests](https://img.shields.io/badge/desktop%20tests-5%2C066-2EA3F2)
 ![License](https://img.shields.io/badge/license-GPLv3-3DA639)
 ![Based on](https://img.shields.io/badge/based%20on-Nuvio%20Desktop-5B5BD6)
 
@@ -36,6 +36,12 @@
 | 🧭 **Episode pages** | Plex-style navigation: every episode has its own page, with a `Show › Season › Episode` trail, previous and next, and the rest of the season. |
 | 🎬 **Movies and collections** | The same download flow for a single movie or a whole collection, with a checklist. |
 | 🚦 **Speed limit** | Cap download speed so the rest of the house keeps streaming. |
+| 🧳 **Trip ready** | See how many offline hours you have, and fill the gap for a trip with one button. |
+| 🛫 **Travel mode** | Downloads pause on hotspots and Low Data Mode without losing progress, a travel mode handles plane and Starlink Wi-Fi, and slow networks are waited out politely. |
+| 🌙 **Keeps downloading** | Downloads carry on with the window closed, with progress in the menu bar. The Mac stays awake only while data is arriving. |
+| 💾 **Your folders, your drives** | Pick where downloads live, move them between drives safely, and rebuild the list from files already on disk. |
+| 🖼 **Mini player and sleep timer** | Keep browsing while a video plays in a small window, and set the player to stop on its own. |
+| 🛡 **Your data stays put** | Signing out or switching accounts never wipes your account data; a new account starts fresh and the old data is archived. |
 | 📡 **Trakt offline queue** | Watches recorded offline are kept and sent when the connection returns. |
 | ♿ **Clearer and more accessible** | Rows say what is happening and why, failures give a next step, and controls are named for assistive technology. |
 
@@ -53,6 +59,13 @@
 | Switch source by itself when one fails mid-play | — | ✅ |
 | Skip intro, subtitles and next episode work offline | — | ✅ |
 | Download speed limit | — | ✅ |
+| Plan downloads for a trip, with offline hours at a glance | — | ✅ |
+| Pause downloads on hotspots, with a travel mode for plane Wi-Fi | — | ✅ |
+| Keep downloading with the window closed | — | ✅ |
+| Choose download folders and move between drives | — | ✅ |
+| Rebuild the downloads list from files on disk | — | ✅ |
+| Replace a dead download link and resume the same file | — | ✅ |
+| Sleep timer | — | ✅ |
 | Windows and Linux builds | ✅ | not yet |
 
 Every row is described, with its branch and what was tested, in **[FORK.md](FORK.md)**.
@@ -61,7 +74,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for what changed in each release and what i
 
 ## 📦 Download
 
-**macOS (Apple silicon):** [**Download NuvioRoid 1.1.38.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.38.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
+**macOS (Apple silicon):** [**Download NuvioRoid 1.1.39.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.39.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
 
 1. Open the DMG and drag NuvioRoid to Applications.
 2. The build is not signed with an Apple developer certificate, so macOS blocks the first launch. Open it once, then go to System Settings > Privacy & Security and choose "Open Anyway".
@@ -73,7 +86,7 @@ NuvioRoid installs beside the official Nuvio app. It has its own name, icon and 
 
 Alpha software under **fast development**. Expect breaking changes, and do not rely on it as your only media app.
 
-- Built and tested on macOS (Apple silicon). The desktop test suite runs 3,356 tests; the three that fail also fail on upstream without any of these changes.
+- Built and tested on macOS (Apple silicon). The desktop test suite runs 5,066 tests; the two that fail also fail on upstream without any of these changes.
 - Android, iOS, Windows and Linux builds of this fork have not been run.
 - NuvioRoid is a client only. You bring your own sources, as with Nuvio.
 

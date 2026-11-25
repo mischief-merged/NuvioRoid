@@ -351,7 +351,7 @@ internal actual object DownloadsPlatformDownloader {
                         // Reported finished only once the file is on disk under its final name, which never replaces
                         // a file this download did not create (a taken name gets " (2)", " (3)", ...).
                         val published = try {
-                            publishDurably(tempFile.toPath(), destination.toPath(), beforeRemovingPartial = { path ->
+                            publishDurably(tempFile.toPath(), destination.toPath(), retirePartial = folders::moveToTrash, beforeRemovingPartial = { path ->
                                 val key = rememberPublishedFile(path)
                                 val uri = path.toFile().toURI().toString()
                                 rememberedUri = uri
@@ -755,21 +755,19 @@ internal actual object DownloadsPlatformDownloader {
         var downloadedBytes = startingBytes
         val traffic = DownloadTraffic.app
         val reporter = ThrottledProgress(progressIntervalMs, System::nanoTime) { bytes -> onProgress(bytes, totalBytes) }
-        // Checked before anything of the body is written, for every download: a file announced as
-        // larger than the room on the disk fails with a plain message instead of a system error.
-        if (totalBytes != null) {
-            val free = freeBytesFor(request.item)
-            if (free != null && totalBytes - startingBytes > free) {
-                opened.close()
-                error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
-            }
-        }
+        val free = freeBytesFor(request.item)
         // Checked before anything of the body is written: a file that is announced as too large for
-        // the limits of an automatic download is not started.
+        // the storage limits or free-space floor waits instead of failing.
         val limits = request.limits
-        limits?.stopBeforeBody(downloadedBytes, totalBytes, freeBytesFor(request.item))?.let { reason ->
+        limits?.stopBeforeBody(downloadedBytes, totalBytes, free)?.let { reason ->
             opened.close()
             throw TransferStoppedByLimit(reason)
+        }
+        // Checked before anything of the body is written, for every download: a file announced as
+        // larger than the room on the disk fails with a plain message instead of a system error.
+        if (totalBytes != null && free != null && totalBytes - startingBytes > free) {
+            opened.close()
+            error(runBlocking { getString(Res.string.downloads_error_not_enough_space) })
         }
         onIdentityObserved(SourceFileIdentity(totalBytes = totalBytes, eTag = opened.eTag, lastModified = opened.lastModified))
         onJoinVerified()
@@ -1472,7 +1470,8 @@ private val foldersCanBeFlushed = !System.getProperty("os.name").orEmpty().lower
  *    removed while it is still the file this call created, so nothing piles up beside the partial file;
  * 3. the folder is flushed; when that fails, the new name is removed again (it is this call's own) and
  *    [DownloadNotDurable] is thrown with the partial file still under its name;
- * 4. only then does the partial name go. The final name is returned.
+ * 4. only then is the owned partial sent to the Trash. A refused move leaves both files intact.
+ *    The final name is returned.
  * Where the platform cannot flush folders at all (Windows), step 3 is skipped and completion rests on the
  * forced file contents.
  */
@@ -1482,6 +1481,7 @@ internal fun publishDurably(
     flushFolder: (java.nio.file.Path) -> Boolean = { folder -> !foldersCanBeFlushed || DownloadMover.flushDirectory(folder) },
     link: (java.nio.file.Path, java.nio.file.Path) -> Unit = { name, existing -> Files.createLink(name, existing) },
     beforeRemovingPartial: (java.nio.file.Path) -> Boolean = { true },
+    retirePartial: (java.nio.file.Path) -> Boolean = DownloadsTrash::moveToTrash,
     copy: (java.nio.channels.FileChannel, java.nio.channels.FileChannel) -> Unit = { input, out ->
         var position = 0L
         val size = input.size()
@@ -1530,7 +1530,8 @@ internal fun publishDurably(
             // Both names keep their bytes when the record could not be made durable.
             throw DownloadNotDurable("The finished file address could not be saved")
         }
-        Files.deleteIfExists(part)
+        // A saved final address does not grant ownership of anything put at the partial name since.
+        trashPublishedFile(part, partKey, retirePartial)
         flushFolder(candidate.parent)
         return candidate
     }

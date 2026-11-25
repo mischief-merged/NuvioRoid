@@ -2,7 +2,7 @@
 
 NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/NuvioDesktop). It adds offline-viewing features to the desktop app and makes the existing download and playback flows easier to follow. Everything here is offered back to the upstream project; nothing has been submitted yet, and each change is kept on its own branch so it can be proposed and reviewed separately.
 
-- **Based on:** upstream `Dev` at `c8ee7621` (14 November 2026).
+- **Based on:** upstream `Dev` at `04c94b54` (24 November 2026), upstream version 0.1.39.
 - **Everything together:** the `downloads-suite` branch.
 - **Scope:** desktop. Built and tested on macOS (Apple silicon). Shared code compiles for desktop only in this fork's test runs; the Android and iOS builds have not been run, and the Linux and Windows player bridges are unchanged.
 
@@ -22,6 +22,19 @@ NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/N
 | Clearer auto-download | Deleting an auto-downloaded episode does not fetch it again; rule rows open their settings; results are reported only after they are saved; closing the window while downloads are running asks first. | `fix/auto-download-clarity` |
 | Complete offline | A download carries what it needs to be watched with no connection: subtitles (now also saved on desktop), intro and credits skip times, the season's episode list for the next-episode card, and a poster and thumbnail, all kept in one folder beside the video. Offline, the episode and show pages are drawn from these saved details. A failed lookup can add to what is saved but never replaces it. Existing downloads are filled in quietly in the background. | `pr/p-offline-skip-times` |
 | Not the real video | A download that is only a provider's placeholder clip is recognised: far smaller than the size the source stated, far too small or too short for the title's length, or a still picture. It is shown as a problem with the reason, is not counted as downloaded, and a real copy is fetched beside it. Downloads made before the checks existed are checked again in the background. Nothing already stored is removed automatically. | `fix/recheck-downloads-and-placeholders` |
+| Choose folders and drives | Pick where downloads are stored and move all or chosen titles to another folder or drive. The copy is verified before the original goes to the Trash, and a move survives a crash or an unplugged drive. Used and free space is shown per location. | [#54](https://github.com/mischief-merged/NuvioRoid/pull/54) |
+| Hotspots and Low Data Mode | On macOS, downloads wait on hotspots and Low Data Mode networks without losing progress and resume on a normal connection. Can be turned off, with a "Download anyway" that ends when the network changes. | [#56](https://github.com/mischief-merged/NuvioRoid/pull/56) |
+| Polite downloads | Downloads let other apps go first and wait out very slow or blocking networks, judging each host on its own. | [#60](https://github.com/mischief-merged/NuvioRoid/pull/60) |
+| Replace a bad source | A download source that fails or turns out to be a placeholder is replaced by the next untried one, and tried sources are remembered across retries and restarts. | [#62](https://github.com/mischief-merged/NuvioRoid/pull/62) |
+| Keep downloading | Downloads carry on when the window closes, with a menu bar progress item and a check before quitting. The Mac stays awake only while data is arriving. | [#64](https://github.com/mischief-merged/NuvioRoid/pull/64) |
+| Offline first | Downloaded copies play with no internet, and pages keep working offline. | [#66](https://github.com/mischief-merged/NuvioRoid/pull/66) |
+| Link refresh | An expired download link is refreshed and the same file resumes instead of starting over. | [#94](https://github.com/mischief-merged/NuvioRoid/pull/94) |
+| Rebuild the list | The downloads list can be rebuilt from the files already on disk, with a "Find downloads on disk" button. | [#98](https://github.com/mischief-merged/NuvioRoid/pull/98) |
+| Trip ready | Offline hours at a glance and a "Fill for my trip" button. | [#100](https://github.com/mischief-merged/NuvioRoid/pull/100) |
+| Travel mode | Settings for plane and Starlink Wi-Fi, with network rules checked again after the Mac wakes. | [#105](https://github.com/mischief-merged/NuvioRoid/pull/105) |
+| Delete after watching, for everything | Delete after watching can also cover downloads you start yourself. Keep can be undone. | [#107](https://github.com/mischief-merged/NuvioRoid/pull/107) |
+| Nothing deleted for good | Downloads, partial files, rejected files and subtitle folders always go to the Trash or a holding folder, and a partial is kept until its replacement is safely in place. | [#149](https://github.com/mischief-merged/NuvioRoid/pull/149) |
+| Storage limit for everything | One storage limit for all downloads, a clean-up list for watched downloads, an optional free-space floor per drive and an optional make-room mode. Everything goes to the Trash with Undo. | [#152](https://github.com/mischief-merged/NuvioRoid/pull/152) |
 
 ## Playback
 
@@ -32,6 +45,11 @@ NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/N
 | Source failover | When a source fails to start or dies during playback, the player moves to the next source in the same ranked order and resumes where it was. A short placeholder clip played in place of the real file counts as a failure. Bounded, never retries a failed source, waits when offline, and can be turned off. | `pr/l-playback-failover` |
 | Stalled and placeholder sources | A source that never makes progress, or stops responding during playback, is abandoned and the next one is tried. Provider placeholder clips are recognised by file name and link together with a second sign such as a very short length. Pausing, seeking, sleep and going offline do not count. | `pr/m-playback-failure-signals` |
 | Source ranking by identity and language | A source that is clearly a different title, episode or film year goes to the back of the list instead of being picked. Audio language is told apart from subtitle language, and an untagged source that looks foreign no longer counts as the chosen language. Ambiguous cases are left alone. | `pr/n-source-ranking` |
+| Player basics | Media keys, Now Playing, keyboard shortcuts and controls that hide on their own. | [#102](https://github.com/mischief-merged/NuvioRoid/pull/102) |
+| Subtitles ready | Subtitles are fetched before playback starts. | [#104](https://github.com/mischief-merged/NuvioRoid/pull/104) |
+| Sleep timer | The player stops on its own after a time you choose. | [#108](https://github.com/mischief-merged/NuvioRoid/pull/108) |
+| Mini player | Keep browsing while a video plays in a small window (macOS). | [#135](https://github.com/mischief-merged/NuvioRoid/pull/135) |
+| Gamepad in the Sources popup | With a gamepad, focus stays on the chosen source in the player's Sources popup instead of jumping to the header. | [#151](https://github.com/mischief-merged/NuvioRoid/pull/151) |
 
 ## Navigation
 
@@ -44,6 +62,7 @@ NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/N
 | Change | What it does | Branch |
 |---|---|---|
 | Profile picker without an account | With no profiles, the picker shows the "Add Profile" tile and a line of guidance instead of an empty screen. Its title, profile cards and buttons are labelled and work from the keyboard. | `fix/profile-picker-first-run` |
+| Account data is never wiped | Sign-out, a lost session or an account change no longer wipes desktop data. A different account is offered "Start fresh", which archives the old data instead of deleting it, and quitting waits for downloads and the player to finish saving. | [#133](https://github.com/mischief-merged/NuvioRoid/pull/133) |
 
 ## Trakt
 
@@ -59,11 +78,10 @@ User-facing English text uses one set of terms ("source", "Auto-download") and p
 
 ## Testing
 
-The desktop test suite on `downloads-suite` runs 3,356 tests. Three fail, and the same three fail on upstream `Dev` at `c8ee7621` without any of these changes:
+The desktop test suite on `downloads-suite` runs 5,066 tests. Two fail, and the same two fail on upstream `Dev` without any of these changes:
 
 - `DesktopWindowInsetsTest` (title bar clearance)
 - `SettingsNavigationTest` (buffer options by platform and playback engine)
-- `WatchProgressIdentityTest` (legacy payload)
 
 Not covered: Android and iOS builds, Intel Macs, Linux and Windows, and screen-reader testing beyond what the semantics tests assert.
 

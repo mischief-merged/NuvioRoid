@@ -26,16 +26,25 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
+import com.nuvio.app.controller.ControllerFocusEngine
+import com.nuvio.app.controller.LocalControllerModalOverlayToken
 
 enum class DialogButtonStyle {
     Primary,
@@ -54,6 +63,21 @@ fun DialogSurface(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val tokens = MaterialTheme.nuvio
+    val modalOverlayToken = remember { Any() }
+    val currentDismissOnBackPress by rememberUpdatedState(properties.dismissOnBackPress)
+    val currentOnDismiss by rememberUpdatedState(onDismissRequest)
+    DisposableEffect(modalOverlayToken) {
+        ControllerFocusEngine.pushModalOverlay(
+            token = modalOverlayToken,
+            onBack = {
+                if (currentDismissOnBackPress) {
+                    currentOnDismiss()
+                }
+                true
+            },
+        )
+        onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
+    }
     PlatformModalBackHandler(
         dismissOnBackPress = properties.dismissOnBackPress,
         onDismiss = onDismissRequest,
@@ -63,10 +87,17 @@ fun DialogSurface(
         modifier = Modifier.platformTouchScroll(),
         properties = properties,
     ) {
+        val dialogFocusManager = LocalFocusManager.current
+        DisposableEffect(dialogFocusManager) {
+            ComposePopupFocus.push(dialogFocusManager)
+            onDispose { ComposePopupFocus.pop(dialogFocusManager) }
+        }
+        CompositionLocalProvider(LocalControllerModalOverlayToken provides modalOverlayToken) {
         Surface(
             modifier = modifier
                 .fillMaxWidth()
-                .widthIn(max = tokens.components.dialogMaxWidth),
+                .widthIn(max = tokens.components.dialogMaxWidth)
+                .onFocusChanged { ComposePopupFocus.setFocused(dialogFocusManager, it.hasFocus) },
             shape = tokens.shapes.dialog,
             color = tokens.colors.surfaceDialog,
             contentColor = tokens.colors.textPrimary,
@@ -92,6 +123,7 @@ fun DialogSurface(
                 }
                 content()
             }
+        }
         }
     }
 }

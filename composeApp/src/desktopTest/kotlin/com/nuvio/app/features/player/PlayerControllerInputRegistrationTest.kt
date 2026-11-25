@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.junit4.createComposeRule
+import com.nuvio.app.controller.ControllerDirection
 import com.nuvio.app.controller.ControllerEvent
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.XboxButton
@@ -60,6 +61,31 @@ class PlayerControllerInputRegistrationTest {
         assertFalse(
             ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.A)),
         )
+    }
+
+    @Test
+    fun native_popup_keeps_repeated_navigation_and_select_in_the_player() {
+        val runtime = sampleRuntime()
+        compose.setContent {
+            PlayerControllerInputRegistration(runtime = runtime, scope = scope, ownsInput = true)
+        }
+        compose.waitForIdle()
+        assertTrue(runtime.handlePlayerControlsEvent("nativeModalState", 1.0))
+        val initialToken = runtime.playerControlsModalNavigationToken
+        val initialPlaying = runtime.playbackSnapshot.isPlaying
+
+        repeat(2) { index ->
+            assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.Navigate(ControllerDirection.Down)))
+            compose.waitUntil { runtime.playerControlsModalNavigationToken == initialToken + index + 1L }
+            assertEquals("down", runtime.playerControlsModalNavigationAction)
+            assertEquals(initialToken + index + 1L, runtime.playerControlsModalNavigationToken)
+        }
+        assertTrue(ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.A)))
+        compose.waitUntil { runtime.playerControlsModalNavigationToken == initialToken + 3L }
+        assertEquals("select", runtime.playerControlsModalNavigationAction)
+        assertEquals(initialToken + 3L, runtime.playerControlsModalNavigationToken)
+        assertEquals(initialPlaying, runtime.playbackSnapshot.isPlaying)
+        assertTrue(runtime.nativeControlsModalOpen)
     }
 
     @Test

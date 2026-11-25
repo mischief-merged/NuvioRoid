@@ -66,6 +66,34 @@ class DesktopDownloadsTrashTest {
     private fun Path.uri() = toUri().toString()
 
     @Test
+    fun archive_message_wait_matches_when_files_can_move_to_trash() {
+        val strings = listOf(
+            File("src/commonMain/composeResources/values/strings.xml"),
+            File("composeApp/src/commonMain/composeResources/values/strings.xml"),
+        ).first { it.isFile }.readText()
+        val message = requireNotNull(
+            Regex("<string name=\"downloads_delete_message_held\">([^<]+)</string>").find(strings),
+        ).groupValues[1]
+        val days = requireNotNull(Regex("for (\\d+) days").find(message)).groupValues[1].toLong()
+        assertEquals(HeldFileDays.toLong(), days)
+        assertTrue(message.contains("then moves to the Trash when available"))
+
+        val video = video()
+        assertTrue(withoutSystemTrash().moveAway(video.uri()))
+        val archived = holding.resolve("$now-episode.mkv")
+        val trash = withSystemTrash()
+
+        assertEquals(0, trash.purgeHeldFiles(now + days * day - 1))
+        assertTrue(trashedBySystem.isEmpty())
+        assertEquals("video", archived.readText())
+        assertEquals(0, withoutSystemTrash().purgeHeldFiles(now + days * day))
+        assertEquals("video", archived.readText())
+        assertEquals(1, trash.purgeHeldFiles(now + days * day))
+        assertEquals(listOf(archived.toFile()), trashedBySystem)
+        assertEquals("video", systemTrashDir.resolve("1-${archived.fileName}").readText())
+    }
+
+    @Test
     fun cancellation_after_subtitles_move_restores_the_video_and_subtitles() {
         val video = video()
         val subtitles = subtitlesOf(video)
@@ -122,6 +150,84 @@ class DesktopDownloadsTrashTest {
         assertFalse(withSystemTrash().moveAway(video.uri()))
 
         assertTrue(video.exists())
+        assertFalse(holding.exists())
+    }
+
+    @Test
+    fun a_rejected_file_is_held_when_the_system_trash_refuses_it() {
+        val video = video()
+        systemTrashWorks = false
+        val key = requireNotNull(DownloadMover.identityOf(video))
+
+        assertTrue(trashPublishedFile(video, key, withSystemTrash()::moveToTrash))
+
+        assertFalse(video.exists())
+        assertEquals("video", holding.resolve("$now-episode.mkv").readText())
+    }
+
+    @Test
+    fun a_partial_is_held_when_the_system_trash_throws() {
+        val partial = video("episode.mkv.part")
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { error("Trash unavailable") }, nowEpochMs = { now })
+
+        assertTrue(trash.moveToTrash(partial))
+
+        assertEquals("video", holding.resolve("$now-episode.mkv.part").readText())
+        assertFalse(partial.exists())
+    }
+
+    @Test
+    fun a_file_changed_during_a_failed_trash_call_is_not_held() {
+        val original = video()
+        val saved = outside.resolve("saved.mkv")
+        val trash = DesktopDownloadsTrash({ downloadsDir }, systemTrash = { file ->
+            Files.move(file.toPath(), saved)
+            file.writeText("another file")
+            false
+        })
+
+        assertFalse(trash.moveToTrash(original))
+
+        assertEquals("another file", original.readText())
+        assertEquals("video", saved.readText())
+        assertFalse(holding.exists())
+    }
+
+    @Test
+    fun regular_removal_refuses_a_linked_downloads_folder() {
+        val original = video()
+        val link = outside.resolve("download-alias")
+        Files.createSymbolicLink(link, downloadsDir)
+
+        assertFalse(withSystemTrash().moveAway(link.resolve(original.fileName).uri()))
+
+        assertEquals("video", original.readText())
+        assertTrue(trashedBySystem.isEmpty())
+    }
+
+    @Test
+    fun watched_removal_refuses_a_linked_downloads_folder() {
+        val original = video()
+        val link = outside.resolve("download-alias")
+        Files.createSymbolicLink(link, downloadsDir)
+
+        assertEquals(AutoDownloadRemovalResult.NotMoved,
+            withSystemTrash().moveWatchedAway(link.resolve(original.fileName).uri()) { true })
+
+        assertEquals("video", original.readText())
+        assertTrue(trashedBySystem.isEmpty())
+    }
+
+    @Test
+    fun moving_to_trash_never_follows_a_linked_parent_inside_the_downloads_folder() {
+        val target = downloadsDir.resolve("target").createDirectories()
+        val original = target.resolve("saved.part").also { it.writeText("partial bytes") }
+        val link = downloadsDir.resolve("alias")
+        Files.createSymbolicLink(link, target)
+
+        assertFalse(withoutSystemTrash().moveToTrash(link.resolve(original.fileName)))
+
+        assertEquals("partial bytes", original.readText())
         assertFalse(holding.exists())
     }
 

@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+## [1.1.39.1] - 2026-11-25
+
+### Added
+
+- Storage limit for all downloads, with a clean-up list for watched downloads, an optional free-space floor per drive, and an optional make-room mode that moves the oldest watched downloads to the Trash; everything goes to the Trash with Undo (#120) ([#152](https://github.com/mischief-merged/NuvioRoid/pull/152)).
+
+### Changed
+
+- Updated to the latest upstream Nuvio Desktop, adding keyboard and gamepad navigation across the desktop app, a faster home screen and startup, subtitle styling fixes, separate Jellyfin and Emby sign-ins per profile, and JDK 25 packaging ([#150](https://github.com/mischief-merged/NuvioRoid/pull/150)).
+
+### Fixed
+
+- Gamepad focus stays on the chosen source in the player Sources popup instead of jumping to the header, and the archive message now says held files wait 7 days before moving to the Trash (#127) ([#151](https://github.com/mischief-merged/NuvioRoid/pull/151)).
+- Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
+
 ## [1.1.38.1] - 2026-11-23
 
 ### Added
@@ -99,6 +114,7 @@ First downloadable alpha build of NuvioRoid for macOS (Apple silicon), based on 
 - Serialised download state updates across threads, saved the downloads list atomically with a fallback copy and tolerant decoding, and resumed or retried interrupted downloads on launch and reconnect ([#4](https://github.com/mischief-merged/NuvioRoid/pull/4)).
 - Showed the "Add Profile" tile and guidance on the first-run profile picker when continuing without an account, with labels and keyboard navigation ([#40](https://github.com/mischief-merged/NuvioRoid/pull/40)).
 
-[Unreleased]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.38.1...HEAD
+[Unreleased]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.39.1...HEAD
+[1.1.39.1]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.38.1...nuvioroid-1.1.39.1
 [1.1.38.1]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.36.1...nuvioroid-1.1.38.1
 [1.1.36.1]: https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.36.1

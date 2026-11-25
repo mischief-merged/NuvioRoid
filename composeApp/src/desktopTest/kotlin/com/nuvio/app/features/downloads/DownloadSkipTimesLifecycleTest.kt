@@ -9,6 +9,7 @@ import java.nio.file.Files
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -48,13 +49,18 @@ class DownloadSkipTimesLifecycleTest {
     private val backend = FakeBackend()
     private val realBackend = DownloadsRepository.backend
     private val realSkipTimes = DownloadsRepository.companions
+    private val world = FolderWorld()
     private lateinit var folder: File
     private val intro = SkipInterval(10.0, 90.0, "intro", "introdb")
     private val requests = mutableListOf<SkipTimesRequest>()
 
     @BeforeTest
     fun use_an_in_memory_store_and_a_temporary_folder() {
-        folder = Files.createTempDirectory("nuvio-skip-lifecycle").toFile()
+        folder = world.appFolder.also { Files.createDirectories(it) }.toFile()
+        DesktopDownloads.replaceForTest(DesktopDownloadFolders(
+            world.locations, world.validator, world.mover(),
+            trashPath = DesktopDownloadsTrash({ world.appFolder }, systemTrash = null, nowEpochMs = { 123L })::moveToTrash,
+        ))
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = backend
         val skipTimes = OfflineSkipTimes(
@@ -74,7 +80,8 @@ class DownloadSkipTimesLifecycleTest {
         DownloadsRepository.clearLocalState()
         DownloadsRepository.backend = realBackend
         DownloadsRepository.companions = realSkipTimes
-        folder.deleteRecursively()
+        DesktopDownloads.replaceForTest(null)
+        world.close()
     }
 
     private fun download(contentType: String, videoId: String, season: Int?, episode: Int?, name: String): String {
@@ -183,7 +190,11 @@ class DownloadSkipTimesLifecycleTest {
 
         assertEquals(setOf("manifest.json", "skip-times.json"), File(folder, "Show.S01E01.mkv.subtitles").list().orEmpty().filterNot { it == SidecarOwnership.MarkerName }.toSet())
 
+        val before = Files.readAllBytes(folder.toPath().resolve("Show.S01E01.mkv.subtitles/skip-times.json"))
         DownloadSubtitleStorage(uri).remove()
         assertEquals(SavedSkipTimesRead.Missing, SkipTimesSidecar.read(uri))
+        val held = folder.toPath().resolve("${DesktopDownloadsTrash.HoldingFolderName}/123-Show.S01E01.mkv.subtitles")
+        assertContentEquals(before, Files.readAllBytes(held.resolve("skip-times.json")))
+        assertEquals("{}", Files.readString(held.resolve("manifest.json")))
     }
 }

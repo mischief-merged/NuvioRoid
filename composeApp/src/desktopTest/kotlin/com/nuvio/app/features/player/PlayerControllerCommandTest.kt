@@ -203,13 +203,18 @@ class PlayerControllerCommandTest {
         assertEquals("down", runtime.playerControlsModalNavigationAction)
         assertEquals(initialNavToken + 1L, runtime.playerControlsModalNavigationToken)
 
+        // Repeated Down must produce another update while the popup rebuilds its rows.
+        assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Down), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
+        assertEquals("down", runtime.playerControlsModalNavigationAction)
+        assertEquals(initialNavToken + 2L, runtime.playerControlsModalNavigationToken)
+
         assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.Navigate(ControllerDirection.Up), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
         assertEquals("up", runtime.playerControlsModalNavigationAction)
-        assertEquals(initialNavToken + 2L, runtime.playerControlsModalNavigationToken)
+        assertEquals(initialNavToken + 3L, runtime.playerControlsModalNavigationToken)
 
         assertTrue(runtime.handlePlayerControllerEvent(ControllerEvent.ButtonPressed(XboxButton.A), modalOpen = true, dispatch = runtime::handlePlayerControllerCommand, onNavigateHandled = {}))
         assertEquals("select", runtime.playerControlsModalNavigationAction)
-        assertEquals(initialNavToken + 3L, runtime.playerControlsModalNavigationToken)
+        assertEquals(initialNavToken + 4L, runtime.playerControlsModalNavigationToken)
 
         // First Back closes the native popup via closeModalsToken without exiting playback.
         assertTrue(runtime.handlePlayerControllerCommand(PlayerCommand.Back))

@@ -59,9 +59,9 @@ internal actual class DownloadSubtitleStorage actual constructor(localVideoUri: 
     actual fun localFileUri(fileName: String): String? =
         file(fileName).takeIf(File::isFile)?.toURI()?.toString()
 
-    /** Removes the folder only when it is the app's own. */
+    /** Keeps the complete folder in the Trash or holding folder, and only when it is the app's own. */
     actual fun remove() {
-        if (SidecarOwnership.isOwned(directory.toPath(), video.name)) directory.deleteRecursively()
+        if (SidecarOwnership.isOwned(directory.toPath(), video.name)) DesktopDownloads.folders.moveToTrash(directory.toPath())
     }
 
     actual fun refused(): Boolean = SidecarOwnership.refuses(directory.toPath(), video.name)

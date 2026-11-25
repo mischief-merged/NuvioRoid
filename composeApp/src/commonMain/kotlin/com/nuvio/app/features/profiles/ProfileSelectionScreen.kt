@@ -702,6 +702,7 @@ private fun ManageProfilesButton(
                 },
                 shape = shape,
             )
+            .nuvioFocusBorder(shape)
             .clickable(
                 enabled = enabled,
                 interactionSource = interactionSource,

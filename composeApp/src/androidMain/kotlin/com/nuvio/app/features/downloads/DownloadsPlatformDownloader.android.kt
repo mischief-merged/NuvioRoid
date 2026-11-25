@@ -13,11 +13,14 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.takeWhile
 import java.io.File
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 
 internal actual object DownloadsPlatformDownloader {
     private var appContext: Context? = null
     private var downloadScheduler: AndroidDownloadScheduler? = null
     private val observerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val activeLimits = ConcurrentHashMap<String, DownloadTransferLimits>()
 
     fun initialize(context: Context) {
         scheduler(context)
@@ -26,7 +29,20 @@ internal actual object DownloadsPlatformDownloader {
     @Synchronized
     internal fun scheduler(context: Context): AndroidDownloadScheduler {
         appContext = context.applicationContext
-        return downloadScheduler ?: AndroidDownloadScheduler(context.applicationContext).also { downloadScheduler = it }
+        return downloadScheduler ?: AndroidDownloadScheduler(context.applicationContext).also { created ->
+            downloadScheduler = created
+            ioScope.launch { reportAndroidDownloadsFreeSpace(created.directory) }
+        }
+    }
+
+    internal fun limitsFor(downloadId: String): DownloadTransferLimits? = activeLimits[downloadId]
+
+    internal fun clearLimits(downloadId: String, limits: DownloadTransferLimits?) {
+        if (limits != null) {
+            activeLimits.remove(downloadId, limits)
+        } else {
+            activeLimits.remove(downloadId)
+        }
     }
 
     internal fun managedTransfers(): List<AndroidDownloadTransfer> =
@@ -43,24 +59,35 @@ internal actual object DownloadsPlatformDownloader {
         onPaused: () -> Unit,
     ): DownloadsTaskHandle {
         val scheduler = checkNotNull(downloadScheduler) { "Downloads are not initialized" }
+        val limits = request.limits
+        if (limits != null) {
+            activeLimits[request.item.id] = limits
+        } else {
+            activeLimits.remove(request.item.id)
+        }
         val transfer = scheduler.enqueue(request.item)
         val observer = observerScope.launch {
-            scheduler.store.transfers.map { it[request.destinationFileName] }
-                .distinctUntilChanged()
-                .takeWhile { current ->
-                    if (current == null || current.generation != transfer.generation) return@takeWhile false
-                    val item = current.item
-                    when (item.status) {
-                        DownloadStatus.Downloading -> onProgress(item.downloadedBytes, item.totalBytes)
-                        DownloadStatus.Completed -> onSuccess(checkNotNull(item.localFileUri), item.totalBytes)
-                        DownloadStatus.Failed -> onFailure(item.errorMessage ?: "Download failed")
-                        DownloadStatus.Paused -> onPaused()
-                    }
-                    item.status == DownloadStatus.Downloading
-                }.collect()
+            try {
+                scheduler.store.transfers.map { it[request.destinationFileName] }
+                    .distinctUntilChanged()
+                    .takeWhile { current ->
+                        if (current == null || current.generation != transfer.generation) return@takeWhile false
+                        val item = current.item
+                        when (item.status) {
+                            DownloadStatus.Downloading -> onProgress(item.downloadedBytes, item.totalBytes)
+                            DownloadStatus.Completed -> onSuccess(checkNotNull(item.localFileUri), item.totalBytes)
+                            DownloadStatus.Failed -> onFailure(item.errorMessage ?: "Download failed")
+                            DownloadStatus.Paused -> onPaused()
+                        }
+                        item.status == DownloadStatus.Downloading
+                    }.collect()
+            } finally {
+                clearLimits(request.item.id, limits)
+            }
         }
         return object : DownloadsTaskHandle {
             override fun cancel() {
+                clearLimits(request.item.id, limits)
                 observer.cancel()
                 if (scheduler.store.get(request.destinationFileName)?.generation == transfer.generation) {
                     scheduler.pause(request.destinationFileName)

@@ -75,7 +75,13 @@ class DownloadsShowEscapeTest {
             KeyEvent.VK_ESCAPE,
             KeyEvent.CHAR_UNDEFINED,
         )
-        return KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(event)
+        val handled = KeyboardFocusManager.getCurrentKeyboardFocusManager().dispatchEvent(event)
+        if (handled && !javax.swing.SwingUtilities.isEventDispatchThread()) {
+            // DesktopKeyboardShortcutHost defers back execution onto the EDT to avoid disposing
+            // a focused popup mid-dispatch; flush the EDT so the handler completes before waitForIdle.
+            javax.swing.SwingUtilities.invokeAndWait {}
+        }
+        return handled
     }
 
     @Test

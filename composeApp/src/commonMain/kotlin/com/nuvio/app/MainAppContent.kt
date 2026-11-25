@@ -225,6 +225,8 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import com.nuvio.app.features.player.dispatchNavigationBack
 import com.nuvio.app.core.ui.PlatformEscapeShortcut
 import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.core.ui.hasOpenPlatformModal
+import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerMainOverlay
 import com.nuvio.app.controller.ControllerNavigationHost
 
@@ -1719,6 +1721,12 @@ internal fun MainAppContent(
                 PlatformEscapeShortcut(navigateBack)
 
                 val playbackMode = playerSessionController.activeSession?.mode
+                val fullPlayerOwnsInput = fullPlayerOwnsControllerInput(playbackMode)
+                val canRunShellShortcuts = {
+                    !fullPlayerOwnsInput &&
+                        !ControllerFocusEngine.isModalOverlayActive &&
+                        !hasOpenPlatformModal()
+                }
                 ControllerNavigationHost(
                     currentRoute = currentRoute,
                     selectedTab = selectedTab,
@@ -1728,7 +1736,52 @@ internal fun MainAppContent(
                         }
                         true
                     },
-                    fullPlayerOwnsInput = fullPlayerOwnsControllerInput(playbackMode),
+                    onBumperLeft = {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
+                            val tabs = AppScreenTab.entries
+                            activateTab(tabs[(selectedTab.ordinal - 1 + tabs.size) % tabs.size])
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    onBumperRight = {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
+                            val tabs = AppScreenTab.entries
+                            activateTab(tabs[(selectedTab.ordinal + 1) % tabs.size])
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    onSearch = {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
+                            activateTab(AppScreenTab.Search)
+                            searchFocusRequestCount++
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                    onOpenNavigation = {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
+                            val tabName = when (selectedTab) {
+                                AppScreenTab.Home -> "home"
+                                AppScreenTab.Search -> "search"
+                                AppScreenTab.Library -> "library"
+                                AppScreenTab.Settings -> "settings"
+                            }
+                            // The navigation rail can be a sidebar or the floating top bar depending on
+                            // the Desktop Navigation setting; try the top bar first, then the sidebar.
+                            ControllerFocusEngine.focusNavigationItem(
+                                "top_nav_$tabName",
+                                "sidebar_$tabName",
+                            )
+                        } else {
+                            false
+                        }
+                    },
+                    fullPlayerOwnsInput = fullPlayerOwnsInput,
                     miniDockClearance = miniPlayerHintClearance(playbackMode),
                 )
 

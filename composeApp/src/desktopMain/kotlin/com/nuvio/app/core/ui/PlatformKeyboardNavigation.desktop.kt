@@ -22,6 +22,7 @@ import java.awt.Toolkit
 import java.awt.event.AWTEventListener
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
+import kotlinx.coroutines.delay
 
 /**
  * Route generation whose screen already received a seeded Compose focus. Compose keeps previous
@@ -106,6 +107,20 @@ private fun FocusManager.moveSpatialFocus(direction: ControllerDirection): Boole
     }
     if (moveFocus(composeDirection)) return true
 
+    // Nothing holds Compose focus (e.g. the spatial ring was cleared when a Compose-driven route
+    // or popup opened): seed a target immediately, even if this route was already seeded once.
+    val hasActiveFocus = if (ComposePopupFocus.active != null) {
+        ComposePopupFocus.hasActiveFocus
+    } else {
+        com.nuvio.app.core.ui.FocusPresence.hasAnyFocus
+    }
+    if (!hasActiveFocus) {
+        clearFocus(force = true)
+        if (moveFocus(FocusDirection.Next)) {
+            return moveFocus(composeDirection)
+        }
+    }
+
     // Seed the incoming screen once per route change, then apply the requested move so the first
     // arrow press reacts instead of being swallowed (previously users had to press Tab).
     if (seedRouteFocusIfNeeded()) {
@@ -133,6 +148,8 @@ private fun applyNavigationCursor(hidden: Boolean) {
 @Composable
 actual fun PlatformKeyboardNavigationHost() {
     val focusManager = LocalFocusManager.current
+    // Popups and modal sheets own their own focus manager; arrows must move focus inside them.
+    val activeFocusManager = { ComposePopupFocus.active ?: focusManager }
 
     DesktopKeyboardShortcutHost()
 
@@ -168,6 +185,19 @@ actual fun PlatformKeyboardNavigationHost() {
         onDispose { Toolkit.getDefaultToolkit().removeAWTEventListener(listener) }
     }
 
+    // Compose-driven routes (settings leaves, details) start with no focus target, which left
+    // Return dead and Esc/Tab jumping to the sidebar. Seed a focus target once the route settles.
+    LaunchedEffect(Unit) {
+        ControllerFocusEngine.routeGeneration.collect {
+            delay(180)
+            if (ControllerFocusEngine.isModalOverlayActive) return@collect
+            if (ControllerFocusEngine.hasInteractiveContent.value) return@collect
+            if (FocusPresence.hasAnyFocus) return@collect
+            focusManager.clearFocus(force = true)
+            if (!ContentEntry.request()) focusManager.moveFocus(FocusDirection.Next)
+        }
+    }
+
     // Hide the mouse pointer while the user navigates with a controller or the keyboard; the first
     // real mouse movement switches navigation off again and restores it.
     LaunchedEffect(Unit) {
@@ -183,14 +213,26 @@ actual fun PlatformKeyboardNavigationHost() {
             when (event) {
                 is ControllerEvent.Navigate -> {
                     ControllerManager.notifyNavigationInput()
-                    if (focusManager.moveSpatialFocus(event.direction)) {
+                    // Never fall back to the underlying page's FocusManager while an in-window
+                    // modal overlay without its own popup focus owner is open.
+                    if (ControllerFocusEngine.isModalOverlayActive && ComposePopupFocus.active == null) {
+                        return@collect
+                    }
+                    val padMoved = activeFocusManager().moveSpatialFocus(event.direction)
+                    if (padMoved) {
+                        ControllerFocusEngine.yieldFocusToCompose()
                         ControllerSoundPlayer.playNavigate()
+                    } else if (
+                        !ControllerFocusEngine.isModalOverlayActive &&
+                        (event.direction == ControllerDirection.Up || event.direction == ControllerDirection.Down)
+                    ) {
+                        ControllerFocusEngine.scrollActivePage(down = event.direction == ControllerDirection.Down)
                     }
                 }
                 is ControllerEvent.ButtonPressed -> when (event.button) {
                     XboxButton.A -> {
                         ControllerSoundPlayer.playSelect()
-                        focusManager.activateSpatialFocus()
+                        activeFocusManager().activateSpatialFocus()
                     }
                     // The engine routes B to registered global back handlers; when a screen does not
                     // register one, fall back to the same navigation back used by the Escape key.
@@ -209,8 +251,10 @@ actual fun PlatformKeyboardNavigationHost() {
         val dispatcher = java.awt.KeyEventDispatcher { event: KeyEvent ->
             if (event.id != KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
 
+            val isPlayerActive =
+                ControllerManager.screenContext.value.screenType == ControllerScreenType.Player
             val isPlayerPlaybackControlsActive =
-                ControllerManager.screenContext.value.screenType == ControllerScreenType.Player &&
+                isPlayerActive &&
                     !PlayerControllerBridge.isOverlayOpen() &&
                     !DesktopEscapeShortcut.hasOpenModal()
 
@@ -224,6 +268,30 @@ actual fun PlatformKeyboardNavigationHost() {
                 }
             }
 
+            // Keyboard equivalents of the controller hint-bar actions. They mirror the gamepad
+            // handlers (Y=Search, LB/RB=Tabs, Menu=Navigation, X=Options) and are ignored inside
+            // the player or while a modal sheet/dialog/overlay owns input.
+            if (
+                !isPlayerActive &&
+                !ControllerFocusEngine.isModalOverlayActive &&
+                !DesktopEscapeShortcut.hasOpenModal()
+            ) {
+                val shortcutButton = when {
+                    event.isControlDown && event.keyCode == KeyEvent.VK_K -> XboxButton.Y
+                    event.isControlDown && event.keyCode == KeyEvent.VK_TAB ->
+                        if (event.isShiftDown) XboxButton.LB else XboxButton.RB
+                    event.isControlDown && event.keyCode == KeyEvent.VK_B -> XboxButton.Menu
+                    event.keyCode == KeyEvent.VK_CONTEXT_MENU ||
+                        (event.isShiftDown && event.keyCode == KeyEvent.VK_F10) -> XboxButton.X
+                    else -> null
+                }
+                if (shortcutButton != null) {
+                    if (ControllerManager.dispatchKeyboardShortcut(shortcutButton)) {
+                        return@KeyEventDispatcher true
+                    }
+                }
+            }
+
             // Enter activates the spatially focused item. Fall through to Compose when the engine
             // has nothing registered, so regular buttons keep their native Enter handling.
             if (event.keyCode == KeyEvent.VK_ENTER) {
@@ -231,8 +299,15 @@ actual fun PlatformKeyboardNavigationHost() {
             }
 
             if (event.keyCode == KeyEvent.VK_TAB) {
-                ControllerManager.notifyNavigationInput()
-                return@KeyEventDispatcher false
+                // Only hand focus traversal to Compose when no modal overlay is open, or when the
+                // active modal popup has registered its own FocusManager in ComposePopupFocus.
+                // Otherwise (an in-window spatial overlay), keep focus confined inside the overlay.
+                if (!ControllerFocusEngine.isModalOverlayActive || ComposePopupFocus.active != null) {
+                    ControllerFocusEngine.yieldFocusToCompose()
+                    ControllerManager.notifyNavigationInput()
+                    return@KeyEventDispatcher false
+                }
+                return@KeyEventDispatcher true
             }
 
             val direction = when (event.keyCode) {
@@ -262,11 +337,24 @@ actual fun PlatformKeyboardNavigationHost() {
                 return@KeyEventDispatcher true
             }
 
+            // While an in-window modal overlay without its own popup FocusManager is open, keep
+            // edge arrows confined to the overlay instead of moving focus on the page underneath.
+            if (ControllerFocusEngine.isModalOverlayActive && ComposePopupFocus.active == null) {
+                return@KeyEventDispatcher true
+            }
+
             // Screens without engine nodes (details, streams, settings, player) use Compose's own
-            // directional focus search.
+            // directional focus search. When focus cannot move further but the page has more
+            // content, scroll it a page so navigation keeps going to the end of the list.
             ControllerManager.notifyNavigationInput()
-            if (focusManager.moveSpatialFocus(direction)) {
+            if (activeFocusManager().moveSpatialFocus(direction)) {
+                ControllerFocusEngine.yieldFocusToCompose()
                 ControllerSoundPlayer.playNavigate()
+            } else if (
+                !ControllerFocusEngine.isModalOverlayActive &&
+                (direction == ControllerDirection.Up || direction == ControllerDirection.Down)
+            ) {
+                ControllerFocusEngine.scrollActivePage(down = direction == ControllerDirection.Down)
             }
             true
         }

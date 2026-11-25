@@ -48,6 +48,12 @@ import nuvio.composeapp.generated.resources.downloads_auto_toast_on
 import nuvio.composeapp.generated.resources.downloads_auto_toast_save_failed
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast
 import nuvio.composeapp.generated.resources.downloads_auto_scheduled_toast_soon
+import nuvio.composeapp.generated.resources.downloads_cleanup_held_toast
+import nuvio.composeapp.generated.resources.downloads_cleanup_moved_toast
+import nuvio.composeapp.generated.resources.downloads_undo_failed_toast
+import nuvio.composeapp.generated.resources.downloads_undo_file_gone_toast
+import nuvio.composeapp.generated.resources.downloads_undo_restored_toast
+import nuvio.composeapp.generated.resources.downloads_undo_subtitles_not_restored_toast
 import org.jetbrains.compose.resources.getPluralString
 import org.jetbrains.compose.resources.getString
 
@@ -68,6 +74,8 @@ internal fun Flow<NetworkCondition>.internetReturns(): Flow<Unit> = flow {
 
 private val DefaultDeletionMode = kotlinx.coroutines.flow.MutableStateFlow(DeleteAfterWatchingMode.AutomaticOnly)
 internal val NoKeptDownloads = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+private val NoTotalStorageLimit = kotlinx.coroutines.flow.MutableStateFlow<Int?>(null)
+private val NoMakeRoomAutomatically = kotlinx.coroutines.flow.MutableStateFlow(false)
 
 private val NoDeletedEpisodes = kotlinx.coroutines.flow.MutableStateFlow(emptyList<AutoDownloadDeleted>())
 
@@ -79,9 +87,17 @@ internal interface AutoDownloadController {
     /** The storage limit for automatic downloads, in gigabytes. Null means no limit. */
     val storageLimitGb: StateFlow<Int?>
 
+    /** The combined storage limit for all downloads, in gigabytes. Null means no limit. */
+    val totalStorageLimitGb: StateFlow<Int?> get() = NoTotalStorageLimit
+
+    /** Whether watched downloads are moved to the Trash automatically when over a storage limit. Off by default. */
+    val makeRoomAutomatically: StateFlow<Boolean> get() = NoMakeRoomAutomatically
+
     val deleteAfterWatchingMode: StateFlow<DeleteAfterWatchingMode> get() = DefaultDeletionMode
     val keptDownloadIds: StateFlow<Set<String>> get() = NoKeptDownloads
     fun setDeleteAfterWatchingMode(profileId: Int, mode: DeleteAfterWatchingMode) = Unit
+    fun setTotalStorageLimit(profileId: Int, limitGb: Int?) = Unit
+    fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) = Unit
     fun undoKeepDownload(profileId: Int, downloadId: String) = Unit
 
     /** The watched episodes that are going to be removed. */
@@ -92,6 +108,8 @@ internal interface AutoDownloadController {
 
     /** False when removed files stay in the holding folder until you remove them. */
     val usesSystemTrash: Boolean
+    val usesUndoableSystemTrash: Boolean get() = usesSystemTrash
+    val supportsWatchedCleanup: Boolean get() = true
 
     /**
      * Turns automatic downloads on for [meta], or changes its rule, and checks the show. Nothing
@@ -109,6 +127,12 @@ internal interface AutoDownloadController {
 
     /** Removes a watched episode now instead of when its time comes. */
     fun deleteDownloadNow(profileId: Int, downloadId: String)
+
+    /** Moves chosen watched downloads to the Trash and lists them under Recently deleted with Undo. */
+    fun cleanUpWatchedDownloads(profileId: Int, downloadIds: Set<String>) = Unit
+
+    /** Restores a recently trashed watched download if it is still in the Trash. */
+    fun undoDeletedDownload(profileId: Int, entry: AutoDownloadDeleted) = Unit
 
     fun checkNow()
 }
@@ -166,6 +190,7 @@ internal object AutoDownloads : AutoDownloadController {
         cancelBatch = SeasonBatchDownloads::cancel,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
         autoDownloadBytes = { DownloadsRepository.autoDownloadBytes() },
+        allDownloadBytes = { DownloadsRepository.allDownloadBytes() },
         resumeDownload = DownloadsRepository::resumeDownload,
         locationAway = { rule -> DownloadsRepository.showLocationIsAway(rule.parentMetaId) },
     )
@@ -188,21 +213,58 @@ internal object AutoDownloads : AutoDownloadController {
         hasLaterEpisode = { rule, item -> engine.knownEpisodes(rule.key)?.let { hasLaterReleasedEpisode(item, it) } },
         removeDownload = DownloadsRepository::removeWatchedAutoDownload,
         nowEpochMs = { DownloadsClock.nowEpochMs() },
+        removeDownloadWithUndo = DownloadsRepository::removeWatchedAutoDownloadWithUndo,
+        usesUndoableTrash = { DownloadsRepository.usesUndoableSystemTrash },
+    )
+
+    private val makeRoom = MakeRoomAutomatically(
+        store = store,
+        downloads = { DownloadsRepository.uiState.value.items },
+        allDownloadBytes = DownloadsRepository::allDownloadBytes,
+        autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+        totalStorageLimitBytes = ::totalStorageLimitBytes,
+        autoStorageLimitBytes = ::storageLimitBytes,
+        watchStatusOf = { item ->
+            WatchProgressRepository.ensureLoaded()
+            WatchedRepository.ensureLoaded()
+            item.watchStatus(WatchProgressRepository.uiState.value)
+        },
+        isPlaying = ::isPlaying,
+        isConnected = DownloadsRepository.backend::isConnected,
+        isBusyOrMoving = DownloadsRepository::isBusyOrAway,
+        usesSystemTrash = { DownloadsRepository.usesUndoableSystemTrash },
+        hasRuleWaitingForStorage = { engine.hasUnqueuedRuleWaitingForStorage(store.profileId()) },
     )
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled
 
     override val deleteAfterWatchingMode get() = store.deleteAfterWatchingMode
     override val keptDownloadIds get() = store.keptDownloadIds
+    override val makeRoomAutomatically get() = store.makeRoomAutomatically
 
     override val rules: StateFlow<List<AutoDownloadRule>> get() = store.rules
     override val statuses: StateFlow<Map<String, AutoDownloadStatus>> get() = engine.statuses
     override val storageLimitGb: StateFlow<Int?> get() = store.storageLimitGb
+    override val totalStorageLimitGb: StateFlow<Int?> get() = store.totalStorageLimitGb
     override val removals: StateFlow<List<AutoDownloadRemoval>> get() = store.removals
     override val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> get() = store.recentlyDeleted
     override val usesSystemTrash: Boolean get() = DownloadsTrash.usesSystemTrash
+    override val usesUndoableSystemTrash: Boolean get() = DownloadsTrash.usesUndoableSystemTrash
+    override val supportsWatchedCleanup: Boolean get() = isAvailable && DownloadsRepository.supportsWatchedCleanup
 
     fun storageLimitBytes(): Long? = store.storageLimitBytes()
+    fun totalStorageLimitBytes(): Long? = store.totalStorageLimitBytes()
+
+    /** Called when a download waits on a storage limit. Automatic clean-up hooks in here when enabled. */
+    fun onStorageLimitBlocked() {
+        if (!isAvailable) return
+        val profileId = ProfileRepository.activeProfileId
+        if (!store.isMakeRoomEnabled(profileId)) return
+        launchTrackedAction {
+            val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+            if (moved > 0) checkSafely()
+        }
+    }
 
     fun start() {
         if (!isAvailable || !started.compareAndSet(expect = false, update = true)) return
@@ -215,7 +277,9 @@ internal object AutoDownloads : AutoDownloadController {
                     engine.rulesWithDueRetry().forEach { checkSafely(it) }
                 }
                 runCatching {
-                    deleteAfterWatching.runDue(store.profileId())
+                    val profile = store.profileId()
+                    deleteAfterWatching.runDue(profile)
+                    if (store.isMakeRoomEnabled(profile)) makeRoom.runIfNeeded(profile)
                     DownloadsTrash.purgeHeldFiles(DownloadsClock.nowEpochMs())
                 }
                 delay(PollIntervalMs)
@@ -286,11 +350,39 @@ internal object AutoDownloads : AutoDownloadController {
 
     /** A higher limit may make room for what the old one held back, so the rules are checked. */
     override fun setStorageLimit(profileId: Int, limitGb: Int?) {
-        scope.launch {
+        launchTrackedAction {
             if (changeAutoDownloadStorageLimit(store, profileId, limitGb)) {
+                DownloadsRepository.onStorageLimitsChanged()
+                if (store.isMakeRoomEnabled(profileId)) runCatching { makeRoom.runIfNeeded(profileId) }
                 checkSafely()
             } else {
                 NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))
+            }
+        }
+    }
+
+    /** Changes the combined storage limit for all downloads and resumes waiting ones when there is room. */
+    override fun setTotalStorageLimit(profileId: Int, limitGb: Int?) {
+        launchTrackedAction {
+            if (changeTotalDownloadStorageLimit(store, profileId, limitGb)) {
+                DownloadsRepository.onStorageLimitsChanged()
+                if (store.isMakeRoomEnabled(profileId)) runCatching { makeRoom.runIfNeeded(profileId) }
+                checkSafely()
+            } else {
+                NuvioToastController.show(getString(Res.string.downloads_auto_toast_limit_failed))
+            }
+        }
+    }
+
+    override fun setMakeRoomAutomatically(profileId: Int, enabled: Boolean) {
+        if (enabled && !usesUndoableSystemTrash) return
+        launchTrackedAction {
+            val saved = runCatching { store.setMakeRoomAutomatically(profileId, enabled) }.getOrDefault(false)
+            if (!saved) {
+                NuvioToastController.show(getString(Res.string.downloads_delete_setting_save_failed))
+            } else if (enabled) {
+                val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+                if (moved > 0) checkSafely()
             }
         }
     }
@@ -334,6 +426,54 @@ internal object AutoDownloads : AutoDownloadController {
                 AutoDownloadRemovalOutcome.LastEpisode, AutoDownloadRemovalOutcome.Cancelled, null -> null
             }
             if (message != null) NuvioToastController.show(getString(message))
+        }
+    }
+
+    override fun cleanUpWatchedDownloads(profileId: Int, downloadIds: Set<String>) {
+        if (downloadIds.isEmpty()) return
+        launchTrackedAction {
+            val moved = runCatching {
+                executeWatchedCleanup(
+                    profileId = profileId,
+                    downloadIds = downloadIds,
+                    store = store,
+                    isWatched = { item ->
+                        WatchProgressRepository.ensureLoaded()
+                        WatchedRepository.ensureLoaded()
+                        item.watchStatus(WatchProgressRepository.uiState.value).isWatched
+                    },
+                )
+            }.getOrDefault(0)
+            if (moved > 0) {
+                val toastPlural = if (usesUndoableSystemTrash) {
+                    Res.plurals.downloads_cleanup_moved_toast
+                } else {
+                    Res.plurals.downloads_cleanup_held_toast
+                }
+                NuvioToastController.show(getPluralString(toastPlural, moved, moved))
+            } else {
+                NuvioToastController.show(getString(Res.string.downloads_auto_delete_failed_toast))
+            }
+        }
+    }
+
+    override fun undoDeletedDownload(profileId: Int, entry: AutoDownloadDeleted) {
+        launchTrackedAction {
+            val result = runCatching { undoDeletedWatchedDownload(profileId, entry, store) }
+                .getOrDefault(UndoTrashResult.NotRestored)
+            val label = entry.restorableItem?.nameForLabels() ?: entry.title
+            when (result) {
+                UndoTrashResult.Restored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_restored_toast, label))
+                UndoTrashResult.PartiallyRestored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_subtitles_not_restored_toast, label))
+                UndoTrashResult.FileGone ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_file_gone_toast))
+                UndoTrashResult.NotReachable ->
+                    NuvioToastController.show(getString(Res.string.downloads_auto_delete_not_connected_toast))
+                UndoTrashResult.TargetTaken, UndoTrashResult.NotRestored ->
+                    NuvioToastController.show(getString(Res.string.downloads_undo_failed_toast))
+            }
         }
     }
 
@@ -497,9 +637,22 @@ internal object AutoDownloads : AutoDownloadController {
         return job
     }
 
-    private suspend fun checkSafely(ruleKey: String? = null, ignoreWaiting: Boolean = false) {
+    private suspend fun checkSafely(
+        ruleKey: String? = null,
+        ignoreWaiting: Boolean = false,
+        allowMakeRoomRetry: Boolean = true,
+    ) {
         try {
             engine.runCheck(ruleKey, ignoreWaiting)
+            if (allowMakeRoomRetry) {
+                val profileId = store.profileId()
+                if (store.isMakeRoomEnabled(profileId) && engine.statuses.value.values.contains(AutoDownloadStatus.StorageLimitReached)) {
+                    val moved = runCatching { makeRoom.runIfNeeded(profileId) }.getOrDefault(0)
+                    if (moved > 0) {
+                        engine.runCheck(ruleKey, ignoreWaiting)
+                    }
+                }
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {

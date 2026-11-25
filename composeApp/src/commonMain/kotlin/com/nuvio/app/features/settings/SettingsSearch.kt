@@ -248,6 +248,22 @@ internal fun settingsSearchEntries(
             pageLabel = playbackPage,
             section = playbackPage,
         )
+        addRow(
+            page = SettingsPage.Playback,
+            key = "playback-free-space-floor",
+            title = stringResource(Res.string.settings_free_space_floor_title),
+            description = stringResource(Res.string.settings_free_space_floor_description),
+            pageLabel = playbackPage,
+            section = playbackPage,
+        )
+        addRow(
+            page = SettingsPage.Playback,
+            key = "playback-make-room-automatically",
+            title = stringResource(Res.string.settings_make_room_title),
+            description = stringResource(Res.string.settings_make_room_description),
+            pageLabel = playbackPage,
+            section = playbackPage,
+        )
     }
     addPage(
         page = SettingsPage.Advanced,
@@ -695,6 +711,7 @@ internal fun settingsSearchEntries(
             add(PlaybackSearchRow("download-audio-language", stringResource(Res.string.downloads_season_audio_language)))
             add(PlaybackSearchRow("when-i-press-play", stringResource(Res.string.settings_preferences_play_heading), stringResource(Res.string.settings_preferences_play_best)))
             if (isDesktop && AppFeaturePolicy.downloadsEnabled) {
+                add(PlaybackSearchRow("total-download-storage-limit", stringResource(Res.string.downloads_total_storage_limit), stringResource(Res.string.downloads_total_storage_limit_description)))
                 add(PlaybackSearchRow("auto-download-storage-limit", stringResource(Res.string.downloads_auto_storage_limit), stringResource(Res.string.downloads_auto_storage_limit_description)))
             }
         },
