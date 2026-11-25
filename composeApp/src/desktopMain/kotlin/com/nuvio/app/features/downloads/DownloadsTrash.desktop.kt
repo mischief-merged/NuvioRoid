@@ -170,12 +170,22 @@ internal class DesktopDownloadsTrash(
      * downloads folder. A link is refused and never followed. Nothing is deleted. True when it is out.
      */
     fun moveToTrash(path: Path): Boolean = synchronized(this) {
-        if (Files.isSymbolicLink(path) || !Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return false
+        // Refuse a linked parent too, even when it points back inside a registered folder.
+        if (path.hasLinkedComponent() ||
+            !Files.exists(path, LinkOption.NOFOLLOW_LINKS)
+        ) return false
         val real = runCatching { path.parent.toRealPath().resolve(path.fileName) }.getOrNull() ?: return false
         val root = roots().firstOrNull { real.startsWith(it) && real != it } ?: return false
         if (real.startsWith(root.resolve(HoldingFolderName))) return false
+        val key = DownloadMover.identityOf(real) ?: return false
         val trash = systemTrash
-        if (trash != null) return trash(real.toFile()) && !Files.exists(real, LinkOption.NOFOLLOW_LINKS)
+        if (trash != null && runCatching { trash(real.toFile()) }.getOrDefault(false) &&
+            !Files.exists(real, LinkOption.NOFOLLOW_LINKS)
+        ) return true
+        // Trash can be supported but unavailable now. Hold only the same file we offered it.
+        if (!Files.exists(real, LinkOption.NOFOLLOW_LINKS) || real.hasLinkedComponent() ||
+            DownloadMover.identityOf(real) != key
+        ) return false
         return runCatching { hold(root, real) }.isSuccess
     }
 
@@ -264,13 +274,16 @@ internal class DesktopDownloadsTrash(
         Files.write(index, entries.map { (heldAt, name) -> "$heldAt\t$name" })
     }
 
+    private fun Path.hasLinkedComponent(): Boolean =
+        generateSequence(toAbsolutePath()) { it.parent }.any { Files.isSymbolicLink(it) }
+
     private fun Path.isRegularFileInside(root: Path): Boolean =
-        !Files.isSymbolicLink(this) &&
+        !hasLinkedComponent() &&
             Files.isRegularFile(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 
     private fun Path.isDirectoryInside(root: Path): Boolean =
-        !Files.isSymbolicLink(this) &&
+        !hasLinkedComponent() &&
             Files.isDirectory(this, LinkOption.NOFOLLOW_LINKS) &&
             runCatching { toRealPath().parent == root }.getOrDefault(false)
 

@@ -15,6 +15,7 @@ import kotlin.test.assertTrue
  */
 class DurablePublishTest {
     private val dir = Files.createTempDirectory("nuvio-publish").toRealPath()
+    private val trash = DesktopDownloadsTrash({ dir }, systemTrash = null)
 
     @AfterTest
     fun clean_up() {
@@ -26,7 +27,7 @@ class DurablePublishTest {
     @Test fun the_published_address_is_saved_before_the_partial_name_is_removed() {
         val part = part("every byte")
         var saves = 0
-        val published = publishDurably(part, dir.resolve("film.mp4"), flushFolder = { true }, beforeRemovingPartial = { path ->
+        val published = publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { true }, beforeRemovingPartial = { path ->
             saves++
             assertTrue(part.exists())
             assertEquals("every byte", Files.readString(path))
@@ -40,7 +41,7 @@ class DurablePublishTest {
     @Test fun an_unsaved_published_address_keeps_both_files_intact() {
         val part = part("every byte")
         assertFailsWith<DownloadNotDurable> {
-            publishDurably(part, dir.resolve("film.mp4"), flushFolder = { true }, beforeRemovingPartial = { false })
+            publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { true }, beforeRemovingPartial = { false })
         }
         assertEquals("every byte", Files.readString(part))
         assertEquals("every byte", Files.readString(dir.resolve("film.mp4")))
@@ -51,7 +52,7 @@ class DurablePublishTest {
         val part = part("the film")
         val events = mutableListOf<String>()
 
-        val published = publishDurably(part, dir.resolve("film.mp4"), flushFolder = { events += "flush ${part.exists()}"; true })
+        val published = publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { events += "flush ${part.exists()}"; true })
 
         assertEquals(dir.resolve("film.mp4"), published)
         assertEquals("the film", Files.readString(published))
@@ -64,9 +65,9 @@ class DurablePublishTest {
     fun a_folder_that_cannot_be_flushed_keeps_the_partial_and_leaves_no_final_name() {
         val part = part("the film")
 
-        assertFailsWith<DownloadNotDurable> { publishDurably(part, dir.resolve("film.mp4"), flushFolder = { false }) }
+        assertFailsWith<DownloadNotDurable> { publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { false }) }
         assertFailsWith<DownloadNotDurable> {
-            publishDurably(part, dir.resolve("film.mp4"), flushFolder = { false }, link = { _, _ -> throw UnsupportedOperationException() })
+            publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { false }, link = { _, _ -> throw UnsupportedOperationException() })
         }
 
         assertEquals("the film", Files.readString(part))
@@ -79,7 +80,7 @@ class DurablePublishTest {
         repeat(3) {
             assertFailsWith<java.io.IOException> {
                 publishDurably(
-                    part, dir.resolve("film.mp4"), flushFolder = { true },
+                    part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { true },
                     link = { _, _ -> throw UnsupportedOperationException() },
                     copy = { _, out -> out.write(java.nio.ByteBuffer.wrap("half".toByteArray())); throw java.io.IOException("disk error") },
                 )
@@ -87,7 +88,7 @@ class DurablePublishTest {
         }
         assertEquals(listOf("film.mp4.part"), Files.list(dir).use { s -> s.map { it.fileName.toString() }.toList() })
 
-        val published = publishDurably(part, dir.resolve("film.mp4"), flushFolder = { true }, link = { _, _ -> throw UnsupportedOperationException() })
+        val published = publishDurably(part, dir.resolve("film.mp4"), retirePartial = trash::moveToTrash, flushFolder = { true }, link = { _, _ -> throw UnsupportedOperationException() })
         assertEquals("the film", Files.readString(published))
         assertTrue(!part.exists())
     }
@@ -95,7 +96,7 @@ class DurablePublishTest {
     @Test
     fun an_existing_file_at_the_final_name_is_never_replaced() {
         val existing = dir.resolve("film.mp4").also { Files.writeString(it, "someone's") }
-        val published = publishDurably(part("new"), existing, flushFolder = { true })
+        val published = publishDurably(part("new"), existing, retirePartial = trash::moveToTrash, flushFolder = { true })
 
         assertEquals(dir.resolve("film (2).mp4"), published)
         assertEquals("someone's", Files.readString(existing))
