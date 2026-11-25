@@ -96,7 +96,7 @@ internal class MakeRoomAutomatically(
         for (index in candidates.indices) {
             if (!store.isMakeRoomEnabled(profileId) || !usesSystemTrash()) break
             val remaining = candidates.subList(index, candidates.size)
-            val need = evaluateRoomNeeded(remaining)
+            val need = evaluateRoomNeeded(remaining, alreadyMovedAny = movedCount > 0)
             if (!need.needAll && !need.needAuto) break
 
             val candidate = candidates[index]
@@ -152,7 +152,10 @@ internal class MakeRoomAutomatically(
         val needAuto: Boolean,
     )
 
-    private fun evaluateRoomNeeded(remainingCandidates: List<CleanableWatchedDownload>): RoomNeed {
+    private fun evaluateRoomNeeded(
+        remainingCandidates: List<CleanableWatchedDownload>,
+        alreadyMovedAny: Boolean = false,
+    ): RoomNeed {
         val totalLimit = totalStorageLimitBytes()
         val autoLimit = autoStorageLimitBytes()
         if (totalLimit == null && autoLimit == null) return RoomNeed(needAll = false, needAuto = false)
@@ -209,14 +212,16 @@ internal class MakeRoomAutomatically(
             }
         }
 
+        val minAllAfterCleanup = (usedAll - freeableAll).coerceAtLeast(0L)
+        val minAutoAfterCleanup = (onDiskOrRunningAuto - freeableAuto).coerceAtLeast(0L)
         val needAll = totalLimit != null && freeableAll > 0L && (
-            usedAll > totalLimit ||
-                (ruleWaiting && usedAll >= totalLimit) ||
+            (usedAll > totalLimit && minAllAfterCleanup <= totalLimit) ||
+                (!alreadyMovedAny && ruleWaiting && usedAll >= totalLimit && minAllAfterCleanup < totalLimit) ||
                 waitingNeedsAll
             )
         val needAuto = autoLimit != null && freeableAuto > 0L && (
-            onDiskOrRunningAuto > autoLimit ||
-                (ruleWaiting && onDiskOrRunningAuto >= autoLimit) ||
+            (onDiskOrRunningAuto > autoLimit && minAutoAfterCleanup <= autoLimit) ||
+                (!alreadyMovedAny && ruleWaiting && onDiskOrRunningAuto >= autoLimit && minAutoAfterCleanup < autoLimit) ||
                 waitingNeedsAuto
             )
         return RoomNeed(needAll = needAll, needAuto = needAuto)

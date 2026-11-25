@@ -90,6 +90,8 @@ class MakeRoomAutomaticallyTest {
 
         override val usesSystemTrash: Boolean get() = trash.usesSystemTrash
 
+        override val usesUndoableSystemTrash: Boolean get() = trash.usesUndoableSystemTrash
+
         override fun trashFile(localFileUri: String): Boolean = trash.moveAway(localFileUri)
 
         override fun trashWatchedFile(localFileUri: String, stillWanted: () -> Boolean): AutoDownloadRemovalResult =
@@ -248,7 +250,7 @@ class MakeRoomAutomaticallyTest {
         isPlaying = isPlaying,
         isConnected = backend::isConnected,
         isBusyOrMoving = isBusyOrMoving,
-        usesSystemTrash = { backend.usesSystemTrash },
+        usesSystemTrash = { backend.usesUndoableSystemTrash },
         hasRuleWaitingForStorage = hasRuleWaitingForStorage,
         nowEpochMs = { now },
     )
@@ -706,6 +708,113 @@ class MakeRoomAutomaticallyTest {
             ProfileRepository.setActiveProfileIdForTest(originalProfile)
             DownloadsRepository.onProfileChanged()
         }
+    }
+
+    @Test
+    fun does_not_evict_watched_files_when_protected_files_alone_exceed_limit_or_over_evict_on_stale_rule_flag() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+        val rule = testRule(showId = "tt-protected-over")
+        store.upsert(profile, rule)
+        assertTrue(store.setMakeRoomAutomatically(profile, true))
+
+        // 1. Protected unwatched files alone exceed totalLimit (1,200 > 1,000): cleanable watched files (300) cannot
+        // bring usage under 1,000, so MakeRoom must keep them untouched instead of wiping all watched downloads.
+        val (unwatchedBigFile, unwatchedBig) = movieOnDisk("m-unwatched-big", "Unwatched Big", 1_200L)
+        val (watchedSmallFile, watchedSmall) = movieOnDisk("m-watched-small", "Watched Small", 300L)
+
+        totalLimitBytes = 1_000L
+        autoLimitBytes = null
+        backend.payload = DownloadsCodec.encode(listOf(unwatchedBig, watchedSmall), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        val watchedIds = mutableSetOf("m-watched-small")
+        val watchedTimes = mutableMapOf("m-watched-small" to now - 30 * dayMs)
+        val runner = makeRoomRunner(
+            store = store,
+            watchStatusOf = { item ->
+                DownloadWatchStatus(
+                    isWatched = item.id in watchedIds,
+                    watchedAtEpochMs = watchedTimes[item.id],
+                )
+            },
+            hasRuleWaitingForStorage = { true },
+        )
+
+        assertEquals(0, runner.runOnce(profile), "watched files must not be trashed when protected files alone exceed total limit")
+        assertTrue(unwatchedBigFile.exists())
+        assertTrue(watchedSmallFile.exists())
+        assertTrue(store.recentlyDeleted.value.isEmpty())
+
+        // Same invariant for automatic-only limit: protected unwatched auto episode (1,200) > autoLimit (1,000).
+        val epUnwatchedFile = downloadsDir.resolve("ep-unwatched-big.mkv").also { it.writeText("auto-unwatched") }
+        val epWatchedFile = downloadsDir.resolve("ep-watched-small.mkv").also { it.writeText("auto-watched") }
+        val epUnwatched = testDownload(1, DownloadStatus.Completed, showId = "tt-protected-over", ruleKey = rule.key, localFileUri = epUnwatchedFile.toUri().toString(), id = "ep-unwatched-big")
+            .copy(fileName = "ep-unwatched-big.mkv", downloadedBytes = 1_200L, totalBytes = 1_200L)
+        val epWatched = testDownload(2, DownloadStatus.Completed, showId = "tt-protected-over", ruleKey = rule.key, localFileUri = epWatchedFile.toUri().toString(), id = "ep-watched-small")
+            .copy(fileName = "ep-watched-small.mkv", downloadedBytes = 300L, totalBytes = 300L)
+        watchedIds += "ep-watched-small"
+        watchedTimes["ep-watched-small"] = now - 25 * dayMs
+
+        totalLimitBytes = null
+        autoLimitBytes = 1_000L
+        backend.payload = DownloadsCodec.encode(listOf(epUnwatched, epWatched), null, 2L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(0, runner.runOnce(profile), "watched auto files must not be trashed when unwatched auto files alone exceed auto limit")
+        assertTrue(epWatchedFile.exists())
+
+        // 2. When usage is at the limit (600 unwatched + 200 watched1 + 200 watched2 = 1,000) with a 200 B waiter and
+        // a stale ruleWaiting flag, moving watched1 starts the waiter (back to 1,000) and must NOT evict watched2.
+        val (unwatchedBaseFile, unwatchedBase) = movieOnDisk("m-base", "Base", 600L)
+        val (watchedOldFile, watchedOld) = movieOnDisk("m-w1", "Watched Oldest", 200L)
+        val (watchedNewFile, watchedNew) = movieOnDisk("m-w2", "Watched Newer", 200L)
+        val waiter = testDownload(3, DownloadStatus.Paused, showId = "tt-protected-over", ruleKey = rule.key, localFileUri = null, id = "ep-wait-200")
+            .copy(
+                fileName = "ep-wait-200.mkv",
+                downloadedBytes = 0L,
+                totalBytes = 200L,
+                waitingSizeBytes = 200L,
+                autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+                createdAtEpochMs = 5L,
+            )
+        watchedIds.apply {
+            clear()
+            add("m-w1")
+            add("m-w2")
+        }
+        watchedTimes["m-w1"] = now - 40 * dayMs
+        watchedTimes["m-w2"] = now - 10 * dayMs
+
+        totalLimitBytes = 1_000L
+        autoLimitBytes = null
+        startedIds.clear()
+        backend.payload = DownloadsCodec.encode(listOf(unwatchedBase, watchedOld, watchedNew, waiter), null, 3L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        assertEquals(1, runner.runOnce(profile))
+        assertTrue(unwatchedBaseFile.exists())
+        assertFalse(watchedOldFile.exists(), "oldest watched file should be moved to fit the 200 B waiter")
+        assertTrue(watchedNewFile.exists(), "second watched file must not be evicted by a stale rule flag once waiter starts")
+        assertEquals(listOf("ep-wait-200"), startedIds)
+
+        // 3. MakeRoom requires a restorable Trash destination: if system Trash returns Moved(null), it rolls back cleanly.
+        trash = DesktopDownloadsTrash(
+            downloadsDir = { downloadsDir },
+            systemTrash = null,
+            nowEpochMs = { now },
+            systemTrashWithResult = { source ->
+                Files.move(source, trashDir.resolve("no-undo-${source.fileName}"))
+                SystemTrashOutcome.Moved(null)
+            },
+        )
+        totalLimitBytes = 700L
+        assertEquals(0, runner.runOnce(profile))
+        assertEquals("video-m-w2", watchedNewFile.readText(), "MakeRoom must roll back via hard link when Trash returns no destination path")
     }
 }
 

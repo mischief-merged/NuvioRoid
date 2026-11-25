@@ -231,7 +231,7 @@ internal object AutoDownloads : AutoDownloadController {
         isConnected = DownloadsRepository.backend::isConnected,
         isBusyOrMoving = DownloadsRepository::isBusyOrAway,
         usesSystemTrash = { DownloadsRepository.usesUndoableSystemTrash },
-        hasRuleWaitingForStorage = { engine.statuses.value.values.contains(AutoDownloadStatus.StorageLimitReached) },
+        hasRuleWaitingForStorage = { engine.hasUnqueuedRuleWaitingForStorage(store.profileId()) },
     )
 
     val isAvailable: Boolean get() = isDesktop && AppFeaturePolicy.downloadsEnabled

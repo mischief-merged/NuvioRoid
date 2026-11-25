@@ -622,6 +622,171 @@ class TotalDownloadStorageLimitTest {
         assertEquals(AutoDownloadStop.TotalStorageLimit, item(4).autoDownloadStop)
         assertEquals(3, transfers.size, "Pausing a single download must never start waiting downloads")
     }
+
+    @Test
+    fun rule_check_and_manual_resume_preserve_waiting_size_without_starting_or_failing_unfitting_waiter() = runBlocking {
+        val payloads = MemoryAutoDownloadPayloads()
+        val profile = 1
+        val store = AutoDownloadStore(payloads) { profile }
+        val rule = testRule(showId = showId, keepCount = 2)
+        store.upsert(profile, rule)
+        assertTrue(store.setTotalStorageLimit(profile, 1))
+        limits.totalLimitBytes = 1L * BytesPerGigabyte
+        limits.autoLimitBytes = null
+
+        val existingCompleted = DownloadItem(
+            id = "manual-700mb",
+            contentType = "movie",
+            parentMetaId = "tt-manual",
+            parentMetaType = "movie",
+            videoId = "tt-manual",
+            title = "Existing Movie",
+            streamTitle = "1080p",
+            providerName = "A",
+            sourceUrl = "https://example.com/existing.mp4",
+            localFileUri = "file:/downloads/existing.mp4",
+            fileName = "existing.mp4",
+            status = DownloadStatus.Completed,
+            downloadedBytes = 700_000_000L,
+            totalBytes = 700_000_000L,
+            framesCheck = DownloadFramesCheck.Passed,
+            createdAtEpochMs = 1L,
+            updatedAtEpochMs = 1L,
+        )
+        // Waiting automatic episode has no totalBytes or expectedSizeBytes — only waitingSizeBytes = 500 MB from its earlier limit stop.
+        val waitingAuto = DownloadItem(
+            id = "auto-wait-500mb",
+            contentType = "series",
+            parentMetaId = showId,
+            parentMetaType = "series",
+            videoId = "$showId:1:1",
+            title = "Show",
+            seasonNumber = 1,
+            episodeNumber = 1,
+            streamTitle = "1080p",
+            providerName = "A",
+            sourceUrl = "https://example.com/ep1.mp4",
+            fileName = "ep1.mp4",
+            autoDownloadRuleKey = rule.key,
+            status = DownloadStatus.Paused,
+            downloadedBytes = 0L,
+            totalBytes = null,
+            expectedSizeBytes = null,
+            waitingSizeBytes = 500_000_000L,
+            autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+            createdAtEpochMs = 2L,
+            updatedAtEpochMs = 2L,
+        )
+
+        backend.payload = DownloadsCodec.encode(listOf(existingCompleted, waitingAuto), null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+        transfers.clear()
+
+        val engine = AutoDownloadEngine(
+            store = store,
+            loadEpisodes = { listOf(testEpisode(1)) },
+            isWatched = { _, _ -> false },
+            downloads = { DownloadsRepository.uiState.value.items },
+            seasonDefaults = { SeasonDownloadDefaults() },
+            startBatch = { SeasonBatchStart.Started },
+            cancelBatch = { _, _ -> },
+            nowEpochMs = { 1_000L },
+            autoDownloadBytes = DownloadsRepository::autoDownloadBytes,
+            allDownloadBytes = DownloadsRepository::allDownloadBytes,
+            resumeDownload = DownloadsRepository::resumeDownload,
+        )
+
+        // 1. Even though allDownloadBytes() (700 MB) < totalLimit (1 GB), 700 MB + 500 MB > 1 GB:
+        // engine.runCheck() must NOT start the transfer or drop waitingSizeBytes.
+        engine.runCheck()
+        val afterCheck = DownloadsRepository.uiState.value.items.first { it.id == "auto-wait-500mb" }
+        assertEquals(DownloadStatus.Paused, afterCheck.status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, afterCheck.autoDownloadStop)
+        assertEquals(500_000_000L, afterCheck.waitingSizeBytes)
+        assertEquals(0, transfers.size, "rule check must not start a waiter that still exceeds remaining room")
+        assertEquals(AutoDownloadStatus.StorageLimitReached, engine.statuses.value[rule.key])
+
+        // 2. Manual resumeDownload while still over limit also preserves waitingSizeBytes and re-parks without touching network.
+        DownloadsRepository.resumeDownload("auto-wait-500mb")
+        val afterManualResume = DownloadsRepository.uiState.value.items.first { it.id == "auto-wait-500mb" }
+        assertEquals(DownloadStatus.Paused, afterManualResume.status)
+        assertEquals(AutoDownloadStop.TotalStorageLimit, afterManualResume.autoDownloadStop)
+        assertEquals(500_000_000L, afterManualResume.waitingSizeBytes)
+        assertEquals(0, transfers.size, "manual resume while still over total limit must never open a transfer that could fail offline")
+
+        // 3. Once the 700 MB file is removed (0 + 500 MB <= 1 GB), engine.runCheck() resumes the waiter cleanly with its 500 MB reservation.
+        assertEquals(DownloadDeleteResult.Removed, DownloadsRepository.deleteDownload("manual-700mb"))
+        transfers.clear()
+        // Re-park briefly to verify engine.runCheck itself resumes when fitting:
+        val reparked = DownloadsRepository.uiState.value.items.first { it.id == "auto-wait-500mb" }.copy(
+            status = DownloadStatus.Paused,
+            autoDownloadStop = AutoDownloadStop.TotalStorageLimit,
+            waitingSizeBytes = 500_000_000L,
+        )
+        backend.payload = DownloadsCodec.encode(listOf(reparked), null, 2L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        engine.runCheck()
+        val resumed = DownloadsRepository.uiState.value.items.first { it.id == "auto-wait-500mb" }
+        assertEquals(DownloadStatus.Downloading, resumed.status)
+        assertEquals(500_000_000L, DownloadsRepository.allDownloadBytes())
+        assertEquals(1, transfers.size)
+    }
+
+    @Test
+    fun progress_callbacks_hold_unsized_transfers_on_total_limit_and_floor_even_when_platform_ignores_transfer_limits() {
+        val realHold = DownloadsRepository.freeSpaceHold
+        val activeProfile = com.nuvio.app.features.profiles.ProfileRepository.activeProfileId
+        val hold = FreeSpaceHold(
+            loadFloorGb = { null },
+            saveFloorGb = { _, _ -> },
+            activeProfileId = { com.nuvio.app.features.profiles.ProfileRepository.activeProfileId },
+        )
+        DownloadsRepository.freeSpaceHold = hold
+        try {
+            // 1. Automatic unsized download receives a non-null request.limits, and platform only calls onProgress (like mobile):
+            // crossing totalLimitBytes pauses cleanly with TotalStorageLimit and keeps partial bytes.
+            limits.totalLimitBytes = 1_000L
+            limits.autoLimitBytes = 5_000L
+            enqueueEpisode(1, automatic = true)
+            val limitTransfer = transfers.last()
+            assertNotNull(limitTransfer.request.limits)
+
+            limitTransfer.onProgress(600L, null)
+            assertEquals(DownloadStatus.Downloading, item(1).status)
+
+            limitTransfer.onProgress(1_100L, null)
+            assertEquals(DownloadStatus.Paused, item(1).status)
+            assertEquals(AutoDownloadStop.TotalStorageLimit, item(1).autoDownloadStop)
+            assertEquals(1_100L, item(1).downloadedBytes)
+            assertEquals(1_100L, item(1).waitingSizeBytes)
+            assertTrue(item(1).id in backend.cancelledIds)
+            assertEquals(0, backend.removedPartials)
+
+            // 2. Download with free-space floor active holds cleanly inside onProgress when announced remaining bytes
+            // would push 6 GB free space below the 5 GB floor (6 GB - 3 GB remaining = 3 GB < 5 GB), without calling request.limits.
+            limits.totalLimitBytes = null
+            hold.reportLocationFreeBytes(mapOf(DefaultFloorLocationId to 6L * BytesPerGigabyte))
+            assertTrue(hold.setFloorGb(5, profileId = activeProfile))
+
+            enqueueEpisode(2, automatic = true)
+            val floorTransfer = transfers.last()
+            assertNotNull(floorTransfer.request.limits)
+            assertEquals(DownloadStatus.Downloading, item(2).status)
+
+            floorTransfer.onProgress(1L * BytesPerGigabyte, 4L * BytesPerGigabyte)
+            assertEquals(DownloadStatus.Paused, item(2).status)
+            assertTrue(item(2).pausedByFreeSpace)
+            assertEquals(1L * BytesPerGigabyte, item(2).downloadedBytes)
+            assertEquals(4L * BytesPerGigabyte, item(2).waitingSizeBytes)
+            assertTrue(item(2).id in backend.cancelledIds)
+            assertEquals(0, backend.removedPartials)
+        } finally {
+            DownloadsRepository.freeSpaceHold = realHold
+        }
+    }
 }
 
 class DesktopTotalStorageLimitTransferTest : TrustedLocalServerTest() {

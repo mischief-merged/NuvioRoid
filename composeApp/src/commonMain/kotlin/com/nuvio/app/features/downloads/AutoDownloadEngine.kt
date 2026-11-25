@@ -313,6 +313,34 @@ internal class AutoDownloadEngine(
         )
     }
 
+    /**
+     * True when [profileId] has a rule with due unqueued episodes from its last check that cannot
+     * start a batch because a storage limit is currently reached.
+     */
+    fun hasUnqueuedRuleWaitingForStorage(profileId: Int): Boolean {
+        if (synchronized(lock) { stateProfileId != profileId }) return false
+        if (!storageLimitReached()) return false
+        val items = downloads()
+        val pendingRemovals = store.removals(profileId).mapTo(mutableSetOf()) { it.downloadId }
+        val now = nowEpochMs()
+        return store.currentRules().any { rule ->
+            if (locationAway(rule)) return@any false
+            val batchRunning = synchronized(lock) { runningBatches.values.any { it.autoDownloadRuleKey == rule.key } }
+            if (batchRunning) return@any false
+            val episodes = knownEpisodes(rule.key) ?: return@any false
+            val plan = planAutoDownload(
+                rule = rule,
+                released = episodes,
+                isWatched = { isWatched(rule, it) },
+                downloads = items,
+                pendingRemovalDownloadIds = pendingRemovals,
+            )
+            plan.toDownload.any { episode ->
+                (retryFor(rule.key, episode)?.notBeforeEpochMs ?: 0L) <= now
+            }
+        }
+    }
+
     private fun storageLimitReached(): Boolean = autoStorageLimitReached() || totalStorageLimitReached()
 
     private fun autoStorageLimitReached(): Boolean {
@@ -325,13 +353,49 @@ internal class AutoDownloadEngine(
         return allDownloadBytes() >= limit
     }
 
-    /** Resumes the rule's downloads that a limit paused, unless the storage limit is still reached. */
+    private fun totalStorageLimitBlocks(item: DownloadItem): Boolean {
+        val limit = store.totalStorageLimitBytes() ?: return false
+        val retained = item.supersededPartials.sumOf { it.bytes.coerceAtLeast(0L) }
+        val usedWithout = (allDownloadBytes() - item.downloadedBytes).coerceAtLeast(retained)
+        val required = maxOf(
+            item.totalBytes ?: item.waitingSizeBytes ?: item.expectedSizeBytes ?: 0L,
+            item.downloadedBytes,
+        )
+        return usedWithout >= limit || usedWithout + required > limit
+    }
+
+    private fun autoStorageLimitBlocks(item: DownloadItem): Boolean {
+        val limit = store.storageLimitBytes() ?: return false
+        val retained = item.supersededPartials.sumOf { it.bytes.coerceAtLeast(0L) }
+        val usedWithout = (autoDownloadBytes() - item.downloadedBytes).coerceAtLeast(retained)
+        val required = maxOf(
+            item.totalBytes ?: item.waitingSizeBytes ?: 0L,
+            item.downloadedBytes,
+        )
+        return usedWithout >= limit || usedWithout + required > limit
+    }
+
+    /** Resumes the rule's downloads that a limit paused once they fit within active storage limits. */
     private fun resumeStoppedDownloads(ruleKey: String, items: List<DownloadItem>) {
         items
-            .filter { it.autoDownloadRuleKey == ruleKey && it.status == DownloadStatus.Paused && it.autoDownloadStop != null }
+            .filter {
+                it.autoDownloadRuleKey == ruleKey &&
+                    it.status == DownloadStatus.Paused &&
+                    it.autoDownloadStop != null &&
+                    !it.pausedByFolder &&
+                    !it.pausedByConnection &&
+                    !it.pausedByFreeSpace
+            }
+            .sortedWith(compareBy<DownloadItem> { it.createdAtEpochMs }.thenBy { it.id })
             .forEach { item ->
-                if (item.autoDownloadStop == AutoDownloadStop.StorageLimit && storageLimitReached()) return@forEach
-                if (item.autoDownloadStop == AutoDownloadStop.TotalStorageLimit && totalStorageLimitReached()) return@forEach
+                when (item.autoDownloadStop) {
+                    AutoDownloadStop.StorageLimit,
+                    AutoDownloadStop.TotalStorageLimit -> {
+                        if (totalStorageLimitBlocks(item) || autoStorageLimitBlocks(item)) return@forEach
+                    }
+                    AutoDownloadStop.LowDiskSpace -> Unit
+                    null -> return@forEach
+                }
                 resumeDownload(item.id)
             }
     }

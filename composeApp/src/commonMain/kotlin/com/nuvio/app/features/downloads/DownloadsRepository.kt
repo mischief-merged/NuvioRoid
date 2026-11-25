@@ -1227,7 +1227,7 @@ object DownloadsRepository {
     }
 
     /** The caller already holds the state lock. This does not load the list and does not take that lock. */
-    private fun resumeDownloadLocked(downloadId: String, keepWaitingSize: Boolean = false) {
+    private fun resumeDownloadLocked(downloadId: String) {
         val item = _uiState.value.items.firstOrNull { it.id == downloadId }?.let(::normalizeCompletedLocalFileUri) ?: return
         if (item.status != DownloadStatus.Paused && item.status != DownloadStatus.Failed) return
 
@@ -1235,7 +1235,7 @@ object DownloadsRepository {
             status = DownloadStatus.Downloading,
             errorMessage = null,
             autoDownloadStop = null,
-            waitingSizeBytes = item.waitingSizeBytes.takeIf { keepWaitingSize },
+            waitingSizeBytes = item.waitingSizeBytes,
             failureKind = null,
             localFileUri = item.localFileUri.takeIf { item.awaitingCheck },
             pausedByFolder = false,
@@ -1429,6 +1429,7 @@ object DownloadsRepository {
 
     /** Whether deleted downloads go to the system Trash. When they do not, the files stay in the holding folder. */
     internal val usesSystemTrash: Boolean get() = backend.usesSystemTrash
+    internal val usesUndoableSystemTrash: Boolean get() = backend.usesUndoableSystemTrash
 
     private fun loadFromDisk() {
         // The caller holds loadLock. The read holds the state lock; the scan below does not, so a pause
@@ -1807,7 +1808,7 @@ object DownloadsRepository {
             }
         _uiState.value.items
             .filter { it.status == DownloadStatus.Paused && it.pausedByFreeSpace && it.canResumeFromFreeSpaceFloor() }
-            .forEach { resumeDownloadLocked(it.id, keepWaitingSize = true) }
+            .forEach { resumeDownloadLocked(it.id) }
         resumeWaitingForStorageLimitLocked()
     }
 
@@ -2041,7 +2042,7 @@ object DownloadsRepository {
                     if (failIfAnnouncedAsPlaceholder(currentItem, totalBytes)) return@ifCurrent
                     val now = DownloadsClock.nowEpochMs()
                     val normalizedBytes = downloadedBytes.coerceAtLeast(0L)
-                    if (!transfer.hasTransferLimits && backend.isConnected(currentItem)) {
+                    if (backend.isConnected(currentItem)) {
                         val totalLimit = autoDownloadLimits.totalStorageLimitBytes()
                         val positiveTotal = totalBytes?.takeIf { it > 0L } ?: currentItem.totalBytes
                         val size = maxOf(positiveTotal ?: 0L, normalizedBytes)
@@ -2939,7 +2940,7 @@ object DownloadsRepository {
                         }
                     }
                     skipped += candidate.id
-                    resumeDownloadLocked(candidate.id, keepWaitingSize = true)
+                    resumeDownloadLocked(candidate.id)
                 }
             } while (resumingWaitingDirty)
         } finally {
@@ -2957,9 +2958,9 @@ object DownloadsRepository {
     private fun transferLimits(item: DownloadItem, transfer: ActiveTransfer): DownloadTransferLimits? {
         val isAutoOrTrip = item.autoDownloadRuleKey != null || item.tripFill
         val limits = autoDownloadLimits
+        val finishing = finishingSteps
         val userFloor = effectiveUserFreeSpaceFloorBytes()
         if (!isAutoOrTrip && limits.totalStorageLimitBytes() == null && userFloor <= 0L) return null
-        transfer.hasTransferLimits = true
         lateinit var guard: DownloadTransferLimits
         guard = DownloadTransferLimits(
             maxAllDownloadsBytes = {
@@ -2991,28 +2992,33 @@ object DownloadsRepository {
             },
             onStopped = { reason ->
                 var blockedByStorage = false
-                ifCurrent(item.id, transfer) {
-                    removeTransfer(item.id)
-                    val refusedBytes = guard.lastRefusedSizeBytes
-                    val stoppedByUserFloor = reason == AutoDownloadStop.LowDiskSpace && guard.lastStoppedByUserFreeSpaceFloor
-                    mutateItem(item.id) { current ->
-                        if (current.status != DownloadStatus.Downloading) return@mutateItem current
-                        val isStorageStop = reason == AutoDownloadStop.TotalStorageLimit || reason == AutoDownloadStop.StorageLimit
-                        if (isStorageStop) blockedByStorage = true
-                        current.copy(
-                            status = DownloadStatus.Paused,
-                            pausedByFreeSpace = if (reason == AutoDownloadStop.LowDiskSpace) stoppedByUserFloor else current.pausedByFreeSpace,
-                            autoDownloadStop = if (stoppedByUserFloor && !isAutoOrTrip) null else reason,
-                            waitingSizeBytes = if (isStorageStop || stoppedByUserFloor) {
-                                refusedBytes ?: current.waitingSizeBytes ?: current.knownRequiredBytes().takeIf { it > 0L }
-                            } else {
-                                null
-                            },
-                            errorMessage = null,
-                            updatedAtEpochMs = DownloadsClock.nowEpochMs(),
-                        )
+                try {
+                    ifCurrent(item.id, transfer) {
+                        removeTransfer(item.id)
+                        val refusedBytes = guard.lastRefusedSizeBytes
+                        val stoppedByUserFloor = reason == AutoDownloadStop.LowDiskSpace && guard.lastStoppedByUserFreeSpaceFloor
+                        mutateItem(item.id) { current ->
+                            if (current.status != DownloadStatus.Downloading) return@mutateItem current
+                            val isStorageStop = reason == AutoDownloadStop.TotalStorageLimit || reason == AutoDownloadStop.StorageLimit
+                            if (isStorageStop) blockedByStorage = true
+                            current.copy(
+                                status = DownloadStatus.Paused,
+                                pausedByFreeSpace = if (reason == AutoDownloadStop.LowDiskSpace) stoppedByUserFloor else current.pausedByFreeSpace,
+                                autoDownloadStop = if (stoppedByUserFloor && !isAutoOrTrip) null else reason,
+                                waitingSizeBytes = if (isStorageStop || stoppedByUserFloor) {
+                                    refusedBytes ?: current.waitingSizeBytes ?: current.knownRequiredBytes().takeIf { it > 0L }
+                                } else {
+                                    null
+                                },
+                                errorMessage = null,
+                                updatedAtEpochMs = DownloadsClock.nowEpochMs(),
+                            )
+                        }
+                        resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
                     }
-                    resumeWaitingForStorageLimitLocked(skipDownloadId = item.id)
+                } finally {
+                    finishing.end(transfer)
+                    transfer.markFinished()
                 }
                 if (blockedByStorage) notifyStorageLimitBlocked()
             },
@@ -3636,10 +3642,6 @@ private class ActiveTransfer {
     /** Set by the platform downloader when the body matched a digest the server sent. */
     @Volatile
     var digestVerified = false
-
-    /** True when the transfer received a [DownloadTransferLimits] guard at start. */
-    @Volatile
-    var hasTransferLimits = false
 
     /** Set once the platform downloader reported the file complete: it is being checked and must not be stopped. */
     @Volatile
