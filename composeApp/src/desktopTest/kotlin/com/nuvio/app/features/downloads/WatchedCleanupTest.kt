@@ -587,6 +587,70 @@ class WatchedCleanupModelAndUndoTest {
             DownloadsRepository.onProfileChanged()
         }
     }
+
+    @Test
+    fun bulk_cleanup_exceeding_twenty_items_preserves_every_undo_entry_including_the_first() {
+        val profile = ProfileRepository.activeProfileId
+        val payloads = MemoryAutoDownloadPayloads()
+        val store = AutoDownloadStore(payloads, nowEpochMs = { now }) { profile }
+
+        // Seed 25 plain history entries first; non-undoable history still caps at 20.
+        (1..25).forEach { ep ->
+            assertTrue(store.recordDeleted(profile, AutoDownloadDeleted("History Show", 1, ep, atEpochMs = now - 2 * dayMs + ep)))
+        }
+        assertEquals(20, store.recentlyDeleted.value.count { !it.canUndo })
+
+        // Clean up 25 watched downloads in a single batch (> MaxRecentlyDeleted = 20).
+        val batchCount = 25
+        val films = (1..batchCount).map { idx ->
+            val path = downloadsDir.resolve("batch-$idx.mkv").also { it.writeText("video-bytes-$idx") }
+            movie("batch-$idx", "Batch Film $idx", 400L + idx, uri = path.toUri().toString())
+                .copy(fileName = "batch-$idx.mkv")
+        }
+        backend.payload = DownloadsCodec.encode(films, null, 1L)
+        DownloadsRepository.clearLocalState()
+        DownloadsRepository.ensureLoaded()
+
+        val moved = executeWatchedCleanup(
+            profileId = profile,
+            downloadIds = films.map { it.id },
+            store = store,
+            isWatched = { true },
+            isPlaying = { false },
+            nowEpochMs = { now },
+        )
+        assertEquals(batchCount, moved)
+
+        // Add more non-undoable history entries over a week later; pending Undo entries must still stay intact.
+        val laterNow = now + 8 * dayMs
+        (26..30).forEach { ep ->
+            assertTrue(store.recordDeleted(profile, AutoDownloadDeleted("Later History", 1, ep, atEpochMs = laterNow + ep)))
+        }
+
+        // Reload from serialized payload to verify StoredAutoDownloads.normalized() preserves all 25 Undo entries.
+        val reloaded = AutoDownloadStore(payloads, nowEpochMs = { laterNow }) { profile }
+        reloaded.currentRules()
+        val storedEntries = reloaded.recentlyDeleted.value
+        val undoEntries = storedEntries.filter { it.canUndo }
+        assertEquals(
+            (1..batchCount).map { "batch-$it" },
+            undoEntries.map { it.downloadId },
+            "every pending Undo record in a >20 batch must survive normalization and later history writes",
+        )
+        assertTrue(storedEntries.count { !it.canUndo } <= AutoDownloadStore.MaxRecentlyDeleted)
+
+        // All 25 pending Undo entries remain visible to the user in recentlyDeletedShown (including the first one).
+        val shown = recentlyDeletedShown(storedEntries, nowEpochMs = laterNow + 100L)
+        assertTrue((1..batchCount).all { idx -> shown.any { it.downloadId == "batch-$idx" && it.canUndo } })
+
+        // Undo the very first download in the batch (batch-1) and verify full file + catalog restoration.
+        val firstEntry = undoEntries.first { it.downloadId == "batch-1" }
+        assertEquals(UndoTrashResult.Restored, undoDeletedWatchedDownload(profile, firstEntry, reloaded))
+        assertEquals("video-bytes-1", downloadsDir.resolve("batch-1.mkv").readText())
+        assertTrue(DownloadsRepository.uiState.value.items.any { it.id == "batch-1" && it.status == DownloadStatus.Completed })
+        assertTrue("batch-1" in reloaded.keptDownloadIds.value)
+        assertEquals((2..batchCount).map { "batch-$it" }, reloaded.recentlyDeleted.value.filter { it.canUndo }.map { it.downloadId })
+    }
 }
 
 @OptIn(ExperimentalTestApi::class)

@@ -235,12 +235,23 @@ private const val MillisPerHour = 3_600_000L
 internal fun removalHoursLeft(dueAtEpochMs: Long, nowEpochMs: Long): Int =
     ((dueAtEpochMs - nowEpochMs + MillisPerHour / 2) / MillisPerHour).coerceAtLeast(0L).toInt()
 
-/** The removed episodes the user is still shown: those of the last week, newest first. */
-internal fun recentlyDeletedShown(entries: List<AutoDownloadDeleted>, nowEpochMs: Long, max: Int = 5): List<AutoDownloadDeleted> =
-    entries
-        .filter { nowEpochMs - it.atEpochMs < AutoDownloadStore.RecentlyDeletedMs }
-        .sortedByDescending { it.atEpochMs }
+/**
+ * The removed downloads shown to the user, newest first: every entry that can still be undone
+ * from the Trash, plus up to [max] non-undoable history entries from the last week.
+ */
+internal fun recentlyDeletedShown(entries: List<AutoDownloadDeleted>, nowEpochMs: Long, max: Int = 5): List<AutoDownloadDeleted> {
+    val keptNonUndo = entries
+        .withIndex()
+        .filter { (_, entry) -> !entry.canUndo && nowEpochMs - entry.atEpochMs < AutoDownloadStore.RecentlyDeletedMs }
+        .sortedWith(compareByDescending<IndexedValue<AutoDownloadDeleted>> { it.value.atEpochMs }.thenByDescending { it.index })
         .take(max)
+        .mapTo(HashSet()) { it.index }
+    return entries
+        .withIndex()
+        .filter { (index, entry) -> entry.canUndo || index in keptNonUndo }
+        .sortedWith(compareByDescending<IndexedValue<AutoDownloadDeleted>> { it.value.atEpochMs }.thenByDescending { it.index })
+        .map { it.value }
+}
 
 /** How many whole days ago [entry] was removed. */
 internal fun daysSinceDeleted(entry: AutoDownloadDeleted, nowEpochMs: Long): Int =

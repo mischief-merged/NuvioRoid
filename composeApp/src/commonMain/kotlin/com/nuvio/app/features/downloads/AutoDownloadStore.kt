@@ -165,11 +165,14 @@ internal class AutoDownloadStore(
     /** The episodes of that profile that were removed after watching, oldest first. */
     val recentlyDeleted: StateFlow<List<AutoDownloadDeleted>> = _recentlyDeleted.asStateFlow()
 
-    /** Notes that [entry] was removed. Entries older than a week are dropped. False when [profileId] is not the active profile. */
+    /** Notes that [entry] was removed. Non-undoable history older than a week is dropped; pending Trash undo entries stay until resolved. False when [profileId] is not the active profile. */
     fun recordDeleted(profileId: Int, entry: AutoDownloadDeleted): Boolean = synchronized(lock) {
         if (ensureLoaded() != profileId) return false
         val cutoff = entry.atEpochMs - RecentlyDeletedMs
-        save(profileId, state.copy(recentlyDeleted = state.recentlyDeleted.filter { it.atEpochMs >= cutoff } + entry))
+        save(
+            profileId,
+            state.copy(recentlyDeleted = state.recentlyDeleted.filter { it.canUndo || it.atEpochMs >= cutoff } + entry),
+        )
         true
     }
 
@@ -628,7 +631,7 @@ internal class AutoDownloadStore(
 
     private fun StoredAutoDownloads.normalized(): StoredAutoDownloads = copy(
         rules = rules.map(AutoDownloadRule::normalized).distinctBy { it.key },
-        recentlyDeleted = recentlyDeleted.takeLast(MaxRecentlyDeleted),
+        recentlyDeleted = trimRecentlyDeleted(recentlyDeleted),
         storageLimitGb = if (storageLimitGb in storageLimitOptionsGb) storageLimitGb else DefaultStorageLimitGb,
         totalStorageLimitGb = if (totalStorageLimitGb in totalStorageLimitOptionsGb) totalStorageLimitGb else null,
         // Changing the setting or a rule drops removals immediately, including before they are due.
@@ -639,6 +642,13 @@ internal class AutoDownloadStore(
             .distinctBy { it.downloadId }
             .filter { it.downloadId in keptDownloadIds && allowsRemoval(it.ruleKey) },
     )
+
+    private fun trimRecentlyDeleted(entries: List<AutoDownloadDeleted>): List<AutoDownloadDeleted> {
+        val nonUndoIndices = entries.indices.filter { !entries[it].canUndo }
+        if (nonUndoIndices.size <= MaxRecentlyDeleted) return entries
+        val droppedNonUndo = nonUndoIndices.dropLast(MaxRecentlyDeleted).toHashSet()
+        return entries.filterIndexed { index, _ -> index !in droppedNonUndo }
+    }
 
     companion object {
         const val DefaultStorageLimitGb = 50
