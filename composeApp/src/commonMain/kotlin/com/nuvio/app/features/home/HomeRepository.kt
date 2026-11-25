@@ -120,6 +120,7 @@ object HomeRepository {
             val desktopContinuations = mutableMapOf<String, DesktopRowContinuation>()
             var heroSourcesPublished = false
             var firstErrorMessage: String? = null
+            var hadFailure = false
 
             // Up to HOME_CATALOG_FETCH_BATCH_SIZE catalogs load at a time, in priority order, and a
             // slot goes to the next catalog as soon as its own one answers. With fixed batches one
@@ -163,9 +164,10 @@ object HomeRepository {
                         }
                     }
                 }
-                if (firstErrorMessage == null) {
-                    val raw = result.exceptionOrNull()?.message
-                    if (raw != null) {
+                if (result.isFailure) {
+                    hadFailure = true
+                    if (firstErrorMessage == null) {
+                        val raw = result.exceptionOrNull()?.message
                         firstErrorMessage = userFacingFailure(raw, getString(Res.string.catalog_load_failed))
                     }
                 }
@@ -199,7 +201,7 @@ object HomeRepository {
             cachedSections = loadedSections.toMap()
             lastErrorMessage = firstErrorMessage
             activeRequestKey = null
-            loadedRequestKey = if (loadedSections.isNotEmpty() || firstErrorMessage == null) requestKey else null
+            loadedRequestKey = if (!hadFailure) requestKey else null
             publishCurrentState(
                 isLoading = false,
                 requestKey = requestKey,
