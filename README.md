@@ -12,7 +12,7 @@
 
 ![Platform](https://img.shields.io/badge/macOS-Apple%20silicon-111111?logo=apple&logoColor=white)
 ![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20fast%20development-8A2BE2)
-![Tests](https://img.shields.io/badge/desktop%20tests-4%2C950-2EA3F2)
+![Tests](https://img.shields.io/badge/desktop%20tests-5%2C066-2EA3F2)
 ![License](https://img.shields.io/badge/license-GPLv3-3DA639)
 ![Based on](https://img.shields.io/badge/based%20on-Nuvio%20Desktop-5B5BD6)
 
@@ -74,7 +74,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** for what changed in each release and what i
 
 ## 📦 Download
 
-**macOS (Apple silicon):** [**Download NuvioRoid 1.1.38.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.38.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
+**macOS (Apple silicon):** [**Download NuvioRoid 1.1.39.1 (alpha)**](https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.39.1) · [all releases](https://github.com/mischief-merged/NuvioRoid/releases)
 
 1. Open the DMG and drag NuvioRoid to Applications.
 2. The build is not signed with an Apple developer certificate, so macOS blocks the first launch. Open it once, then go to System Settings > Privacy & Security and choose "Open Anyway".
@@ -86,7 +86,7 @@ NuvioRoid installs beside the official Nuvio app. It has its own name, icon and 
 
 Alpha software under **fast development**. Expect breaking changes, and do not rely on it as your only media app.
 
-- Built and tested on macOS (Apple silicon). The desktop test suite runs 4,950 tests; the two that fail also fail on upstream without any of these changes.
+- Built and tested on macOS (Apple silicon). The desktop test suite runs 5,066 tests; the two that fail also fail on upstream without any of these changes.
 - Android, iOS, Windows and Linux builds of this fork have not been run.
 - NuvioRoid is a client only. You bring your own sources, as with Nuvio.
 

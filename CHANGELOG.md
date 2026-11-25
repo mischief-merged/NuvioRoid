@@ -6,11 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
-## [1.1.38.1] - 2026-11-23
+## [1.1.39.1] - 2026-11-25
 
 ### Added
 
 - Storage limit for all downloads, with a clean-up list for watched downloads, an optional free-space floor per drive, and an optional make-room mode that moves the oldest watched downloads to the Trash; everything goes to the Trash with Undo (#120) ([#152](https://github.com/mischief-merged/NuvioRoid/pull/152)).
+
+### Changed
+
+- Updated to the latest upstream Nuvio Desktop, adding keyboard and gamepad navigation across the desktop app, a faster home screen and startup, subtitle styling fixes, separate Jellyfin and Emby sign-ins per profile, and JDK 25 packaging ([#150](https://github.com/mischief-merged/NuvioRoid/pull/150)).
+
+### Fixed
+
+- Gamepad focus stays on the chosen source in the player Sources popup instead of jumping to the header, and the archive message now says held files wait 7 days before moving to the Trash (#127) ([#151](https://github.com/mischief-merged/NuvioRoid/pull/151)).
+- Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
+
+## [1.1.38.1] - 2026-11-23
+
+### Added
+
 - Subtitles are ready before playback starts ([#104](https://github.com/mischief-merged/NuvioRoid/pull/104)).
 - Offline first: downloaded copies play without internet and pages keep working offline ([#66](https://github.com/mischief-merged/NuvioRoid/pull/66)).
 - Trip ready: offline hours at a glance and a Fill for my trip button ([#100](https://github.com/mischief-merged/NuvioRoid/pull/100)).
@@ -33,7 +47,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Changed
 
-- Updated to the latest upstream Nuvio Desktop, adding keyboard and gamepad navigation across the desktop app, a faster home screen and startup, subtitle styling fixes, separate Jellyfin and Emby sign-ins per profile, and JDK 25 packaging ([#150](https://github.com/mischief-merged/NuvioRoid/pull/150)).
 - Network security: certificates are verified with the macOS trust store, and add-on and download network rules are tighter ([#72](https://github.com/mischief-merged/NuvioRoid/pull/72)).
 - Clear empty and error states with a working Retry, and accessible player controls ([#74](https://github.com/mischief-merged/NuvioRoid/pull/74)).
 - Downloads screen polish: header icons are easier to see, there is a settings button, and sizes use one GB unit ([#68](https://github.com/mischief-merged/NuvioRoid/pull/68)).
@@ -46,8 +59,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
-- Gamepad focus stays on the chosen source in the player Sources popup instead of jumping to the header, and the archive message now says held files wait 7 days before moving to the Trash (#127) ([#151](https://github.com/mischief-merged/NuvioRoid/pull/151)).
-- Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
 - Downloads that are receiving data no longer say Waiting for the internet after the connection comes back, and the app notices the connection returning on its own (#144) ([#147](https://github.com/mischief-merged/NuvioRoid/pull/147)).
 - Stopping trip queueing now counts the downloads that had already started, and the progress label shows how many are queued (#145) ([#146](https://github.com/mischief-merged/NuvioRoid/pull/146)).
 - Marking a finished download as unwatched, or tapping Keep, now stays in effect when you close the player, so it is no longer scheduled for removal again (#139, #141) ([#143](https://github.com/mischief-merged/NuvioRoid/pull/143)).
@@ -103,6 +114,7 @@ First downloadable alpha build of NuvioRoid for macOS (Apple silicon), based on 
 - Serialised download state updates across threads, saved the downloads list atomically with a fallback copy and tolerant decoding, and resumed or retried interrupted downloads on launch and reconnect ([#4](https://github.com/mischief-merged/NuvioRoid/pull/4)).
 - Showed the "Add Profile" tile and guidance on the first-run profile picker when continuing without an account, with labels and keyboard navigation ([#40](https://github.com/mischief-merged/NuvioRoid/pull/40)).
 
-[Unreleased]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.38.1...HEAD
+[Unreleased]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.39.1...HEAD
+[1.1.39.1]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.38.1...nuvioroid-1.1.39.1
 [1.1.38.1]: https://github.com/mischief-merged/NuvioRoid/compare/nuvioroid-1.1.36.1...nuvioroid-1.1.38.1
 [1.1.36.1]: https://github.com/mischief-merged/NuvioRoid/releases/tag/nuvioroid-1.1.36.1
