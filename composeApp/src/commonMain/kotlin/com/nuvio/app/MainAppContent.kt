@@ -225,6 +225,7 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import com.nuvio.app.features.player.dispatchNavigationBack
 import com.nuvio.app.core.ui.PlatformEscapeShortcut
 import com.nuvio.app.core.ui.dispatchPlatformLocalBack
+import com.nuvio.app.core.ui.hasOpenPlatformModal
 import com.nuvio.app.controller.ControllerFocusEngine
 import com.nuvio.app.controller.ControllerMainOverlay
 import com.nuvio.app.controller.ControllerNavigationHost
@@ -1721,6 +1722,11 @@ internal fun MainAppContent(
 
                 val playbackMode = playerSessionController.activeSession?.mode
                 val fullPlayerOwnsInput = fullPlayerOwnsControllerInput(playbackMode)
+                val canRunShellShortcuts = {
+                    !fullPlayerOwnsInput &&
+                        !ControllerFocusEngine.isModalOverlayActive &&
+                        !hasOpenPlatformModal()
+                }
                 ControllerNavigationHost(
                     currentRoute = currentRoute,
                     selectedTab = selectedTab,
@@ -1731,7 +1737,7 @@ internal fun MainAppContent(
                         true
                     },
                     onBumperLeft = {
-                        if (!fullPlayerOwnsInput && currentRoute is TabsRoute) {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
                             val tabs = AppScreenTab.entries
                             activateTab(tabs[(selectedTab.ordinal - 1 + tabs.size) % tabs.size])
                             true
@@ -1740,7 +1746,7 @@ internal fun MainAppContent(
                         }
                     },
                     onBumperRight = {
-                        if (!fullPlayerOwnsInput && currentRoute is TabsRoute) {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
                             val tabs = AppScreenTab.entries
                             activateTab(tabs[(selectedTab.ordinal + 1) % tabs.size])
                             true
@@ -1749,7 +1755,7 @@ internal fun MainAppContent(
                         }
                     },
                     onSearch = {
-                        if (!fullPlayerOwnsInput && currentRoute is TabsRoute) {
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
                             activateTab(AppScreenTab.Search)
                             searchFocusRequestCount++
                             true
@@ -1758,10 +1764,7 @@ internal fun MainAppContent(
                         }
                     },
                     onOpenNavigation = {
-                        if (fullPlayerOwnsInput) {
-                            false
-                        } else {
-                            ControllerFocusEngine.setNavigationZoneExpanded(true)
+                        if (canRunShellShortcuts() && currentRoute is TabsRoute) {
                             val tabName = when (selectedTab) {
                                 AppScreenTab.Home -> "home"
                                 AppScreenTab.Search -> "search"
@@ -1770,8 +1773,14 @@ internal fun MainAppContent(
                             }
                             // The navigation rail can be a sidebar or the floating top bar depending on
                             // the Desktop Navigation setting; try the top bar first, then the sidebar.
-                            ControllerFocusEngine.requestFocus("top_nav_$tabName", triggerScroll = false) ||
+                            val focused = ControllerFocusEngine.requestFocus("top_nav_$tabName", triggerScroll = false) ||
                                 ControllerFocusEngine.requestFocus("sidebar_$tabName", triggerScroll = false)
+                            if (focused) {
+                                ControllerFocusEngine.setNavigationZoneExpanded(true)
+                            }
+                            focused
+                        } else {
+                            false
                         }
                     },
                     fullPlayerOwnsInput = fullPlayerOwnsInput,

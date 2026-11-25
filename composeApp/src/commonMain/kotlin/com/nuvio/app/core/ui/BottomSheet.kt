@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -60,20 +61,14 @@ fun NuvioModalBottomSheet(
     fullHeight: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    // Sheets are Compose overlays with their own scrollable content. Let Compose own focus while a
-    // sheet is visible: arrow keys then scroll long option lists natively, instead of the spatial
-    // engine moving between registered rows without being able to scroll the sheet.
-    val focusManager = LocalFocusManager.current
-    // Route the desktop arrows/pad into this popup's focus owner while it is visible.
-    DisposableEffect(focusManager) {
-        ComposePopupFocus.push(focusManager)
-        onDispose { ComposePopupFocus.pop(focusManager) }
-    }
-    DisposableEffect(Unit) {
-        val previousDefer = ControllerFocusEngine.deferNavigationToCompose
-        ControllerFocusEngine.deferNavigationToCompose = false
-        ControllerFocusEngine.clearFocus()
-        onDispose { ControllerFocusEngine.deferNavigationToCompose = previousDefer }
+    // Mark this modal sheet as owning input above the current route without altering the route's
+    // own deferNavigationToCompose setting: spatial Overlay action rows work inside the sheet,
+    // while sheets without action rows (or after swapping to a form/rating panel) hand arrows to
+    // the popup's own Compose FocusManager captured inside the sheet content below.
+    val modalOverlayToken = remember { Any() }
+    DisposableEffect(modalOverlayToken) {
+        ControllerFocusEngine.pushModalOverlay(modalOverlayToken)
+        onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
     }
     RegisterControllerHandler(
         key = "nuvio_bottom_sheet",
@@ -87,16 +82,6 @@ fun NuvioModalBottomSheet(
     PlatformBackHandler(enabled = true) {
         onDismissRequest()
     }
-    LaunchedEffect(Unit) {
-        if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
-        delay(220)
-        // Sheets made of action rows are driven by the spatial engine (white ring + bring-into-view);
-        // forms without rows fall back to Compose focus.
-        if (!ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions")) {
-            focusManager.clearFocus(force = true)
-            focusManager.moveFocus(FocusDirection.Next)
-        }
-    }
 
     if (usesNativeNuvioBottomSheet) {
         NuvioNativeModalBottomSheet(
@@ -106,8 +91,11 @@ fun NuvioModalBottomSheet(
             contentColor = contentColor,
             showDragHandle = showDragHandle,
             fullHeight = fullHeight,
-            content = content,
-        )
+        ) {
+            BottomSheetPopupFocusHost {
+                content()
+            }
+        }
     } else {
         val tokens = MaterialTheme.nuvio
         ModalBottomSheet(
@@ -120,27 +108,59 @@ fun NuvioModalBottomSheet(
             dragHandle = null,
         ) {
             CompositionLocalProvider(LocalBottomInsetsConsumed provides true) {
-                Column(
-                    modifier = modifier
-                        .padding(NuvioTokens.Space.s10)
-                        .clip(SheetShape)
-                        .background(containerColor)
-                        .border(tokens.borders.thin, SurfaceEdge, SheetShape),
-                ) {
-                    if (showDragHandle) {
-                        NuvioBottomSheetDragHandle(Modifier.align(Alignment.CenterHorizontally))
-                    }
-                    if (isWindows) {
-                        // Inside the sheet's draggable, so content scrolls before
-                        // the sheet can claim its drag. Keep the handle outside
-                        // this scope so dragging it still moves the sheet.
-                        Column(modifier = Modifier.platformTouchScroll(), content = content)
-                    } else {
-                        content()
+                BottomSheetPopupFocusHost {
+                    Column(
+                        modifier = modifier
+                            .padding(NuvioTokens.Space.s10)
+                            .clip(SheetShape)
+                            .background(containerColor)
+                            .border(tokens.borders.thin, SurfaceEdge, SheetShape),
+                    ) {
+                        if (showDragHandle) {
+                            NuvioBottomSheetDragHandle(Modifier.align(Alignment.CenterHorizontally))
+                        }
+                        if (isWindows) {
+                            // Inside the sheet's draggable, so content scrolls before
+                            // the sheet can claim its drag. Keep the handle outside
+                            // this scope so dragging it still moves the sheet.
+                            Column(modifier = Modifier.platformTouchScroll(), content = content)
+                        } else {
+                            content()
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * Runs inside the bottom sheet's popup composition so [LocalFocusManager] resolves to the popup's
+ * own focus owner rather than the underlying screen's focus manager.
+ */
+@Composable
+private fun BottomSheetPopupFocusHost(
+    content: @Composable () -> Unit,
+) {
+    val popupFocusManager = LocalFocusManager.current
+    DisposableEffect(popupFocusManager) {
+        ComposePopupFocus.push(popupFocusManager)
+        onDispose { ComposePopupFocus.pop(popupFocusManager) }
+    }
+    LaunchedEffect(popupFocusManager) {
+        if (!ControllerManager.isNavigationActive.value) return@LaunchedEffect
+        delay(220)
+        // Sheets made of action rows are driven by the spatial engine (white ring + bring-into-view);
+        // forms without rows fall back to Compose focus inside this popup.
+        if (!ControllerFocusEngine.focusFirstInGroup("bottom_sheet_actions")) {
+            popupFocusManager.clearFocus(force = true)
+            popupFocusManager.moveFocus(FocusDirection.Next)
+        }
+    }
+    Box(
+        modifier = Modifier.onFocusChanged { ComposePopupFocus.setFocused(popupFocusManager, it.hasFocus) },
+    ) {
+        content()
     }
 }
 

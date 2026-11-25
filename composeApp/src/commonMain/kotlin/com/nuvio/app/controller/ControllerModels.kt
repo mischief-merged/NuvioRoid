@@ -242,7 +242,9 @@ object ControllerManager {
         // Deferred routes and screens without controllerFocusable nodes (e.g. details) leave the
         // engine without a focused node. Returning false lets Compose's native Enter handling
         // activate the focused button instead of the engine swallowing the key.
-        if (ControllerFocusEngine.deferNavigationToCompose) return false
+        // Modal overlays with spatial Overlay rows (e.g. bottom sheet action rows) still activate
+        // their focused Overlay node even when the route underneath defers to Compose.
+        if (ControllerFocusEngine.deferNavigationToCompose && !ControllerFocusEngine.isModalOverlayActive) return false
         if (ControllerFocusEngine.focusedNodeId.value == null) return false
         notifyNavigationInput()
         return ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(XboxButton.A))
@@ -254,8 +256,11 @@ object ControllerManager {
      * controller mode, so Xbox hints stay hidden for keyboard users.
      */
     fun dispatchKeyboardShortcut(button: XboxButton): Boolean {
-        notifyNavigationInput()
-        return ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(button))
+        val handled = ControllerFocusEngine.handleEvent(ControllerEvent.ButtonPressed(button))
+        if (handled) {
+            notifyNavigationInput()
+        }
+        return handled
     }
 }
 

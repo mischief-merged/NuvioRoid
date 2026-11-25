@@ -108,8 +108,13 @@ private fun FocusManager.moveSpatialFocus(direction: ControllerDirection): Boole
     if (moveFocus(composeDirection)) return true
 
     // Nothing holds Compose focus (e.g. the spatial ring was cleared when a Compose-driven route
-    // opened): seed a target immediately, even if this route was already seeded once.
-    if (!com.nuvio.app.core.ui.FocusPresence.hasAnyFocus) {
+    // or popup opened): seed a target immediately, even if this route was already seeded once.
+    val hasActiveFocus = if (ComposePopupFocus.active != null) {
+        ComposePopupFocus.hasActiveFocus
+    } else {
+        com.nuvio.app.core.ui.FocusPresence.hasAnyFocus
+    }
+    if (!hasActiveFocus) {
         clearFocus(force = true)
         if (moveFocus(FocusDirection.Next)) {
             return moveFocus(composeDirection)
@@ -185,6 +190,7 @@ actual fun PlatformKeyboardNavigationHost() {
     LaunchedEffect(Unit) {
         ControllerFocusEngine.routeGeneration.collect {
             delay(180)
+            if (ControllerFocusEngine.isModalOverlayActive) return@collect
             if (ControllerFocusEngine.hasInteractiveContent.value) return@collect
             if (FocusPresence.hasAnyFocus) return@collect
             focusManager.clearFocus(force = true)
@@ -255,8 +261,12 @@ actual fun PlatformKeyboardNavigationHost() {
 
             // Keyboard equivalents of the controller hint-bar actions. They mirror the gamepad
             // handlers (Y=Search, LB/RB=Tabs, Menu=Navigation, X=Options) and are ignored inside
-            // the player, where those keys belong to playback.
-            if (!isPlayerActive) {
+            // the player or while a modal sheet/dialog/overlay owns input.
+            if (
+                !isPlayerActive &&
+                !ControllerFocusEngine.isModalOverlayActive &&
+                !DesktopEscapeShortcut.hasOpenModal()
+            ) {
                 val shortcutButton = when {
                     event.isControlDown && event.keyCode == KeyEvent.VK_K -> XboxButton.Y
                     event.isControlDown && event.keyCode == KeyEvent.VK_TAB ->

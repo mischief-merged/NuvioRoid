@@ -265,6 +265,12 @@ fun NuvioPosterZoomActionOverlay(
         }
     }
 
+    val modalOverlayToken = remember { Any() }
+    DisposableEffect(modalOverlayToken) {
+        ControllerFocusEngine.pushModalOverlay(modalOverlayToken)
+        onDispose { ControllerFocusEngine.popModalOverlay(modalOverlayToken) }
+    }
+
     // B closes the preview: the engine routes gamepad back through the global handler stack,
     // so the Compose back handler above alone is not enough.
     RegisterControllerHandler(
