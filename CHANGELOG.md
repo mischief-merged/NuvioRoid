@@ -45,6 +45,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- Gamepad focus stays on the chosen source in the player Sources popup instead of jumping to the header, and the archive message now says held files wait 7 days before moving to the Trash (#127) ([#151](https://github.com/mischief-merged/NuvioRoid/pull/151)).
 - Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
 - Downloads that are receiving data no longer say Waiting for the internet after the connection comes back, and the app notices the connection returning on its own (#144) ([#147](https://github.com/mischief-merged/NuvioRoid/pull/147)).
 - Stopping trip queueing now counts the downloads that had already started, and the progress label shows how many are queued (#145) ([#146](https://github.com/mischief-merged/NuvioRoid/pull/146)).

@@ -756,7 +756,7 @@
     <string name="downloads_empty_hint_seasons">On a series page you can also download a whole season, or keep new episodes downloaded automatically.</string>
     <string name="downloads_empty_browse">Browse titles</string>
     <string name="downloads_delete_message_trash">It moves to the Trash. You can put it back from there.</string>
-    <string name="downloads_delete_message_held">It is moved to the archive folder inside the downloads folder until you remove it or the Trash is available.</string>
+    <string name="downloads_delete_message_held">It stays in the downloads archive for 7 days, then moves to the Trash when available.</string>
     <string name="downloads_delete_auto_note">Auto-download will not fetch this episode again.</string>
     <string name="downloads_delete_message_partial">This stops the download and removes what was downloaded so far.</string>
     <string name="downloads_delete_confirm_trash">Move to Trash</string>
