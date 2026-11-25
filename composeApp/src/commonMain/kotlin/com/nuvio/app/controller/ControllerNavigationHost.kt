@@ -36,6 +36,8 @@ fun ControllerNavigationHost(
     onBack: () -> Boolean,
     onBumperLeft: (() -> Boolean)? = null,
     onBumperRight: (() -> Boolean)? = null,
+    onSearch: (() -> Boolean)? = null,
+    onOpenNavigation: (() -> Boolean)? = null,
     fullPlayerOwnsInput: Boolean = false,
     miniDockClearance: Dp = 0.dp,
 ) {
@@ -60,6 +62,12 @@ fun ControllerNavigationHost(
             !fullPlayerOwnsInput && currentRoute is TabsRoute && selectedTab == AppScreenTab.Home
         ControllerFocusEngine.deferNavigationToCompose = navigation.deferNavigationToCompose
         ControllerFocusEngine.onRouteOrTabChanged("$routeIdentity:$selectedTab:$fullPlayerOwnsInput")
+        if (navigation.deferNavigationToCompose) {
+            // Compose owns focus on these routes; drop any spatial selection so the engine ring
+            // does not stay frozen on a node while Compose focus moves (details rails looked
+            // like they could not move left/right).
+            ControllerFocusEngine.clearFocus()
+        }
         ControllerManager.updateScreenContext(navigation.screenContext)
     }
 
@@ -68,6 +76,8 @@ fun ControllerNavigationHost(
         onBack = onBack,
         onBumperLeft = onBumperLeft,
         onBumperRight = onBumperRight,
+        onActionY = onSearch,
+        onMenuButton = onOpenNavigation,
     )
 }
 
