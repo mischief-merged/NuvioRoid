@@ -2948,7 +2948,14 @@ object DownloadsRepository {
         ruleKey: String?,
         stillWanted: () -> Boolean = { true },
     ): AutoDownloadRemovalResult =
-        removeWatchedAutoDownloadWithUndo(downloadId, ruleKey, stillWanted).result
+        removeWatchedWithUndoInternal(
+            downloadId = downloadId,
+            expectedRuleKey = ruleKey,
+            requireMatchingRuleKey = true,
+            allowHoldingWhenNoSystemTrash = false,
+            withUndo = false,
+            stillWanted = stillWanted,
+        ).outcome.result
 
     internal fun removeWatchedAutoDownloadWithUndo(
         downloadId: String,
@@ -2960,6 +2967,7 @@ object DownloadsRepository {
             expectedRuleKey = ruleKey,
             requireMatchingRuleKey = true,
             allowHoldingWhenNoSystemTrash = false,
+            withUndo = true,
             stillWanted = stillWanted,
         ).outcome
 
@@ -2978,6 +2986,7 @@ object DownloadsRepository {
             expectedRuleKey = null,
             requireMatchingRuleKey = false,
             allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+            withUndo = true,
             stillWanted = stillWanted,
         )
 
@@ -2986,6 +2995,7 @@ object DownloadsRepository {
         expectedRuleKey: String?,
         requireMatchingRuleKey: Boolean,
         allowHoldingWhenNoSystemTrash: Boolean,
+        withUndo: Boolean,
         stillWanted: () -> Boolean,
     ): RemovedWatchedDownload {
         ensureLoaded()
@@ -2999,6 +3009,7 @@ object DownloadsRepository {
                         expectedRuleKey = expectedRuleKey,
                         requireMatchingRuleKey = requireMatchingRuleKey,
                         allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                        withUndo = withUndo,
                         stillWanted = stillWanted,
                         lockedUri = locked,
                     )
@@ -3009,6 +3020,7 @@ object DownloadsRepository {
                     expectedRuleKey = expectedRuleKey,
                     requireMatchingRuleKey = requireMatchingRuleKey,
                     allowHoldingWhenNoSystemTrash = allowHoldingWhenNoSystemTrash,
+                    withUndo = withUndo,
                     stillWanted = stillWanted,
                     lockedUri = null,
                 )
@@ -3026,6 +3038,7 @@ object DownloadsRepository {
         expectedRuleKey: String?,
         requireMatchingRuleKey: Boolean,
         allowHoldingWhenNoSystemTrash: Boolean,
+        withUndo: Boolean,
         stillWanted: () -> Boolean,
         lockedUri: String?,
     ): RemovedWatchedDownload? = synchronized(stateLock) {
@@ -3056,7 +3069,7 @@ object DownloadsRepository {
             return synchronized(WatchedRemovalGuard.lock) {
                 val checked = WatchedRemovalGuard.check(stillWanted)
                 backend.withListLock {
-                    val outcome = removeWatchedLocked(item, items, allowHoldingWhenNoSystemTrash, checked)
+                    val outcome = removeWatchedLocked(item, items, allowHoldingWhenNoSystemTrash, withUndo, checked)
                     RemovedWatchedDownload(
                         outcome = outcome,
                         removedItem = item.takeIf { outcome.result == AutoDownloadRemovalResult.Removed },
@@ -3072,6 +3085,7 @@ object DownloadsRepository {
         item: DownloadItem,
         items: List<DownloadItem>,
         allowHoldingWhenNoSystemTrash: Boolean,
+        withUndo: Boolean,
         stillWanted: () -> Boolean,
     ): WatchedTrashOutcome {
         if (!stillWanted()) return WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
@@ -3086,7 +3100,11 @@ object DownloadsRepository {
         val outcome = runCatching {
             if (!stillWanted()) WatchedTrashOutcome(AutoDownloadRemovalResult.Changed)
             else if (fileUri != null && !shared) {
-                backend.trashWatchedFileWithUndo(fileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+                if (withUndo) {
+                    backend.trashWatchedFileWithUndo(fileUri, allowHoldingWhenNoSystemTrash, stillWanted)
+                } else {
+                    WatchedTrashOutcome(backend.trashWatchedFile(fileUri, stillWanted))
+                }
             } else {
                 WatchedTrashOutcome(AutoDownloadRemovalResult.Removed)
             }
