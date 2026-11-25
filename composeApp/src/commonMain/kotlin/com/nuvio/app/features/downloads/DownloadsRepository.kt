@@ -376,7 +376,6 @@ object DownloadsRepository {
     internal fun selectProfileForDownloads(select: () -> Unit) = synchronized(stateLock) { select() }
 
     fun onProfileChanged() {
-        freeSpaceHold.onProfileChanged()
         beforeCatalogLoad()
         synchronized(loadLock) {
             // A read already on this thread must not start another, or the two would wait on each other.
@@ -1519,6 +1518,7 @@ object DownloadsRepository {
                 notifyLiveStatusPlatform()
                 // Set once the list is the one just read, and before a hold or a resumed transfer looks at it.
                 markCatalogLoaded()
+                freeSpaceHold.syncProfileSilently(profileId)
                 if (shouldPersistNormalized) {
                     persist()
                 }
@@ -1796,6 +1796,8 @@ object DownloadsRepository {
      */
     private fun applyFreeSpaceHold(): Unit = synchronized(stateLock) {
         if (!hasLoaded) return
+        val currentProfile = loadedProfileId
+        if (currentProfile != null && !freeSpaceHold.isLoadedForProfile(currentProfile)) return
         _uiState.value.items
             .filter { it.status == DownloadStatus.Downloading && it.isBelowFreeSpaceFloor() }
             .filter { activeTransfers[it.id]?.finishing != true }

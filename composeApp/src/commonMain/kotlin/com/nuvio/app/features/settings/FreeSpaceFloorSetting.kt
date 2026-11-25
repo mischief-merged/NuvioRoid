@@ -9,6 +9,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.details.components.DownloadChoiceDialog
 import com.nuvio.app.features.downloads.FreeSpaceFloors
@@ -29,6 +30,7 @@ internal fun FreeSpaceFloorSetting(
     val state by hold.state.collectAsStateWithLifecycle()
     var showDialog by remember(profileId) { mutableStateOf(false) }
     val title = stringResource(Res.string.settings_free_space_floor_title)
+    val saveFailedMessage = stringResource(Res.string.downloads_delete_setting_save_failed)
     SettingsNavigationRow(
         title = title,
         description = stringResource(Res.string.settings_free_space_floor_description),
@@ -49,7 +51,11 @@ internal fun FreeSpaceFloorSetting(
             selected = state.floorGb,
             label = { freeSpaceFloorLabel(it) },
             onSelect = {
-                hold.setFloorGb(value = it, profileId = profileId, notifyInBackground = true)
+                hold.changeFloorFromUi(
+                    profileId = profileId,
+                    value = it,
+                    onSaveFailed = { NuvioToastController.show(saveFailedMessage) },
+                )
                 showDialog = false
             },
             onDismiss = { showDialog = false },

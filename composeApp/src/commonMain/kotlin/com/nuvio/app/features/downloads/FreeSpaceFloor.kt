@@ -15,6 +15,7 @@ internal const val DefaultFloorLocationId = "app"
 internal data class FreeSpaceFloorState(
     val floorGb: Int? = null,
     val locationFreeBytes: Map<String, Long?> = emptyMap(),
+    val profileId: Int? = null,
 ) {
     val floorBytes: Long?
         get() = floorGb?.takeIf { it > 0 }?.times(BytesPerGigabyte)
@@ -83,6 +84,26 @@ internal class FreeSpaceHold(
         }
     }
 
+    fun isLoadedForProfile(profileId: Int): Boolean = synchronized(lock) {
+        ensureLoadedLocked()
+        loadedProfileId == profileId
+    }
+
+    fun syncProfileSilently(profileId: Int) {
+        synchronized(lock) {
+            if (loaded && loadedProfileId == profileId) return
+            loaded = true
+            loadedProfileId = profileId
+            val stored = runCatching { loadFloorGb(profileId) }.getOrNull()
+            floorGb = stored?.takeIf { it in optionsGb }
+            _state.value = FreeSpaceFloorState(
+                floorGb = floorGb,
+                locationFreeBytes = locationFreeBytes,
+                profileId = profileId,
+            )
+        }
+    }
+
     fun onProfileChanged(notifyInBackground: Boolean = false) {
         val notify = synchronized(lock) {
             val before = _state.value
@@ -98,23 +119,38 @@ internal class FreeSpaceHold(
         notifyInBackground: Boolean = false,
     ): Boolean {
         val normalized = value?.takeIf { it in optionsGb }
-        val work = synchronized(lock) {
+        val notify = synchronized(lock) {
             ensureLoadedLocked()
             if (loadedProfileId != profileId) return false
-            val before = _state.value
-            val changedSetting = floorGb != normalized
-            floorGb = normalized
-            val next = FreeSpaceFloorState(floorGb = floorGb, locationFreeBytes = locationFreeBytes)
-            _state.value = next
-            val notify = listener.takeIf { next != before }
-            val runEffects: () -> Unit = {
-                if (changedSetting) runCatching { saveFloorGb(profileId, normalized) }
-                notify?.invoke()
+            if (floorGb != normalized) {
+                if (runCatching { saveFloorGb(profileId, normalized) }.isFailure) return false
             }
-            runEffects
+            val before = _state.value
+            floorGb = normalized
+            val next = FreeSpaceFloorState(
+                floorGb = floorGb,
+                locationFreeBytes = locationFreeBytes,
+                profileId = loadedProfileId,
+            )
+            _state.value = next
+            listener.takeIf { next != before }
         }
-        if (notifyInBackground) ConnectionUpdates.submit(work) else work()
+        if (notify != null) {
+            if (notifyInBackground) ConnectionUpdates.submit(notify) else notify()
+        }
         return true
+    }
+
+    fun changeFloorFromUi(
+        profileId: Int,
+        value: Int?,
+        onSaveFailed: () -> Unit = {},
+    ) {
+        ConnectionUpdates.submit {
+            if (!setFloorGb(value = value, profileId = profileId, notifyInBackground = false)) {
+                onSaveFailed()
+            }
+        }
     }
 
     fun reportLocationFreeBytes(freeByLocation: Map<String, Long?>, notifyInBackground: Boolean = false) {
@@ -123,7 +159,11 @@ internal class FreeSpaceHold(
             ensureLoadedLocked()
             val before = _state.value
             locationFreeBytes = normalizedMap
-            val next = FreeSpaceFloorState(floorGb = floorGb, locationFreeBytes = locationFreeBytes)
+            val next = FreeSpaceFloorState(
+                floorGb = floorGb,
+                locationFreeBytes = locationFreeBytes,
+                profileId = loadedProfileId,
+            )
             _state.value = next
             listener.takeIf { next != before }
         } ?: return
@@ -141,7 +181,11 @@ internal class FreeSpaceHold(
         loadedProfileId = currentProfile
         val stored = runCatching { loadFloorGb(currentProfile) }.getOrNull()
         floorGb = stored?.takeIf { it in optionsGb }
-        _state.value = FreeSpaceFloorState(floorGb = floorGb, locationFreeBytes = locationFreeBytes)
+        _state.value = FreeSpaceFloorState(
+            floorGb = floorGb,
+            locationFreeBytes = locationFreeBytes,
+            profileId = currentProfile,
+        )
     }
 
     companion object {

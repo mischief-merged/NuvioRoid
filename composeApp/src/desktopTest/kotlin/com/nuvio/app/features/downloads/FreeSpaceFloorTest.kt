@@ -11,12 +11,14 @@ import androidx.compose.ui.test.performClick
 import com.nuvio.app.core.storage.DesktopStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.core.ui.NuvioTheme
+import com.nuvio.app.core.ui.NuvioToastController
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.settings.FreeSpaceFloorSetting
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
 import kotlinx.coroutines.runBlocking
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.downloads_delete_setting_save_failed
 import nuvio.composeapp.generated.resources.settings_free_space_floor_off
 import nuvio.composeapp.generated.resources.settings_free_space_floor_title
 import nuvio.composeapp.generated.resources.settings_free_space_floor_value
@@ -349,15 +351,24 @@ class FreeSpaceFloorTest {
             enqueueMovie("profile-a-movie", locationId = "app")
             assertEquals(DownloadStatus.Paused, itemOf("profile-a-movie").status)
             assertTrue(itemOf("profile-a-movie").pausedByFreeSpace)
+            assertTrue(backend.startedIds.isEmpty())
 
-            // Switch to profile B (floor is Off): 15 GB free must NOT hold profile B's downloads!
+            // Switch to profile B (floor is Off), including an early UI floor refresh before catalog reload:
+            // Profile A's held download must NEVER start or be overwritten as Downloading in Profile A's stored catalog!
             ProfileRepository.setActiveProfileIdForTest(profileB)
+            storageBackedHold.onProfileChanged()
+            assertTrue(backend.startedIds.isEmpty(), "early floor refresh on profile switch must not resume outgoing profile's downloads")
             DownloadsRepository.onProfileChanged()
             assertNull(storageBackedHold.floorBytes)
+            assertTrue(backend.startedIds.isEmpty(), "switching to an Off-floor profile must never start outgoing profile's held downloads")
+            val storedProfileA = DownloadsCodec.decode(assertNotNull(payloadsByProfile[profileA]))!!.items.single()
+            assertEquals(DownloadStatus.Paused, storedProfileA.status)
+            assertTrue(storedProfileA.pausedByFreeSpace)
 
             enqueueMovie("profile-b-movie", locationId = "app")
             assertEquals(DownloadStatus.Downloading, itemOf("profile-b-movie").status)
             assertFalse(itemOf("profile-b-movie").pausedByFreeSpace)
+            assertEquals(listOf(itemOf("profile-b-movie").id), backend.startedIds)
 
             // Switch back to profile A -> 20 GB floor reloads automatically!
             ProfileRepository.setActiveProfileIdForTest(profileA)
@@ -523,5 +534,60 @@ class FreeSpaceFloorSettingTest {
         assertTrue(latch2.await(5, TimeUnit.SECONDS))
         assertNull(storedByProfile[4])
         assertNull(hold.floorBytes)
+    }
+
+    @Test
+    fun failed_floor_save_preserves_saved_value_in_ui_and_storage_and_reports_failure() {
+        val tempRoot = java.nio.file.Files.createTempDirectory("nuvio-floor-save-fail").toRealPath()
+        val storeDir = tempRoot.resolve("store").createDirectories()
+        val cacheDir = tempRoot.resolve("cache").createDirectories()
+        val profile = 7
+        DesktopStorage.setRootDirForTest(storeDir, cacheDir)
+        NuvioToastController.dismiss()
+        try {
+            val hold = FreeSpaceHold(
+                loadFloorGb = LimitedConnectionStorage::loadFreeSpaceFloorGb,
+                saveFloorGb = LimitedConnectionStorage::saveFreeSpaceFloorGb,
+                activeProfileId = { profile },
+            )
+            assertTrue(hold.setFloorGb(value = 10, profileId = profile))
+            assertEquals(10, LimitedConnectionStorage.loadFreeSpaceFloorGb(profile))
+
+            compose.setContent {
+                NuvioTheme {
+                    FreeSpaceFloorSetting(isTablet = false, hold = hold, profileId = profile)
+                }
+            }
+            compose.onNodeWithText(text(Res.string.settings_free_space_floor_value, 10)).assertIsDisplayed()
+
+            // Block writes on the underlying store file so persist() throws a real IOException.
+            val blockingTmpDir = storeDir.resolve("nuvio_limited_connections.properties.tmp").createDirectories()
+            assertFalse(hold.setFloorGb(value = 50, profileId = profile))
+            assertEquals(10L * BytesPerGigabyte, hold.floorBytes, "in-memory floor must remain at the saved value on write failure")
+            assertEquals(10, LimitedConnectionStorage.loadFreeSpaceFloorGb(profile), "stored floor must remain intact on write failure")
+
+            // Attempt selection through the UI dialog -> must keep 10 GB displayed and show failure toast.
+            compose.onNodeWithText(text(Res.string.settings_free_space_floor_title)).performClick()
+            compose.onNode(hasText(text(Res.string.settings_free_space_floor_value, 50)) and hasAnyAncestor(isDialog())).performClick()
+            compose.waitForIdle()
+
+            val latch = CountDownLatch(1)
+            ConnectionUpdates.submit { latch.countDown() }
+            assertTrue(latch.await(5, TimeUnit.SECONDS))
+            compose.waitForIdle()
+
+            compose.onNodeWithText(text(Res.string.settings_free_space_floor_value, 10)).assertIsDisplayed()
+            assertEquals(10, LimitedConnectionStorage.loadFreeSpaceFloorGb(profile))
+            assertEquals(
+                text(Res.string.downloads_delete_setting_save_failed),
+                NuvioToastController.currentToast.value?.message,
+            )
+
+            java.nio.file.Files.deleteIfExists(blockingTmpDir)
+        } finally {
+            NuvioToastController.dismiss()
+            DesktopStorage.setRootDirForTest(null, null)
+            tempRoot.toFile().deleteRecursively()
+        }
     }
 }

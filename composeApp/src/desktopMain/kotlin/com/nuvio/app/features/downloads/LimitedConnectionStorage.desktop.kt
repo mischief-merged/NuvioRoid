@@ -26,6 +26,11 @@ internal actual object LimitedConnectionStorage {
         store.getString(ProfileScopedKey.of("free_space_floor_gb", profileId))?.toIntOrNull()?.takeIf { it > 0 }
 
     actual fun saveFreeSpaceFloorGb(profileId: Int, value: Int?) {
-        store.putString(ProfileScopedKey.of("free_space_floor_gb", profileId), value?.toString().orEmpty())
+        try {
+            store.putString(ProfileScopedKey.of("free_space_floor_gb", profileId), value?.toString())
+        } catch (error: Throwable) {
+            store.clearInMemory()
+            throw error
+        }
     }
 }
