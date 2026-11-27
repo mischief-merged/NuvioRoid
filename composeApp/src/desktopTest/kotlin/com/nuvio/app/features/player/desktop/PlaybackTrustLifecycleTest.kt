@@ -57,4 +57,32 @@ class PlaybackTrustLifecycleTest {
         finally { finishRetry.countDown(); teardown.join(5000); SwingUtilities.invokeAndWait {} }
         assertTrue(disposed.await(5, TimeUnit.SECONDS))
     }
+
+    @Test fun `a queued retry cannot pick up a replacement source identity`() {
+        val queued = java.util.ArrayDeque<Runnable>()
+        val dispatcher = object : kotlinx.coroutines.CoroutineDispatcher() {
+            override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) { queued.add(block) }
+        }
+        val retries = AtomicInteger()
+        val remembered = AtomicInteger()
+        val controller = NativePlayerController(NativePlayerHost(), backend = NoOpNativePlayerBackend, nativeDispose = {},
+            isHostDisplayable = { false }, networkIdentity = { "session:1" }, confirmUnverified = { true },
+            nativeRetryUnverified = { _, _ -> retries.incrementAndGet(); true },
+            rememberPlaybackNetwork = { remembered.incrementAndGet() }, playbackRetryDispatcher = dispatcher)
+        try {
+            SwingUtilities.invokeAndWait {
+                controller.attachSource("https://example.invalid/a")
+                controller.handle(42L)
+                controller.javaClass.getDeclaredMethod("handlePlayerEvent", String::class.java, Double::class.javaPrimitiveType)
+                    .apply { isAccessible = true }.invoke(controller, "certificateFailure", 0.0)
+            }
+            assertEquals(1, queued.size)
+            SwingUtilities.invokeAndWait { controller.attachSource("https://example.invalid/b") }
+            queued.removeFirst().run()
+            SwingUtilities.invokeAndWait {}
+            assertEquals(0, retries.get(), "a queued retry must still belong to its original source")
+            assertEquals(0, remembered.get())
+        } finally { controller.dispose() }
+    }
+
 }

@@ -162,6 +162,7 @@ internal interface NativePlayerBackend {
     ): Long
 
     fun dispose(handle: Long)
+    fun setControlsImage(handle: Long, key: String, data: String?) = Unit
     fun updateControls(handle: Long, controlsJson: String)
     fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
     fun setRemoteCommandsEnabled(handle: Long, enabled: Boolean)
@@ -380,6 +381,9 @@ internal object RealNativePlayerBackend : NativePlayerBackend {
     }
 
     override fun dispose(handle: Long) = NativePlayerBridge.dispose(handle)
+    override fun setControlsImage(handle: Long, key: String, data: String?) {
+        if (DesktopHostOs.current == DesktopHostOs.MACOS) NativePlayerBridge.setControlsImage(handle, key, data)
+    }
     override fun updateControls(handle: Long, controlsJson: String) =
         NativePlayerBridge.updateControls(handle, controlsJson)
 

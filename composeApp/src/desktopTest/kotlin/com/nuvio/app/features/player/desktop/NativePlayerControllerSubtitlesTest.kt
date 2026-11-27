@@ -380,6 +380,7 @@ class NativePlayerControllerSubtitlesTest {
         val sink = AtomicReference<NativePlayerEventSink?>(null)
         val prompts = AtomicInteger(0)
         val retries = AtomicInteger(0)
+        val retried = CountDownLatch(1)
         val bridgeOps = RecordingSubtitleBridgeOps()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
@@ -389,7 +390,7 @@ class NativePlayerControllerSubtitlesTest {
                 41L
             },
             nativeDispose = {},
-            nativeRetryUnverified = { _, _ -> retries.incrementAndGet(); true },
+            nativeRetryUnverified = { _, _ -> retries.incrementAndGet(); retried.countDown(); true },
             rememberPlaybackNetwork = {},
             isHostDisplayable = { true },
             resolveHostView = { 1L },
@@ -428,6 +429,7 @@ class NativePlayerControllerSubtitlesTest {
             SwingUtilities.invokeAndWait {}
             SwingUtilities.invokeAndWait {}
             assertEquals(1, prompts.get(), "the certificate prompt was dropped after the subtitle update")
+            assertTrue(retried.await(5, TimeUnit.SECONDS), "native retry did not complete")
             assertEquals(1, retries.get())
         } finally {
             controller.assignNativeHandleForTest(0L)

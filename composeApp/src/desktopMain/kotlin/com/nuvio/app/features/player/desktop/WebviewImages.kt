@@ -44,6 +44,15 @@ internal object WebviewImages {
         return loader.resolve(url, onReady)
     }
 
+    /** Called only by image-request workers, never by controls serialization. */
+    fun load(url: String): String? {
+        images[url]?.let { return it }
+        return runCatching { encode(url) }.getOrNull()?.also {
+            // Large artwork lives in the bounded native image cache, rather than filling this string cache.
+            if (it.length <= 512 * 1024) images[url] = it
+        }
+    }
+
     internal fun encode(url: String): String? {
         if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
             val bytes = client.newCall(Request.Builder().url(url).build()).execute().use { response ->
