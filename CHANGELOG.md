@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
+### Fixed
+
+- The player no longer locks up on Starting playback while audio plays on series with many episodes; controls no longer carry embedded pictures and start-up work stays off the main thread (#153) ([#155](https://github.com/mischief-merged/NuvioRoid/pull/155)).
+
 ## [1.1.38.1] - 2026-11-23
 
 ### Added
