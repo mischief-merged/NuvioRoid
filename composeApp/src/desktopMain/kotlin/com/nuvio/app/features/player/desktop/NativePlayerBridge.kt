@@ -120,6 +120,7 @@ internal object NativePlayerBridge {
     ): Array<ByteArray?>?
 
     external fun dispose(handle: Long)
+    external fun setControlsImage(handle: Long, key: String, data: String?)
     external fun updateControls(handle: Long, controlsJson: String)
 
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */

@@ -33,6 +33,89 @@ static bool afterWakeup;
 - (void)shutdown { shutdowns++; [super shutdown]; }
 @end
 
+static NSString *pendingImageKey;
+static NSUInteger imageRequests;
+static NSUInteger imageStops;
+static dispatch_semaphore_t initEntered;
+static dispatch_semaphore_t finishInit;
+@interface ControlsProbePlayer : MpvWebPlayer
+@end
+@implementation ControlsProbePlayer
+- (void)sendPlayerEvent:(NSString *)type value:(double)value {
+    if ([type hasPrefix:@"controlsImage:"]) {
+        imageRequests++;
+        pendingImageKey = [type substringFromIndex:@"controlsImage:".length];
+    } else if ([type hasPrefix:@"controlsImageStopped:"]) {
+        imageStops++;
+    }
+}
+@end
+@interface InitializingProbePlayer : MpvWebPlayer
+@end
+@implementation InitializingProbePlayer
+- (int)initializeCore:(mpv_handle *)core {
+    dispatch_semaphore_signal(initEntered);
+    dispatch_semaphore_wait(finishInit, DISPATCH_TIME_FOREVER);
+    return [super initializeCore:core];
+}
+@end
+
+static id readScript(WKWebView *view, NSString *script) {
+    __block BOOL finished = NO;
+    __block id result = nil;
+    [view evaluateJavaScript:script completionHandler:^(id value, NSError *error) {
+        result = error ? nil : value;
+        finished = YES;
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (!finished && deadline.timeIntervalSinceNow > 0)
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    return result;
+}
+
+static BOOL checkControlsBurst(MpvWebPlayer *player) {
+    WKWebView *view = [player valueForKey:@"webView"];
+    [view loadHTMLString:@"<html><body><img id='picture'><script>window.controlPushes=0;window.lastTitle='';window.playerControls=s=>{window.controlPushes++;window.lastTitle=s.title;const img=document.getElementById('picture');if(img.getAttribute('src')!==s.openingArtwork)img.src=s.openingArtwork;};</script></body></html>" baseURL:nil];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (![[readScript(view, @"typeof window.playerControls") description] isEqual:@"function"])
+        if (deadline.timeIntervalSinceNow <= 0) return NO;
+    [player handleScriptMessage:@{@"type": @"controlsReady", @"value": @0}];
+    NSString *image = [@"nuvio-image://" stringByAppendingString:[@"" stringByPaddingToLength:64 withString:@"a" startingAtIndex:0]];
+    NSMutableArray *episodes = [NSMutableArray new];
+    for (int index = 0; index < 400; index++) [episodes addObject:@{@"index": @(index), @"season": @(index / 20 + 1), @"thumbnail": image}];
+    for (int revision = 0; revision < 400; revision++) {
+        @autoreleasepool {
+            NSDictionary *state = @{@"title": @(revision).stringValue, @"isInMiniPlayer": @NO, @"episodeItems": episodes, @"openingArtwork": image};
+            NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+            if (data.length > 128 * 1024) return NO;
+            [player updateControlsJson:[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]];
+        }
+    }
+    deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (![[readScript(view, @"window.lastTitle") description] isEqual:@"399"] || pendingImageKey == nil)
+        if (deadline.timeIntervalSinceNow <= 0) return NO;
+    NSUInteger pushes = [readScript(view, @"window.controlPushes") unsignedIntegerValue];
+    if (pushes > 3 || imageRequests != 1) return NO;
+    NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:2 pixelsHigh:2 bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:8 bitsPerPixel:32];
+    memset(bitmap.bitmapData, 255, 16);
+    NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    [player setControlsImage:pendingImageKey data:png];
+    deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (![readScript(view, @"document.getElementById('picture').naturalWidth===2") boolValue])
+        if (deadline.timeIntervalSinceNow <= 0) return NO;
+    NSString *canceled = [@"nuvio-image://" stringByAppendingString:[@"" stringByPaddingToLength:64 withString:@"b" startingAtIndex:0]];
+    readScript(view, [NSString stringWithFormat:@"document.getElementById('picture').src='%@';true", canceled]);
+    deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (imageRequests != 2) if (deadline.timeIntervalSinceNow <= 0) return NO; else [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    if ([readScript(view, @"window.controlPushes") unsignedIntegerValue] != pushes) return NO;
+    [view loadHTMLString:@"<html><body id='after-cancel'></body></html>" baseURL:nil];
+    deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (imageStops == 0) if (deadline.timeIntervalSinceNow <= 0) return NO; else [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    [player setControlsImage:pendingImageKey data:png];
+    printf("controls=%lu images=%lu canceled=%lu\n", (unsigned long)pushes, (unsigned long)imageRequests, (unsigned long)imageStops);
+    return [[readScript(view, @"document.body.id") description] isEqual:@"after-cancel"];
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         NSString *mode = argc > 1 ? @(argv[1]) : @"";
@@ -100,7 +183,9 @@ int main(int argc, char **argv) {
             [player shutdown];
             return 0;
         }
-        BOOL renderMode = [mode isEqual:@"render-startup"];
+        BOOL controlsMode = [mode isEqual:@"controls-burst"];
+        BOOL initializingMode = [mode isEqual:@"initializing-core"];
+        BOOL renderMode = [mode isEqual:@"render-startup"] || controlsMode || initializingMode;
         NSWindow *window = nil;
         NSString *source = renderMode ? @(argv[2]) : @"https://example.invalid/stream";
         NSString *trustFile = renderMode ? NuvioWritePlaybackTrustFile(NuvioSystemTrustPEM()) : @"";
@@ -114,7 +199,8 @@ int main(int argc, char **argv) {
             [window orderFront:nil];
         }
         afterWakeup = [mode isEqual:@"after-wakeup"];
-        Class playerClass = renderMode ? [MpvWebPlayer class] : [FailingPlayer class];
+        Class playerClass = controlsMode ? [ControlsProbePlayer class] : initializingMode ? [InitializingProbePlayer class] : renderMode ? [MpvWebPlayer class] : [FailingPlayer class];
+        initEntered = dispatch_semaphore_create(0); finishInit = dispatch_semaphore_create(0);
         MpvWebPlayer *player = [[playerClass alloc] initWithHostView:host
                 sourceUrl:source
                 headerLines:@[]
@@ -145,12 +231,25 @@ int main(int argc, char **argv) {
             }
             dispatch_semaphore_signal(completed);
         });
+        if (initializingMode) {
+            NSDate *until = [NSDate dateWithTimeIntervalSinceNow:5];
+            while (dispatch_semaphore_wait(initEntered, DISPATCH_TIME_NOW) != 0) {
+                if (until.timeIntervalSinceNow <= 0) return 35;
+                [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+            }
+            Ivar ivar = class_getInstanceVariable([MpvWebPlayer class], "_mpv");
+            auto *published = reinterpret_cast<std::atomic<mpv_handle *> *>((char *)(__bridge void *)player + ivar_getOffset(ivar));
+            if (published->load() != nullptr) return 36;
+            [player syncControls];
+            dispatch_semaphore_signal(finishInit);
+        }
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5];
         while (dispatch_semaphore_wait(completed, DISPATCH_TIME_NOW) != 0) {
             if (deadline.timeIntervalSinceNow <= 0) return 31;
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
         }
         if (result != 0) return result;
+        BOOL controlsOk = !controlsMode || checkControlsBurst(player);
         if (renderMode) {
             deadline = [NSDate dateWithTimeIntervalSinceNow:10];
             while (([player isLoading] || ![player hasRenderedFrameForTest]) && deadline.timeIntervalSinceNow > 0) {
@@ -170,7 +269,7 @@ int main(int argc, char **argv) {
             [window close];
             if (trustFile.length) [[NSFileManager defaultManager] removeItemAtPath:trustFile error:nil];
             printf("rendered=%d subviews=%lu\n", rendered, (unsigned long)host.subviews.count);
-            return rendered && host.subviews.count == 0 ? 0 : 32;
+            return rendered && controlsOk && host.subviews.count == 0 ? 0 : 32;
         }
         printf("shutdowns=%d subviews=%lu\n", shutdowns, (unsigned long)host.subviews.count);
         // Do not pump a dangling callback on the old implementation after reporting its leak.

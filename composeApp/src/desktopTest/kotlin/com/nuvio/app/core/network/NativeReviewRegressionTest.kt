@@ -36,7 +36,7 @@ class NativeReviewRegressionTest {
                     frameworks.flatMap { listOf("-framework", it) } + listOf("-o", output.toString()))
                 output
             }
-            run(listOf(binary.toString()) + args)
+            run(listOf(binary.toString()) + args).lineSequence().filter { it.startsWith("controls=") }.forEach(::println)
         }
     }
     @Test fun `unconditional trust survives scoped sibling settings`() = probe("TrustSettingsProbe", "siblings")
@@ -52,7 +52,16 @@ class NativeReviewRegressionTest {
     @Test fun `a queued network change restores verification even after returning home`() = probe("PlayerTrustLifecycleProbe", "queued-network-change")
     @Test fun `startup failure cleans resources before the wakeup callback`() = probe("PlayerTrustLifecycleProbe", "before-wakeup")
     @Test fun `startup failure cleans resources after the wakeup callback`() = probe("PlayerTrustLifecycleProbe", "after-wakeup")
-    @Test fun `native startup renders a video frame while the main run loop stays active`() {
+    @Test fun `native startup renders a video frame while the main run loop stays active`() = withRawVideo {
+        probe("PlayerTrustLifecycleProbe", "render-startup", it.toString())
+    }
+    @Test fun `four hundred control updates keep rendering and load image bytes separately`() = withRawVideo {
+        probe("PlayerTrustLifecycleProbe", "controls-burst", it.toString())
+    }
+    @Test fun `an initializing core stays private while the interface processes callbacks`() = withRawVideo {
+        probe("PlayerTrustLifecycleProbe", "initializing-core", it.toString())
+    }
+    private fun withRawVideo(check: (Path) -> Unit) {
         val video = Files.createTempFile(directory, "startup-", ".y4m")
         try {
             Files.newOutputStream(video).use { output ->
@@ -63,7 +72,7 @@ class NativeReviewRegressionTest {
                     output.write(ByteArray(64 * 48 / 2) { 128.toByte() })
                 }
             }
-            probe("PlayerTrustLifecycleProbe", "render-startup", video.toString())
+            check(video)
         } finally {
             Files.deleteIfExists(video)
         }

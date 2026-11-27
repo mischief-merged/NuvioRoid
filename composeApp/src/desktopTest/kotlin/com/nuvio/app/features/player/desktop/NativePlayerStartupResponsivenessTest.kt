@@ -65,7 +65,7 @@ class NativePlayerStartupResponsivenessTest {
             },
             nativeDispose = { disposed.countDown() },
             isHostDisplayable = { true }, resolveHostView = { 1L },
-            startupTimeoutMs = 100L, startupNowMs = now::get,
+            startupTimeoutMs = 100L, startupNowMs = now::get, startupIsOffline = { false },
         )
         try {
             SwingUtilities.invokeAndWait {
@@ -174,7 +174,7 @@ class NativePlayerStartupResponsivenessTest {
         val controller = NativePlayerController(
             host = NativePlayerHost(), backend = NoOpNativePlayerBackend,
             isHostDisplayable = { false }, nativeDispose = {},
-            startupTimeoutMs = 100L, startupNowMs = now::get,
+            startupTimeoutMs = 100L, startupNowMs = now::get, startupIsOffline = { false },
         )
         try {
             SwingUtilities.invokeAndWait {
@@ -234,6 +234,134 @@ class NativePlayerStartupResponsivenessTest {
             finishRead.countDown()
             controller.dispose()
         }
+    }
+
+    @Test
+    fun unchanged_unknown_video_size_never_signals_another_snapshot() {
+        val read = CountDownLatch(1)
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val backend = object : NativePlayerBackend by NoOpNativePlayerBackend {
+            override fun stringProperty(handle: Long, name: String): String { calls.incrementAndGet(); read.countDown(); return "" }
+        }
+        val controller = NativePlayerController(NativePlayerHost(), backend = backend, nativeDispose = {}, startupNowMs = { 0L })
+        controller.assignNativeHandleForTest(70L)
+        try {
+            controller.snapshot(includeVideoSize = false)
+            assertTrue(read.await(5, TimeUnit.SECONDS))
+            val completed = CountDownLatch(1)
+            controller.releaseBeforeNavigation({ completed.countDown() }, { error(it) })
+            assertTrue(completed.await(5, TimeUnit.SECONDS))
+            assertEquals(0L, controller.manualRefreshTick.value, "an empty size must not wake paused or minimized playback")
+            assertTrue(calls.get() <= 2)
+        } finally { controller.dispose() }
+    }
+
+    @Test
+    fun a_create_error_is_terminal_for_the_startup_deadline() {
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val failed = CountDownLatch(1)
+        val errors = java.util.concurrent.atomic.AtomicInteger()
+        val controller = NativePlayerController(NativePlayerHost(),
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ -> error("Cannot start") }, nativeDispose = {},
+            isHostDisplayable = { true }, resolveHostView = { 1L }, startupNowMs = now::get,
+            startupTimeoutMs = 100L, startupIsOffline = { false })
+        try {
+            controller.attach("https://example.invalid/a", emptyMap(), true, 0L, 0, false) {
+                errors.incrementAndGet(); failed.countDown()
+            }
+            assertTrue(failed.await(5, TimeUnit.SECONDS))
+            now.set(101L)
+            SwingUtilities.invokeAndWait { repeat(10) { controller.snapshot() } }
+            assertEquals(1, errors.get())
+        } finally { controller.dispose() }
+    }
+
+    @Test
+    fun host_resolution_errors_are_terminal_for_the_startup_deadline() {
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val failed = CountDownLatch(1)
+        val errors = java.util.concurrent.atomic.AtomicInteger()
+        val controller = NativePlayerController(NativePlayerHost(), backend = NoOpNativePlayerBackend, nativeDispose = {},
+            isHostDisplayable = { true }, resolveHostView = { error("Cannot open the video surface") },
+            startupNowMs = now::get, startupTimeoutMs = 100L, startupIsOffline = { false })
+        try {
+            controller.attach("https://example.invalid/a", emptyMap(), true, 0L, 0, false) {
+                errors.incrementAndGet(); failed.countDown()
+            }
+            assertTrue(failed.await(5, TimeUnit.SECONDS))
+            now.set(101L)
+            SwingUtilities.invokeAndWait { repeat(10) { controller.snapshot() } }
+            assertEquals(1, errors.get())
+        } finally { controller.dispose() }
+    }
+
+    @Test
+    fun native_playback_errors_are_terminal_for_the_startup_deadline() {
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val failed = CountDownLatch(1)
+        val errors = java.util.concurrent.atomic.AtomicInteger()
+        val controller = NativePlayerController(NativePlayerHost(), backend = NoOpNativePlayerBackend, nativeDispose = {},
+            isHostDisplayable = { false }, startupNowMs = now::get, startupTimeoutMs = 100L, startupIsOffline = { false })
+        try {
+            controller.attach("https://example.invalid/a", emptyMap(), true, 0L, 0, false) {
+                errors.incrementAndGet(); failed.countDown()
+            }
+            controller.javaClass.getDeclaredMethod("handlePlayerEvent", String::class.java, Double::class.javaPrimitiveType)
+                .also { it.isAccessible = true }.invoke(controller, "playbackFailed", 0.0)
+            assertTrue(failed.await(5, TimeUnit.SECONDS))
+            now.set(101L)
+            SwingUtilities.invokeAndWait { repeat(10) { controller.snapshot() } }
+            assertEquals(1, errors.get())
+        } finally { controller.dispose() }
+    }
+
+    @Test
+    fun pause_offline_and_sleep_gaps_do_not_consume_the_startup_budget() {
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        var offline = false
+        val failed = CountDownLatch(1)
+        val controller = NativePlayerController(NativePlayerHost(), backend = NoOpNativePlayerBackend, nativeDispose = {},
+            isHostDisplayable = { false }, startupNowMs = now::get, startupTimeoutMs = 100L, startupIsOffline = { offline })
+        try {
+            controller.attach("https://example.invalid/a", emptyMap(), false, 0L, 0, false) { failed.countDown() }
+            now.set(200L); controller.snapshot()
+            controller.play()
+            offline = true
+            now.set(400L); controller.snapshot()
+            offline = false
+            now.set(10_000L); controller.snapshot()
+            assertEquals(1L, failed.count, "a held or suspended startup must not expire")
+            now.set(10_101L); controller.snapshot()
+            assertTrue(failed.await(5, TimeUnit.SECONDS))
+        } finally { controller.dispose() }
+    }
+
+    @Test
+    fun closing_during_startup_subtitle_lookup_never_frees_the_creating_handle() {
+        val entered = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val disposed = CountDownLatch(1)
+        val freed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val usesAfterFree = java.util.concurrent.atomic.AtomicInteger()
+        val backend = object : NativePlayerBackend by NoOpNativePlayerBackend {
+            override fun configureStartupSubtitles(handle: Long, urls: Array<String>, titles: Array<String>, languages: Array<String>, selectedIndex: Int, disableAutoSelect: Boolean) {
+                if (freed.get()) usesAfterFree.incrementAndGet()
+            }
+        }
+        val controller = NativePlayerController(NativePlayerHost(), backend = backend,
+            nativeCreate = { _, _, _, _, _, _, _, _, _, _ -> 71L },
+            nativeDispose = { freed.set(true); disposed.countDown() }, isHostDisplayable = { true }, resolveHostView = { 1L },
+            resolveLocalFilePath = { entered.countDown(); finish.await(); "/startup-test/sub.srt" })
+        try {
+            controller.attach("https://example.invalid/a", emptyMap(), true, 0L, 0, false,
+                externalSubtitles = listOf(com.nuvio.app.features.streams.StreamSubtitle("file:/startup-test/sub.srt", "en")), onError = {})
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            SwingUtilities.invokeAndWait { controller.dispose(); controller.dispose() }
+            assertFalse(freed.get())
+            finish.countDown()
+            assertTrue(disposed.await(5, TimeUnit.SECONDS))
+            assertEquals(0, usesAfterFree.get())
+        } finally { finish.countDown(); controller.dispose() }
     }
 
 }

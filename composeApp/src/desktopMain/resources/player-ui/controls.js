@@ -985,6 +985,7 @@ const setImageSource = (element, source) => {
   const loadedUrl = element.getAttribute("data-loaded-src") || "";
   if (currentUrl !== url) {
     element.setAttribute("decoding", "async");
+    element.setAttribute("loading", "lazy");
     setImageVisualState(element, "loading");
     element.onload = () => {
       if (element.getAttribute("src") !== url) return;
@@ -2242,6 +2243,7 @@ const renderEpisodeList = (modalOpened = false) => {
     selectedSeason == null ? "" : String(selectedSeason),
     id => {
       selectedEpisodeSeason = Number(id);
+      send("episodeSeason", selectedEpisodeSeason);
       currentEpisodeItems = [];
       renderEpisodeList(true);
     },
