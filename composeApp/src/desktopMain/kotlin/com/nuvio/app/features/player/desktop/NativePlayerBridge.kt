@@ -98,6 +98,7 @@ internal object NativePlayerBridge {
         inMiniPlayer: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
+    external fun hasRenderedFrameForTest(handle: Long): Boolean
     external fun activeSyncTimerIntervalSecondsForTest(handle: Long): Double
     external fun attemptedInitialFocusForTest(handle: Long): Boolean
     external fun lastNowPlayingRateForTest(handle: Long): Double

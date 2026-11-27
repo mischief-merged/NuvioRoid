@@ -158,6 +158,8 @@ internal class NativePlayerController(
     },
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
+    private val startupTimeoutMs: Long = 60_000L,
+    private val startupNowMs: () -> Long = { System.nanoTime() / 1_000_000L },
     private val onCreateWaitCompleted: () -> Unit = {},
     private val hideTimerNowMs: () -> Long = System::currentTimeMillis,
     private val hideTimerScheduler: DesktopTimerScheduler = SwingDesktopTimerScheduler,
@@ -182,6 +184,9 @@ internal class NativePlayerController(
         languageHint: String?,
     ) -> String? = SubtitleStartupCoordinator::resolvePlayableLocalSubtitle,
     private val resolveLocalFilePath: (String) -> String? = SubtitleLocalFilePlatform::resolveLocalFilePath,
+    private val resolveSubtitleFont: (String) -> Pair<String, String> = { id ->
+        SubtitleFontResolver.mpvFontName(id) to SubtitleFontResolver.fontsDir()
+    },
     subtitleBridgeOps: NativeSubtitleBridgeOps? = null,
 ) : PlayerEngineController {
     private val usesInjectedCreateStub = nativeCreate != null && backend === RealNativePlayerBackend
@@ -199,6 +204,7 @@ internal class NativePlayerController(
 
         /** Cap on waiting for the previous player's teardown so a hung one cannot block playback. */
         const val TEARDOWN_WAIT_MS = 5_000L
+        val fontDispatcher = Dispatchers.IO.limitedParallelism(1)
 
         @Volatile
         var rememberedVolumeLevel: Float = DesktopPlayerVolumeStorage.loadVolumeLevel() ?: 1f
@@ -253,6 +259,7 @@ internal class NativePlayerController(
     val manualRefreshTick: StateFlow<Long> = _manualRefreshTick.asStateFlow()
     @Volatile
     private var lastKnownVideoSize: IntSize = IntSize.Zero
+    private var videoSizeRead: Pair<Long, Thread>? = null
     @Volatile
     private var currentVolumeLevel = rememberedVolumeLevel.coerceDesktopPlayerVolumeLevel()
     private var pendingSubtitleDelayMs: Int? = null
@@ -266,6 +273,7 @@ internal class NativePlayerController(
     private var onExternalSubtitleLoadFailed: ((String) -> Unit)? = null
     private val subtitleScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val subtitleRequestGeneration = AtomicLong(0L)
+    private val subtitleAppearanceGeneration = AtomicLong(0L)
     @Volatile
     private var activeSubtitleJob: Job? = null
     @Volatile
@@ -274,6 +282,8 @@ internal class NativePlayerController(
     private var startupLoadedLocalPaths: Set<String> = emptySet()
     @Volatile
     private var startupSelectedLocalPath: String? = null
+    @Volatile
+    private var startupSelectedOriginalUrl: String? = null
     private fun eventSink(pending: PendingSource, token: Any) = NativePlayerEventSink { type, value ->
         if (type == "stateSynchronized") {
             val current = synchronized(lifecycleLock) {
@@ -321,10 +331,12 @@ internal class NativePlayerController(
             externalSubtitles = externalSubtitles,
             startupSubtitleSelection = startupSubtitleSelection,
             onError = onError,
+            startupStartedAtMs = startupNowMs(),
         )
         startupConfiguredForSource = null
         startupLoadedLocalPaths = emptySet()
         startupSelectedLocalPath = null
+        startupSelectedOriginalUrl = null
         cancelInFlightSubtitleLoad()
         var terminalFailure: String? = null
         val accepted = synchronized(lifecycleLock) {
@@ -550,8 +562,9 @@ internal class NativePlayerController(
                     createdHandle.also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
                     val accepted = synchronized(lifecycleLock) {
-                        if (!releaseRequested && terminalReleaseFailure == null && pendingSource === pending && activeEventToken === eventToken) {
+                        if (!releaseRequested && !pending.startupTimedOut && terminalReleaseFailure == null && pendingSource === pending && activeEventToken === eventToken) {
                             handle = created
+                            pending.nativeHandle = created
                             lastKnownVideoSize = IntSize.Zero
                             true
                         } else {
@@ -568,7 +581,7 @@ internal class NativePlayerController(
                         val shouldConfigure = synchronized(lifecycleLock) {
                             when {
                                 handle != created -> false
-                                pendingSource !== pending || !isHostDisplayable() -> {
+                                pendingSource !== pending || pending.startupTimedOut || !isHostDisplayable() -> {
                                     handle = 0L
                                     lastSentControlsStructureKey = null
                                     startTrackedDisposeLocked(created)
@@ -884,6 +897,15 @@ internal class NativePlayerController(
             log.d { "event received handle=$handle type=$type value=$value" }
         }
         when (type) {
+            "playbackFailed" -> {
+                val pending = pendingSource ?: return
+                subtitleScope.launch {
+                    val message = org.jetbrains.compose.resources.getString(Res.string.player_error_video_startup_failed)
+                    SwingUtilities.invokeLater {
+                        if (!releaseRequested && pendingSource === pending && activeEventToken === eventToken) pending.onError(message)
+                    }
+                }
+            }
             "certificateFailure" -> {
                 val (current, source) = synchronized(lifecycleLock) {
                     if (releaseRequested || activeEventToken !== eventToken) return
@@ -1165,22 +1187,64 @@ internal class NativePlayerController(
         backend.setSpeed(current, next)
     }
 
+    private fun refreshVideoSize(current: Long) {
+        synchronized(lifecycleLock) {
+            if (releaseRequested || handle != current || videoSizeRead != null) return
+            val worker = Thread({
+                try {
+                    val size = runCatching {
+                        desktopMpvVideoSize { name -> backend.stringProperty(current, name) }
+                    }.getOrDefault(IntSize.Zero)
+                    synchronized(lifecycleLock) {
+                        if (!releaseRequested && handle == current && size != IntSize.Zero) {
+                            lastKnownVideoSize = size
+                        }
+                    }
+                } finally {
+                    synchronized(lifecycleLock) { videoSizeRead = null }
+                    _manualRefreshTick.update { it + 1L }
+                }
+            }, "nuvio-player-video-size").apply { isDaemon = true }
+            videoSizeRead = current to worker
+            worker.start()
+        }
+    }
+
+    private fun awaitVideoSizeRead(current: Long) {
+        val worker = synchronized(lifecycleLock) { videoSizeRead?.takeIf { it.first == current }?.second }
+        awaitThreadCompletion(worker, "video size lookup")
+    }
+
+    private fun checkStartup(snapshot: PlayerPlaybackSnapshot) {
+        val expired = synchronized(lifecycleLock) {
+            val pending = pendingSource ?: return
+            if (releaseRequested || pending.startupCompleted || pending.startupTimedOut) return
+            if (!snapshot.isLoading) {
+                pending.startupCompleted = true
+                return
+            }
+            if (startupNowMs() - pending.startupStartedAtMs < startupTimeoutMs) return
+            pending.startupTimedOut = true
+            activeEventToken = null
+            pending
+        }
+        handle.takeIf { it != 0L }?.let { backend.setPaused(it, true) }
+        subtitleScope.launch {
+            val message = org.jetbrains.compose.resources.getString(Res.string.player_error_video_startup_timeout)
+            SwingUtilities.invokeLater {
+                if (!releaseRequested && pendingSource === expired) expired.onError(message)
+            }
+        }
+    }
+
     fun snapshot(includeVideoSize: Boolean = true): PlayerPlaybackSnapshot {
         val current = handle
-        if (current == 0L) return PlayerPlaybackSnapshot(isLoading = true)
-        return runCatching {
+        val sourceOwnsHandle = pendingSource?.let { it.nativeHandle == current } ?: true
+        val snapshot = if (current == 0L || releaseRequested || !sourceOwnsHandle) PlayerPlaybackSnapshot(isLoading = true) else runCatching {
             val isLoading = backend.isLoading(current)
             val isEnded = backend.isEnded(current)
-            val cachedSize = lastKnownVideoSize
-            val videoSize = if (includeVideoSize || cachedSize == IntSize.Zero) {
-                desktopMpvVideoSize { name -> backend.stringProperty(current, name) }.also { resolved ->
-                    if (resolved != IntSize.Zero) {
-                        lastKnownVideoSize = resolved
-                    }
-                }
-            } else {
-                cachedSize
-            }
+            if (includeVideoSize || lastKnownVideoSize == IntSize.Zero) refreshVideoSize(current)
+            val videoSize = lastKnownVideoSize
             PlayerPlaybackSnapshot(
                 isLoading = isLoading,
                 isPlaying = !backend.isPaused(current) && !isLoading && !isEnded,
@@ -1193,6 +1257,8 @@ internal class NativePlayerController(
                 videoHeight = videoSize.height,
             )
         }.getOrDefault(PlayerPlaybackSnapshot(isLoading = true))
+        checkStartup(snapshot)
+        return snapshot
     }
 
     fun releaseBeforeNavigation(onReleased: () -> Unit) {
@@ -1243,6 +1309,7 @@ internal class NativePlayerController(
                             val current = if (failureMessage == null) detachPlayerHandle() else 0L
                             if (current != 0L) {
                                 log.d { "pre-navigation dispose started handle=$current" }
+                                awaitVideoSizeRead(current)
                                 runCatching { nativeDispose(current) }
                                     .onSuccess { log.d { "pre-navigation dispose completed handle=$current" } }
                                     .onFailure { error ->
@@ -1444,10 +1511,12 @@ internal class NativePlayerController(
     /** Must be called while holding [lifecycleLock]. */
     private fun startTrackedDisposeLocked(current: Long) {
         val prior = disposeInFlight?.takeIf { it.isAlive }
+        val videoRead = videoSizeRead?.takeIf { it.first == current }?.second
         val worker = Thread(
             {
                 try {
                     awaitThreadCompletion(prior, "prior native teardown")
+                    awaitThreadCompletion(videoRead, "video size lookup")
                     runCatching { nativeDispose(current) }
                         .onFailure { error -> recordTerminalDisposeFailure(error, "native", current) }
                 } finally {
@@ -1631,8 +1700,7 @@ internal class NativePlayerController(
         val generation = subtitleRequestGeneration.incrementAndGet()
         activeSubtitleJob?.cancel()
         val subtitleMeta = pendingSource?.externalSubtitles?.firstOrNull { it.url == url }
-        val targetPathIfLocal = url.takeIf { it.isLocalSubtitleUri() }
-            ?.let(resolveLocalFilePath)
+        val targetPathIfLocal = startupSelectedLocalPath.takeIf { url == startupSelectedOriginalUrl }
         if (targetPathIfLocal != null && targetPathIfLocal == startupSelectedLocalPath) {
             val existingTracks = decodeTracks { subtitleOps.subtitleTracksJson(it) }
             val matchingIndex = existingTracks.indexOfFirst { track ->
@@ -1661,6 +1729,7 @@ internal class NativePlayerController(
 
             if (localPath != null) {
                 startupSelectedLocalPath = localPath
+                startupSelectedOriginalUrl = url
                 subtitleOps.clearExternalSubtitles(activeHandle)
                 subtitleOps.addSubtitleTrack(
                     handle = activeHandle,
@@ -1672,6 +1741,7 @@ internal class NativePlayerController(
             } else {
                 log.w { "setSubtitleUri timed out or failed validation; falling back to none for ${url.toPlaybackLogKey()}" }
                 startupSelectedLocalPath = null
+                startupSelectedOriginalUrl = null
                 subtitleOps.clearExternalSubtitles(activeHandle)
                 SwingUtilities.invokeLater {
                     if (!releaseRequested && subtitleRequestGeneration.get() == generation) {
@@ -1722,8 +1792,7 @@ internal class NativePlayerController(
         // The attachment keeps its identity: events and the certificate prompt compare against it.
         pending.startupSubtitles = StartupSubtitles(externalSubtitles, startupSubtitleSelection)
         if (externalSubtitles.any { it.url.isLocalSubtitleUri() }) {
-            subtitleOps.clearExternalSubtitles(current)
-            configureStartupSubtitlesSafe(current, pending)
+            configureStartupSubtitlesSafe(current, pending, clearExisting = true)
         } else {
             triggerFallbackRemoteStartupSubtitleIfNeeded(pending)
         }
@@ -1735,8 +1804,31 @@ internal class NativePlayerController(
         activeSubtitleJob = null
     }
 
-    private fun configureStartupSubtitlesSafe(nativeHandle: Long, pending: PendingSource) {
-        val localEntries = pending.externalSubtitles.mapNotNull { subtitle ->
+    private fun configureStartupSubtitlesSafe(nativeHandle: Long, pending: PendingSource, clearExisting: Boolean = false) {
+        val subtitles = pending.startupSubtitles
+        if (SwingUtilities.isEventDispatchThread()) {
+            subtitleScope.launch {
+                val entries = resolveStartupSubtitleEntries(subtitles.externalSubtitles)
+                SwingUtilities.invokeLater {
+                    if (!releaseRequested && handle == nativeHandle && pendingSource === pending &&
+                        pending.startupSubtitles === subtitles
+                    ) {
+                        if (clearExisting) subtitleOps.clearExternalSubtitles(nativeHandle)
+                        applyStartupSubtitleEntries(nativeHandle, pending, entries)
+                    }
+                }
+            }
+        } else {
+            // Initial creation owns the handle until this worker finishes.
+            val entries = resolveStartupSubtitleEntries(subtitles.externalSubtitles)
+            if (pending.startupSubtitles !== subtitles) return
+            if (clearExisting) subtitleOps.clearExternalSubtitles(nativeHandle)
+            applyStartupSubtitleEntries(nativeHandle, pending, entries)
+        }
+    }
+
+    private fun resolveStartupSubtitleEntries(subtitles: List<StreamSubtitle>): List<StartupSubtitleEntry> =
+        subtitles.mapNotNull { subtitle ->
             if (!subtitle.url.isLocalSubtitleUri()) return@mapNotNull null
             val path = resolveLocalFilePath(subtitle.url) ?: return@mapNotNull null
             StartupSubtitleEntry(
@@ -1746,6 +1838,8 @@ internal class NativePlayerController(
                 language = subtitle.language,
             )
         }
+
+    private fun applyStartupSubtitleEntries(nativeHandle: Long, pending: PendingSource, localEntries: List<StartupSubtitleEntry>) {
         val selection = pending.startupSubtitleSelection
         val selectedIndex = when {
             localEntries.isEmpty() -> -1
@@ -1758,6 +1852,7 @@ internal class NativePlayerController(
         startupConfiguredForSource = pending.sourceUrl
         startupLoadedLocalPaths = localEntries.mapTo(LinkedHashSet()) { it.localPath }
         startupSelectedLocalPath = localEntries.getOrNull(selectedIndex)?.localPath
+        startupSelectedOriginalUrl = localEntries.getOrNull(selectedIndex)?.originalUrl
 
         if (localEntries.isEmpty() && !disableAutoSelect) return
 
@@ -1836,14 +1931,26 @@ internal class NativePlayerController(
             useLibass = useLibass,
             stripSdh = style.stripSdh,
         )
-        backend.setSubtitleAppearance(
-            handle = handle,
-            font = SubtitleFontResolver.mpvFontName(style.appearance.fontId),
-            fontsDir = SubtitleFontResolver.fontsDir(),
-            shadowColor = shadow.color,
-            shadowOffset = shadow.offset,
-            shadowBlur = shadow.blur,
-        )
+        val appearanceGeneration = subtitleAppearanceGeneration.incrementAndGet()
+        val source = pendingSource
+        subtitleScope.launch(fontDispatcher) {
+            if (subtitleAppearanceGeneration.get() != appearanceGeneration) return@launch
+            val (font, directory) = runCatching { resolveSubtitleFont(style.appearance.fontId) }
+                .getOrDefault("sans-serif" to "")
+            SwingUtilities.invokeLater {
+                if (releaseRequested || this@NativePlayerController.handle != handle ||
+                    pendingSource !== source || subtitleAppearanceGeneration.get() != appearanceGeneration
+                ) return@invokeLater
+                backend.setSubtitleAppearance(
+                    handle = handle,
+                    font = font,
+                    fontsDir = directory,
+                    shadowColor = shadow.color,
+                    shadowOffset = shadow.offset,
+                    shadowBlur = shadow.blur,
+                )
+            }
+        }
     }
 
     private fun decodeTracks(readJson: (Long) -> String): List<NativeMpvTrack> {
@@ -1977,7 +2084,13 @@ private class PendingSource(
     externalSubtitles: List<StreamSubtitle> = emptyList(),
     startupSubtitleSelection: StartupSubtitleSelection? = null,
     val onError: (String?) -> Unit,
+    val startupStartedAtMs: Long,
 ) {
+    var startupCompleted: Boolean = false
+    @Volatile
+    var nativeHandle: Long = 0L
+    @Volatile
+    var startupTimedOut: Boolean = false
     @Volatile
     var startupSubtitles: StartupSubtitles = StartupSubtitles(externalSubtitles, startupSubtitleSelection)
 

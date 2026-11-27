@@ -3608,4 +3608,6 @@
     <string name="settings_make_room_title">Make room automatically</string>
     <string name="settings_make_room_description">When over a storage limit, moves watched downloads to the Trash, oldest watched first. Never touches unwatched, Keep, playing, or downloading titles.</string>
     <string name="settings_make_room_unavailable_description">Unavailable on this computer because the Trash cannot restore moved downloads with Undo. Watched downloads stay where they are.</string>
+    <string name="player_error_video_startup_timeout">The video did not start. Please try another source.</string>
+    <string name="player_error_video_startup_failed">This video could not be played. Please try another source.</string>
 </resources>
