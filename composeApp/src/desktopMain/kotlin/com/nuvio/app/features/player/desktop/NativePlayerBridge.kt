@@ -98,6 +98,7 @@ internal object NativePlayerBridge {
         inMiniPlayer: Boolean,
         eventSink: NativePlayerEventSink,
     ): Long
+    external fun hasRenderedFrameForTest(handle: Long): Boolean
     external fun activeSyncTimerIntervalSecondsForTest(handle: Long): Double
     external fun attemptedInitialFocusForTest(handle: Long): Boolean
     external fun lastNowPlayingRateForTest(handle: Long): Double
@@ -119,6 +120,7 @@ internal object NativePlayerBridge {
     ): Array<ByteArray?>?
 
     external fun dispose(handle: Long)
+    external fun setControlsImage(handle: Long, key: String, data: String?)
     external fun updateControls(handle: Long, controlsJson: String)
 
     /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
