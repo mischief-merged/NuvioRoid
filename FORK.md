@@ -2,7 +2,7 @@
 
 NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/NuvioDesktop). It adds offline-viewing features to the desktop app and makes the existing download and playback flows easier to follow. Everything here is offered back to the upstream project; nothing has been submitted yet, and each change is kept on its own branch so it can be proposed and reviewed separately.
 
-- **Based on:** upstream `Dev` at `1a5805eb` (22 November 2026).
+- **Based on:** upstream `Dev` at `04c94b54` (24 November 2026), upstream version 0.1.39.
 - **Everything together:** the `downloads-suite` branch.
 - **Scope:** desktop. Built and tested on macOS (Apple silicon). Shared code compiles for desktop only in this fork's test runs; the Android and iOS builds have not been run, and the Linux and Windows player bridges are unchanged.
 
@@ -33,6 +33,8 @@ NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/N
 | Trip ready | Offline hours at a glance and a "Fill for my trip" button. | [#100](https://github.com/mischief-merged/NuvioRoid/pull/100) |
 | Travel mode | Settings for plane and Starlink Wi-Fi, with network rules checked again after the Mac wakes. | [#105](https://github.com/mischief-merged/NuvioRoid/pull/105) |
 | Delete after watching, for everything | Delete after watching can also cover downloads you start yourself. Keep can be undone. | [#107](https://github.com/mischief-merged/NuvioRoid/pull/107) |
+| Nothing deleted for good | Downloads, partial files, rejected files and subtitle folders always go to the Trash or a holding folder, and a partial is kept until its replacement is safely in place. | [#149](https://github.com/mischief-merged/NuvioRoid/pull/149) |
+| Storage limit for everything | One storage limit for all downloads, a clean-up list for watched downloads, an optional free-space floor per drive and an optional make-room mode. Everything goes to the Trash with Undo. | [#152](https://github.com/mischief-merged/NuvioRoid/pull/152) |
 
 ## Playback
 
@@ -47,6 +49,7 @@ NuvioRoid is a fork of [NuvioMedia/NuvioDesktop](https://github.com/NuvioMedia/N
 | Subtitles ready | Subtitles are fetched before playback starts. | [#104](https://github.com/mischief-merged/NuvioRoid/pull/104) |
 | Sleep timer | The player stops on its own after a time you choose. | [#108](https://github.com/mischief-merged/NuvioRoid/pull/108) |
 | Mini player | Keep browsing while a video plays in a small window (macOS). | [#135](https://github.com/mischief-merged/NuvioRoid/pull/135) |
+| Gamepad in the Sources popup | With a gamepad, focus stays on the chosen source in the player's Sources popup instead of jumping to the header. | [#151](https://github.com/mischief-merged/NuvioRoid/pull/151) |
 
 ## Navigation
 
@@ -75,7 +78,7 @@ User-facing English text uses one set of terms ("source", "Auto-download") and p
 
 ## Testing
 
-The desktop test suite on `downloads-suite` runs 4,950 tests. Two fail, and the same two fail on upstream `Dev` without any of these changes:
+The desktop test suite on `downloads-suite` runs 5,066 tests. Two fail, and the same two fail on upstream `Dev` without any of these changes:
 
 - `DesktopWindowInsetsTest` (title bar clearance)
 - `SettingsNavigationTest` (buffer options by platform and playback engine)
