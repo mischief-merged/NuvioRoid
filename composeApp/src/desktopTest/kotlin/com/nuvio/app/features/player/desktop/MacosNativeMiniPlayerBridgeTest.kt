@@ -56,6 +56,114 @@ class MacosNativeMiniPlayerBridgeTest {
     }
 
     @Test
+    fun invalid_media_reports_failure_without_waiting_for_the_startup_deadline() {
+        assumeTrue(DesktopHostOs.current == DesktopHostOs.MACOS)
+        NativePlayerBridge.ensureLoaded()
+        val failed = CountDownLatch(1)
+        val handle = NativePlayerBridge.createHeadlessMacosForTest(
+            "/missing-playback-test/episode.mkv", emptyArray(), true, 0L, true,
+            NativePlayerEventSink { type, _ -> if (type == "playbackFailed") failed.countDown() },
+        )
+        try {
+            assertTrue(failed.await(3, TimeUnit.SECONDS), "native media failure was not reported")
+        } finally {
+            RealNativePlayerBackend.dispose(handle)
+        }
+    }
+
+    @Test
+    fun native_surface_renders_first_frame_and_remains_responsive_through_subtitle_setup() {
+        assumeTrue(DesktopHostOs.current == DesktopHostOs.MACOS)
+        assumeTrue(!java.awt.GraphicsEnvironment.isHeadless())
+        NativePlayerBridge.ensureLoaded()
+        val video = java.nio.file.Files.createTempFile("startup-surface-", ".y4m").toFile()
+        video.writeBytes(buildTestY4mBytes(durationSeconds = 8).first)
+        val host = NativePlayerHost()
+        val frame = javax.swing.JFrame("Playback test")
+        var handle = 0L
+        try {
+            var pointer = 0L
+            javax.swing.SwingUtilities.invokeAndWait {
+                frame.add(host)
+                frame.setSize(400, 300)
+                frame.isVisible = true
+                pointer = AwtNativeViewResolver.resolveNativeViewPointer(host)
+            }
+            handle = RealNativePlayerBackend.create(
+                pointer, video.absolutePath, emptyArray(), true, 0L,
+                RealNativePlayerBackend.controlsPageUrl(), 2, false, false,
+                NativePlayerEventSink { _, _ -> }, remoteCommandsEnabled = false,
+            )
+            RealNativePlayerBackend.applySubtitleStyle(
+                handle, "#FFFFFFFF", "#00000000", "#FF000000", 1f, false, 24f, 100, true, false,
+            )
+            RealNativePlayerBackend.setSubtitleAppearance(handle, "sans-serif", "", "#00000000", 0f, 0f)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (RealNativePlayerBackend.isLoading(handle) && System.nanoTime() < deadline) Thread.sleep(20)
+            assertFalse(RealNativePlayerBackend.isLoading(handle), "startup did not finish")
+            assertTrue(NativePlayerBridge.hasRenderedFrameForTest(handle), "startup cleared before a frame was rendered")
+            val pulse = CountDownLatch(1)
+            javax.swing.SwingUtilities.invokeLater { pulse.countDown() }
+            assertTrue(pulse.await(1, TimeUnit.SECONDS), "window stopped responding")
+        } finally {
+            if (handle != 0L) RealNativePlayerBackend.dispose(handle)
+            javax.swing.SwingUtilities.invokeAndWait { frame.dispose() }
+            video.delete()
+        }
+    }
+
+    @Test
+    fun stalled_subtitle_reader_keeps_pause_and_ui_state_responsive() {
+        assumeTrue(DesktopHostOs.current == DesktopHostOs.MACOS)
+        NativePlayerBridge.ensureLoaded()
+        val video = java.nio.file.Files.createTempFile("startup-video-", ".y4m").toFile()
+        video.writeBytes(buildTestY4mBytes(durationSeconds = 8).first)
+        val requested = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val paused = CountDownLatch(1)
+        val listenForPause = AtomicBoolean(false)
+        val server = ServerSocket(0, 8, InetAddress.getLoopbackAddress())
+        val worker = Thread({
+            runCatching {
+                server.accept().use { socket ->
+                    val reader = socket.getInputStream().bufferedReader()
+                    while (!reader.readLine().isNullOrEmpty()) { }
+                    requested.countDown()
+                    release.await(10, TimeUnit.SECONDS)
+                    val body = "1\n00:00:00,000 --> 00:00:05,000\nTest\n"
+                    socket.getOutputStream().write(
+                        ("HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n" + body).toByteArray(),
+                    )
+                }
+            }
+        }, "startup-subtitle-server").apply { isDaemon = true; start() }
+        var handle = 0L
+        try {
+            handle = NativePlayerBridge.createHeadlessMacosForTest(
+                video.absolutePath, emptyArray(), true, 0L, true,
+                NativePlayerEventSink { type, _ ->
+                    if (type == "stateSynchronized" && listenForPause.get()) paused.countDown()
+                },
+            )
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (RealNativePlayerBackend.isLoading(handle) && System.nanoTime() < deadline) Thread.sleep(20)
+            assertFalse(RealNativePlayerBackend.isLoading(handle), "fixture must be playing before subtitle loading")
+            RealNativePlayerBackend.addSubtitleUrl(handle, "http://127.0.0.1:${server.localPort}/slow.srt")
+            assertTrue(requested.await(5, TimeUnit.SECONDS), "subtitle request did not reach the server")
+            listenForPause.set(true)
+            RealNativePlayerBackend.setPaused(handle, true)
+            assertTrue(paused.await(1, TimeUnit.SECONDS), "pause blocked the player UI behind subtitle loading")
+            assertTrue(RealNativePlayerBackend.isPaused(handle))
+        } finally {
+            release.countDown()
+            server.close()
+            worker.join(2_000)
+            if (handle != 0L) RealNativePlayerBackend.dispose(handle)
+            video.delete()
+        }
+    }
+
+    @Test
     fun minimized_native_player_sync_observes_demuxer_cache_growth_preserves_focus_and_updates_rate() {
         assumeTrue("macOS native player bridge test only runs on macOS", DesktopHostOs.current == DesktopHostOs.MACOS)
         NativePlayerBridge.ensureLoaded()

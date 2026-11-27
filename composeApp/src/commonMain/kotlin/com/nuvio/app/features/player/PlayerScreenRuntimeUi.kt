@@ -1366,6 +1366,7 @@ internal fun PlayerScreenRuntime.handlePlayerControlsEvent(type: String, value: 
         playerControlsLog.d { "event type=$type value=$value ${playerControlLogContext()}" }
     }
     when (type) {
+        "tracksChanged" -> refreshTracks()
         "cursorActivity" -> {
             if (!playerControlsLocked && !args.isMinimized) {
                 controlsVisible = true

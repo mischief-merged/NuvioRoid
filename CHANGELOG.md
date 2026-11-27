@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ## [Unreleased]
 
-## [1.1.39.1] - 2026-11-25
+## [1.1.39.1] - 2026-11-26
 
 ### Added
 
@@ -18,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Ver
 
 ### Fixed
 
+- The player no longer locks up on Starting playback while audio plays on series with many episodes; controls no longer carry embedded pictures and start-up work stays off the main thread (#153) ([#155](https://github.com/mischief-merged/NuvioRoid/pull/155)).
 - Gamepad focus stays on the chosen source in the player Sources popup instead of jumping to the header, and the archive message now says held files wait 7 days before moving to the Trash (#127) ([#151](https://github.com/mischief-merged/NuvioRoid/pull/151)).
 - Downloads, partial files, rejected files and subtitle folders are never deleted for good: anything removed goes to the Trash or the holding folder, and a partial is kept until its replacement is safely in place (#126, #76) ([#149](https://github.com/mischief-merged/NuvioRoid/pull/149)).
 
